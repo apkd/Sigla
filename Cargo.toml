@@ -1,0 +1,45 @@
+[package]
+name = "sigla"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Shared C# and Rust source navigation over MCP"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+blake3 = "1"
+dotscope = { version = "=0.9.1", default-features = false }
+clap = { version = "4", features = ["derive"] }
+chardetng = "0.1"
+encoding_rs = "0.8"
+globset = "0.4"
+heed = "0.22"
+inotify = "0.11"
+postcard = { version = "1", features = ["alloc"] }
+zstd = "0.13"
+quick-xml = "0.39"
+regex = "1"
+ra_ap_syntax = "=0.0.300"
+rmcp = { version = "=3.4.0", features = ["server", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.9"
+tree-sitter = "0.25"
+tree-sitter-c-sharp = "0.23"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+windows-metadata = "=0.100.0"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,19 @@
+[Unit]
+Description=Sigla codebase search MCP
+
+[Service]
+ExecStart=%h/.local/bin/sigla --root %h/src --root %h/Unity serve
+CacheDirectory=sigla
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/sigla
+PrivateTmp=true
+MemoryHigh=1G
+MemoryMax=2G
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
