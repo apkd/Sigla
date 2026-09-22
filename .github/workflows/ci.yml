@@ -22,13 +22,22 @@ jobs:
         with:
           dotnet-version: 10.0.x
       - name: Install remote sandbox dependency
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libcap-dev
+          curl -fsSL https://github.com/containers/bubblewrap/releases/download/v0.11.2/bubblewrap-0.11.2.tar.xz -o "$RUNNER_TEMP/bubblewrap.tar.xz"
+          tar -xf "$RUNNER_TEMP/bubblewrap.tar.xz" -C "$RUNNER_TEMP"
+          meson setup "$RUNNER_TEMP/bubblewrap-build" "$RUNNER_TEMP/bubblewrap-0.11.2" -Dtests=false -Dman=disabled -Dselinux=disabled
+          meson compile -C "$RUNNER_TEMP/bubblewrap-build"
+          echo "$RUNNER_TEMP/bubblewrap-build" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: dotnet build tests/metadata-fixture -c Release
-      - run: cargo test --locked --all-targets -- --include-ignored
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test with network namespace privileges
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" cargo test --locked --all-targets -- --include-ignored
+      - name: Run Clippy
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" cargo clippy --locked --all-targets -- -D warnings
       - run: dotnet build tests/metadata-oracle -c Release
       - name: Compare native signatures with the reference reader
         run: |
           dotnet tests/metadata-oracle/bin/Release/net10.0/MetadataOracle.dll --signatures tests/metadata-fixture/bin/Release/net10.0/MetadataFixture.dll > target/signatures.json
-          cargo run --locked --example metadata_compare -- tests/metadata-fixture/bin/Release/net10.0/MetadataFixture.dll target/signatures.json
+          sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" cargo run --locked --example metadata_compare -- tests/metadata-fixture/bin/Release/net10.0/MetadataFixture.dll target/signatures.json
