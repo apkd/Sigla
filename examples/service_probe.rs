@@ -16,7 +16,7 @@ fn serial() -> usize {
 }
 #[derive(Clone, Deserialize)]
 struct Case {
-    project_path: String,
+    project: String,
     query: String,
 }
 #[tokio::main]
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
                 let app = app.clone();
                 jobs.spawn(async move {
             let start = Instant::now();
-            let output = app.search(&case.project_path, &case.query).await?;
+            let output = app.search(&case.project, &case.query).await?;
             let status = std::fs::read_to_string("/proc/self/status")?;
             let memory = |prefix: &str| {
                 status
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
             };
             println!(
                 "{}",
-                serde_json::json!({"iteration":iteration,"project":case.project_path,"query":case.query,"elapsed_us":start.elapsed().as_micros(),"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string(),"rss":memory("VmRSS:"),"anonymous_rss":memory("RssAnon:"),"file_rss":memory("RssFile:"),"peak_rss":memory("VmHWM:"),"threads":memory("Threads:")})
+                serde_json::json!({"iteration":iteration,"project":case.project,"query":case.query,"elapsed_us":start.elapsed().as_micros(),"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string(),"rss":memory("VmRSS:"),"anonymous_rss":memory("RssAnon:"),"file_rss":memory("RssFile:"),"peak_rss":memory("VmHWM:"),"threads":memory("Threads:")})
             );
             Ok::<_, anyhow::Error>(())
             });

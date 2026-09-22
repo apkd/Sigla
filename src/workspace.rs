@@ -63,11 +63,50 @@ pub struct FileEntry {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
+    pub discovery_policy: [u8; 32],
     pub environment: [u8; 32],
     pub root: PathBuf,
     pub projects: Vec<Project>,
     pub files: BTreeMap<String, FileEntry>,
     pub metadata: BTreeMap<PathBuf, Stamp>,
+    pub inputs: Vec<SourceInput>,
+    pub dependencies: BTreeSet<PathBuf>,
+    pub diagnostics: Vec<String>,
+}
+
+impl Manifest {
+    pub fn metadata_visible(&self, file: &FileEntry, project: usize) -> bool {
+        self.projects[project].assemblies.iter().any(|reference| {
+            reference.path == file.path
+                && (reference.aliases.is_empty() || reference.aliases.iter().any(|a| a == "global"))
+        })
+    }
+    pub fn display<'a>(
+        &'a self,
+        file: &'a FileEntry,
+        membership: &Membership,
+    ) -> std::borrow::Cow<'a, str> {
+        let mapping = self.projects[membership.project]
+            .source_roots
+            .iter()
+            .filter(|root| file.path.starts_with(&root.physical))
+            .max_by_key(|root| root.physical.components().count());
+        match mapping {
+            Some(root) => {
+                let relative = file
+                    .path
+                    .strip_prefix(&root.physical)
+                    .unwrap()
+                    .to_string_lossy();
+                std::borrow::Cow::Owned(if root.logical.is_empty() {
+                    relative.into_owned()
+                } else {
+                    format!("{}/{relative}", root.logical)
+                })
+            }
+            None => std::borrow::Cow::Borrowed(&file.display),
+        }
+    }
 }
 
 pub struct Workspace {
@@ -76,13 +115,22 @@ pub struct Workspace {
     pub assemblies: Arc<Store>,
     pub manifest: Arc<Manifest>,
     policy: Policy,
+    cache: PathBuf,
     pub builds: usize,
     monitor: Arc<crate::watch::Monitor>,
     directories: BTreeSet<PathBuf>,
     fence: u64,
     initialized: bool,
 }
+pub struct Preparation {
+    discovery: discovery::Discovery,
+    fence: u64,
+    started: std::time::Instant,
+}
 impl Workspace {
+    pub fn update_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
     pub fn open(
         entry: PathBuf,
         cache: &Path,
@@ -90,9 +138,13 @@ impl Workspace {
         assemblies: Arc<Store>,
         monitor: Arc<crate::watch::Monitor>,
     ) -> Result<Self> {
-        let key = blake3::hash(entry.as_os_str().as_encoded_bytes())
-            .to_hex()
-            .to_string();
+        let key = blake3::hash(&postcard::to_allocvec(&(
+            &entry,
+            policy.unity_platform,
+            policy.remote.is_some(),
+        ))?)
+        .to_hex()
+        .to_string();
         let store = Arc::new(Store::open(&cache.join(key))?);
         let manifest = store.get_manifest()?.unwrap_or_default();
         Ok(Self {
@@ -101,6 +153,7 @@ impl Workspace {
             assemblies,
             manifest: Arc::new(manifest),
             policy,
+            cache: cache.to_owned(),
             builds: 0,
             monitor,
             directories: BTreeSet::new(),
@@ -109,6 +162,19 @@ impl Workspace {
         })
     }
     pub fn refresh(&mut self) -> Result<()> {
+        if let Some(prepared) = self.prepare()? {
+            self.apply(prepared)?;
+        }
+        Ok(())
+    }
+
+    /// Managed materialization bypasses watcher timing, while still comparing input stamps.
+    pub fn materialized(&mut self) {
+        self.initialized = false;
+    }
+
+    /// Dependency preparation does not consume an indexing worker.
+    pub fn prepare(&mut self) -> Result<Option<Preparation>> {
         if !self.initialized {
             for p in self
                 .manifest
@@ -129,9 +195,10 @@ impl Workspace {
         }
         let (dirty, fence) = self.monitor.fence(&self.directories, self.fence);
         if self.initialized && !dirty {
-            return Ok(());
+            return Ok(None);
         }
         let metadata_changed = !self.store.manifest_current()?
+            || self.manifest.discovery_policy != self.policy.identity()?
             || self.manifest.projects.is_empty()
             || self
                 .manifest
@@ -146,17 +213,45 @@ impl Workspace {
         if !metadata_changed && !sources_changed {
             self.fence = fence;
             self.initialized = true;
-            return Ok(());
+            return Ok(None);
         }
         let start = std::time::Instant::now();
-        let discovery = discovery::discover(&self.entry, &self.policy)?;
+        let discovery = if metadata_changed {
+            discovery::discover_cached(&self.entry, &self.policy, &self.cache)?
+        } else {
+            discovery::Discovery {
+                root: self.manifest.root.clone(),
+                projects: self.manifest.projects.clone(),
+                sources: self.manifest.inputs.clone(),
+                metadata: self.manifest.metadata.keys().cloned().collect(),
+                dependencies: self.manifest.dependencies.clone(),
+                diagnostics: self.manifest.diagnostics.clone(),
+            }
+        };
+        Ok(Some(Preparation {
+            discovery,
+            fence,
+            started: start,
+        }))
+    }
+
+    pub fn apply(&mut self, prepared: Preparation) -> Result<()> {
+        let Preparation {
+            discovery,
+            fence,
+            started: start,
+        } = prepared;
         let mut directories = BTreeSet::new();
         let mut manifest = Manifest {
+            discovery_policy: self.policy.identity()?,
             environment: [0; 32],
             root: discovery.root,
             projects: discovery.projects,
             files: BTreeMap::new(),
             metadata: BTreeMap::new(),
+            inputs: discovery.sources.clone(),
+            dependencies: discovery.dependencies,
+            diagnostics: discovery.diagnostics,
         };
         for p in discovery.metadata {
             if let Some(dir) = if p.is_dir() {
@@ -174,9 +269,18 @@ impl Workspace {
         let mut queue: VecDeque<_> = discovery.sources.into();
         for (project, p) in manifest.projects.iter().enumerate() {
             for assembly in &p.assemblies {
-                if assembly.is_file() {
+                ensure!(
+                    assembly.path.is_file(),
+                    "Selected reference is unavailable: {}",
+                    assembly.path.display()
+                );
+                if assembly.path.is_file() {
                     queue.push_back(SourceInput {
-                        path: self.policy.canonical(assembly)?,
+                        path: if manifest.dependencies.contains(&assembly.path) {
+                            assembly.path.clone()
+                        } else {
+                            self.policy.canonical(&assembly.path)?
+                        },
                         project,
                         module: String::new(),
                         language: Language::CSharp,
@@ -411,6 +515,11 @@ fn read_stable(path: &Path, language: Language) -> Result<String> {
     for _ in 0..2 {
         let before = Stamp::read(path)?;
         let bytes = std::fs::read(path)?;
+        ensure!(
+            !bytes.starts_with(b"version https://git-lfs.github.com/spec/v1"),
+            "Source input is an unavailable Git LFS object: {}",
+            path.display()
+        );
         let after = Stamp::read(path)?;
         if before == after {
             return tracing::debug_span!("decode_source",path=%path.display())

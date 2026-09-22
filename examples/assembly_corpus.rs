@@ -12,7 +12,7 @@ fn main() -> Result<()> {
     let paths: BTreeSet<_> = discovery
         .projects
         .iter()
-        .flat_map(|p| p.assemblies.iter())
+        .flat_map(|p| p.assemblies.iter().map(|a| &a.path))
         .collect();
     let start = Instant::now();
     let (mut loaded, mut missing, mut failed, mut members) = (0, 0, 0, 0);
@@ -21,7 +21,11 @@ fn main() -> Result<()> {
             missing += 1;
             continue;
         }
-        let path = policy.canonical(path)?;
+        let path = if discovery.dependencies.contains(path) {
+            path.clone()
+        } else {
+            policy.canonical(path)?
+        };
         match sigla::metadata::extract(&path) {
             Ok(facts) => {
                 loaded += 1;

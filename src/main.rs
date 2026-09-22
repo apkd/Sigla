@@ -12,11 +12,8 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 #[derive(Parser)]
 #[command(name = "sigla", version, about = "C# and Rust source navigation")]
 struct Cli {
-    /// Allowed source and reference roots. Repeat to allow several directories.
-    #[arg(long, global = true, default_value = "/")]
-    root: Vec<PathBuf>,
-    #[arg(long, global = true)]
-    cache: Option<PathBuf>,
+    #[command(flatten)]
+    options: sigla::config::Options,
     /// maximum concurrent indexing/search jobs across all workspaces.
     #[arg(long,global=true,default_value_t=2,value_parser=clap::value_parser!(u16).range(1..=16))]
     workers: u16,
@@ -25,6 +22,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[command(name = "__git-job", hide = true)]
+    GitJob { input: PathBuf, output: PathBuf },
     /// run the shared HTTP MCP service at /mcp.
     Serve {
         #[arg(long, default_value = "127.0.0.1:7331")]
@@ -40,37 +39,33 @@ enum Command {
         allowed_origin: Vec<String>,
     },
     /// execute the same search locally, for development and diagnostics.
-    Query { project_path: String, query: String },
+    Query { project: String, query: String },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sigla=info".into()),
-        )
+        .with_env_filter("sigla=info")
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let cache = cli.cache.unwrap_or_else(|| {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
-            })
-            .join("sigla")
+    if let Command::GitJob { input, output } = &cli.command {
+        return sigla::repository::job::worker(input, output);
+    }
+    let remote = cli.options.validate()?;
+    let mut policy = Policy::new(cli.options.local_roots())?;
+    policy.unity_platform = cli.options.unity_platform;
+    let app = Arc::new(match remote {
+        Some(remote) => App::remote(policy, cli.options.cache_dir, cli.workers as usize, remote)?,
+        None => App::new(policy, cli.options.cache_dir, cli.workers as usize)?,
     });
-    let app = Arc::new(App::new(
-        Policy::new(cli.root)?,
-        cache,
-        cli.workers as usize,
-    )?);
     match cli.command {
-        Command::Query {
-            project_path,
-            query,
-        } => println!("{}", app.search(&project_path, &query).await?),
+        Command::GitJob { .. } => unreachable!(),
+        Command::Query { project, query } => {
+            let result = app.search(&project, &query).await;
+            sigla::shutdown();
+            println!("{}", result?);
+        }
         Command::Serve {
             listen,
             token_file,
@@ -101,8 +96,9 @@ async fn main() -> Result<()> {
             if !allowed_origin.is_empty() {
                 config = config.with_allowed_origins(allowed_origin);
             }
+            let mcp_app = app.clone();
             let service = StreamableHttpService::new(
-                move || Ok(Mcp::new(app.clone())),
+                move || Ok(Mcp::new(mcp_app.clone())),
                 Arc::new(LocalSessionManager::default()),
                 config,
             );
@@ -134,10 +130,12 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(listen).await?;
             let listen = listener.local_addr()?;
             tracing::info!(%listen,"Sigla listening at /mcp");
+            app.start_setup();
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     ct.cancel();
+                    sigla::shutdown();
                 })
                 .await?;
         }

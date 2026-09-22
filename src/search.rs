@@ -203,7 +203,12 @@ impl<'a> Search<'a> {
                 .manifest
                 .files
                 .iter()
-                .filter(|(_, f)| !f.metadata && f.display == loc.path)
+                .filter(|(_, f)| {
+                    !f.metadata
+                        && f.memberships
+                            .iter()
+                            .any(|m| self.manifest.display(f, m) == loc.path)
+                })
                 .map(|(k, _)| k.clone())
                 .collect::<Vec<_>>();
             let mut result = Vec::new();
@@ -214,6 +219,9 @@ impl<'a> Search<'a> {
                 };
                 let file = &self.manifest.files[&key];
                 for membership in &file.memberships {
+                    if self.manifest.display(file, membership) != loc.path {
+                        continue;
+                    }
                     if let Some(d) = data
                         .facts
                         .declarations
@@ -259,7 +267,13 @@ impl<'a> Search<'a> {
             let mut projected_contexts = BTreeSet::new();
             for membership in &file.memberships {
                 self.check()?;
-                if from.is_some_and(|from| !self.visible(from, membership.project)) {
+                if from.is_some_and(|from| {
+                    if file.metadata {
+                        membership.project != from || !self.manifest.metadata_visible(&file, from)
+                    } else {
+                        !self.visible(from, membership.project)
+                    }
+                }) {
                     continue;
                 }
                 if let Some(query) = projection {
@@ -328,7 +342,7 @@ impl<'a> Search<'a> {
             || self.manifest.projects[from]
                 .references
                 .iter()
-                .any(|p| p == &self.manifest.projects[to].path)
+                .any(|reference| reference.visible(&self.manifest.projects[to].identity))
     }
     fn same_domain(&self, a: &Hit, b: &Hit) -> bool {
         match (
@@ -806,8 +820,11 @@ impl<'a> Search<'a> {
     ) -> Option<BTreeSet<String>> {
         if q.filters.iter().any(|f| f.key == "path") {
             let allowed = |key: &String| {
-                q.filters.iter().filter(|f| f.key == "path").all(|f| {
-                    self.path_matches(&f.value, &self.manifest.files[key].display) != f.negate
+                let file = &self.manifest.files[key];
+                file.memberships.iter().any(|m| {
+                    q.filters.iter().filter(|f| f.key == "path").all(|f| {
+                        self.path_matches(&f.value, &self.manifest.display(file, m)) != f.negate
+                    })
                 })
             };
             if let Some(files) = files.as_mut() {
@@ -839,7 +856,7 @@ impl<'a> Search<'a> {
                 continue;
             }
             let yes = match f.key.as_str() {
-                "path" => self.path_matches(&f.value, &file.display),
+                "path" => self.path_matches(&f.value, &self.manifest.display(file, m)),
                 "project" => wildcard(&f.value, &self.manifest.projects[m.project].name),
                 "namespace" => decl.is_some_and(|d| component_prefix(&d.namespace, &f.value)),
                 "access" => decl.is_some_and(|d| {
@@ -931,7 +948,7 @@ impl<'a> Search<'a> {
                     h.rank,
                     file.metadata,
                     h.decl.local(),
-                    file.display.clone(),
+                    this.manifest.display(file, &h.membership).into_owned(),
                     h.decl.name_span.start,
                     h.decl.qualified.clone(),
                 );
@@ -972,18 +989,19 @@ impl<'a> Search<'a> {
                     .iter()
                     .filter(|d| !d.local() && d.span.contains(&matched.start()))
                     .min_by_key(|d| d.span.end - d.span.start);
-                if !file.memberships.iter().any(|m| {
+                let Some(membership) = file.memberships.iter().find(|m| {
                     let containing = containing.map(|d| contextual(d, m));
                     self.filters(q, file, m, containing.as_ref(), matched.start(), inside)
-                }) {
+                }) else {
                     continue;
-                }
+                };
+                let display = self.manifest.display(file, membership);
                 let (line_no, column) = position(&data.source, matched.start());
                 if previous_line == Some(line_no) {
                     continue;
                 }
                 previous_line = Some(line_no);
-                let rank = (file.display.clone(), matched.start());
+                let rank = (display.to_string(), matched.start());
                 if !units.accepts(&rank) {
                     continue;
                 }
@@ -997,9 +1015,9 @@ impl<'a> Search<'a> {
                     rank,
                     crate::render::result(
                         &containing
-                            .map(|d| contextual(d, &file.memberships[0]).qualified)
-                            .unwrap_or_else(|| file.display.clone()),
-                        &format!("{}:{line_no}:{column}", file.display),
+                            .map(|d| contextual(d, membership).qualified)
+                            .unwrap_or_else(|| display.to_string()),
+                        &format!("{display}:{line_no}:{column}"),
                         &data.source[start..end],
                         file.language,
                     ),
@@ -1133,7 +1151,8 @@ impl<'a> Search<'a> {
                         }
                         relevant.iter().all(|(_, p)| *p)
                     };
-                    let rank = (uncertain, file.display.clone(), o.span.start);
+                    let display = self.manifest.display(file, m);
+                    let rank = (uncertain, display.to_string(), o.span.start);
                     if !units.accepts(&rank) {
                         continue;
                     }
@@ -1141,10 +1160,10 @@ impl<'a> Search<'a> {
                     let owner = containing
                         .as_ref()
                         .map(|d| d.qualified.as_str())
-                        .unwrap_or(&file.display);
+                        .unwrap_or(&display);
                     let unit = crate::render::result(
                         owner,
-                        &format!("{}:{line_no}:{col}", file.display),
+                        &format!("{display}:{line_no}:{col}"),
                         line(&data.source, o.span.start),
                         file.language,
                     );
@@ -1243,7 +1262,10 @@ impl<'a> Search<'a> {
                     ) {
                         continue;
                     }
-                    let rank = (f.display.clone(), candidate.decl.name_span.start);
+                    let rank = (
+                        self.manifest.display(f, &candidate.membership).into_owned(),
+                        candidate.decl.name_span.start,
+                    );
                     if units.accepts(&rank) {
                         units.insert(rank, self.declaration_unit(&candidate)?);
                     }
@@ -1358,8 +1380,11 @@ impl<'a> Search<'a> {
                                     inside,
                                 )
                             {
-                                let rank =
-                                    (file.metadata, file.display.clone(), h.decl.name_span.start);
+                                let rank = (
+                                    file.metadata,
+                                    self.manifest.display(file, &h.membership).into_owned(),
+                                    h.decl.name_span.start,
+                                );
                                 if units.accepts(&rank) {
                                     units.insert(rank, self.declaration_unit(&h)?);
                                 }
@@ -1393,7 +1418,10 @@ impl<'a> Search<'a> {
             let source = crate::render::source_excerpt(&data.source, h.decl.span.clone());
             Ok(crate::render::result(
                 &h.decl.qualified,
-                &format!("{}:{line}:{column}", f.display),
+                &format!(
+                    "{}:{line}:{column}",
+                    self.manifest.display(f, &h.membership)
+                ),
                 &source,
                 f.language,
             ))

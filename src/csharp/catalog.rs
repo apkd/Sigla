@@ -244,10 +244,7 @@ impl Catalog {
         let context = if view.manifest.files[file].metadata {
             file.into()
         } else {
-            view.manifest.projects[project]
-                .path
-                .to_string_lossy()
-                .into_owned()
+            view.manifest.projects[project].identity.clone()
         };
         let mut owners = Vec::new();
         if !view.manifest.files[file].metadata {
@@ -319,11 +316,13 @@ impl Catalog {
             if file.language != Language::CSharp {
                 continue;
             }
-            if !file
-                .memberships
-                .iter()
-                .any(|m| visible(view.manifest, project, m.project))
-            {
+            if !file.memberships.iter().any(|m| {
+                if file.metadata {
+                    m.project == project && view.manifest.metadata_visible(file, project)
+                } else {
+                    visible(view.manifest, project, m.project)
+                }
+            }) {
                 continue;
             }
             let facts = if file.metadata {
@@ -336,7 +335,11 @@ impl Catalog {
                 self.headers(view, &key)?
             };
             for membership in &file.memberships {
-                if !visible(view.manifest, project, membership.project) {
+                if if file.metadata {
+                    membership.project != project || !view.manifest.metadata_visible(file, project)
+                } else {
+                    !visible(view.manifest, project, membership.project)
+                } {
                     continue;
                 }
                 for (index, declaration) in facts.declarations.iter().enumerate() {
@@ -368,5 +371,6 @@ fn visible(manifest: &Manifest, from: usize, to: usize) -> bool {
     from == to
         || manifest.projects[from]
             .references
-            .contains(&manifest.projects[to].path)
+            .iter()
+            .any(|reference| reference.visible(&manifest.projects[to].identity))
 }

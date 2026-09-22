@@ -21,6 +21,8 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
+      - name: Install remote sandbox dependency
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - run: cargo fmt --check
       - run: dotnet build tests/metadata-fixture -c Release
       - run: cargo test --locked --all-targets -- --include-ignored

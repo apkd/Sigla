@@ -9,6 +9,43 @@ use dotscope::metadata::{cilassemblyview::CilAssemblyView, tables::*};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
 
+/// Inspect the PE CLR directory without loading or executing the assembly.
+pub fn is_managed(path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let mut dos = [0; 64];
+    if file.read(&mut dos)? < dos.len() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        !dos.starts_with(b"version https://git-lfs.github.com/spec/v1"),
+        "Managed input is an unavailable Git LFS object: {}",
+        path.display()
+    );
+    if &dos[..2] != b"MZ" {
+        return Ok(false);
+    }
+    let pe = u32::from_le_bytes(dos[60..64].try_into().unwrap()) as u64;
+    if pe + 24 + 232 > file.metadata()?.len() {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(pe))?;
+    let mut header = [0; 24 + 232];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"PE\0\0" {
+        return Ok(false);
+    }
+    let optional = &header[24..];
+    let directory = match u16::from_le_bytes(optional[..2].try_into().unwrap()) {
+        0x10b => 96,
+        0x20b => 112,
+        _ => return Ok(false),
+    };
+    Ok(optional[directory + 14 * 8..directory + 14 * 8 + 8]
+        .iter()
+        .any(|b| *b != 0))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Member {
     pub semantic: Header,

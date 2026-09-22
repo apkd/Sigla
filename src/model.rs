@@ -93,14 +93,42 @@ pub struct SourceInput {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
-    pub path: PathBuf,
+    pub identity: String,
+    pub origin: Option<PathBuf>,
     pub name: String,
     pub defines: Vec<String>,
-    pub references: Vec<PathBuf>,
-    pub assemblies: Vec<PathBuf>,
+    pub references: Vec<ProjectReference>,
+    pub assemblies: Vec<MetadataReference>,
     pub edition: String,
     /// Explicit project settings retained in the compilation identity.
     pub compiler_options: std::collections::BTreeMap<String, String>,
+    pub source_roots: Vec<SourceRoot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceRoot {
+    pub physical: PathBuf,
+    pub logical: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectReference {
+    pub target: String,
+    pub aliases: Vec<String>,
+}
+
+impl ProjectReference {
+    pub fn visible(&self, target: &str) -> bool {
+        self.target == target
+            && (self.aliases.is_empty() || self.aliases.iter().any(|a| a == "global"))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataReference {
+    pub path: PathBuf,
+    pub aliases: Vec<String>,
+    pub provenance: String,
 }
 
 pub fn offset(source: &str, line: usize, column: usize) -> Option<usize> {

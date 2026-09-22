@@ -536,6 +536,9 @@ impl Store {
         Ok(result)
     }
     pub fn get_manifest<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
+        if !self.manifest_current()? {
+            return Ok(None);
+        }
         let tx = self.read()?;
         self.metadata
             .get(&tx, "manifest")?
@@ -544,13 +547,13 @@ impl Store {
     }
     pub fn manifest_current(&self) -> Result<bool> {
         let tx = self.read()?;
-        Ok(self.metadata.get(&tx, "manifest_revision")? == Some(b"3".as_slice()))
+        Ok(self.metadata.get(&tx, "manifest_revision")? == Some(b"6".as_slice()))
     }
     pub fn save_manifest<T: Serialize>(&self, manifest: &T) -> Result<()> {
         let bytes = postcard::to_allocvec(manifest)?;
         let mut tx = self.env.write_txn()?;
         self.metadata.put(&mut tx, "manifest", &bytes)?;
-        self.metadata.put(&mut tx, "manifest_revision", b"3")?;
+        self.metadata.put(&mut tx, "manifest_revision", b"6")?;
         tx.commit()?;
         Ok(())
     }

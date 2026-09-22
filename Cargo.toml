@@ -15,17 +15,23 @@ clap = { version = "4", features = ["derive"] }
 chardetng = "0.1"
 encoding_rs = "0.8"
 globset = "0.4"
+gix-protocol = { version = "0.65.1", features = ["blocking-client", "sha1", "sha256"] }
+gix-transport = { version = "0.59.2", features = ["blocking-client", "http-client-reqwest-rust-tls"] }
+gix-features = { version = "0.49.1", features = ["progress"] }
+gix-hash = { version = "0.26.2", features = ["sha1", "sha256"] }
 heed = "0.22"
 inotify = "0.11"
+libc = "0.2"
 postcard = { version = "1", features = ["alloc"] }
 zstd = "0.13"
-quick-xml = "0.39"
 regex = "1"
 ra_ap_syntax = "=0.0.300"
 rmcp = { version = "=3.4.0", features = ["server", "transport-streamable-http-server"] }
 schemars = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+serde_yaml = "0.9"
+semver = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.9"
@@ -33,13 +39,26 @@ tree-sitter = "0.25"
 tree-sitter-c-sharp = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+tempfile = "3"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+tar = "0.4"
+xz2 = "0.1"
+flate2 = "1"
+base64 = "0.22"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
 
 [dev-dependencies]
-tempfile = "3"
+quick-xml = "0.39"
 windows-metadata = "=0.100.0"
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[[test]]
+name = "remote"
+harness = false
