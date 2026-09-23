@@ -81,9 +81,12 @@ pub fn capture(
     if owns_group {
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
-        .context("Cannot start required subprocess")?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Cannot start required subprocess `{}`",
+            command.get_program().to_string_lossy()
+        )
+    })?;
     let pid = child.id();
     if owns_group {
         let mut children = CHILDREN.lock().unwrap();
