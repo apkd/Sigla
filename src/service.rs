@@ -586,6 +586,7 @@ mod tests {
         });
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .tls_certs_only([])
             .build()
             .unwrap();
         let initialized = client.post(&url).header("Accept", "application/json, text/event-stream")
