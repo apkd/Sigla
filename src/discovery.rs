@@ -75,7 +75,7 @@ impl RemoteContext {
 impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         Ok(*blake3::hash(&serde_json::to_vec(&(
-            3u32,
+            4u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -147,33 +147,80 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
     };
     let mut inputs = BTreeSet::new();
     if entry.is_dir() {
-        collect_entries(&entry, policy, &mut inputs, &mut result.metadata)?;
+        if let Err(error) = collect_entries(
+            &entry,
+            policy,
+            &mut inputs,
+            &mut result.metadata,
+            &mut result.diagnostics,
+        ) {
+            result
+                .diagnostics
+                .push(format!("Incomplete project discovery: {error:#}"));
+        }
     } else {
-        inputs.insert(entry);
+        inputs.insert(entry.clone());
     }
-    ensure!(
-        !inputs.is_empty(),
-        "No supported projects found in {}",
-        result.root.display()
-    );
+    if inputs.is_empty() {
+        result.diagnostics.push("No usable project files found. Searching readable sources; build settings and references are unavailable.".into());
+        fallback_sources(&entry, policy, &mut result)?;
+    }
     let mut seen = HashSet::new();
     let mut managed = Vec::new();
     for input in inputs {
-        if input.is_dir() {
-            crate::unity::discover(&input, policy, cache, &mut result)?;
+        let projects = result.projects.len();
+        let sources = result.sources.len();
+        let loaded = if input.is_dir() {
+            crate::unity::discover(&input, policy, cache, &mut result)
         } else if input.file_name().is_some_and(|n| n == "Cargo.toml") {
-            load_cargo(&input, policy, &mut result, &mut seen)?;
+            load_cargo(&input, policy, &mut result, &mut seen)
         } else if input
             .extension()
             .is_some_and(|e| matches!(e.to_str(), Some("csproj" | "sln" | "slnx")))
         {
             managed.push(input);
+            continue;
         } else {
-            bail!("Unsupported project entry {}", input.display());
+            fallback_sources(&input, policy, &mut result)
+        };
+        if let Err(error) = loaded {
+            if error.downcast_ref::<RequiredInputs>().is_some() {
+                return Err(error);
+            }
+            result.projects.truncate(projects);
+            result.sources.truncate(sources);
+            result.diagnostics.push(format!("Incomplete project details for {}: {error:#}. Searching readable sources; references may be incomplete.", input.display()));
+            fallback_sources(&input, policy, &mut result)?;
         }
     }
     if !managed.is_empty() {
-        load_csharp(&managed, policy, cache, &mut result)?;
+        let projects = result.projects.len();
+        let sources = result.sources.len();
+        if let Err(error) = load_csharp(&managed, policy, cache, &mut result) {
+            if error.downcast_ref::<RequiredInputs>().is_some() {
+                return Err(error);
+            }
+            result.projects.truncate(projects);
+            result.sources.truncate(sources);
+            result.diagnostics.push(format!("Incomplete .NET project details: {error:#}. Searching readable sources; references may be incomplete."));
+            for input in &managed {
+                if managed.len() > 1 {
+                    let projects = result.projects.len();
+                    let sources = result.sources.len();
+                    match load_csharp(std::slice::from_ref(input), policy, cache, &mut result) {
+                        Ok(()) => continue,
+                        Err(error) => {
+                            if error.downcast_ref::<RequiredInputs>().is_some() {
+                                return Err(error);
+                            }
+                            result.projects.truncate(projects);
+                            result.sources.truncate(sources);
+                        }
+                    }
+                }
+                fallback_sources(input, policy, &mut result)?;
+            }
+        }
     }
     let mut identities = std::collections::HashMap::new();
     let mut contexts: Vec<Project> = Vec::new();
@@ -188,10 +235,12 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
             .assemblies
             .sort_by(|a, b| (&a.path, &a.aliases).cmp(&(&b.path, &b.aliases)));
         let index = if let Some(&index) = identities.get(&project.identity) {
-            ensure!(
-                serde_json::to_value(&contexts[index])? == serde_json::to_value(&project)?,
-                "Discovery returned conflicting instances of the same project context"
-            );
+            if serde_json::to_value(&contexts[index])? != serde_json::to_value(&project)? {
+                result.diagnostics.push(format!(
+                    "Conflicting project details for {}; using the first context.",
+                    project.name
+                ));
+            }
             index
         } else {
             let index = contexts.len();
@@ -218,7 +267,12 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         else {
             continue;
         };
-        let manifest: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<toml::Value>(&text) else {
+            continue;
+        };
         for section in ["dependencies", "dev-dependencies"] {
             if let Some(deps) = manifest.get(section).and_then(toml::Value::as_table) {
                 for (alias, dep) in deps {
@@ -248,11 +302,149 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
     Ok(result)
 }
 
+/// Recover source facts without claiming that build settings or references are known.
+fn fallback_sources(entry: &Path, policy: &Policy, result: &mut Discovery) -> Result<()> {
+    let base = if entry.is_dir() {
+        entry
+    } else {
+        entry.parent().unwrap()
+    };
+    if let Some(remote) = &policy.remote {
+        remote.require_analysis_tree(base)?;
+    }
+    let mut pending = vec![base.to_owned()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let directory = match policy.canonical(&directory) {
+            Ok(path) => path,
+            Err(error) => {
+                result
+                    .diagnostics
+                    .push(format!("Skipped directory: {error:#}"));
+                continue;
+            }
+        };
+        result.metadata.insert(directory.clone());
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                result
+                    .diagnostics
+                    .push(format!("Cannot read {}: {error}", directory.display()));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    result.diagnostics.push(error.to_string());
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    result
+                        .diagnostics
+                        .push(format!("Cannot read {}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                if name == "Library" && base.join("Assets").is_dir() {
+                    if path.join("PackageCache").is_dir() {
+                        pending.push(path.join("PackageCache"));
+                    }
+                } else if !crate::unity::ignored_name(&name)
+                    && !matches!(
+                        name.to_str(),
+                        Some(
+                            "target"
+                                | "bin"
+                                | "obj"
+                                | "node_modules"
+                                | "Temp"
+                                | "Logs"
+                                | "UserSettings"
+                        )
+                    )
+                {
+                    pending.push(path);
+                }
+            } else if kind.is_file() {
+                let language = match path.extension().and_then(|e| e.to_str()) {
+                    Some("cs") => Language::CSharp,
+                    Some("rs") => Language::Rust,
+                    _ => continue,
+                };
+                files.push((path, language));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for language in [Language::CSharp, Language::Rust] {
+        let project = result.projects.len();
+        let name = base
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .replace('-', "_");
+        let sources: Vec<_> = files
+            .iter()
+            .filter(|(_, lang)| *lang == language)
+            .map(|(path, _)| SourceInput {
+                path: path.clone(),
+                project,
+                module: if language == Language::Rust {
+                    std::iter::once(name.clone())
+                        .chain(
+                            path.strip_prefix(base)
+                                .unwrap()
+                                .with_extension("")
+                                .components()
+                                .filter_map(|c| {
+                                    let part = c.as_os_str().to_string_lossy().into_owned();
+                                    (!matches!(part.as_str(), "src" | "lib" | "main" | "mod"))
+                                        .then_some(part)
+                                }),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("::")
+                } else {
+                    String::new()
+                },
+                language,
+                metadata: false,
+            })
+            .collect();
+        if sources.is_empty() {
+            continue;
+        }
+        result.projects.push(Project {
+            identity: format!("fallback:{}:{language:?}", base.display()),
+            origin: None,
+            name,
+            defines: Vec::new(),
+            references: Vec::new(),
+            assemblies: Vec::new(),
+            edition: "2024".into(),
+            compiler_options: Default::default(),
+            source_roots: Vec::new(),
+        });
+        result.sources.extend(sources);
+    }
+    Ok(())
+}
+
 fn collect_entries(
     directory: &Path,
     policy: &Policy,
     inputs: &mut BTreeSet<PathBuf>,
     metadata: &mut BTreeSet<PathBuf>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<()> {
     if directory.join("Assets").is_dir()
         && directory
@@ -294,7 +486,12 @@ fn collect_entries(
         solutions
     });
     for child in children {
-        collect_entries(&child, policy, inputs, metadata)?;
+        if let Err(error) = collect_entries(&child, policy, inputs, metadata, diagnostics) {
+            diagnostics.push(format!(
+                "Cannot discover projects in {}: {error:#}",
+                child.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -333,8 +530,17 @@ fn load_csharp(
         }
         let index = result.projects.len();
         for source in project.sources {
+            let source = match policy.canonical(&source) {
+                Ok(source) => source,
+                Err(error) => {
+                    result
+                        .diagnostics
+                        .push(format!("Unavailable .NET source: {error:#}"));
+                    continue;
+                }
+            };
             result.sources.push(SourceInput {
-                path: policy.canonical(&source)?,
+                path: source,
                 project: index,
                 module: String::new(),
                 language: Language::CSharp,
@@ -348,7 +554,16 @@ fn load_csharp(
             {
                 continue;
             }
-            let path = assembly.path.canonicalize()?;
+            let path = match assembly.path.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    result.diagnostics.push(format!(
+                        "Unavailable .NET reference {}: {error}",
+                        assembly.path.display()
+                    ));
+                    continue;
+                }
+            };
             result.dependencies.insert(path.clone());
             assemblies.push(MetadataReference {
                 path,
@@ -481,13 +696,21 @@ fn load_cargo(
         .and_then(toml::Value::as_str)
         .context("Cargo package missing name")?
         .replace('-', "_");
-    let edition = cargo_edition(package, base, policy, &mut result.metadata)?;
+    let edition = cargo_edition(package, base, policy, &mut result.metadata).unwrap_or_else(|error| {
+        result.diagnostics.push(format!("Cannot determine Rust edition for {}: {error:#}. Parsing with the latest supported edition.", path.display()));
+        "2024".into()
+    });
     let mut references = Vec::new();
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(deps) = value.get(key).and_then(toml::Value::as_table) {
             for dep in deps.values() {
                 if let Some(p) = dep.get("path").and_then(toml::Value::as_str) {
-                    references.push(policy.canonical(&base.join(p).join("Cargo.toml"))?);
+                    match policy.canonical(&base.join(p).join("Cargo.toml")) {
+                        Ok(path) => references.push(path),
+                        Err(error) => result
+                            .diagnostics
+                            .push(format!("Unavailable Rust dependency: {error:#}")),
+                    }
                 }
             }
         }
@@ -547,8 +770,17 @@ fn load_cargo(
         }
     }
     for (root, module) in roots {
+        let root = match policy.canonical(&root) {
+            Ok(root) => root,
+            Err(error) => {
+                result
+                    .diagnostics
+                    .push(format!("Unavailable Rust source: {error:#}"));
+                continue;
+            }
+        };
         result.sources.push(SourceInput {
-            path: policy.canonical(&root)?,
+            path: root,
             project,
             module,
             language: Language::Rust,
@@ -556,7 +788,16 @@ fn load_cargo(
         });
     }
     for reference in references {
-        load_cargo(&reference, policy, result, seen)?;
+        if let Err(error) = load_cargo(&reference, policy, result, seen) {
+            if error.downcast_ref::<RequiredInputs>().is_some() {
+                return Err(error);
+            }
+            result.diagnostics.push(format!(
+                "Incomplete Rust dependency {}: {error:#}",
+                reference.display()
+            ));
+            fallback_sources(&reference, policy, result)?;
+        }
     }
     Ok(())
 }

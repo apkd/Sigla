@@ -68,10 +68,63 @@ fn name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_dependency_mismatch_keeps_available_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, contents: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        write(
+            "Packages/manifest.json",
+            r#"{"dependencies":{"com.example.core":"1.0"}}"#,
+        );
+        write(
+            "Packages/packages-lock.json",
+            r#"{"dependencies":{"com.example.core":{"version":"1.0","source":"builtin","depth":0,"dependencies":{"com.example.dep":"1.0"}},"com.example.dep":{"version":"1.0","source":"registry","depth":1}}}"#,
+        );
+        write(
+            "Editor/Resources/PackageManager/BuiltInPackages/com.example.core/package.json",
+            r#"{"name":"com.example.core","version":"1.0","dependencies":{"com.example.dep":"2.0"}}"#,
+        );
+        write(
+            "Library/PackageCache/dep/package.json",
+            r#"{"name":"com.example.dep","version":"2.0"}"#,
+        );
+        let editor = Editor {
+            declared: "6000.3.0f1".parse().unwrap(),
+            selected: "6000.3.0f1".parse().unwrap(),
+            data: root.path().join("Editor"),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let packages = Packages::local(
+            root.path(),
+            &Policy::new(vec![root.path().into()]).unwrap(),
+            &editor,
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(packages.selected.len(), 2);
+        assert!(!packages.diagnostics.is_empty());
+        assert!(
+            packages
+                .selected
+                .iter()
+                .all(|package| package.root.is_dir())
+        );
+    }
+}
 fn package(
     root: PathBuf,
     expected: &str,
-    version: Option<&str>,
+    _version: Option<&str>,
     identity: String,
     testable: bool,
 ) -> Result<Package> {
@@ -80,12 +133,6 @@ fn package(
         manifest.name == expected && !manifest.version.is_empty(),
         "Package manifest identity does not match {expected}"
     );
-    if let Some(version) = version {
-        ensure!(
-            manifest.version == version,
-            "Package {expected} does not match locked version {version}"
-        );
-    }
     Ok(Package {
         manifest,
         root: root.canonicalize()?,
@@ -104,6 +151,7 @@ impl Packages {
         let lock_path = root.join("Packages/packages-lock.json");
         let manifest: Manifest = read(&manifest_path)?;
         let lock: Lock = read(&lock_path)?;
+        let mut diagnostics = Vec::new();
         let mut watched = BTreeSet::from([manifest_path, lock_path, root.join("Packages")]);
         for (package, node) in &lock.dependencies {
             ensure!(
@@ -152,10 +200,9 @@ impl Packages {
             let node = lock.dependencies.get(package).with_context(|| {
                 format!("Package lock has no selection for direct dependency {package}")
             })?;
-            ensure!(
-                node.depth == 0 && &node.version == request,
-                "Manifest and package lock disagree for {package}"
-            );
+            if node.depth != 0 || &node.version != request {
+                diagnostics.push(format!("Manifest and package lock disagree for {package}; using available locked contents."));
+            }
         }
         let cache_root = root.join("Library/PackageCache");
         let mut candidates = Vec::new();
@@ -180,7 +227,6 @@ impl Packages {
             .collect();
         let mut visited = BTreeSet::new();
         let mut selected = Vec::new();
-        let mut diagnostics = Vec::new();
         while let Some(package_name) = pending.pop_front() {
             if !visited.insert(package_name.clone()) {
                 continue;
@@ -212,10 +258,6 @@ impl Packages {
                     "Locked registry disagrees with scoped registry for {package_name}"
                 );
             }
-            let mandatory = node.source == "builtin"
-                || node.source == "registry"
-                    && package_name.starts_with("com.unity.")
-                    && registry.trim_end_matches('/') == "https://packages.unity.com";
             let identity = serde_json::to_string(&(
                 node.source.as_str(),
                 registry,
@@ -308,19 +350,30 @@ impl Packages {
                     _ => unreachable!(),
                 }
             })();
+            let available = available.or_else(|error| {
+                let mut matching: Vec<_> = candidates.iter().filter(|(info, _)| info.name == package_name).collect();
+                matching.sort_by(|a, b| a.1.cmp(&b.1));
+                if let Some((info, path)) = matching.first() {
+                    diagnostics.push(format!("Package {package_name} selection failed: {error:#}. Using available version {}.", info.version));
+                    package(policy.canonical(path)?, &package_name, None, identity.clone(), testable)
+                } else { Err(error) }
+            });
             match available {
                 Ok(package) => {
-                    if node.source == "local" { ensure!(package.manifest.dependencies == node.dependencies, "Mutable local package dependencies disagree with the lock for {package_name}"); }
+                    if matches!(node.source.as_str(), "registry" | "builtin") && package.manifest.version != node.version {
+                        diagnostics.push(format!("Package {package_name} requests {}, using available version {}.", node.version, package.manifest.version));
+                    }
+                    if node.source == "local" && package.manifest.dependencies != node.dependencies { diagnostics.push(format!("Local package dependencies disagree with the lock for {package_name}; using available contents.")); }
                     if node.source == "builtin" {
                         for (dependency, requested) in &package.manifest.dependencies {
-                            let selected = lock.dependencies.get(dependency).with_context(|| format!("Selected editor requires missing package {dependency}"))?;
-                            ensure!(&selected.version == requested, "Selected editor is incompatible with locked dependency {dependency}");
+                            if !lock.dependencies.get(dependency).is_some_and(|selected| &selected.version == requested) {
+                                diagnostics.push(format!("Selected editor requests {dependency} {requested}, which differs from the lock; using available contents."));
+                            }
                         }
                     }
                     watched.insert(package.root.join("package.json"));
                     selected.push(package);
                 }
-                Err(error) if mandatory => return Err(error).with_context(|| format!("Mandatory Unity package {package_name} is unavailable")),
                 Err(error) => diagnostics.push(format!("Excluded package {package_name}: {error}. References to this package remain unresolved.")),
             }
         }

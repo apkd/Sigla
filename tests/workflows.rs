@@ -11,6 +11,73 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn missing_dependency_and_oversized_source_preserve_other_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "good/Cargo.toml",
+        "[package]\nname='good'\nversion='0.1.0'\n[dependencies]\nmissing={path='../absent'}",
+    );
+    write(root.path(), "good/src/lib.rs", "pub struct Healthy;");
+    write(root.path(), "broken/Cargo.toml", "invalid manifest");
+    write(root.path(), "broken/src/lib.rs", "pub struct Recovered;");
+    write(root.path(), "broken/src/huge.rs", "");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("broken/src/huge.rs"))
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    let a = app(root.path(), cache.path());
+    for symbol in ["Healthy", "Recovered"] {
+        let found = a
+            .search(root.path().to_str().unwrap(), symbol)
+            .await
+            .unwrap();
+        assert!(found.contains(symbol), "{found}");
+    }
+}
+
+#[tokio::test]
+async fn broken_project_details_preserve_readable_sources() {
+    for (entry, details, source) in [
+        ("Cargo.toml", "[package", "src/lib.rs"),
+        ("Broken.csproj", "<Project", "Code.cs"),
+        (
+            "ProjectSettings/ProjectVersion.txt",
+            "invalid editor",
+            "Assets/Code.cs",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write(root.path(), entry, details);
+        write(
+            root.path(),
+            source,
+            if source.ends_with(".rs") {
+                "pub struct Recoverable;"
+            } else {
+                "public class Recoverable {}"
+            },
+        );
+        let a = app(root.path(), cache.path());
+        let found = a
+            .search(root.path().to_str().unwrap(), "Recoverable")
+            .await
+            .unwrap();
+        assert!(found.contains("Recoverable"), "{found}");
+        let discovered = sigla::discovery::discover(
+            root.path(),
+            &Policy::new(vec![root.path().into()]).unwrap(),
+        )
+        .unwrap();
+        assert!(!discovered.diagnostics.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn csharp_navigation_refresh_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

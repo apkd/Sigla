@@ -264,16 +264,22 @@ impl Workspace {
                     self.monitor.register(dir);
                 }
             }
-            manifest.metadata.insert(p.clone(), Stamp::read(&p)?);
+            match Stamp::read(&p) {
+                Ok(stamp) => {
+                    manifest.metadata.insert(p, stamp);
+                }
+                Err(error) => manifest.diagnostics.push(format!(
+                    "Cannot read project input {}: {error}",
+                    p.display()
+                )),
+            }
         }
         let mut queue: VecDeque<_> = discovery.sources.into();
         for (project, p) in manifest.projects.iter().enumerate() {
             for assembly in &p.assemblies {
-                ensure!(
-                    assembly.path.is_file(),
-                    "Selected reference is unavailable: {}",
-                    assembly.path.display()
-                );
+                if !assembly.path.is_file() {
+                    manifest.diagnostics.push(format!("Reference is unavailable: {}. References to this assembly remain unresolved.", assembly.path.display()));
+                }
                 if assembly.path.is_file() {
                     queue.push_back(SourceInput {
                         path: if manifest.dependencies.contains(&assembly.path) {
@@ -301,10 +307,12 @@ impl Workspace {
             if !visited.insert((input.path.clone(), input.project, input.module.clone())) {
                 continue;
             }
-            ensure!(
-                visited.len() < 1_000_000,
-                "Workspace source membership exceeds configured implementation bound"
-            );
+            if visited.len() >= 1_000_000 {
+                manifest.diagnostics.push(
+                    "Workspace source limit reached; remaining files were not analyzed.".into(),
+                );
+                break;
+            }
             let project = &manifest.projects[input.project];
             let profile = if input.metadata {
                 String::new()
@@ -313,7 +321,15 @@ impl Workspace {
             } else {
                 format!("rust-2:{}", project.edition)
             };
-            let stamp = Stamp::read(&input.path)?;
+            let stamp = match Stamp::read(&input.path) {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    manifest
+                        .diagnostics
+                        .push(format!("Skipped {}: {error}", input.path.display()));
+                    continue;
+                }
+            };
             // Assembly records are immutable. Another workspace may publish a newer
             // revision without invalidating this workspace's pinned catalog.
             let revision = if input.metadata {
@@ -332,19 +348,21 @@ impl Workspace {
                 });
                 continue;
             }
-            ensure!(
-                input.metadata || stamp.size as usize <= MAX_SOURCE_BYTES,
-                "Source exceeds {} MiB: {}",
-                MAX_SOURCE_BYTES / 1024 / 1024,
-                crate::render::inline(&input.path.to_string_lossy())
-            );
+            if !input.metadata && stamp.size as usize > MAX_SOURCE_BYTES {
+                manifest.diagnostics.push(format!(
+                    "Skipped source exceeding {} MiB: {}",
+                    MAX_SOURCE_BYTES / 1024 / 1024,
+                    input.path.display()
+                ));
+                continue;
+            }
             let store = if input.metadata {
                 &self.assemblies
             } else {
                 &self.store
             };
             let admission = crate::memory::admit_file(stamp.size, input.metadata);
-            let (changed, modules) = store.ensure_revision(&key, &stamp, || {
+            let extracted = store.ensure_revision(&key, &stamp, || {
                 let data = if input.metadata {
                     crate::metadata::file_data(&input.path).with_context(|| {
                         format!(
@@ -377,8 +395,17 @@ impl Workspace {
                     "File changed during extraction; retry query"
                 );
                 Ok(data)
-            })?;
+            });
             drop(admission);
+            let (changed, modules) = match extracted {
+                Ok(value) => value,
+                Err(error) => {
+                    manifest
+                        .diagnostics
+                        .push(format!("Skipped {}: {error:#}", input.path.display()));
+                    continue;
+                }
+            };
             parsed += usize::from(changed);
             if input.language == Language::Rust {
                 let base = input.path.parent().unwrap();
@@ -419,7 +446,15 @@ impl Workspace {
                         }
                         continue;
                     } // cfg/build-generated module files may not exist without a build.
-                    let path = self.policy.canonical(&path)?;
+                    let path = match self.policy.canonical(&path) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            manifest
+                                .diagnostics
+                                .push(format!("Skipped module: {error:#}"));
+                            continue;
+                        }
+                    };
                     let module = std::iter::once(input.module.as_str())
                         .chain(m.inline.iter().map(String::as_str))
                         .chain(std::iter::once(m.name.as_str()))
@@ -467,9 +502,9 @@ impl Workspace {
             }
         }
         for directory in &directories {
-            manifest
-                .metadata
-                .insert(directory.clone(), Stamp::read(directory)?);
+            if let Ok(stamp) = Stamp::read(directory) {
+                manifest.metadata.insert(directory.clone(), stamp);
+            }
         }
         let mut environment = blake3::Hasher::new();
         environment.update(&postcard::to_allocvec(&manifest.projects)?);
