@@ -8,6 +8,32 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 #[test]
+fn restore_failure_exposes_msbuild_diagnostic() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let diagnostic = "Restore deliberately rejected by project";
+    write(
+        root.path(),
+        "Broken.csproj",
+        &format!(
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+      <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+      <Target Name="RejectRestore" BeforeTargets="Restore">
+        <Error Text="{diagnostic}" />
+      </Target>
+    </Project>"#
+        ),
+    );
+    write(root.path(), "Broken.cs", "public class Broken {}");
+    let entry = root.path().join("Broken.csproj");
+    let policy = Policy::new(vec![root.path().into()]).unwrap();
+    let result = discover_cached(&entry, &policy, cache.path()).unwrap();
+    let message = result.diagnostics.join("\n");
+    assert!(message.contains(diagnostic), "{message}");
+    assert!(message.contains(&entry.display().to_string()), "{message}");
+}
+
+#[test]
 fn remote_discovery_confines_generated_files_and_hides_host_files() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

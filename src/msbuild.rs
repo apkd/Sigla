@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -308,24 +309,55 @@ pub fn discover_in(
                 "-nologo",
                 "-m:1",
             ]);
-            let log = tempfile::tempfile()?;
+            let mut log = tempfile::tempfile()?;
             let result = process::capture(
                 &mut restore,
                 Duration::from_secs(300),
                 None,
                 Some(log.try_clone()?),
             )?;
-            ensure!(
-                result.status.success(),
-                "Dependency restore failed: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
+            if !result.status.success() {
+                let stdout = restore_log_tail(&mut log)
+                    .unwrap_or_else(|error| format!("Cannot read restore log: {error}"));
+                anyhow::bail!(
+                    "Dependency restore failed for {} ({}).\nstdout:\n{}\nstderr:\n{}",
+                    entry.display(),
+                    result.status,
+                    stdout,
+                    diagnostic_tail(&result.stderr),
+                );
+            }
             if let Some(sandbox) = &sandbox {
                 sandbox.validate_writes()?;
             }
         }
     }
     unreachable!()
+}
+
+const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+
+fn diagnostic_tail(bytes: &[u8]) -> String {
+    let start = bytes.len().saturating_sub(DIAGNOSTIC_LIMIT);
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    if text.trim().is_empty() {
+        "(no output)".into()
+    } else if start > 0 {
+        format!("[earlier output omitted]\n{text}")
+    } else {
+        text.into_owned()
+    }
+}
+
+fn restore_log_tail(log: &mut fs::File) -> std::io::Result<String> {
+    let length = log.seek(SeekFrom::End(0))?;
+    log.seek(SeekFrom::Start(
+        length.saturating_sub(DIAGNOSTIC_LIMIT as u64 + 1),
+    ))?;
+    let mut bytes = Vec::new();
+    log.take(DIAGNOSTIC_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(diagnostic_tail(&bytes))
 }
 
 fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> Result<()> {
@@ -370,4 +402,22 @@ fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn log_tail_handles_empty_and_large_output() {
+        let mut log = tempfile::tempfile().unwrap();
+        assert!(!restore_log_tail(&mut log).unwrap().trim().is_empty());
+        log.write_all(&vec![b'x'; DIAGNOSTIC_LIMIT * 2]).unwrap();
+        let diagnostic = "final restore diagnostic";
+        log.write_all(diagnostic.as_bytes()).unwrap();
+        let tail = restore_log_tail(&mut log).unwrap();
+        assert!(tail.ends_with(diagnostic));
+        assert!(tail.len() < DIAGNOSTIC_LIMIT * 2);
+    }
 }

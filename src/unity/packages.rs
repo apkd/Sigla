@@ -69,58 +69,6 @@ fn name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn editor_dependency_mismatch_keeps_available_packages() {
-        let root = tempfile::tempdir().unwrap();
-        let write = |path: &str, contents: &str| {
-            let path = root.path().join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, contents).unwrap();
-        };
-        write(
-            "Packages/manifest.json",
-            r#"{"dependencies":{"com.example.core":"1.0"}}"#,
-        );
-        write(
-            "Packages/packages-lock.json",
-            r#"{"dependencies":{"com.example.core":{"version":"1.0","source":"builtin","depth":0,"dependencies":{"com.example.dep":"1.0"}},"com.example.dep":{"version":"1.0","source":"registry","depth":1}}}"#,
-        );
-        write(
-            "Editor/Resources/PackageManager/BuiltInPackages/com.example.core/package.json",
-            r#"{"name":"com.example.core","version":"1.0","dependencies":{"com.example.dep":"2.0"}}"#,
-        );
-        write(
-            "Library/PackageCache/dep/package.json",
-            r#"{"name":"com.example.dep","version":"2.0"}"#,
-        );
-        let editor = Editor {
-            declared: "6000.3.0f1".parse().unwrap(),
-            selected: "6000.3.0f1".parse().unwrap(),
-            data: root.path().join("Editor"),
-            declared_revision: None,
-            selected_revision: None,
-        };
-        let packages = Packages::local(
-            root.path(),
-            &Policy::new(vec![root.path().into()]).unwrap(),
-            &editor,
-            root.path(),
-        )
-        .unwrap();
-        assert_eq!(packages.selected.len(), 2);
-        assert!(!packages.diagnostics.is_empty());
-        assert!(
-            packages
-                .selected
-                .iter()
-                .all(|package| package.root.is_dir())
-        );
-    }
-}
 fn package(
     root: PathBuf,
     expected: &str,
@@ -366,7 +314,11 @@ impl Packages {
                     if node.source == "local" && package.manifest.dependencies != node.dependencies { diagnostics.push(format!("Local package dependencies disagree with the lock for {package_name}; using available contents.")); }
                     if node.source == "builtin" {
                         for (dependency, requested) in &package.manifest.dependencies {
-                            if !lock.dependencies.get(dependency).is_some_and(|selected| &selected.version == requested) {
+                            if lock
+                                .dependencies
+                                .get(dependency)
+                                .is_none_or(|selected| &selected.version != requested)
+                            {
                                 diagnostics.push(format!("Selected editor requests {dependency} {requested}, which differs from the lock; using available contents."));
                             }
                         }
@@ -382,5 +334,58 @@ impl Packages {
             diagnostics,
             watched,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_dependency_mismatch_keeps_available_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, contents: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        write(
+            "Packages/manifest.json",
+            r#"{"dependencies":{"com.example.core":"1.0"}}"#,
+        );
+        write(
+            "Packages/packages-lock.json",
+            r#"{"dependencies":{"com.example.core":{"version":"1.0","source":"builtin","depth":0,"dependencies":{"com.example.dep":"1.0"}},"com.example.dep":{"version":"1.0","source":"registry","depth":1}}}"#,
+        );
+        write(
+            "Editor/Resources/PackageManager/BuiltInPackages/com.example.core/package.json",
+            r#"{"name":"com.example.core","version":"1.0","dependencies":{"com.example.dep":"2.0"}}"#,
+        );
+        write(
+            "Library/PackageCache/dep/package.json",
+            r#"{"name":"com.example.dep","version":"2.0"}"#,
+        );
+        let editor = Editor {
+            declared: "6000.3.0f1".parse().unwrap(),
+            selected: "6000.3.0f1".parse().unwrap(),
+            data: root.path().join("Editor"),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let packages = Packages::local(
+            root.path(),
+            &Policy::new(vec![root.path().into()]).unwrap(),
+            &editor,
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(packages.selected.len(), 2);
+        assert!(!packages.diagnostics.is_empty());
+        assert!(
+            packages
+                .selected
+                .iter()
+                .all(|package| package.root.is_dir())
+        );
     }
 }
