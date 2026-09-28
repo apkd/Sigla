@@ -137,7 +137,7 @@ impl Sandbox {
             }
         }
         if network {
-            for path in ["/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"] {
+            for path in ["/etc/resolv.conf", "/etc/hosts"] {
                 if Path::new(path).exists() {
                     command
                         .arg("--ro-bind")
@@ -145,6 +145,16 @@ impl Sandbox {
                         .arg(path);
                 }
             }
+            command.args(["--dir", "/etc/ssl/certs"]);
+            command
+                .arg("--ro-bind")
+                .arg(ca_bundle()?)
+                .arg("/etc/ssl/certs/ca-certificates.crt")
+                .args([
+                    "--setenv",
+                    "SSL_CERT_FILE",
+                    "/etc/ssl/certs/ca-certificates.crt",
+                ]);
         }
         command
             .arg("--overlay-src")
@@ -314,6 +324,34 @@ impl Sandbox {
     }
 }
 
+fn ca_bundle() -> Result<PathBuf> {
+    let configured = ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let path = configured.or_else(|| {
+        [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/certs/ca-bundle.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+    });
+    let path = path.context("No host CA certificate bundle is available for sandboxed restore")?;
+    resolve_ca_bundle(&path)
+}
+
+fn resolve_ca_bundle(path: &Path) -> Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("Cannot resolve CA certificate bundle {}", path.display()))?;
+    ensure!(resolved.is_file(), "CA certificate bundle is not a file");
+    Ok(resolved)
+}
+
 fn confined(root: &Path, path: &Path) -> Result<PathBuf> {
     let relative = path.strip_prefix(root)?;
     let mut cursor = root.to_owned();
@@ -367,6 +405,19 @@ pub fn read_job_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ca_bundle_follows_symlinks_to_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("bundle.crt");
+        fs::write(&bundle, b"certificate bundle").unwrap();
+        let first = root.path().join("first.crt");
+        let second = root.path().join("second.crt");
+        std::os::unix::fs::symlink(&bundle, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        assert_eq!(resolve_ca_bundle(&second).unwrap(), bundle);
+    }
+
     #[test]
     fn job_files_cannot_redirect_parent_access() {
         let root = tempfile::tempdir().unwrap();
