@@ -18,6 +18,11 @@ struct WorkspaceSlot {
     state: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     used: Instant,
 }
+enum Request {
+    Search(Query),
+    Browse(String),
+    View(String, crate::navigation::Mode),
+}
 type Startup = tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>;
 pub struct App {
     _ownership: std::fs::File,
@@ -31,16 +36,16 @@ pub struct App {
     startup: Mutex<Option<Startup>>,
 }
 impl App {
-    async fn search_cancellable(
+    async fn request_cancellable(
         self: &Arc<Self>,
         path: &str,
-        query: &str,
+        request: Request,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => anyhow::bail!("Query cancelled"),
-            result = self.search(path, query) => result,
+            result = self.request(path, request) => result,
         }
     }
     fn trim_idle(&self) {
@@ -206,12 +211,26 @@ impl App {
         }
     }
     pub async fn search(self: &Arc<Self>, path: &str, query: &str) -> Result<String> {
+        ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit");
+        self.request(path, Request::Search(Query::parse(query)?))
+            .await
+    }
+    pub async fn browse(self: &Arc<Self>, project: &str, path: &str) -> Result<String> {
+        self.request(project, Request::Browse(path.into())).await
+    }
+    pub async fn view(self: &Arc<Self>, project: &str, path: &str, mode: &str) -> Result<String> {
+        self.request(project, Request::View(path.into(), mode.parse()?))
+            .await
+    }
+    async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<String> {
+        ensure!(path.len() <= 4096, "Project exceeds request size limit");
+        match &request {
+            Request::Browse(path) | Request::View(path, _) => {
+                ensure!(path.len() <= 4096, "Path exceeds request size limit")
+            }
+            Request::Search(_) => (),
+        }
         self.ready().await?;
-        ensure!(
-            query.len() <= 16 * 1024 && path.len() <= 4096,
-            "Query or path exceeds request size limit"
-        );
-        let query = Query::parse(query)?;
         self.expire_idle().await?;
         let repository = crate::repository::Repository::parse(path)?;
         let branch = match repository {
@@ -405,6 +424,11 @@ impl App {
                 metadata.indexed_revision.as_deref().unwrap()
             )
         });
+        let repository_root = branch
+            .as_ref()
+            .map(|branch| branch.source().canonicalize())
+            .transpose()?;
+        let allow_absolute = self.remote.is_none();
         let permit = self.workers.clone().acquire_owned().await?;
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -422,7 +446,15 @@ impl App {
                 // stay on this blocking thread through rendering and destruction.
                 let mut search = Search::new(&store, &assemblies, &manifest, &cancel)?;
                 drop(state);
-                let mut text = search.run(&query)?;
+                let root = repository_root.as_deref().unwrap_or(&manifest.root);
+                let mut text = match request {
+                    Request::Search(query) if query.selector == "file" => {
+                        search.files(&query, root)
+                    }
+                    Request::Search(query) => search.run(&query),
+                    Request::Browse(path) => search.browse(root, &path, allow_absolute),
+                    Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
+                }?;
                 for diagnostic in &manifest.diagnostics {
                     text.push_str("\n\n");
                     text.push_str(diagnostic);
@@ -447,6 +479,21 @@ pub struct Arguments {
     pub project: String,
     pub query: String,
 }
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseArguments {
+    pub project: String,
+    #[serde(default)]
+    pub path: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ViewArguments {
+    pub project: String,
+    pub path: String,
+    #[serde(default)]
+    pub mode: crate::navigation::Mode,
+}
 
 #[derive(Clone)]
 pub struct Mcp {
@@ -469,33 +516,99 @@ impl Mcp {
         name = "search",
         description = r#"Find symbols, follow references, and explore C# and Rust codebases.
 
-Bare names find declarations. Narrow by kind with type:, method:, function:, property:, field:, trait:, or module:.
-Aliases: t: for type:, m: for method:, x: for text:.
-Qualified names and parameter signatures narrow targets.
-@path:line:column finds a declaration (1-based Unicode columns).
+Declarations
+Bare names find declarations. Qualified names and signatures narrow targets.
 
-uses:, calls:, and writes: find explicit references, calls, and direct updates.
-derived: and impl: follow inheritance and implementation.
-in:TARGET restricts containment. calls:* in:TARGET shows outgoing calls.
+Kinds
+t: type: m: method: function: property: field: trait: module:
 
-Filters: project:, path:, namespace:, access:, attr:. Prefix a filter with - to exclude matches.
-Use match:exact (default) or match:loose.
-text:"literal" searches source.
-limit:N caps the result count (default 20). limit:5 returns up to five complete matches."#,
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+Filters
+project: path: namespace: access: attr: in:
+Prefix filters with - to exclude matches.
+File queries support only project: and path: filters.
+
+Matching
+match:exact (default)
+match:loose broadens matching.
+
+Limits
+limit:N returns up to N complete matches (default 20).
+
+Locations
+1-based lines and Unicode columns.
+
+Examples
+method:Parser.Parse(string)
+@src/Parser.cs:20:5
+uses:Parser
+calls:Parser.Parse
+writes:Player.health
+derived:Base
+impl:IParser
+method:* in:Parser
+calls:* in:Parser.Parse
+text:"TODO" path:src/**
+file:*.cs
+file:src/**/*.cs"#,
+        annotations(read_only_hint = true)
     )]
     async fn search(
         &self,
         Parameters(args): Parameters<Arguments>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        let search = self
-            .app
-            .search_cancellable(&args.project, &args.query, &context.ct);
+        let request = (|| {
+            ensure!(
+                args.query.len() <= 16 * 1024,
+                "Query exceeds request size limit"
+            );
+            Ok(Request::Search(Query::parse(&args.query)?))
+        })();
+        self.execute(&args.project, request, context).await
+    }
+
+    #[tool(
+        description = "Browse indexed source files. Omit path for the repository root; pass a directory path to explore it.",
+        annotations(read_only_hint = true)
+    )]
+    async fn browse(
+        &self,
+        Parameters(args): Parameters<BrowseArguments>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        self.execute(&args.project, Ok(Request::Browse(args.path)), context)
+            .await
+    }
+
+    #[tool(
+        description = "Read an indexed file by path. mode: minified (default) simplifies code for reading; exact preserves source text.\n\nExamples:\npath=\"src/Server.cs\"\npath=\"src/Server.cs:20-50\"",
+        annotations(read_only_hint = true)
+    )]
+    async fn view(
+        &self,
+        Parameters(args): Parameters<ViewArguments>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        self.execute(
+            &args.project,
+            Ok(Request::View(args.path, args.mode)),
+            context,
+        )
+        .await
+    }
+}
+impl Mcp {
+    async fn execute(
+        &self,
+        project: &str,
+        request: Result<Request>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        let search = async {
+            self.app
+                .request_cancellable(project, request?, &context.ct)
+                .await
+        };
         let heartbeat = async {
             // The HTTP session manager counts transport activity, including while
             // a tool is preparing. Ping only during an active request so a long
@@ -516,7 +629,7 @@ limit:N caps the result count (default 20). limit:5 returns up to five complete 
                 };
                 if ping.await.is_err() {
                     return anyhow::anyhow!(
-                        "Client stopped responding while waiting for the search; shared preparation continues"
+                        "Client stopped responding while waiting for the tool; shared preparation continues"
                     );
                 }
             }
@@ -693,8 +806,12 @@ mod tests {
             let path = root.path().to_str().unwrap().to_owned();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                app.search_cancellable(&path, "type:X limit:1", &cancel)
-                    .await
+                app.request_cancellable(
+                    &path,
+                    Request::Search(Query::parse("type:X limit:1").unwrap()),
+                    &cancel,
+                )
+                .await
             })
         };
         tokio::task::yield_now().await;

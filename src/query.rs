@@ -56,6 +56,7 @@ const SELECTORS: &[&str] = &[
     "derived",
     "impl",
     "text",
+    "file",
 ];
 const FILTERS: &[&str] = &["project", "namespace", "access", "path", "attr", "in"];
 
@@ -145,6 +146,15 @@ impl Query {
                 Target::parse(&f.value)?;
             }
         }
+        if selector == "file" {
+            globset::Glob::new(&value)?;
+            ensure!(
+                filters
+                    .iter()
+                    .all(|f| matches!(f.key.as_str(), "path" | "project")),
+                "`file:` supports `project:` and `path:` filters."
+            );
+        }
         if selector == "text" {
             ensure!(
                 filters
@@ -153,7 +163,7 @@ impl Query {
                 "`text:` supports `project:`, `path:`, and `in:` filters."
             );
         }
-        let target = if selector == "text" || selector == "operator" {
+        let target = if matches!(selector.as_str(), "text" | "operator" | "file") {
             Target {
                 name: value,
                 parameters: None,
@@ -416,6 +426,8 @@ mod tests {
             "type:Parser namespace:MyApp.Syntax",
             "path:src/** limit:5",
             "GameManager limit:1",
+            "file:*.rs path:src",
+            "file:\"src/My Folder/Code.cs\"",
         ] {
             Query::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
         }
@@ -425,7 +437,8 @@ mod tests {
             "limit:-1",
             "method:Parse text:hello",
             "case:ignore",
-            "file:X",
+            "file:X method:Y",
+            "file:X in:Y",
             "method:f(",
             "text:\"oops",
             "Widget limit:200 limit:300",

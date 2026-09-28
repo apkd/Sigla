@@ -5,8 +5,10 @@ pub mod discovery;
 pub mod extract;
 mod memory;
 pub mod metadata;
+mod minify;
 pub mod model;
 mod msbuild;
+mod navigation;
 mod process;
 mod sandbox;
 

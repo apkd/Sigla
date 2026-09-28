@@ -159,10 +159,13 @@ impl Server {
             .error_for_status()?)
     }
     fn query(&self, project: &str, query: &str) -> Result<(bool, String)> {
+        self.call("search", json!({"project":project,"query":query}))
+    }
+    fn call(&self, name: &str, arguments: Value) -> Result<(bool, String)> {
         let id = self
             .request_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let response = self.post(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"search","arguments":{"project":project,"query":query}}}))?;
+        let response = self.post(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}))?;
         let response: Value = if response
             .headers()
             .get("content-type")
@@ -271,6 +274,30 @@ fn lifecycle() -> Result<()> {
         "Initial acquisition failed"
     );
     let count = fs::read(root.path().join("requests.log"))?.len();
+    let (error, tree) = server.call("browse", json!({"project":main}))?;
+    ensure!(
+        !error && tree.contains("lib.rs") && !tree.contains("asset.bin"),
+        "Remote browse failed: {tree}"
+    );
+    let (error, viewed) = server.call(
+        "view",
+        json!({"project":main,"path":"lib.rs:1","mode":"exact"}),
+    )?;
+    ensure!(
+        !error && viewed.contains("pub struct Main;\n") && viewed.contains("src/lib.rs:1-1"),
+        "Remote view failed: {viewed}"
+    );
+    let (error, paths) = server.query(main, "file:*.rs")?;
+    ensure!(
+        !error && paths.contains("src/lib.rs"),
+        "Remote filename search failed: {paths}"
+    );
+    ensure!(
+        server
+            .call("view", json!({"project":main,"path":"/etc/passwd"}))?
+            .0,
+        "Remote view accepted an absolute path"
+    );
     let cached = server.query("https://github.com/fixture/repo#main", "type:Main")?;
     ensure!(
         !cached.0 && cached.1.contains("Main"),

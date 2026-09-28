@@ -76,9 +76,10 @@ async fn http_contract_and_origin_validation() {
         .unwrap();
     let listed = body(response).await;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
-    let tool = &tools[0];
-    assert_eq!(tool["name"], "search");
+    for name in ["search", "browse", "view"] {
+        assert!(tools.iter().any(|tool| tool["name"] == name));
+    }
+    let tool = tools.iter().find(|tool| tool["name"] == "search").unwrap();
     assert_eq!(
         tool["inputSchema"]["properties"].as_object().unwrap().len(),
         2
@@ -104,6 +105,39 @@ async fn http_contract_and_origin_validation() {
     let rendered = result["content"][0]["text"].as_str().unwrap();
     assert!(rendered.starts_with("# `"), "{rendered}");
     assert!(rendered.contains("\n```rust\n"), "{rendered}");
+    for (name, args, expected) in [
+        (
+            "browse",
+            serde_json::json!({"project":root.path()}),
+            "lib.rs",
+        ),
+        (
+            "view",
+            serde_json::json!({"project":root.path(),"path":"lib.rs"}),
+            "FoundOverHttp",
+        ),
+        (
+            "view",
+            serde_json::json!({"project":root.path(),"path":"src/lib.rs:1","mode":"exact"}),
+            "```rust",
+        ),
+    ] {
+        let mut request = client
+            .post(&url)
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(session) = &session {
+            request = request.header("mcp-session-id", session);
+        }
+        let called = body(request.json(&serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":name,"arguments":args}})).send().await.unwrap()).await;
+        assert_ne!(called["result"]["isError"], true, "{called}");
+        assert!(
+            called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{called}"
+        );
+    }
     let denied = client
         .post(&url)
         .header("Origin", "https://untrusted.invalid")

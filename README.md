@@ -32,6 +32,8 @@ Sigla runs on Linux and works with Cargo workspaces and Unity-generated C# proje
 | Calls made inside a method | `calls:* in:GameManager.Awake` |
 | Implementations of an interface | `impl:IParser` |
 | Text in part of the project | `text:"[Singleton]" path:Assets/Scripts` |
+| Source files by name | `file:*Parser*.cs` |
+| Source paths under a directory | `file:src/**/*.rs` |
 
 ## Getting started
 
@@ -51,7 +53,13 @@ Connect your coding agent to `http://127.0.0.1:7331/mcp`. For Codex, add this to
 url = "http://127.0.0.1:7331/mcp"
 ```
 
-The agent gets one tool, `sigla.search`, with a project path and a query. Its tool description explains the query syntax, so you can simply ask the agent to find something.
+The agent gets three tools. Each takes `project`, a local project path or, in remote mode, a repository URL with an optional `#branch`.
+
+| Tool | Other arguments | Result |
+|---|---|---|
+| `search` | `query` | Symbols, references, text, or `file:GLOB` paths |
+| `browse` | Optional `path` | An adaptive, indented directory tree |
+| `view` | `path`, optional `mode` | File contents; `minified` by default, or `exact` |
 
 ## Authentication
 

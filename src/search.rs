@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -891,6 +891,9 @@ impl<'a> Search<'a> {
         true
     }
     pub fn run(&mut self, q: &Query) -> Result<String> {
+        if q.selector == "file" {
+            return self.files(q, &self.manifest.root);
+        }
         self.path_matchers = q
             .filters
             .iter()
@@ -960,6 +963,140 @@ impl<'a> Search<'a> {
             },
         )?;
         Ok(units.finish())
+    }
+    fn source_paths(&self, root: &std::path::Path) -> BTreeMap<String, String> {
+        self.manifest
+            .files
+            .iter()
+            .filter(|(_, file)| !file.metadata)
+            .filter_map(|(key, file)| {
+                file.path
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|path| (path.to_string_lossy().into_owned(), key.clone()))
+            })
+            .collect()
+    }
+    pub fn files(&self, q: &Query, root: &std::path::Path) -> Result<String> {
+        let pattern = globset::GlobBuilder::new(&q.target.name)
+            .case_insensitive(q.loose)
+            .literal_separator(true)
+            .build()?
+            .compile_matcher();
+        let paths = q
+            .filters
+            .iter()
+            .filter(|f| f.key == "path")
+            .map(|f| Ok((f, globset::Glob::new(&f.value)?.compile_matcher())))
+            .collect::<Result<Vec<_>>>()?;
+        let mut found = Vec::new();
+        let mut total = 0;
+        for (path, key) in self.source_paths(root) {
+            self.check()?;
+            let target = if q.target.name.contains('/') {
+                path.as_str()
+            } else {
+                path.rsplit('/').next().unwrap()
+            };
+            if !pattern.is_match(target)
+                || !paths.iter().all(|(f, p)| {
+                    (p.is_match(&path)
+                        || path
+                            .strip_prefix(&f.value)
+                            .is_some_and(|suffix| suffix.starts_with('/')))
+                        != f.negate
+                })
+            {
+                continue;
+            }
+            let file = &self.manifest.files[&key];
+            if !file.memberships.iter().any(|m| {
+                q.filters.iter().filter(|f| f.key == "project").all(|f| {
+                    wildcard(&f.value, &self.manifest.projects[m.project].name) != f.negate
+                })
+            }) {
+                continue;
+            }
+            total += 1;
+            if found.len() < q.limit {
+                found.push(crate::navigation::quote(&path));
+            }
+        }
+        if total == 0 {
+            return Ok("No matches.".into());
+        }
+        let mut text = found.join("\n");
+        if total > found.len() {
+            text.push_str(&format!("\n{}", crate::render::omission(Some(total))));
+        }
+        Ok(text)
+    }
+    pub fn browse(&self, root: &std::path::Path, path: &str, absolute: bool) -> Result<String> {
+        self.check()?;
+        let path = crate::navigation::normalize(path, root, absolute)?;
+        let files = self.source_paths(root);
+        let tree = crate::navigation::Directory::new(files.keys().map(String::as_str));
+        if path.is_empty() {
+            return Ok(tree.render(""));
+        }
+        let dirs = tree.paths();
+        let matches = crate::navigation::matches(dirs.iter().map(String::as_str), &path);
+        if matches.len() != 1 {
+            return Ok(crate::navigation::choices(&matches, "directories"));
+        }
+        Ok(tree.at(matches[0]).render(matches[0]))
+    }
+    pub fn view(
+        &mut self,
+        root: &std::path::Path,
+        path: &str,
+        mode: crate::navigation::Mode,
+        absolute: bool,
+    ) -> Result<String> {
+        self.check()?;
+        let files = self.source_paths(root);
+        let literal = crate::navigation::normalize(path, root, absolute)?;
+        let (path, requested) = if files.contains_key(&literal)
+            || files.keys().any(|p| {
+                p.strip_suffix(&literal)
+                    .is_some_and(|prefix| prefix.ends_with('/'))
+            }) {
+            (literal, None)
+        } else {
+            let (path, lines) = crate::navigation::location(path)?;
+            (crate::navigation::normalize(path, root, absolute)?, lines)
+        };
+        let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
+        if matches.len() != 1 {
+            return Ok(crate::navigation::choices(&matches, "files"));
+        }
+        let path = matches[0];
+        let key = &files[path];
+        let language = self.manifest.files[key].language;
+        let data = self.data(key)?;
+        let (range, first, last) = crate::navigation::lines(&data.source, requested)?;
+        let (body, tag) = match mode {
+            crate::navigation::Mode::Exact => (
+                data.source[range].to_owned(),
+                match language {
+                    Language::Rust => "rust",
+                    Language::CSharp => "cs",
+                },
+            ),
+            crate::navigation::Mode::Minified => {
+                (crate::minify::render(&data.source, language, range), "")
+            }
+        };
+        let fence =
+            "`".repeat(3.max(body.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
+        let separator = if body.ends_with('\n') { "" } else { "\n" };
+        Ok(format!(
+            "{}\n{fence}{tag}\n{body}{separator}{fence}",
+            crate::render::inline(&format!(
+                "{}:{first}-{last}",
+                crate::navigation::quote(path)
+            ))
+        ))
     }
     fn text(&mut self, q: &Query, inside: &[(bool, Vec<Hit>)]) -> Result<String> {
         let mut units = crate::selection::Selection::new(q.limit);
