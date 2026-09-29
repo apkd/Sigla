@@ -322,10 +322,16 @@ fn lifecycle() -> Result<()> {
         json!({"project":main,"path":"lib.rs:1","mode":"exact"}),
     )?;
     ensure!(
-        !error && viewed.contains("pub struct Main;\n") && viewed.contains("src/lib.rs:1-1"),
+        !error && viewed.contains("pub struct Main;\n") && viewed.contains("`src/lib.rs:1`"),
         "Remote view failed: {viewed}"
     );
     let (error, paths) = server.query(main, "file:*.rs")?;
+    for response in [&tree, &viewed, &paths] {
+        ensure!(
+            response.starts_with("`repo #main`\n\n"),
+            "Unexpected remote header: {response}"
+        );
+    }
     ensure!(
         !error && paths.contains("src/lib.rs"),
         "Remote filename search failed: {paths}"

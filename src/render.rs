@@ -1,5 +1,90 @@
 //! Markdown presentation shared by all search modes.
 use crate::model::Language;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub fn location(path: &str, first: usize, last: usize) -> String {
+    if first == last {
+        format!("{path}:{first}")
+    } else {
+        format!("{path}:{first}-{last}")
+    }
+}
+
+pub fn lines(source: &str, span: std::ops::Range<usize>) -> (usize, usize) {
+    let first = source.as_bytes()[..span.start]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1;
+    let end = span.end.saturating_sub(1).max(span.start);
+    let last = first
+        + source.as_bytes()[span.start..end]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+    (first, last)
+}
+
+/// Response-local abbreviations, checked against the complete source inventory.
+pub struct Paths {
+    suffixes: BTreeMap<String, usize>,
+    known: BTreeSet<String>,
+}
+
+impl Paths {
+    pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        let mut suffixes = BTreeMap::new();
+        for path in paths.into_iter().collect::<BTreeSet<_>>() {
+            for (offset, _) in path.match_indices('/') {
+                *suffixes.entry(path[offset + 1..].to_owned()).or_default() += 1;
+            }
+            *suffixes.entry(path).or_default() += 1;
+        }
+        Self {
+            suffixes,
+            known: BTreeSet::new(),
+        }
+    }
+
+    pub fn display(&mut self, path: &str) -> String {
+        let directories: Vec<_> = path.match_indices('/').map(|(i, _)| i).collect();
+        let shortened = directories.iter().rev().find_map(|&end| {
+            if !self.known.contains(&path[..end]) {
+                return None;
+            }
+            let start = path[..end].rfind('/')? + 1;
+            let suffix = &path[start..];
+            (self.suffixes.get(suffix) == Some(&1)).then(|| format!("…/{suffix}"))
+        });
+        self.known
+            .extend(directories.into_iter().map(|end| path[..end].to_owned()));
+        shortened.unwrap_or_else(|| path.to_owned())
+    }
+}
+
+pub struct SearchResult {
+    pub symbol: Option<(String, String)>,
+    pub path: String,
+    pub lines: Option<(usize, usize)>,
+    pub source: String,
+    pub language: Language,
+    pub uncertain: bool,
+}
+
+impl SearchResult {
+    pub fn render(self, paths: &mut Paths) -> String {
+        let location = match self.lines {
+            Some((first, last)) => location(&paths.display(&self.path), first, last),
+            None => self.path,
+        };
+        let symbol = self.symbol.map(|(kind, name)| format!("{kind}:{name}"));
+        let mut text = result(symbol.as_deref(), &location, &self.source, self.language);
+        if self.uncertain {
+            text.push_str("\n\nPossible match; the target could not be determined uniquely.");
+        }
+        text
+    }
+}
 
 pub fn inline(value: &str) -> String {
     let fence = "`".repeat(value.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
@@ -10,18 +95,18 @@ pub fn inline(value: &str) -> String {
     }
 }
 
-pub fn result(symbol: &str, location: &str, source: &str, language: Language) -> String {
+pub fn result(symbol: Option<&str>, location: &str, source: &str, language: Language) -> String {
     let source = dedent(source);
     let fence = "`".repeat(3.max(source.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
     let language = match language {
         Language::CSharp => "cs",
         Language::Rust => "rust",
     };
-    format!(
-        "# {}\n{}\n\n{fence}{language}\n{source}\n{fence}",
-        inline(symbol),
-        inline(location)
-    )
+    let heading = symbol.map_or_else(
+        || inline(location),
+        |symbol| format!("{} in {}", inline(symbol), inline(location)),
+    );
+    format!("{heading}\n\n{fence}{language}\n{source}\n{fence}")
 }
 
 pub fn excerpt(source: &str) -> String {
@@ -178,10 +263,43 @@ pub fn external_declaration(declaration: &crate::model::Declaration, signature: 
 mod tests {
     use super::*;
     #[test]
+    fn source_lines_use_exclusive_span_ends() {
+        let source = "α\nb\nc\n";
+        assert_eq!(lines(source, 0..3), (1, 1));
+        assert_eq!(lines(source, 0..5), (1, 2));
+        assert_eq!(lines(source, 3..4), (2, 2));
+        assert_eq!(lines(source, 3..3), (2, 2));
+        assert_eq!(location("a.cs", 2, 2), "a.cs:2");
+        assert_eq!(location("a.cs", 2, 3), "a.cs:2-3");
+    }
+
+    #[test]
+    fn paths_only_shorten_known_unambiguous_directories() {
+        let inventory = [
+            "Assets/Scripts/GameCore/World.cs",
+            "Assets/Scripts/Inputs/Input.cs",
+            "Other/GameCore/World.cs",
+            "Assets/Scripts/GameCore/Unique.cs",
+        ];
+        let mut paths = Paths::new(inventory.map(str::to_owned));
+        assert_eq!(paths.display(inventory[0]), inventory[0]);
+        // The collision is indexed but has never appeared in this response.
+        assert_eq!(paths.display(inventory[0]), "…/Scripts/GameCore/World.cs");
+        assert_eq!(paths.display(inventory[3]), "…/GameCore/Unique.cs");
+        assert_eq!(paths.display(inventory[1]), "…/Scripts/Inputs/Input.cs");
+        let mut fresh = Paths::new(inventory.map(str::to_owned));
+        assert_eq!(fresh.display(inventory[1]), inventory[1]);
+    }
+    #[test]
     fn code_preserves_relative_indentation_and_embedded_fences() {
         let source = "    fn f() {\n        // ```\n    }";
-        let rendered = result("a::f", "A folder/a.rs:1:5", source, Language::Rust);
-        assert!(rendered.contains("`A folder/a.rs:1:5`"));
+        let rendered = result(
+            Some("function:a::f"),
+            "A folder/a.rs:1-5",
+            source,
+            Language::Rust,
+        );
+        assert!(rendered.contains("`function:a::f` in `A folder/a.rs:1-5`"));
         assert!(rendered.contains("````rust\nfn f() {\n    // ```\n}\n````"));
         assert_eq!(
             dedent("void F() {\n        Run();\n    }"),

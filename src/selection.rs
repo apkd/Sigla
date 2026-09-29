@@ -1,12 +1,12 @@
 //! Retain the best N results and count distinct matches for omission messages.
 use std::collections::{BTreeMap, BTreeSet};
 
-pub struct Selection<K> {
-    entries: BTreeMap<K, String>,
+pub struct Selection<K, V = String> {
+    entries: BTreeMap<K, V>,
     seen: BTreeSet<K>,
     limit: usize,
 }
-impl<K: Ord + Clone> Selection<K> {
+impl<K: Ord + Clone, V> Selection<K, V> {
     pub fn new(limit: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -29,7 +29,7 @@ impl<K: Ord + Clone> Selection<K> {
         }
         true
     }
-    pub fn insert(&mut self, key: K, unit: String) {
+    pub fn insert(&mut self, key: K, unit: V) {
         if !self.accepts(&key) {
             return;
         }
@@ -38,10 +38,7 @@ impl<K: Ord + Clone> Selection<K> {
             self.entries.pop_last();
         }
     }
-    pub fn finish(self) -> String {
-        self.finish_with(|_, unit| unit)
-    }
-    pub fn finish_with(self, mut transform: impl FnMut(K, String) -> String) -> String {
+    pub fn finish_with(self, mut transform: impl FnMut(K, V) -> String) -> String {
         crate::search::render_selected(
             self.entries
                 .into_iter()
@@ -49,6 +46,13 @@ impl<K: Ord + Clone> Selection<K> {
                 .collect(),
             self.seen.len(),
         )
+    }
+}
+
+#[cfg(test)]
+impl<K: Ord + Clone> Selection<K> {
+    pub fn finish(self) -> String {
+        self.finish_with(|_, unit| unit)
     }
 }
 

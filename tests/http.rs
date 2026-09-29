@@ -103,7 +103,10 @@ async fn http_contract_and_origin_validation() {
     );
     assert!(result.get("structuredContent").is_none());
     let rendered = result["content"][0]["text"].as_str().unwrap();
-    assert!(rendered.starts_with("# `"), "{rendered}");
+    assert!(
+        rendered.starts_with("`struct:") && rendered.contains("` in `"),
+        "{rendered}"
+    );
     assert!(rendered.contains("\n```rust\n"), "{rendered}");
     for (name, args, expected) in [
         (

@@ -57,9 +57,15 @@ async fn browse_find_and_read_use_the_same_refreshed_sources() {
     write(root.path(), "src/first/mod.rs", source);
     let exact = app.view(project, "first/mod.rs", "exact").await.unwrap();
     assert!(exact.contains(source), "{exact}");
+    assert_eq!(
+        app.view(project, "…/first/mod.rs", "exact").await.unwrap(),
+        exact
+    );
+    let ambiguous_hint = app.view(project, "…/mod.rs", "exact").await.unwrap();
+    assert_eq!(ambiguous_hint, ambiguous);
     for suffix in [":2", ":2-2", "#L2-L2", ":2:3", "(2,3)"] {
         let viewed = app
-            .view(project, &format!("first/mod.rs{suffix}"), "exact")
+            .view(project, &format!("…/first/mod.rs{suffix}"), "exact")
             .await
             .unwrap();
         assert!(
@@ -112,7 +118,7 @@ async fn minified_view_is_read_only_and_keeps_original_line_locations() {
     let project = root.path().to_str().unwrap();
     let view = app.view(project, "Code.cs:5", "minified").await.unwrap();
     assert!(
-        view.contains("Code.cs:5-5") && view.contains("=>left+right;"),
+        view.contains("Code.cs:5`") && view.contains("=>left+right;"),
         "{view}"
     );
     assert!(!view.contains("```cs"));

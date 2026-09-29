@@ -35,6 +35,10 @@ pub struct Identity {
 }
 
 impl Identity {
+    pub fn name(&self) -> &str {
+        self.components.last().expect("repository has a name")
+    }
+
     pub fn storage_key(&self) -> String {
         blake3::hash(&serde_json::to_vec(self).expect("repository identity is serializable"))
             .to_hex()

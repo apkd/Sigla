@@ -36,6 +36,11 @@ pub struct Query {
 const SELECTORS: &[&str] = &[
     "symbol",
     "type",
+    "class",
+    "interface",
+    "struct",
+    "enum",
+    "delegate",
     "method",
     "property",
     "field",
@@ -82,6 +87,8 @@ impl Query {
             let negate = raw_key.starts_with('-');
             let key = match raw_key.trim_start_matches('-') {
                 "t" => "type",
+                "c" => "class",
+                "i" => "interface",
                 "m" => "method",
                 "x" => "text",
                 x => x,
@@ -427,6 +434,25 @@ pub fn qualified_name_rank(pattern: &str, value: &str, loose: bool) -> Option<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concrete_type_selectors_and_aliases() {
+        for (selector, kind) in [
+            ("c", "class"),
+            ("i", "interface"),
+            ("class", "class"),
+            ("interface", "interface"),
+            ("struct", "struct"),
+            ("enum", "enum"),
+            ("delegate", "delegate"),
+        ] {
+            assert_eq!(
+                Query::parse(&format!("{selector}:Example"))
+                    .unwrap()
+                    .selector,
+                kind
+            );
+        }
+    }
     #[test]
     fn qualification_matches_whole_components_and_ranks_exact_names_first() {
         for (target, full, wrong) in [

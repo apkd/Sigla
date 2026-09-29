@@ -490,13 +490,11 @@ impl App {
             }
         }
         let context = branch.as_ref().map(|branch| {
-            let metadata = branch_state.as_ref().unwrap().as_ref().unwrap();
-            format!(
-                "{} #{} @{}",
-                branch.repository.identity,
-                branch.name,
-                metadata.indexed_revision.as_deref().unwrap()
-            )
+            crate::render::inline(&format!(
+                "{} #{}",
+                branch.repository.identity.name(),
+                branch.name
+            ))
         });
         let repository_root = branch
             .as_ref()
@@ -605,7 +603,7 @@ Declarations
 Bare names find declarations. Qualified names and signatures narrow targets.
 
 Kinds
-t: type: m: method: function: property: field: trait: module:
+t: type: c: class: i: interface: struct: enum: delegate: m: method: function: property: field: trait: module:
 
 Filters
 project: path: namespace: access: attr: in:

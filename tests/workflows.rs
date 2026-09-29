@@ -11,6 +11,50 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn concrete_kinds_and_declaration_line_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Test.csproj",
+        "<Project><ItemGroup><Compile Include=\"Src/Core/Types.cs\"/></ItemGroup></Project>",
+    );
+    let source = "// outside\nnamespace Test;\nclass Example {\n void Run() {\n }\n}\ninterface Contract {}\nstruct Value {}\nenum Choice { One }\ndelegate void Callback();\n";
+    write(root.path(), "Src/Core/Types.cs", source);
+    let app = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    for (kind, name) in [
+        ("class", "Example"),
+        ("interface", "Contract"),
+        ("struct", "Value"),
+        ("enum", "Choice"),
+        ("delegate", "Callback"),
+    ] {
+        let result = app.search(project, &format!("{kind}:*")).await.unwrap();
+        assert!(
+            result.starts_with(&format!("`{kind}:Test.{name}` in `")),
+            "{result}"
+        );
+        assert_eq!(result.matches(" in `").count(), 1, "{result}");
+        assert_eq!(
+            result,
+            app.search(project, &format!("type:{name}")).await.unwrap()
+        );
+    }
+    let class = app.search(project, "c:Example").await.unwrap();
+    assert!(class.contains("`Src/Core/Types.cs:3-6`"), "{class}");
+    let method = app.search(project, "method:Example.Run").await.unwrap();
+    assert!(method.contains("`Src/Core/Types.cs:4-5`"), "{method}");
+    let text = app.search(project, "text:outside").await.unwrap();
+    assert!(text.starts_with("`Src/Core/Types.cs:1`"), "{text}");
+    let limited = app.search(project, "type:* limit:2").await.unwrap();
+    assert!(
+        limited.contains("`Src/Core/Types.cs:") && limited.contains("`…/Core/Types.cs:"),
+        "{limited}"
+    );
+}
+
+#[tokio::test]
 async fn partial_qualification_preserves_declarations_and_relationships() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -807,14 +851,14 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
     assert_eq!(
         limited
             .lines()
-            .filter(|l| l.starts_with("`Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
             .count(),
         3
     );
     let full = a.search(path, "calls:* in:Example limit:8").await.unwrap();
     assert_eq!(
         full.lines()
-            .filter(|l| l.starts_with("`Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
             .count(),
         8
     );
@@ -827,7 +871,7 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
     assert_eq!(
         directory
             .lines()
-            .filter(|l| l.starts_with("`Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
             .count(),
         3
     );
@@ -838,7 +882,7 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
     assert_eq!(
         declarations
             .lines()
-            .filter(|l| l.starts_with("`Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
             .count(),
         1
     );

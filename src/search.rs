@@ -1003,7 +1003,7 @@ impl<'a> Search<'a> {
                 Ok(())
             },
         )?;
-        Ok(units.finish())
+        Ok(self.finish_results(units))
     }
     fn source_paths(&self, root: &std::path::Path) -> BTreeMap<String, String> {
         self.manifest
@@ -1105,6 +1105,11 @@ impl<'a> Search<'a> {
             (literal, None)
         } else {
             let (path, lines) = crate::navigation::location(path)?;
+            let path = if files.contains_key(path) {
+                path
+            } else {
+                path.strip_prefix("…/").unwrap_or(path)
+            };
             (crate::navigation::normalize(path, root, absolute)?, lines)
         };
         let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
@@ -1133,9 +1138,10 @@ impl<'a> Search<'a> {
         let separator = if body.ends_with('\n') { "" } else { "\n" };
         Ok(format!(
             "{}\n{fence}{tag}\n{body}{separator}{fence}",
-            crate::render::inline(&format!(
-                "{}:{first}-{last}",
-                crate::navigation::quote(path)
+            crate::render::inline(&crate::render::location(
+                &crate::navigation::quote(path),
+                first,
+                last
             ))
         ))
     }
@@ -1174,7 +1180,7 @@ impl<'a> Search<'a> {
                     continue;
                 };
                 let display = self.manifest.display(file, membership);
-                let (line_no, column) = position(&data.source, matched.start());
+                let (line_no, _) = position(&data.source, matched.start());
                 if previous_line == Some(line_no) {
                     continue;
                 }
@@ -1191,18 +1197,21 @@ impl<'a> Search<'a> {
                     .map_or(0, |n| n + 1);
                 units.insert(
                     rank,
-                    crate::render::result(
-                        &containing
-                            .map(|d| contextual(d, membership).qualified)
-                            .unwrap_or_else(|| display.to_string()),
-                        &format!("{display}:{line_no}:{column}"),
-                        &data.source[start..end],
-                        file.language,
-                    ),
+                    crate::render::SearchResult {
+                        symbol: containing.map(|d| {
+                            let d = contextual(d, membership);
+                            (d.kind, d.qualified)
+                        }),
+                        path: display.to_string(),
+                        lines: Some(crate::render::lines(&data.source, matched.range())),
+                        source: data.source[start..end].to_owned(),
+                        language: file.language,
+                        uncertain: false,
+                    },
                 );
             }
         }
-        Ok(units.finish())
+        Ok(self.finish_results(units))
     }
     fn relationship(
         &mut self,
@@ -1336,28 +1345,21 @@ impl<'a> Search<'a> {
                     if !units.accepts(&rank) {
                         continue;
                     }
-                    let (line_no, col) = position(&data.source, o.span.start);
-                    let owner = containing
-                        .as_ref()
-                        .map(|d| d.qualified.as_str())
-                        .unwrap_or(&display);
-                    let unit = crate::render::result(
-                        owner,
-                        &format!("{display}:{line_no}:{col}"),
-                        line(&data.source, o.span.start),
-                        file.language,
-                    );
+                    let unit = crate::render::SearchResult {
+                        symbol: containing
+                            .as_ref()
+                            .map(|d| (d.kind.clone(), d.qualified.clone())),
+                        path: display.to_string(),
+                        lines: Some(crate::render::lines(&data.source, o.span.clone())),
+                        source: line(&data.source, o.span.start).to_owned(),
+                        language: file.language,
+                        uncertain,
+                    };
                     units.insert(rank, unit);
                 }
             }
         }
-        Ok(units.finish_with(|(uncertain, _, _), unit| {
-            if uncertain {
-                format!("{unit}\n\nPossible match; the target could not be determined uniquely.")
-            } else {
-                unit
-            }
-        }))
+        Ok(self.finish_results(units))
     }
     fn hierarchy(
         &mut self,
@@ -1457,7 +1459,7 @@ impl<'a> Search<'a> {
                     }
                 }
             }
-            return Ok(units.finish());
+            return Ok(self.finish_results(units));
         }
         let mut selected = targets.to_vec();
         let mut units = crate::selection::Selection::new(q.limit);
@@ -1617,7 +1619,7 @@ impl<'a> Search<'a> {
             }
             selected = added;
         }
-        Ok(units.finish())
+        Ok(self.finish_results(units))
     }
     fn hierarchy_candidates(
         &mut self,
@@ -1662,30 +1664,55 @@ impl<'a> Search<'a> {
         }
         Ok(result)
     }
-    fn declaration_unit(&mut self, h: &Hit) -> Result<String> {
+    fn finish_results<K: Ord + Clone>(
+        &self,
+        units: crate::selection::Selection<K, crate::render::SearchResult>,
+    ) -> String {
+        let mut paths = crate::render::Paths::new(
+            self.manifest
+                .files
+                .values()
+                .filter(|f| !f.metadata)
+                .flat_map(|f| {
+                    f.memberships
+                        .iter()
+                        .map(|m| self.manifest.display(f, m).into_owned())
+                }),
+        );
+        units.finish_with(|_, unit| unit.render(&mut paths))
+    }
+    fn declaration_unit(&mut self, h: &Hit) -> Result<crate::render::SearchResult> {
         let f = &self.manifest.files[&h.file];
         let data = self.data(&h.file)?;
         let header = data.source[h.decl.header.clone()].trim();
         if f.metadata {
             let signature = crate::render::external_declaration(&h.decl, header);
-            Ok(crate::render::result(
-                &crate::render::metadata(&h.decl.qualified),
-                &f.path.file_name().unwrap_or_default().to_string_lossy(),
-                &signature,
-                f.language,
-            ))
+            Ok(crate::render::SearchResult {
+                symbol: Some((
+                    h.decl.kind.clone(),
+                    crate::render::metadata(&h.decl.qualified),
+                )),
+                path: f
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                lines: None,
+                source: signature,
+                language: f.language,
+                uncertain: false,
+            })
         } else {
-            let (line, column) = position(&data.source, h.decl.name_span.start);
             let source = crate::render::source_excerpt(&data.source, h.decl.span.clone());
-            Ok(crate::render::result(
-                &h.decl.qualified,
-                &format!(
-                    "{}:{line}:{column}",
-                    self.manifest.display(f, &h.membership)
-                ),
-                &source,
-                f.language,
-            ))
+            Ok(crate::render::SearchResult {
+                symbol: Some((h.decl.kind.clone(), h.decl.qualified.clone())),
+                path: self.manifest.display(f, &h.membership).into_owned(),
+                lines: Some(crate::render::lines(&data.source, h.decl.span.clone())),
+                source,
+                language: f.language,
+                uncertain: false,
+            })
         }
     }
     fn containment_files(&self, inside: &[(bool, Vec<Hit>)]) -> Result<Option<BTreeSet<String>>> {
