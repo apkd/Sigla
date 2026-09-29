@@ -21,7 +21,7 @@ jobs:
       - name: Install remote sandbox dependency
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libcap-dev
+          sudo apt-get install -y meson ninja-build libcap-dev libarchive-dev pkg-config
           curl -fsSL https://github.com/containers/bubblewrap/releases/download/v0.11.2/bubblewrap-0.11.2.tar.xz -o "$RUNNER_TEMP/bubblewrap.tar.xz"
           tar -xf "$RUNNER_TEMP/bubblewrap.tar.xz" -C "$RUNNER_TEMP"
           meson setup "$RUNNER_TEMP/bubblewrap-build" "$RUNNER_TEMP/bubblewrap-0.11.2" -Dtests=false -Dman=disabled -Dselinux=disabled

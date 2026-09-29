@@ -75,7 +75,7 @@ impl RemoteContext {
 impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         Ok(*blake3::hash(&serde_json::to_vec(&(
-            4u32,
+            6u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -514,10 +514,13 @@ fn load_csharp(
     result: &mut Discovery,
 ) -> Result<()> {
     let snapshot = crate::msbuild::discover_in(entries, cache, policy.remote.as_ref())?;
+    let cache = cache.canonicalize()?;
     let mut approved = policy.clone();
     if let Some(remote) = &policy.remote {
         approved.roots.push(remote.writable.join("upper"));
         approved.roots.push(remote.writable.join("packages"));
+    } else {
+        approved.roots.push(cache.join("dotnet").canonicalize()?);
     }
     let policy = &approved;
     let source_projects: HashSet<_> = snapshot.projects.iter().map(|p| p.origin.clone()).collect();
@@ -628,7 +631,12 @@ fn load_csharp(
                         },
                     ]
                 })
-                .unwrap_or_default(),
+                .unwrap_or_else(|| {
+                    vec![crate::model::SourceRoot {
+                        physical: cache.join("dotnet"),
+                        logical: ".sigla".into(),
+                    }]
+                }),
         });
     }
     Ok(())

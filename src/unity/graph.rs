@@ -102,10 +102,11 @@ fn discover_with_editor(
     ]);
     result.diagnostics.extend(packages.diagnostics);
     if editor.declared != editor.selected {
-        result.diagnostics.push(format!(
+        tracing::info!(
             "Unity editor: declared {}; selected {}.",
-            editor.declared, editor.selected
-        ));
+            editor.declared,
+            editor.selected
+        );
     }
     let prefix = root
         .strip_prefix(&result.root)
@@ -156,11 +157,31 @@ fn discover_with_editor(
     }
     let mut plugins = Vec::new();
     for (_, path) in &files {
-        if path.extension().is_some_and(|e| e == "dll") && crate::metadata::is_managed(path)? {
+        if path.extension().is_none_or(|e| e != "dll") {
+            continue;
+        }
+        let managed = match crate::metadata::is_managed(path) {
+            Ok(managed) => managed,
+            Err(error) => {
+                result
+                    .diagnostics
+                    .push(format!("Skipping plugin {}: {error:#}", path.display()));
+                continue;
+            }
+        };
+        if managed {
             let meta = PathBuf::from(format!("{}.meta", path.display()));
             let settings = if meta.is_file() {
                 result.metadata.insert(meta.clone());
-                Some(super::settings::yaml(&meta)?)
+                match super::settings::yaml(&meta) {
+                    Ok(settings) => Some(settings),
+                    Err(error) => {
+                        result
+                            .diagnostics
+                            .push(format!("Skipping plugin {}: {error:#}", path.display()));
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -175,7 +196,7 @@ fn discover_with_editor(
         if file.extension().is_none_or(|x| x != "asmdef") {
             continue;
         }
-        let descriptor: Descriptor = serde_json::from_slice(&std::fs::read(file)?)
+        let descriptor: Descriptor = super::settings::json(file)
             .with_context(|| format!("Malformed assembly definition {}", file.display()))?;
         ensure!(
             !descriptor.name.is_empty() && !PREDEFINED.contains(&descriptor.name.as_str()),
@@ -252,7 +273,7 @@ fn discover_with_editor(
     };
     for (_, file) in &files {
         if file.extension().is_some_and(|x| x == "asmref") {
-            let reference: AssemblyReference = serde_json::from_slice(&std::fs::read(file)?)?;
+            let reference: AssemblyReference = super::settings::json(file)?;
             let target = resolve(&reference.reference).with_context(|| {
                 format!(
                     "Unresolved assembly ownership reference {}",
@@ -405,8 +426,16 @@ fn discover_with_editor(
         }));
         let mut selected_plugins = BTreeSet::new();
         for (path, settings) in &plugins {
-            if !plugin_enabled(settings.as_ref(), policy.unity_platform, &inputs.defines)? {
-                continue;
+            match plugin_enabled(settings.as_ref(), policy.unity_platform, &inputs.defines) {
+                Ok(true) => (),
+                Ok(false) => continue,
+                Err(error) => {
+                    let diagnostic = format!("Skipping plugin {}: {error:#}", path.display());
+                    if !result.diagnostics.contains(&diagnostic) {
+                        result.diagnostics.push(diagnostic);
+                    }
+                    continue;
+                }
             }
             let explicit = settings
                 .as_ref()
@@ -883,6 +912,12 @@ mod tests {
                 };
                 if scope.is_empty() && filename == "editor-standard.json" {
                     check_module_selection(&editor, root.path());
+                    // A missing LFS plugin must not discard the otherwise valid graph.
+                    std::fs::write(
+                        root.path().join("Assets/Unavailable.dll"),
+                        "version https://git-lfs.github.com/spec/v1\noid sha256:broken\nsize 1\n",
+                    )
+                    .unwrap();
                 }
                 let mut actual = Discovery {
                     root: root.path().into(),
@@ -894,6 +929,9 @@ mod tests {
                 };
                 discover_with_editor(root.path(), &policy, cache.path(), &mut actual, &editor)
                     .unwrap();
+                if scope.is_empty() && filename == "editor-standard.json" {
+                    assert!(!actual.diagnostics.is_empty());
+                }
                 let expected = snapshot["assemblies"].as_array().unwrap();
                 assert_eq!(
                     actual

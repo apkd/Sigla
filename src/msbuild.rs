@@ -127,6 +127,17 @@ pub fn discover_in(
     remote: Option<&crate::discovery::RemoteContext>,
 ) -> Result<Snapshot> {
     fs::create_dir_all(cache)?;
+    let cache = cache.canonicalize()?;
+    let cache = cache.as_path();
+    let artifacts = cache.join("dotnet");
+    if remote.is_none() {
+        fs::create_dir_all(&artifacts)?;
+        let path = artifacts.join("Artifacts.props");
+        let props = include_bytes!("../managed/Artifacts.props");
+        if fs::read(&path).ok().as_deref() != Some(props.as_slice()) {
+            fs::write(path, props)?;
+        }
+    }
     let directory = entries
         .first()
         .context("MSBuild entry is missing")?
@@ -184,7 +195,7 @@ pub fn discover_in(
             command
         }
         None => {
-            let mut command = Command::new(&host);
+            let mut command = crate::sandbox::local_command(&host, directory, cache, job.path())?;
             command
                 .current_dir(directory)
                 .arg(bootstrap.join("Sigla.Discovery.dll"))
@@ -234,6 +245,7 @@ pub fn discover_in(
             &request,
             &serde_json::to_vec(
                 &serde_json::json!({"Entries": mapped_entries, "DependencyState": previous, "Restored": restored,
+                    "ArtifactsPath": remote.is_none().then_some(&artifacts),
                     "Tracked": remote.map(|r| r.tracked.iter().map(|p| Path::new("/workspace").join(p)).collect::<Vec<_>>())}),
             )?,
         )?;
@@ -247,7 +259,9 @@ pub fn discover_in(
                 command
             }
             None => {
-                let mut command = command(directory);
+                let mut command =
+                    crate::sandbox::local_command(&host, directory, cache, job.path())?;
+                local_artifacts(&mut command, &artifacts);
                 command
                     .arg(root.join("Sigla.Discovery.dll"))
                     .arg(&sdk)
@@ -301,7 +315,12 @@ pub fn discover_in(
         for entry in &mapped_entries {
             let mut restore = match &sandbox {
                 Some(s) => s.command(&host, &root, job.path(), directory, true)?,
-                None => command(directory),
+                None => {
+                    let mut command =
+                        crate::sandbox::local_command(&host, directory, cache, job.path())?;
+                    local_artifacts(&mut command, &artifacts);
+                    command
+                }
             };
             restore.arg(sdk.join("MSBuild.dll")).arg(entry).args([
                 "-target:Restore",
@@ -309,6 +328,21 @@ pub fn discover_in(
                 "-nologo",
                 "-m:1",
             ]);
+            if remote.is_none() {
+                // MSBuild treats commas and semicolons as property separators even within one argv entry.
+                let path = artifacts
+                    .to_str()
+                    .context("Invalid artifacts path")?
+                    .replace('%', "%25")
+                    .replace(';', "%3B")
+                    .replace(',', "%2C");
+                restore
+                    .args([
+                        "-p:UseArtifactsOutput=true",
+                        "-p:IncludeProjectNameInArtifactsPaths=true",
+                    ])
+                    .arg(format!("-p:ArtifactsPath={path}"));
+            }
             let mut log = tempfile::tempfile()?;
             let result = process::capture(
                 &mut restore,
@@ -336,10 +370,31 @@ pub fn discover_in(
     unreachable!()
 }
 
+fn local_artifacts(command: &mut Command, artifacts: &Path) {
+    if let Some(original) = std::env::var_os("CustomBeforeDirectoryBuildProps") {
+        command.env("SiglaBeforeDirectoryBuildProps", original);
+    }
+    command.env(
+        "CustomBeforeDirectoryBuildProps",
+        artifacts.join("Artifacts.props"),
+    );
+    // Reuse already-restored host packages as read-only inputs; new downloads stay in the cache.
+    let packages = std::env::var_os("NUGET_PACKAGES")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("DOTNET_CLI_HOME")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(".nuget/packages"))
+        });
+    if let Some(packages) = packages.filter(|path| path.is_dir()) {
+        command.env("SiglaFallbackPackages", packages);
+    }
+}
+
 const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
 
 fn restore_reason(detail: &str) -> &'static str {
-    if detail.contains("UntrustedRoot") || detail.contains("certificate chain") {
+    if detail.contains("UntrustedRoot") || detail.contains("certificate verify failed") {
         "TLS certificate trust failed"
     } else if detail.contains("NU1301") {
         "package feed is unavailable"
@@ -426,6 +481,8 @@ mod diagnostic_tests {
         assert!(summary.contains("certificate"));
         assert!(!summary.contains('\n'));
         assert!(summary.len() < verbose.len());
+        let missing_package = "X.509 certificate chain validation will use the fallback certificate bundle\nerror NU1101: Unable to find package";
+        assert!(super::restore_reason(missing_package).contains("package"));
     }
     use super::*;
     use std::io::Write;

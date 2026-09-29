@@ -10,10 +10,18 @@ pub struct Settings {
     pub editor_api: u32,
 }
 
+pub fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Missing Unity input {}", path.display()))?;
+    serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
+        .with_context(|| format!("Malformed Unity input {}", path.display()))
+}
+
 pub fn yaml(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Missing Unity input {}", path.display()))?;
     let text = text
+        .trim_start_matches('\u{feff}')
         .lines()
         .filter(|l| !l.starts_with('%'))
         .map(|l| {
@@ -123,5 +131,22 @@ impl Settings {
             input,
             editor_api,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn metadata_accepts_utf8_bom_and_numeric_guids() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Assembly.asmdef.meta");
+        let guid = "12345678901234567890123456789012";
+        for prefix in ["", "\u{feff}"] {
+            std::fs::write(&path, format!("{prefix}fileFormatVersion: 2\nguid: {guid}\nAssetOrigin:\n  packageName: 'Package: Name'\n")).unwrap();
+            assert_eq!(super::yaml(&path).unwrap()["guid"].as_str(), Some(guid));
+            std::fs::write(&path, format!("{prefix}{{\"name\":\"Assembly\"}}")).unwrap();
+            let descriptor: serde_json::Value = super::json(&path).unwrap();
+            assert_eq!(descriptor["name"], "Assembly");
+        }
     }
 }

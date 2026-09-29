@@ -61,6 +61,11 @@ static class Discovery
                 ["DesignTimeBuild"] = "true", ["BuildProjectReferences"] = "false",
                 ["SkipCompilerExecution"] = "true", ["ProvideCommandLineArgs"] = "true"
             };
+            if (request.ArtifactsPath is { } artifacts) {
+                defaults["UseArtifactsOutput"] = "true";
+                defaults["IncludeProjectNameInArtifactsPaths"] = "true";
+                defaults["ArtifactsPath"] = artifacts;
+            }
             var entries = new List<Microsoft.Build.Graph.ProjectGraphEntryPoint>();
             void Probe(string entry, IDictionary<string, string> globals)
             {
@@ -138,12 +143,19 @@ static class Discovery
             } catch when (required.Count != 0) { return Missing(); }
             if (required.Count != 0) return Missing();
             var dependencyState = new Dictionary<string, string>();
+            var outputOwners = new Dictionary<string, string>(StringComparer.Ordinal);
             var restore = false;
             foreach (var node in graph.ProjectNodes)
             {
                 var project = node.ProjectInstance;
                 var assets = project.GetPropertyValue("ProjectAssetsFile");
                 if (assets.Length == 0 || project.GetPropertyValue("IsCrossTargetingBuild") == "true") continue;
+                if (request.ArtifactsPath != null) {
+                    var output = Path.GetFullPath(assets, project.Directory);
+                    if (outputOwners.TryGetValue(output, out var owner) && owner != project.FullPath)
+                        throw new InvalidOperationException($"Projects share dependency output {output}: {owner} and {project.FullPath}");
+                    outputOwners[output] = project.FullPath;
+                }
                 var identity = Identity(project);
                 var fingerprint = JsonSerializer.Serialize(new {
                     Properties = project.Properties.Where(p => p.Name.StartsWith("Restore", StringComparison.OrdinalIgnoreCase)
@@ -238,7 +250,7 @@ static class Discovery
         return JsonSerializer.Serialize(new { Path = project.FullPath, Properties = properties.OrderBy(p => p.Key).ToArray() });
     }
 
-    sealed record Request(string[] Entries, Dictionary<string, string> DependencyState, bool Restored, string[]? Tracked);
+    sealed record Request(string[] Entries, Dictionary<string, string> DependencyState, bool Restored, string[]? Tracked, string? ArtifactsPath);
     sealed class Imports : Microsoft.Build.Framework.ILogger
     {
         public List<Microsoft.Build.Framework.ProjectImportedEventArgs> Events { get; } = [];

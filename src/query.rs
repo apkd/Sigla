@@ -404,9 +404,59 @@ pub fn name_rank(pattern: &str, value: &str, loose: bool) -> Option<u8> {
     v.contains(&p).then_some(4)
 }
 
+/// Qualified targets may omit leading namespace or module components.
+pub fn qualified_name_rank(pattern: &str, value: &str, loose: bool) -> Option<u8> {
+    let separator = if pattern.contains("::") {
+        "::"
+    } else if pattern.contains('.') {
+        "."
+    } else {
+        return name_rank(pattern, value, loose);
+    };
+    let mut best =
+        name_rank(pattern, value, loose).map(|rank| if rank == 0 { 0 } else { rank + 2 });
+    for (at, _) in value.match_indices(separator) {
+        if let Some(rank) = name_rank(pattern, &value[at + separator.len()..], loose) {
+            let rank = if rank == 0 { 1 } else { rank + 2 };
+            best = Some(best.map_or(rank, |current| current.min(rank)));
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_matches_whole_components_and_ranks_exact_names_first() {
+        for (target, full, wrong) in [
+            ("Type.Run", "Library.Type.Run", "Library.OtherType.Run"),
+            (
+                "inner::run",
+                "crate_name::outer::inner::run",
+                "crate_name::other_inner::run",
+            ),
+            (
+                "Outer.Inner.Run",
+                "Library.Outer.Inner.Run",
+                "Library.OtherOuter.Inner.Run",
+            ),
+        ] {
+            assert!(qualified_name_rank(target, full, false).is_some());
+            assert!(qualified_name_rank(target, wrong, false).is_none());
+            assert!(
+                qualified_name_rank(target, target, false).unwrap()
+                    < qualified_name_rank(target, full, false).unwrap()
+            );
+            assert!(
+                qualified_name_rank(target, full, true).unwrap()
+                    < qualified_name_rank(target, &full.to_uppercase(), true).unwrap()
+            );
+        }
+        assert!(qualified_name_rank("Type.R*", "Library.Type.Run", false).is_some());
+        assert!(qualified_name_rank("inner::*", "crate_name::inner::run", false).is_some());
+        assert!(qualified_name_rank("Type.Run", "Library.Type.RunExtra", false).is_none());
+    }
     #[test]
     fn contract_examples() {
         for q in [

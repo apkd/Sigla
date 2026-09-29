@@ -11,6 +11,212 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn partial_qualification_preserves_declarations_and_relationships() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Test.csproj",
+        "<Project><ItemGroup><Compile Include=\"Members.cs\"/><Compile Include=\"Calls.cs\"/></ItemGroup></Project>",
+    );
+    let members = r#"namespace Library;
+partial class Worker {
+ public void PublicMethod() { }
+ internal void InternalMethod() { }
+ private void PrivateMethod() { }
+ public static Worker Create() => new Worker();
+ public const int Code = 1;
+ public void Overload(int value) { }
+ public void Overload(string value) { }
+ public class Nested { public void Run() { } }
+}
+"#;
+    write(root.path(), "Members.cs", members);
+    write(
+        root.path(),
+        "Calls.cs",
+        r#"namespace Library;
+partial class Worker {
+ void Execute() { PublicMethod(); InternalMethod(); PrivateMethod(); var item = Worker.Create(); Overload(1); }
+ int Select(int value) => value switch { Worker.Code => 1, _ => 0 };
+}
+"#,
+    );
+    let app = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    for name in [
+        "PublicMethod",
+        "InternalMethod",
+        "PrivateMethod",
+        "Create",
+        "Code",
+    ] {
+        for selector in ["", "uses:"] {
+            let full = app
+                .search(project, &format!("{selector}Library.Worker.{name}"))
+                .await
+                .unwrap();
+            assert!(
+                full.contains("Members.cs:") || full.contains("Calls.cs:"),
+                "{full}"
+            );
+            for target in [name.to_owned(), format!("Worker.{name}")] {
+                assert_eq!(
+                    app.search(project, &format!("{selector}{target}"))
+                        .await
+                        .unwrap(),
+                    full
+                );
+            }
+        }
+    }
+    for name in ["PublicMethod", "InternalMethod", "PrivateMethod", "Create"] {
+        let full = app
+            .search(project, &format!("calls:Library.Worker.{name}"))
+            .await
+            .unwrap();
+        assert!(full.contains("Worker.Execute"), "{full}");
+        assert_eq!(
+            app.search(project, &format!("calls:Worker.{name}"))
+                .await
+                .unwrap(),
+            full
+        );
+        let offset = members.find(&format!("{name}(")).unwrap();
+        let line = members[..offset].bytes().filter(|b| *b == b'\n').count() + 1;
+        let column = members[..offset]
+            .rsplit('\n')
+            .next()
+            .unwrap()
+            .chars()
+            .count()
+            + 1;
+        assert_eq!(
+            app.search(project, &format!("calls:@Members.cs:{line}:{column}"))
+                .await
+                .unwrap(),
+            full
+        );
+        assert_eq!(
+            app.search(project, &format!("@Members.cs:{line}:{column}"))
+                .await
+                .unwrap(),
+            app.search(project, &format!("method:Worker.{name}"))
+                .await
+                .unwrap()
+        );
+    }
+    for target in [
+        "Worker.Overload(int)",
+        "Worker.Nested.Run",
+        "Worker.* in:Library.Worker",
+        "Worker.PrivateMethod access:private",
+    ] {
+        let result = app
+            .search(project, &format!("method:{target}"))
+            .await
+            .unwrap();
+        assert!(result.contains("Members.cs:"), "{target}: {result}");
+    }
+    let overload = app
+        .search(project, "method:Worker.Overload(int)")
+        .await
+        .unwrap();
+    assert!(!overload.contains("Overload(string"), "{overload}");
+    let outgoing = app
+        .search(project, "calls:* in:Worker.Execute")
+        .await
+        .unwrap();
+    assert!(outgoing.contains("PublicMethod()"), "{outgoing}");
+    assert_eq!(
+        outgoing,
+        app.search(project, "calls:* in:Library.Worker.Execute")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        app.search(project, "file:*Members*.cs project:Test")
+            .await
+            .unwrap(),
+        app.search(project, "file:*Members*.cs").await.unwrap()
+    );
+    assert_eq!(
+        app.search(project, "file:*Members*.cs project:owner/repo")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+}
+
+#[tokio::test]
+async fn qualified_suffixes_keep_namespace_collisions_and_rust_modules() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Test.csproj",
+        "<Project><ItemGroup><Compile Include=\"Types.cs\"/></ItemGroup></Project>",
+    );
+    write(
+        root.path(),
+        "Types.cs",
+        "namespace First { class Worker { public void Run() {} } } namespace Second { class Worker { public void Run() {} } } namespace Third { class OtherWorker { public void Run() {} } }",
+    );
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[package]\nname='qualified_fixture'\nversion='0.1.0'\n",
+    );
+    write(
+        root.path(),
+        "src/lib.rs",
+        "pub mod outer { pub mod inner { pub fn run() {} pub fn invoke() { run(); } } } pub mod other { pub fn run() {} pub fn invoke() { run(); } }",
+    );
+    let app = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    let matches = app.search(project, "method:Worker.Run").await.unwrap();
+    assert!(
+        matches.contains("First.Worker.Run") && matches.contains("Second.Worker.Run"),
+        "{matches}"
+    );
+    assert!(!matches.contains("OtherWorker"), "{matches}");
+    let precise = app
+        .search(project, "method:First.Worker.Run")
+        .await
+        .unwrap();
+    assert!(!precise.contains("Second.Worker"), "{precise}");
+    for selector in ["function:", "calls:"] {
+        let result = app
+            .search(project, &format!("{selector}inner::run"))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("src/lib.rs:"),
+            "{selector}inner::run: {result}"
+        );
+        assert!(!result.contains("other::invoke"), "{result}");
+        assert_eq!(
+            result,
+            app.search(project, &format!("{selector}outer::inner::run"))
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        app.search(project, "function:inner::*")
+            .await
+            .unwrap()
+            .contains("invoke")
+    );
+    assert!(
+        app.search(project, "calls:* in:inner::invoke")
+            .await
+            .unwrap()
+            .contains("run()")
+    );
+}
+
+#[tokio::test]
 async fn implementation_filters_keep_external_ancestors_and_separate_languages() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -122,6 +328,12 @@ async fn broken_project_details_preserve_readable_sources() {
         )
         .unwrap();
         assert!(!discovered.diagnostics.is_empty());
+        for diagnostic in &discovered.diagnostics {
+            assert!(
+                !found.contains(diagnostic),
+                "Recoverable diagnostic leaked into query results"
+            );
+        }
     }
 }
 

@@ -37,7 +37,7 @@ Sigla runs on Linux and works with Cargo workspaces and Unity-generated C# proje
 
 ## Getting started
 
-With a Rust toolchain installed:
+With a Rust toolchain, `pkg-config`, and libarchive development files installed (`libarchive-dev` on Debian/Ubuntu):
 
 ```sh
 cargo install --git https://github.com/apkd/sigla --locked
@@ -45,6 +45,12 @@ sigla serve
 ```
 
 By default, Sigla may read anywhere your user account can access. Use `--root /path/to/projects` to restrict it to a directory, and repeat `--root` to allow several directories.
+
+Remote mode uses `--allow-repo 'https://github.com/owner/*'` for anonymous public access. Add `--allow-repo-private 'https://github.com/owner/private-repo'` to permit authenticated access to a repository. These rules also apply to Git package dependencies. Recoverable discovery and dependency problems go to server logs; query responses contain only results or request failures.
+
+Selected Git LFS inputs are downloaded into a verified cache. Unavailable objects are skipped and retried during later preparation; an unreadable plugin does not discard the Unity project graph.
+
+Local .NET discovery and restore run through `bubblewrap` with the checkout read-only. Standard SDK outputs, generated sources, and package caches go into Sigla's cache. Existing NuGet user configuration remains readable. Custom targets that require checkout writes produce a discovery diagnostic; Sigla falls back to readable sources. Remote .NET discovery uses its existing cached filesystem overlay.
 
 Connect your coding agent to `http://127.0.0.1:7331/mcp`. For Codex, add this to `~/.codex/config.toml`:
 

@@ -254,31 +254,31 @@ impl App {
                 ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit")
             }
         }
-        if let Some(upstream) = &self.upstream {
-            if let Some(repository) = crate::repository::Repository::project(path, true)? {
-                let mut project = repository.transport;
-                if let Some(branch) = repository.branch {
-                    project.push('#');
-                    project.push_str(&branch);
-                }
-                let (name, args) = match request {
-                    Request::Search(query) => (
-                        "search",
-                        serde_json::json!({"project":project,"query":query}),
-                    ),
-                    Request::Browse(path) => {
-                        ("browse", serde_json::json!({"project":project,"path":path}))
-                    }
-                    Request::View(path, mode) => (
-                        "view",
-                        serde_json::json!({"project":project,"path":path,"mode":match mode {
-                            crate::navigation::Mode::Exact => "exact",
-                            crate::navigation::Mode::Minified => "minified",
-                        }}),
-                    ),
-                };
-                return upstream.call(name, args.as_object().unwrap().clone()).await;
+        if let Some(upstream) = &self.upstream
+            && let Some(repository) = crate::repository::Repository::project(path, true)?
+        {
+            let mut project = repository.transport;
+            if let Some(branch) = repository.branch {
+                project.push('#');
+                project.push_str(&branch);
             }
+            let (name, args) = match request {
+                Request::Search(query) => (
+                    "search",
+                    serde_json::json!({"project":project,"query":query}),
+                ),
+                Request::Browse(path) => {
+                    ("browse", serde_json::json!({"project":project,"path":path}))
+                }
+                Request::View(path, mode) => (
+                    "view",
+                    serde_json::json!({"project":project,"path":path,"mode":match mode {
+                        crate::navigation::Mode::Exact => "exact",
+                        crate::navigation::Mode::Minified => "minified",
+                    }}),
+                ),
+            };
+            return upstream.call(name, args.as_object().unwrap().clone()).await;
         }
         let text = self.request(path, request).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
@@ -318,7 +318,15 @@ impl App {
             policy.unity_platform = self.policy.unity_platform;
             policy.remote = Some(crate::discovery::RemoteContext {
                 workspace: source.clone(),
-                tracked: Arc::new(state.prepared.tracked.keys().cloned().collect()),
+                tracked: Arc::new(
+                    state
+                        .prepared
+                        .tracked
+                        .keys()
+                        .filter(|p| !state.prepared.unavailable.contains(*p))
+                        .cloned()
+                        .collect(),
+                ),
                 writable: branch.root.join("generated"),
                 shared: self.cache.clone(),
                 repositories: self.remote.as_ref().unwrap().options.rules.clone(),
@@ -448,8 +456,15 @@ impl App {
                             !applied.repair,
                             "Repository materialization requires repair"
                         );
-                        policy.remote.as_mut().unwrap().tracked =
-                            Arc::new(applied.prepared.tracked.keys().cloned().collect());
+                        policy.remote.as_mut().unwrap().tracked = Arc::new(
+                            applied
+                                .prepared
+                                .tracked
+                                .keys()
+                                .filter(|p| !applied.prepared.unavailable.contains(*p))
+                                .cloned()
+                                .collect(),
+                        );
                         branch_state = Some(gate);
                     }
                 }
@@ -518,15 +533,6 @@ impl App {
                     Request::Browse(path) => search.browse(root, &path, allow_absolute),
                     Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
                 }?;
-                let mut diagnostics = std::collections::HashSet::new();
-                for diagnostic in manifest
-                    .diagnostics
-                    .iter()
-                    .filter(|d| diagnostics.insert(d.as_str()))
-                {
-                    text.push_str("\n\n");
-                    text.push_str(diagnostic);
-                }
                 if let Some(context) = context {
                     text = format!("{context}\n\n{text}");
                 }
@@ -605,6 +611,7 @@ Filters
 project: path: namespace: access: attr: in:
 Prefix filters with - to exclude matches.
 File queries support only project: and path: filters.
+project: matches build-project names.
 
 Matching
 match:exact (default)
@@ -621,6 +628,7 @@ method:Parser.Parse(string)
 @src/Parser.cs:20:5
 uses:Parser
 calls:Parser.Parse
+calls:@src/Parser.cs:20:5
 writes:Player.health
 derived:Base
 impl:IParser

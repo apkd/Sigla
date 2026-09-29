@@ -55,7 +55,7 @@ fn credential(registry: &url::Url) -> Result<Option<String>> {
 
 fn check(root: &Path, name: &str, version: Option<&str>) -> Result<()> {
     let manifest: super::packages::PackageManifest =
-        serde_json::from_slice(&fs::read(root.join("package.json"))?)?;
+        super::settings::json(&root.join("package.json"))?;
     ensure!(
         manifest.name == name && version.is_none_or(|v| manifest.version == v),
         "Acquired package manifest does not match its locked source identity"
@@ -65,10 +65,12 @@ fn check(root: &Path, name: &str, version: Option<&str>) -> Result<()> {
 
 pub fn complete(root: &Path, identity: &str) -> bool {
     let read = || -> Result<bool> {
-        let saved: String = serde_json::from_slice(&fs::read(root.join("identity.json"))?)?;
+        let (format, saved): (u32, String) =
+            serde_json::from_slice(&fs::read(root.join("identity.json"))?)?;
         let inventory: Vec<String> =
             serde_json::from_slice(&fs::read(root.join("inventory.json"))?)?;
-        Ok(saved == identity
+        Ok(format == 2
+            && saved == identity
             && inventory
                 .iter()
                 .all(|p| root.join("contents").join(p).is_file()))
@@ -86,11 +88,7 @@ fn unpack(
     let stage = tempfile::Builder::new()
         .prefix("package-")
         .tempdir_in(cache)?;
-    let inventory = acquisition::extract(
-        flate2::read::GzDecoder::new(archive),
-        stage.path(),
-        acquisition::analysis_input,
-    )?;
+    let inventory = acquisition::extract(archive, stage.path(), acquisition::analysis_input)?;
     let package = stage.path().join("package");
     let package = if package.is_dir() {
         package
@@ -113,7 +111,7 @@ fn unpack(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     fs::rename(package, &contents)?;
     write_json(&cache.join("inventory.json"), &inventory)?;
-    write_json(&cache.join("identity.json"), &identity)?;
+    write_json(&cache.join("identity.json"), &(2, identity))?;
     Ok(contents)
 }
 
@@ -256,8 +254,10 @@ impl GitSource {
         name: &str,
         remote: Option<&crate::discovery::RemoteContext>,
     ) -> Result<PathBuf> {
-        if let Some(remote) = remote {
-            crate::repository::authorize(&remote.repositories, &self.repository)?;
+        if let Some(remote) = remote
+            && !crate::repository::authorize(&remote.repositories, &self.repository)?
+        {
+            crate::repository::transport::verify_public(&self.repository)?;
         }
         let root = cache
             .join("unity-packages")
@@ -276,6 +276,10 @@ impl GitSource {
                 .tempdir_in(&root)?;
             let sources = stage.path().join("sources");
             let request = crate::repository::materialize::Request {
+                allow_private: crate::repository::authorize(
+                    &remote.unwrap().repositories,
+                    &self.repository,
+                )?,
                 repository: self.repository.transport.clone(),
                 preferred_transport: None,
                 target: crate::repository::materialize::Target::Commit(self.commit.clone()),
@@ -313,7 +317,7 @@ impl GitSource {
             }
             fs::rename(package, &contents)?;
             write_json(&root.join("inventory.json"), &inventory)?;
-            write_json(&root.join("identity.json"), &self.identity)?;
+            write_json(&root.join("identity.json"), &(2, &self.identity))?;
             Ok(contents)
         })
     }

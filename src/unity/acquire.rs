@@ -171,8 +171,7 @@ pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
             pin.integrity.as_deref(),
         )?;
         archive.seek(SeekFrom::Start(0))?;
-        let inventory =
-            acquisition::extract(xz2::read::XzDecoder::new(archive), staging.path(), retained)?;
+        let inventory = acquisition::extract(archive, staging.path(), retained)?;
         validate(&staging.path().join("Editor/Data"), version)?;
         if content.exists() {
             fs::remove_dir_all(&content)?;
@@ -196,11 +195,7 @@ pub fn inspect_archive(
     version: UnityVersion,
 ) -> Result<Vec<String>> {
     fs::create_dir_all(destination)?;
-    let inventory = acquisition::extract(
-        xz2::read::XzDecoder::new(File::open(archive)?),
-        destination,
-        retained,
-    )?;
+    let inventory = acquisition::extract(File::open(archive)?, destination, retained)?;
     validate(&destination.join("Editor/Data"), version)?;
     Ok(inventory)
 }

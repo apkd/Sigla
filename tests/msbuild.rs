@@ -8,7 +8,7 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 #[test]
-fn restore_failure_exposes_msbuild_diagnostic() {
+fn restore_failure_keeps_project_context_and_readable_sources() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let diagnostic = "Restore deliberately rejected by project";
@@ -29,8 +29,14 @@ fn restore_failure_exposes_msbuild_diagnostic() {
     let policy = Policy::new(vec![root.path().into()]).unwrap();
     let result = discover_cached(&entry, &policy, cache.path()).unwrap();
     let message = result.diagnostics.join("\n");
-    assert!(message.contains(diagnostic), "{message}");
+    assert!(!message.is_empty());
     assert!(message.contains(&entry.display().to_string()), "{message}");
+    assert!(
+        result
+            .sources
+            .iter()
+            .any(|source| source.path.ends_with("Broken.cs"))
+    );
 }
 
 #[test]
@@ -114,6 +120,15 @@ fn sdk_membership_generated_inputs_and_unbuilt_references() {
     let snapshot =
         discover_cached(&root.path().join("App/App.csproj"), &policy, cache.path()).unwrap();
     assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:?}",
+        snapshot.diagnostics
+    );
+    for project in ["App", "Library"] {
+        assert!(!root.path().join(project).join("obj").exists());
+        assert!(!root.path().join(project).join("bin").exists());
+    }
+    assert!(
         snapshot
             .sources
             .iter()
@@ -150,6 +165,134 @@ fn sdk_membership_generated_inputs_and_unbuilt_references() {
             .exists()
     );
     assert!(!root.path().join("App/bin/Debug/net10.0/App.dll").exists());
+}
+
+#[test]
+fn same_named_projects_restore_to_separate_cached_outputs() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "NuGet.Config",
+        "<configuration><packageSources><clear /></packageSources></configuration>",
+    );
+    write(
+        root.path(),
+        "Directory.Build.props",
+        "<Project><PropertyGroup><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup></Project>",
+    );
+    write(
+        root.path(),
+        "Library/Shared.csproj",
+        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFrameworks>net10.0;net10.0-windows</TargetFrameworks><AssemblyName>Library</AssemblyName><LangVersion>latest</LangVersion></PropertyGroup></Project>"#,
+    );
+    write(
+        root.path(),
+        "Library/Library.cs",
+        "public class LibraryType {}",
+    );
+    write(
+        root.path(),
+        "App/Shared.csproj",
+        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><AssemblyName>App</AssemblyName></PropertyGroup><ItemGroup><ProjectReference Include="../Library/Shared.csproj" /></ItemGroup></Project>"#,
+    );
+    write(
+        root.path(),
+        "App/App.cs",
+        "public class AppType : LibraryType {}",
+    );
+    write(
+        root.path(),
+        "App/obj/Old.cs",
+        "#error Stale generated source must stay excluded",
+    );
+    write(
+        root.path(),
+        "App/bin/Old.cs",
+        "#error Stale output must stay excluded",
+    );
+    let policy = Policy::new(vec![root.path().into()]).unwrap();
+    let entry = root.path().join("App/Shared.csproj");
+    for _ in 0..2 {
+        let result = discover_cached(&entry, &policy, cache.path()).unwrap();
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let assets: std::collections::HashSet<_> = result
+            .projects
+            .iter()
+            .map(|p| p.compiler_options["ProjectAssetsFile"].clone())
+            .collect();
+        let origins: std::collections::HashSet<_> =
+            result.projects.iter().map(|p| p.origin.clone()).collect();
+        assert_eq!(assets.len(), origins.len());
+        let intermediates: std::collections::HashSet<_> = result
+            .projects
+            .iter()
+            .map(|p| p.compiler_options["IntermediateOutputPath"].clone())
+            .collect();
+        assert_eq!(intermediates.len(), result.projects.len());
+        for path in assets {
+            assert!(Path::new(&path).starts_with(cache.path()));
+            assert!(Path::new(&path).is_file());
+        }
+        assert!(!result.sources.iter().any(|s| s.path.ends_with("Old.cs")));
+        assert!(
+            result
+                .sources
+                .iter()
+                .any(|s| s.path.starts_with(cache.path())
+                    && s.path.to_string_lossy().contains("GlobalUsings"))
+        );
+        let app = result.projects.iter().find(|p| p.name == "App").unwrap();
+        assert!(
+            result
+                .projects
+                .iter()
+                .filter(|p| p.name == "Library")
+                .any(|library| app.references.iter().any(|r| r.visible(&library.identity)))
+        );
+    }
+    assert!(!root.path().join("Library/obj").exists());
+    assert_eq!(
+        std::fs::read_dir(root.path().join("App/obj"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path().join("App/bin"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn local_custom_targets_cannot_write_to_checkout() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "NuGet.Config",
+        "<configuration><packageSources><clear /></packageSources></configuration>",
+    );
+    write(
+        root.path(),
+        "Project.csproj",
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+      <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+      <Target Name="WriteIntoCheckout" BeforeTargets="PrepareForBuild">
+        <WriteLinesToFile File="$(MSBuildProjectDirectory)/unexpected.txt" Lines="unexpected" />
+      </Target>
+    </Project>"#,
+    );
+    write(root.path(), "Source.cs", "class StillReadable {}");
+    let policy = Policy::new(vec![root.path().into()]).unwrap();
+    let result =
+        discover_cached(&root.path().join("Project.csproj"), &policy, cache.path()).unwrap();
+    assert!(!root.path().join("unexpected.txt").exists());
+    assert!(!result.diagnostics.is_empty());
+    assert!(result.sources.iter().any(|s| s.path.ends_with("Source.cs")));
 }
 
 #[test]

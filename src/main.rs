@@ -50,7 +50,11 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     if let Command::GitJob { input, output } = &cli.command {
-        return sigla::repository::job::worker(input, output);
+        let (input, output) = (input.clone(), output.clone());
+        return tokio::task::spawn_blocking(move || {
+            sigla::repository::job::worker(&input, &output)
+        })
+        .await?;
     }
     let remote = cli.options.validate()?;
     let mut policy = Policy::new(cli.options.local_roots())?;

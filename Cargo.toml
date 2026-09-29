@@ -42,15 +42,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
-tar = "0.4"
-xz2 = "0.1"
-flate2 = "1"
+libarchive3-sys = "0.1.2"
 base64 = "0.22"
 sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 
 [dev-dependencies]
+tar = "0.4"
 quick-xml = "0.39"
 windows-metadata = "=0.100.0"
 

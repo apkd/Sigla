@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use url::Url;
 pub mod job;
+mod lfs;
 pub mod manager;
 pub mod materialize;
 pub mod selection;
@@ -142,7 +143,7 @@ impl Repository {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct Rule(Identity);
+pub struct Rule(Identity, bool);
 
 impl Rule {
     pub fn parse(input: &str) -> Result<Self> {
@@ -150,7 +151,13 @@ impl Rule {
             !input.contains('#'),
             "Authorization rules cannot select a branch. {SYNTAX}"
         );
-        Ok(Self(parse_identity(input, true)?))
+        Ok(Self(parse_identity(input, true)?, false))
+    }
+
+    pub fn parse_private(input: &str) -> Result<Self> {
+        let mut rule = Self::parse(input)?;
+        rule.1 = true;
+        Ok(rule)
     }
 
     pub fn matches(&self, repository: &Identity) -> bool {
@@ -172,13 +179,15 @@ impl Rule {
     }
 }
 
-pub fn authorize(rules: &[Rule], repository: &Repository) -> Result<()> {
+pub fn authorize(rules: &[Rule], repository: &Repository) -> Result<bool> {
     ensure!(
         rules.iter().any(|rule| rule.matches(&repository.identity)),
         "Repository is not authorized: {}",
         repository.identity
     );
-    Ok(())
+    Ok(rules
+        .iter()
+        .any(|rule| rule.1 && rule.matches(&repository.identity)))
 }
 
 fn looks_remote(input: &str) -> bool {
@@ -536,5 +545,16 @@ mod tests {
         ] {
             assert!(Rule::parse(input).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn private_access_requires_its_own_matching_rule() {
+        let public = Rule::parse("https://github.com/owner/*").unwrap();
+        let private = Rule::parse_private("https://github.com/owner/private").unwrap();
+        let target = repo("git@github.com:owner/private.git");
+        assert!(!authorize(std::slice::from_ref(&public), &target).unwrap());
+        assert!(authorize(std::slice::from_ref(&private), &target).unwrap());
+        assert!(authorize(&[public.clone(), private.clone()], &target).unwrap());
+        assert!(!authorize(&[private, public], &repo("https://github.com/owner/other")).unwrap());
     }
 }

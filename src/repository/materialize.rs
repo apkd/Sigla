@@ -26,6 +26,8 @@ pub enum Target {
 pub struct Request {
     pub repository: String,
     #[serde(default)]
+    pub allow_private: bool,
+    #[serde(default)]
     pub preferred_transport: Option<String>,
     pub target: Target,
     pub store: PathBuf,
@@ -40,6 +42,8 @@ pub struct Request {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Prepared {
+    #[serde(default)]
+    pub unavailable: BTreeSet<String>,
     #[serde(default)]
     pub transport: Option<String>,
     pub branch: Option<String>,
@@ -102,7 +106,11 @@ fn receive(
 
 pub fn prepare(request: &Request) -> Result<Prepared> {
     prepare_with(request, |repository| {
-        Session::connect(repository, request.preferred_transport.as_deref())
+        Session::connect(
+            repository,
+            request.preferred_transport.as_deref(),
+            request.allow_private,
+        )
     })
 }
 
@@ -155,6 +163,7 @@ fn prepare_with(
                 .to_owned();
             super::validate_branch(&name)?;
             return Ok(Prepared {
+                unavailable: BTreeSet::new(),
                 transport: session.endpoint.clone(),
                 branch: Some(name),
                 revision: id.to_string(),
@@ -345,6 +354,7 @@ fn prepare_with(
         }
     }
     Ok(Prepared {
+        unavailable: BTreeSet::new(),
         transport,
         branch,
         revision: revision.to_string(),
@@ -399,6 +409,7 @@ mod tests {
 
     fn request(root: &Path) -> Request {
         Request {
+            allow_private: false,
             repository: "https://example.invalid/team/repo".into(),
             preferred_transport: None,
             target: Target::Branch("main".into()),

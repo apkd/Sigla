@@ -55,11 +55,8 @@ pub struct Packages {
 }
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    serde_json::from_slice(
-        &std::fs::read(path)
-            .with_context(|| format!("Missing package input {}", path.display()))?,
-    )
-    .with_context(|| format!("Malformed package input {}", path.display()))
+    super::settings::json(path)
+        .with_context(|| format!("Malformed package input {}", path.display()))
 }
 fn name(name: &str) -> bool {
     !name.is_empty()
@@ -309,9 +306,9 @@ impl Packages {
             match available {
                 Ok(package) => {
                     if matches!(node.source.as_str(), "registry" | "builtin") && package.manifest.version != node.version {
-                        diagnostics.push(format!("Package {package_name} requests {}, using available version {}.", node.version, package.manifest.version));
+                        tracing::info!("Package {package_name} requests {}, using available version {}.", node.version, package.manifest.version);
                     }
-                    if node.source == "local" && package.manifest.dependencies != node.dependencies { diagnostics.push(format!("Local package dependencies disagree with the lock for {package_name}; using available contents.")); }
+                    if node.source == "local" && package.manifest.dependencies != node.dependencies { tracing::info!("Local package dependencies disagree with the lock for {package_name}; using available contents."); }
                     if node.source == "builtin" {
                         for (dependency, requested) in &package.manifest.dependencies {
                             if lock
@@ -319,7 +316,7 @@ impl Packages {
                                 .get(dependency)
                                 .is_none_or(|selected| &selected.version != requested)
                             {
-                                diagnostics.push(format!("Selected editor requests {dependency} {requested}, which differs from the lock; using available contents."));
+                                tracing::info!("Selected editor requests {dependency} {requested}, which differs from the lock; using available contents.");
                             }
                         }
                     }

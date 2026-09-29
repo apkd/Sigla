@@ -1,6 +1,6 @@
 use crate::{
     model::*,
-    query::{Query, Target, name_rank, wildcard},
+    query::{Query, Target, name_rank, qualified_name_rank, wildcard},
     store::{FileData, Store},
     workspace::{FileEntry, Manifest, Membership},
 };
@@ -316,7 +316,13 @@ impl<'a> Search<'a> {
                     } else {
                         &decl.name
                     };
-                    if let Some(rank) = name_rank(&target.name, compared, loose) {
+                    // Source binding uses complete names; query targets may omit namespaces.
+                    let rank = if from.is_some() {
+                        name_rank(&target.name, compared, loose)
+                    } else {
+                        qualified_name_rank(&target.name, compared, loose)
+                    };
+                    if let Some(rank) = rank {
                         if target
                             .parameters
                             .as_ref()
@@ -799,7 +805,7 @@ impl<'a> Search<'a> {
                 || d.qualified == context_name(written, m);
         }
         let ns = containing.map(|d| d.namespace.as_str()).unwrap_or("");
-        d.namespace == ns
+        d.namespace == context_name(ns, m)
             || d.namespace == m.module
             || d.owner == m.module
             || imports.iter().any(|i| {

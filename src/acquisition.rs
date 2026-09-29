@@ -1,4 +1,5 @@
 //! Downloads and confined extraction shared by Unity editors and packages.
+mod archive;
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use sha2::Digest;
@@ -170,15 +171,14 @@ pub fn transfer(
 }
 
 pub fn extract(
-    reader: impl Read,
+    reader: File,
     destination: &Path,
     retain: impl Fn(&Path) -> bool,
 ) -> Result<Vec<String>> {
-    let mut archive = tar::Archive::new(reader);
+    let mut archive = archive::Archive::open(reader)?;
     let mut retained = Vec::new();
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
+    while let Some(entry) = archive.next()? {
+        let path = entry.path;
         ensure!(
             !path.is_absolute()
                 && path
@@ -190,27 +190,7 @@ pub fn extract(
             .components()
             .filter(|c| matches!(c, Component::Normal(_)))
             .collect();
-        if let Some(link) = entry.link_name()? {
-            ensure!(
-                !link.is_absolute(),
-                "Archive link escapes extraction directory"
-            );
-            let mut depth = if entry.header().entry_type().is_hard_link() {
-                0
-            } else {
-                path.parent().map_or(0, |p| p.components().count())
-            };
-            for component in link.components() {
-                match component {
-                    Component::Normal(_) => depth += 1,
-                    Component::CurDir => (),
-                    Component::ParentDir if depth > 0 => depth -= 1,
-                    _ => anyhow::bail!("Archive link escapes extraction directory"),
-                }
-            }
-            continue;
-        }
-        if !entry.header().entry_type().is_file() || !retain(&path) {
+        if entry.link || !entry.regular || !retain(&path) {
             continue;
         }
         ensure!(!path.as_os_str().is_empty(), "Empty archive file path");
@@ -219,8 +199,13 @@ pub fn extract(
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(output)?;
-        std::io::copy(&mut entry, &mut file)?;
+            .open(&output)
+            .with_context(|| {
+                format!("Cannot extract {} to {}", path.display(), output.display())
+            })?;
+        archive
+            .copy(&mut file)
+            .with_context(|| format!("Cannot decode {}", path.display()))?;
         retained.push(
             path.to_str()
                 .context("Archive path is not UTF-8")?
@@ -244,6 +229,88 @@ pub fn analysis_input(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn archive(bytes: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        std::io::Seek::rewind(&mut file).unwrap();
+        file
+    }
+
+    fn tar(paths: &[&str]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for path in paths {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, b"x".as_slice())
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn unity_long_names_remain_distinct_with_nonstandard_tar_magic() {
+        let directory = "long-directory/".repeat(8);
+        let first = format!("package/{directory}First.cs");
+        let second = format!("package/{directory}Second.cs");
+        let mut bytes = tar(&[&first, &second]);
+        let mut offset = 0;
+        while offset + 512 <= bytes.len() && bytes[offset..offset + 512].iter().any(|b| *b != 0) {
+            let mut header = tar::Header::from_byte_slice(&bytes[offset..offset + 512]).clone();
+            let size = header.entry_size().unwrap() as usize;
+            header.as_mut_bytes()[257..265].copy_from_slice(b"ustar\0 \0");
+            header.set_cksum();
+            bytes[offset..offset + 512].copy_from_slice(header.as_bytes());
+            offset += 512 + size.div_ceil(512) * 512;
+        }
+        let root = tempfile::tempdir().unwrap();
+        extract(archive(&bytes), root.path(), analysis_input).unwrap();
+        for path in [first, second] {
+            assert_eq!(fs::read(root.path().join(path)).unwrap(), b"x");
+        }
+    }
+
+    #[test]
+    fn duplicate_files_and_escaping_paths_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            extract(
+                archive(&tar(&["Code.cs", "Code.cs"])),
+                root.path(),
+                analysis_input
+            )
+            .is_err()
+        );
+        let mut bytes = tar(&["Fine.cs"]);
+        let mut header = tar::Header::from_byte_slice(&bytes[..512]).clone();
+        header.as_mut_bytes()[..100].fill(0);
+        header.as_mut_bytes()[..10].copy_from_slice(b"../Bad.cs\0");
+        header.set_cksum();
+        bytes[..512].copy_from_slice(header.as_bytes());
+        assert!(extract(archive(&bytes), root.path(), analysis_input).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires SIGLA_TEST_ARCHIVES containing downloaded package paths"]
+    fn downloaded_package_archives_extract() {
+        let Some(paths) = std::env::var_os("SIGLA_TEST_ARCHIVES") else {
+            return;
+        };
+        for path in std::env::split_paths(&paths) {
+            let root = tempfile::tempdir().unwrap();
+            let inventory =
+                extract(File::open(&path).unwrap(), root.path(), analysis_input).unwrap();
+            assert!(!inventory.is_empty());
+            assert!(
+                inventory
+                    .iter()
+                    .all(|path| root.path().join(path).is_file())
+            );
+            eprintln!("{}: {} selected files", path.display(), inventory.len());
+        }
+    }
     #[test]
     fn extraction_keeps_analysis_inputs_without_unpacking_assets() {
         let mut builder = tar::Builder::new(Vec::new());
@@ -261,7 +328,10 @@ mod tests {
         }
         let bytes = builder.into_inner().unwrap();
         let root = tempfile::tempdir().unwrap();
-        extract(bytes.as_slice(), root.path(), analysis_input).unwrap();
+        let mut archive = tempfile::tempfile().unwrap();
+        archive.write_all(&bytes).unwrap();
+        std::io::Seek::rewind(&mut archive).unwrap();
+        extract(archive, root.path(), analysis_input).unwrap();
         assert!(root.path().join("package/Code.cs").is_file());
         assert!(!root.path().join("package/texture.png").exists());
     }

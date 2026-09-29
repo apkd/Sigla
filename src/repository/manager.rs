@@ -188,6 +188,7 @@ impl Manager {
                 tokio::spawn(async move {
                     let result = async {
                         let request = Request {
+                            allow_private: authorize(&manager.options.rules, &repository)?,
                             repository: repository.transport.clone(),
                             preferred_transport: None,
                             target: Target::DefaultBranch,
@@ -293,7 +294,11 @@ impl Manager {
     }
 
     pub async fn resolve(self: &Arc<Self>, repository: Repository) -> Result<Arc<Branch>> {
-        authorize(&self.options.rules, &repository)?;
+        if !authorize(&self.options.rules, &repository)? {
+            let repository = repository.clone();
+            tokio::task::spawn_blocking(move || super::transport::verify_public(&repository))
+                .await??;
+        }
         let name = match &repository.branch {
             Some(name) => name.clone(),
             None => self.default_branch(&repository).await?,
@@ -314,13 +319,16 @@ impl Manager {
                 } else {
                     None
                 };
-                if let Some(value) = &state {
+                if let Some(value) = &mut state {
                     ensure!(
-                        value.schema == 2
+                        matches!(value.schema, 2 | 3)
                             && value.repository == repository.identity
                             && value.branch == name,
                         "Cached branch identity is invalid"
                     );
+                    if value.schema < 3 {
+                        value.repair = true;
+                    }
                     let ttl = if matches!(name.as_str(), "main" | "master") {
                         self.options.repo_ttl
                     } else {
@@ -353,10 +361,9 @@ impl Manager {
             !s.repair
                 && branch.source().is_dir()
                 && s.policy == self.options.selection.identity
-                && s.prepared
-                    .selected
-                    .keys()
-                    .all(|p| branch.source().join(p).is_file())
+                && s.prepared.selected.keys().all(|p| {
+                    s.prepared.unavailable.contains(p) || branch.source().join(p).is_file()
+                })
         });
         let due = state.as_ref().is_none_or(|s| {
             now().saturating_sub(s.refreshed) >= self.options.refresh_interval.as_millis() as u64
@@ -432,6 +439,7 @@ impl Manager {
             .prefix("required-")
             .tempdir_in(&branch.root)?;
         let request = Request {
+            allow_private: authorize(&self.options.rules, &branch.repository)?,
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
             target: Target::Commit(revision.to_owned()),
@@ -463,6 +471,13 @@ impl Manager {
         *state = Some(next.clone());
         for path in next.prepared.selected.keys() {
             let staged = stage.path().join(path);
+            if next.prepared.unavailable.contains(path) {
+                let target = branch.source().join(path);
+                if target.is_file() {
+                    fs::remove_file(target)?;
+                }
+                continue;
+            }
             if staged.is_file() {
                 let target = branch.source().join(path);
                 fs::create_dir_all(target.parent().unwrap())?;
@@ -507,6 +522,7 @@ impl Manager {
             })
             .unwrap_or_default();
         let request = Request {
+            allow_private: authorize(&self.options.rules, &branch.repository)?,
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
             target: Target::Branch(branch.name.clone()),
@@ -530,7 +546,7 @@ impl Manager {
             tokio::task::spawn_blocking(move || job::execute(&request, &cache)).await??;
         let mut state = branch.state.lock().await;
         let mut next = State {
-            schema: 2,
+            schema: 3,
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),
@@ -575,6 +591,13 @@ impl Manager {
         }
         for path in next.prepared.selected.keys() {
             let staged = stage.path().join(path);
+            if next.prepared.unavailable.contains(path) {
+                let target = source.join(path);
+                if target.is_file() {
+                    fs::remove_file(target)?;
+                }
+                continue;
+            }
             if staged.is_file() {
                 let target = source.join(path);
                 fs::create_dir_all(target.parent().unwrap())?;
@@ -588,6 +611,7 @@ impl Manager {
         if before.as_ref().is_some_and(|s| {
             !s.repair
                 && s.prepared.selected == next.prepared.selected
+                && s.prepared.unavailable == next.prepared.unavailable
                 && s.indexed_revision.as_ref() == Some(&s.prepared.revision)
         }) {
             next.indexed_revision = Some(next.prepared.revision.clone());

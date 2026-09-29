@@ -10,10 +10,14 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
         .join("transports")
         .join(repository.identity.storage_key());
     let mut request = request.clone();
-    request.preferred_transport = match fs::read_to_string(&preference) {
-        Ok(endpoint) => Some(endpoint),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
+    request.preferred_transport = if !request.allow_private {
+        None
+    } else {
+        match fs::read_to_string(&preference) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
     };
     let directory = tempfile::Builder::new()
         .prefix("git-job-")
@@ -34,7 +38,14 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
         .env_remove("DISPLAY")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE");
-    crate::process::run(&mut command, Duration::from_secs(300))?;
+    let output_log = crate::process::capture(&mut command, Duration::from_secs(300), None, None)?;
+    if !output_log.stderr.is_empty() {
+        tracing::warn!("{}", String::from_utf8_lossy(&output_log.stderr).trim());
+    }
+    ensure!(
+        output_log.status.success(),
+        "Repository preparation subprocess failed"
+    );
     ensure!(
         fs::metadata(&output)?.len() <= 256 * 1024 * 1024,
         "Repository inventory exceeds size limit"
@@ -57,7 +68,16 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
         "Repository request exceeds size limit"
     );
     let request: Request = serde_json::from_slice(&fs::read(input)?)?;
-    let result = super::materialize::prepare(&request).map_err(|error| format!("{error:#}"));
+    let result = (|| -> Result<Prepared> {
+        let mut prepared = super::materialize::prepare(&request)?;
+        super::lfs::hydrate(
+            &request,
+            &mut prepared,
+            input.parent().unwrap().parent().unwrap(),
+        )?;
+        Ok(prepared)
+    })()
+    .map_err(|error| format!("{error:#}"));
     fs::write(output, serde_json::to_vec(&result)?)?;
     Ok(())
 }

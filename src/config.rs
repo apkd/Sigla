@@ -31,8 +31,12 @@ pub struct Options {
     pub root: Vec<PathBuf>,
     #[arg(long, global = true, default_value = "UNITY_EDITOR_LINUX")]
     pub unity_platform: Platform,
+    /// Allow anonymous access to matching public repositories.
     #[arg(long, global = true)]
     pub allow_repo: Vec<String>,
+    /// Allow authenticated access to matching repositories, including private repositories.
+    #[arg(long, global = true)]
+    pub allow_repo_private: Vec<String>,
     #[arg(long, global = true, value_parser = duration)]
     pub refresh_interval: Option<Duration>,
     #[arg(long, global = true, value_parser = duration)]
@@ -73,25 +77,31 @@ impl Options {
         if self.mode != Mode::Remote {
             ensure!(
                 self.allow_repo.is_empty()
+                    && self.allow_repo_private.is_empty()
                     && self.refresh_interval.is_none()
                     && self.repo_ttl.is_none()
                     && self.branch_ttl.is_none()
                     && self.unity_version.is_empty()
                     && self.remote_include.is_empty()
                     && self.remote_exclude.is_empty(),
-                "--allow-repo, --refresh-interval, --repo-ttl, --branch-ttl, --unity-version, --remote-include, and --remote-exclude require --mode remote"
+                "--allow-repo, --allow-repo-private, --refresh-interval, --repo-ttl, --branch-ttl, --unity-version, --remote-include, and --remote-exclude require --mode remote"
             );
             return Ok(None);
         }
         ensure!(
-            !self.allow_repo.is_empty(),
-            "Remote mode requires at least one --allow-repo rule"
+            !self.allow_repo.is_empty() || !self.allow_repo_private.is_empty(),
+            "Remote mode requires --allow-repo or --allow-repo-private"
         );
         Ok(Some(RemoteOptions {
             rules: self
                 .allow_repo
                 .iter()
                 .map(|r| Rule::parse(r))
+                .chain(
+                    self.allow_repo_private
+                        .iter()
+                        .map(|r| Rule::parse_private(r)),
+                )
                 .collect::<Result<_>>()?,
             refresh_interval: self.refresh_interval.unwrap_or(Duration::from_secs(5 * 60)),
             repo_ttl: self
@@ -159,6 +169,24 @@ mod tests {
         .options;
         assert!(remote.validate().unwrap().is_some());
         assert!(remote.local_roots().is_empty());
+        let private = Cli::try_parse_from([
+            "sigla",
+            "--mode",
+            "remote",
+            "--allow-repo-private",
+            "https://github.com/owner/private",
+        ])
+        .unwrap()
+        .options;
+        assert!(private.validate().unwrap().is_some());
+        let local_private = Cli::try_parse_from([
+            "sigla",
+            "--allow-repo-private",
+            "https://github.com/owner/private",
+        ])
+        .unwrap()
+        .options;
+        assert!(local_private.validate().is_err());
         for flag in ["--refresh-interval", "--repo-ttl", "--branch-ttl"] {
             let local = Cli::try_parse_from(["sigla", flag, "5m"]).unwrap().options;
             assert!(local.validate().is_err());

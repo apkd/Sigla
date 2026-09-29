@@ -523,6 +523,11 @@ impl Workspace {
             self.monitor.unregister(obsolete);
         }
         self.directories = directories;
+        for diagnostic in &manifest.diagnostics {
+            if !self.manifest.diagnostics.contains(diagnostic) {
+                tracing::warn!("{diagnostic}");
+            }
+        }
         self.manifest = Arc::new(manifest);
         self.fence = fence;
         self.initialized = true;

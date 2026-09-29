@@ -8,6 +8,56 @@ use std::{
     time::Duration,
 };
 
+/// Local projects retain host inputs and credentials, but may write only to their cache.
+pub fn local_command(host: &Path, directory: &Path, cache: &Path, job: &Path) -> Result<Command> {
+    let cache = cache.join("dotnet").canonicalize()?;
+    for child in ["tmp", "home", "packages", "http-cache", "plugins"] {
+        fs::create_dir_all(cache.join(child))?;
+    }
+    let mut command = Command::new("bwrap");
+    command
+        .args([
+            "--die-with-parent",
+            "--unshare-pid",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+        ])
+        .arg("--bind")
+        .arg(&cache)
+        .arg(&cache)
+        .arg("--bind")
+        .arg(job)
+        .arg(job)
+        .args(["--proc", "/proc", "--dev", "/dev"])
+        .arg("--chdir")
+        .arg(directory);
+    // DOTNET_CLI_HOME relocates NuGet's user settings too. Keep existing feed credentials readable.
+    if let Some(home) = std::env::var_os("DOTNET_CLI_HOME").or_else(|| std::env::var_os("HOME")) {
+        let config = PathBuf::from(home).join(".nuget/NuGet");
+        if config.is_dir() {
+            let target = cache.join("home/.nuget/NuGet");
+            fs::create_dir_all(&target)?;
+            command.arg("--ro-bind").arg(config).arg(target);
+        }
+    }
+    command
+        .arg("--")
+        .arg(host)
+        .env("TMPDIR", cache.join("tmp"))
+        .env("DOTNET_CLI_HOME", cache.join("home"))
+        .env("NUGET_PACKAGES", cache.join("packages"))
+        .env("NUGET_HTTP_CACHE_PATH", cache.join("http-cache"))
+        .env("NUGET_PLUGINS_CACHE_PATH", cache.join("plugins"))
+        .env("MSBUILDDISABLENODEREUSE", "1")
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+        .env("DOTNET_NOLOGO", "1");
+    Ok(command)
+}
+
 pub struct Sandbox {
     pub source: PathBuf,
     pub writable: PathBuf,

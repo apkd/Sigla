@@ -18,182 +18,19 @@ pub fn render(source: &str, language: Language, range: Range<usize>) -> String {
         Language::CSharp => csharp(source, &range),
     };
     edits.extend(spacing(source, &tokens));
-    if let Some(first) = tokens.iter().find(|t| t.range.end > range.start) {
-        if first.range.start >= range.start
-            && first.range.start <= range.end
-            && source[range.start..first.range.start]
-                .chars()
-                .all(char::is_whitespace)
-        {
-            edits.push(Edit {
-                range: range.start..first.range.start,
-                text: String::new(),
-            });
-        }
+    if let Some(first) = tokens.iter().find(|t| t.range.end > range.start)
+        && first.range.start >= range.start
+        && first.range.start <= range.end
+        && source[range.start..first.range.start]
+            .chars()
+            .all(char::is_whitespace)
+    {
+        edits.push(Edit {
+            range: range.start..first.range.start,
+            text: String::new(),
+        });
     }
     apply(source, range, edits)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    #[ignore = "manual token measurement; requires m-count-tokens"]
-    fn measure_tokens() {
-        use std::{
-            io::Write,
-            process::{Command, Stdio},
-        };
-        fn count(text: &str) -> usize {
-            let mut child = Command::new("m-count-tokens")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(text.as_bytes())
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
-            assert!(output.status.success());
-            String::from_utf8(output.stdout)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap()
-        }
-        for (name, source, language) in [
-            ("Rust search", include_str!("search.rs"), Language::Rust),
-            ("Rust service", include_str!("service.rs"), Language::Rust),
-            (
-                "C# fixture",
-                include_str!("../tests/metadata-fixture/Fixture.cs"),
-                Language::CSharp,
-            ),
-            (
-                "C# Unity exporter",
-                include_str!("../tests/unity-reference/ExportCompilation.cs"),
-                Language::CSharp,
-            ),
-        ] {
-            let output = min(source, language);
-            let before = count(source);
-            let after = count(&output);
-            println!(
-                "{name}: {before} -> {after} tokens ({:.1}% saved)",
-                100.0 * (before as f64 - after as f64) / before as f64
-            );
-        }
-    }
-    fn min(source: &str, language: Language) -> String {
-        render(source, language, 0..source.len())
-    }
-    #[test]
-    fn rust_shortens_code_without_touching_macros_literals_or_tuple_shape() {
-        let source = r####"use std::collections::HashMap;
-use std::collections::HashSet;
-struct Point { x: i32, y: i32 }
-fn make(x: i32, y: i32) -> Point {
-    let literal = r#" keep   all spaces "#;
-    let tuple = (x,);
-    let separate = x - -y;
-    custom! { x : x,  keep   spacing };
-    Point { x: x, y: y, }
-}
-"####;
-        let result = min(source, Language::Rust);
-        assert!(
-            result.contains("use std::collections::{HashMap,HashSet};"),
-            "{result}"
-        );
-        assert!(result.contains("Point{x,y}"), "{result}");
-        assert!(result.contains("(x,)"), "{result}");
-        assert!(result.contains("r#\" keep   all spaces \"#"), "{result}");
-        assert!(result.contains("{ x : x,  keep   spacing }"), "{result}");
-        assert!(result.contains("- -"), "{result}");
-        assert!(result.len() < source.len());
-    }
-    #[test]
-    fn csharp_preserves_types_comments_strings_and_directives() {
-        let source = r####"using Alias = System.Int32?;
-class Sample {
-    /// <summary>Keep the value.</summary>
-    public int Value { get { return 42; } }
-    int Add(int a, int b) { return a + b; }
-    void Run(bool ready) {
-        int? nullable = new int?();
-        Alias alias = new Alias();
-        System.IO.Stream stream = new System.IO.MemoryStream();
-        int number = default(int);
-        int initialized = new int {};
-        int[] values = ready ? [1] : [2];
-        if (ready) { number++; }
-        // Keep this invariant.
-        string text = "a   b";
-    }
-#if ACTIVE
-    string raw = " stay   exact ";
-#endif
-}
-"####;
-        let result = min(source, Language::CSharp);
-        assert!(
-            result.contains("Value=>42;") && result.contains("=>a+b;"),
-            "{result}"
-        );
-        assert!(
-            result.contains("// Keep the value.") && result.contains("// Keep this invariant."),
-            "{result}"
-        );
-        assert!(result.contains("nullable=new int?()"), "{result}");
-        assert!(result.contains("alias=new Alias()"), "{result}");
-        assert!(
-            result.contains("System.IO.Stream stream=new System.IO.MemoryStream()"),
-            "{result}"
-        );
-        assert!(result.contains("number=default;"), "{result}");
-        assert!(result.contains("new int{}"), "{result}");
-        assert!(result.contains("? [1]"), "{result}");
-        assert!(
-            result.contains("\"a   b\"") && result.contains("\" stay   exact \""),
-            "{result}"
-        );
-        assert!(result.len() < source.len());
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-            .unwrap();
-        assert!(
-            !parser.parse(&result, None).unwrap().root_node().has_error(),
-            "{result}"
-        );
-    }
-    #[test]
-    fn selected_lines_inside_literals_remain_unchanged() {
-        for (language, source) in [
-            (Language::Rust, "fn f(){let x=r#\"\n  a   b\n  c   d\n\"#;}"),
-            (
-                Language::CSharp,
-                "class C { string s=@\"\n  a   b\n  c   d\n\"; }",
-            ),
-        ] {
-            let (range, _, _) = crate::navigation::lines(source, Some((2, 2))).unwrap();
-            assert_eq!(render(source, language, range.clone()), source[range]);
-        }
-    }
-    #[test]
-    fn ranges_do_not_apply_half_a_namespace_conversion() {
-        let source = "namespace Example\n{\nclass C { int Get() { return 1; } }\n}\n";
-        let (range, _, _) = crate::navigation::lines(source, Some((2, 2))).unwrap();
-        assert_eq!(render(source, Language::CSharp, range), "{\n");
-        let full = min(source, Language::CSharp);
-        assert!(
-            full.contains("namespace Example;") && full.contains("=>1;"),
-            "{full}"
-        );
-    }
 }
 
 fn apply(source: &str, range: Range<usize>, mut edits: Vec<Edit>) -> String {
@@ -227,19 +64,18 @@ fn spacing(source: &str, tokens: &[Token]) -> Vec<Edit> {
         if !gap.is_empty() && gap.chars().all(char::is_whitespace) {
             let left = previous.map(|t| &source[t.range.clone()]).unwrap_or("");
             let right = &source[token.range.clone()];
-            let text = if previous.is_none() {
-                ""
-            } else if gap.contains('\n') {
-                // Keep comments and directives on their own lines; retain source statement layout.
-                if right == "{" && !previous.unwrap().opaque {
-                    ""
-                } else {
-                    "\n"
+            let text = match previous {
+                None => "",
+                Some(previous) if gap.contains('\n') => {
+                    // Keep comments and directives on their own lines; retain source statement layout.
+                    if right == "{" && !previous.opaque {
+                        ""
+                    } else {
+                        "\n"
+                    }
                 }
-            } else if previous.unwrap().opaque || token.opaque || separator(left, right) {
-                " "
-            } else {
-                ""
+                Some(previous) if previous.opaque || token.opaque || separator(left, right) => " ",
+                Some(_) => "",
             };
             edits.push(Edit {
                 range: end..token.range.start,
@@ -320,39 +156,38 @@ fn rust(source: &str) -> (Vec<Token>, Vec<Edit>) {
         {
             continue;
         }
-        if let Some(field) = ast::RecordExprField::cast(node.clone()) {
-            if let (Some(name), Some(expr), Some(_)) =
+        if let Some(field) = ast::RecordExprField::cast(node.clone())
+            && let (Some(name), Some(expr), Some(_)) =
                 (field.name_ref(), field.expr(), field.colon_token())
-            {
-                let name = name.syntax().text().to_string();
-                if expr.syntax().text().to_string() == name && !has_rust_comment(&node) {
-                    // Keep field attributes outside the replaced name/expression span.
-                    let start = field
-                        .name_ref()
-                        .unwrap()
-                        .syntax()
-                        .text_range()
-                        .start()
-                        .into();
-                    edits.push(Edit {
-                        range: start..expr.syntax().text_range().end().into(),
-                        text: name,
-                    });
-                }
+        {
+            let name = name.syntax().text().to_string();
+            if expr.syntax().text().to_string() == name && !has_rust_comment(&node) {
+                // Keep field attributes outside the replaced name/expression span.
+                let start = field
+                    .name_ref()
+                    .unwrap()
+                    .syntax()
+                    .text_range()
+                    .start()
+                    .into();
+                edits.push(Edit {
+                    range: start..expr.syntax().text_range().end().into(),
+                    text: name,
+                });
             }
         }
-        if let Some(tree) = ast::UseTree::cast(node.clone()) {
-            if let Some(list) = tree.use_tree_list() {
-                let children: Vec<_> = list.use_trees().collect();
-                if children.len() == 1 && !has_rust_comment(&node) {
-                    let child = &children[0];
-                    // `prefix::{self}` is not `prefix::self`.
-                    if !child.syntax().text().to_string().contains("self") {
-                        edits.push(Edit {
-                            range: list.syntax().text_range().into(),
-                            text: compact(source, child.syntax().text_range().into(), &tokens),
-                        });
-                    }
+        if let Some(tree) = ast::UseTree::cast(node.clone())
+            && let Some(list) = tree.use_tree_list()
+        {
+            let children: Vec<_> = list.use_trees().collect();
+            if children.len() == 1 && !has_rust_comment(&node) {
+                let child = &children[0];
+                // `prefix::{self}` is not `prefix::self`.
+                if !child.syntax().text().to_string().contains("self") {
+                    edits.push(Edit {
+                        range: list.syntax().text_range().into(),
+                        text: compact(source, child.syntax().text_range().into(), &tokens),
+                    });
                 }
             }
         }
@@ -534,31 +369,31 @@ fn simplify_cs(
     let text = |n: tree_sitter::Node<'_>| &source[n.byte_range()];
     match node.kind() {
         "method_declaration" => {
-            if let Some(body) = node.child_by_field_name("body") {
-                if let Some(expr) = returned(body) {
-                    edits.push(Edit {
-                        range: body.byte_range(),
-                        text: format!("=>{};", compact(source, expr.byte_range(), tokens)),
-                    });
-                }
+            if let Some(body) = node.child_by_field_name("body")
+                && let Some(expr) = returned(body)
+            {
+                edits.push(Edit {
+                    range: body.byte_range(),
+                    text: format!("=>{};", compact(source, expr.byte_range(), tokens)),
+                });
             }
         }
         "property_declaration" => {
-            if let Some(list) = node.child_by_field_name("accessors") {
-                if list.named_child_count() == 1 && clean_cs(list) {
-                    let getter = list.named_child(0).unwrap();
-                    if getter
-                        .child_by_field_name("name")
-                        .is_some_and(|name| text(name) == "get")
-                        && getter.named_child_count() == 1
-                    {
-                        if let Some(expr) = getter.child_by_field_name("body").and_then(returned) {
-                            edits.push(Edit {
-                                range: list.byte_range(),
-                                text: format!("=>{};", compact(source, expr.byte_range(), tokens)),
-                            });
-                        }
-                    }
+            if let Some(list) = node.child_by_field_name("accessors")
+                && list.named_child_count() == 1
+                && clean_cs(list)
+            {
+                let getter = list.named_child(0).unwrap();
+                if getter
+                    .child_by_field_name("name")
+                    .is_some_and(|name| text(name) == "get")
+                    && getter.named_child_count() == 1
+                    && let Some(expr) = getter.child_by_field_name("body").and_then(returned)
+                {
+                    edits.push(Edit {
+                        range: list.byte_range(),
+                        text: format!("=>{};", compact(source, expr.byte_range(), tokens)),
+                    });
                 }
             }
         }
@@ -575,24 +410,21 @@ fn simplify_cs(
                             "using_directive" | "extern_alias_directive" | "comment"
                         )
                 })
+                && let Some(body) = node.child_by_field_name("body")
+                && clean_cs(body)
+                && !body
+                    .named_children(&mut body.walk())
+                    .any(|n| n.kind() == "namespace_declaration")
+                && siblings.iter().all(|n| n.end_byte() <= node.end_byte())
             {
-                if let Some(body) = node.child_by_field_name("body") {
-                    if clean_cs(body)
-                        && !body
-                            .named_children(&mut body.walk())
-                            .any(|n| n.kind() == "namespace_declaration")
-                        && siblings.iter().all(|n| n.end_byte() <= node.end_byte())
-                    {
-                        edits.push(Edit {
-                            range: body.start_byte()..body.start_byte() + 1,
-                            text: ";".into(),
-                        });
-                        edits.push(Edit {
-                            range: body.end_byte() - 1..body.end_byte(),
-                            text: String::new(),
-                        });
-                    }
-                }
+                edits.push(Edit {
+                    range: body.start_byte()..body.start_byte() + 1,
+                    text: ";".into(),
+                });
+                edits.push(Edit {
+                    range: body.end_byte() - 1..body.end_byte(),
+                    text: String::new(),
+                });
             }
         }
         "variable_declaration" if clean_cs(node) => {
@@ -714,4 +546,166 @@ fn xml_doc(doc: &str) -> Option<String> {
             reduced.split_whitespace().collect::<Vec<_>>().join(" ")
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "manual token measurement; requires m-count-tokens"]
+    fn measure_tokens() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        fn count(text: &str) -> usize {
+            let mut child = Command::new("m-count-tokens")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+        for (name, source, language) in [
+            ("Rust search", include_str!("search.rs"), Language::Rust),
+            ("Rust service", include_str!("service.rs"), Language::Rust),
+            (
+                "C# fixture",
+                include_str!("../tests/metadata-fixture/Fixture.cs"),
+                Language::CSharp,
+            ),
+            (
+                "C# Unity exporter",
+                include_str!("../tests/unity-reference/ExportCompilation.cs"),
+                Language::CSharp,
+            ),
+        ] {
+            let output = min(source, language);
+            let before = count(source);
+            let after = count(&output);
+            println!(
+                "{name}: {before} -> {after} tokens ({:.1}% saved)",
+                100.0 * (before as f64 - after as f64) / before as f64
+            );
+        }
+    }
+    fn min(source: &str, language: Language) -> String {
+        render(source, language, 0..source.len())
+    }
+    #[test]
+    fn rust_shortens_code_without_touching_macros_literals_or_tuple_shape() {
+        let source = r####"use std::collections::HashMap;
+use std::collections::HashSet;
+struct Point { x: i32, y: i32 }
+fn make(x: i32, y: i32) -> Point {
+    let literal = r#" keep   all spaces "#;
+    let tuple = (x,);
+    let separate = x - -y;
+    custom! { x : x,  keep   spacing };
+    Point { x: x, y: y, }
+}
+"####;
+        let result = min(source, Language::Rust);
+        assert!(
+            result.contains("use std::collections::{HashMap,HashSet};"),
+            "{result}"
+        );
+        assert!(result.contains("Point{x,y}"), "{result}");
+        assert!(result.contains("(x,)"), "{result}");
+        assert!(result.contains("r#\" keep   all spaces \"#"), "{result}");
+        assert!(result.contains("{ x : x,  keep   spacing }"), "{result}");
+        assert!(result.contains("- -"), "{result}");
+        assert!(result.len() < source.len());
+    }
+    #[test]
+    fn csharp_preserves_types_comments_strings_and_directives() {
+        let source = r####"using Alias = System.Int32?;
+class Sample {
+    /// <summary>Keep the value.</summary>
+    public int Value { get { return 42; } }
+    int Add(int a, int b) { return a + b; }
+    void Run(bool ready) {
+        int? nullable = new int?();
+        Alias alias = new Alias();
+        System.IO.Stream stream = new System.IO.MemoryStream();
+        int number = default(int);
+        int initialized = new int {};
+        int[] values = ready ? [1] : [2];
+        if (ready) { number++; }
+        // Keep this invariant.
+        string text = "a   b";
+    }
+#if ACTIVE
+    string raw = " stay   exact ";
+#endif
+}
+"####;
+        let result = min(source, Language::CSharp);
+        assert!(
+            result.contains("Value=>42;") && result.contains("=>a+b;"),
+            "{result}"
+        );
+        assert!(
+            result.contains("// Keep the value.") && result.contains("// Keep this invariant."),
+            "{result}"
+        );
+        assert!(result.contains("nullable=new int?()"), "{result}");
+        assert!(result.contains("alias=new Alias()"), "{result}");
+        assert!(
+            result.contains("System.IO.Stream stream=new System.IO.MemoryStream()"),
+            "{result}"
+        );
+        assert!(result.contains("number=default;"), "{result}");
+        assert!(result.contains("new int{}"), "{result}");
+        assert!(result.contains("? [1]"), "{result}");
+        assert!(
+            result.contains("\"a   b\"") && result.contains("\" stay   exact \""),
+            "{result}"
+        );
+        assert!(result.len() < source.len());
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        assert!(
+            !parser.parse(&result, None).unwrap().root_node().has_error(),
+            "{result}"
+        );
+    }
+    #[test]
+    fn selected_lines_inside_literals_remain_unchanged() {
+        for (language, source) in [
+            (Language::Rust, "fn f(){let x=r#\"\n  a   b\n  c   d\n\"#;}"),
+            (
+                Language::CSharp,
+                "class C { string s=@\"\n  a   b\n  c   d\n\"; }",
+            ),
+        ] {
+            let (range, _, _) = crate::navigation::lines(source, Some((2, 2))).unwrap();
+            assert_eq!(render(source, language, range.clone()), source[range]);
+        }
+    }
+    #[test]
+    fn ranges_do_not_apply_half_a_namespace_conversion() {
+        let source = "namespace Example\n{\nclass C { int Get() { return 1; } }\n}\n";
+        let (range, _, _) = crate::navigation::lines(source, Some((2, 2))).unwrap();
+        assert_eq!(render(source, Language::CSharp, range), "{\n");
+        let full = min(source, Language::CSharp);
+        assert!(
+            full.contains("namespace Example;") && full.contains("=>1;"),
+            "{full}"
+        );
+    }
 }

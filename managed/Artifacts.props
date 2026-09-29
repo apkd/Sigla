@@ -1,0 +1,9 @@
+<Project>
+  <!-- Preserve an existing environment-supplied hook. Directory.Build.props is still imported normally. -->
+  <Import Project="$(SiglaBeforeDirectoryBuildProps)" Condition="'$(SiglaBeforeDirectoryBuildProps)' != ''" />
+  <PropertyGroup>
+    <!-- Full project paths distinguish projects with identical names without hash collisions. -->
+    <ArtifactsProjectName>$(MSBuildProjectFullPath.TrimStart('/'))</ArtifactsProjectName>
+    <RestoreFallbackFolders Condition="'$(SiglaFallbackPackages)' != ''">$(SiglaFallbackPackages);$(RestoreFallbackFolders)</RestoreFallbackFolders>
+  </PropertyGroup>
+</Project>

@@ -14,6 +14,43 @@ pub struct Session {
     pub endpoint: Option<String>,
 }
 
+/// Share only checks currently in flight. A later request must prove public access again.
+pub fn verify_public(repository: &super::Repository) -> Result<()> {
+    use std::sync::{Arc, Condvar, LazyLock, Mutex};
+    type Check = Arc<(Mutex<Option<std::result::Result<(), String>>>, Condvar)>;
+    static CHECKS: LazyLock<Mutex<std::collections::HashMap<String, Check>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let key = repository.identity.storage_key();
+    let (check, leader) = {
+        let mut checks = CHECKS.lock().unwrap();
+        match checks.get(&key) {
+            Some(check) => (check.clone(), false),
+            None => {
+                let check = Arc::new((Mutex::new(None), Condvar::new()));
+                checks.insert(key.clone(), check.clone());
+                (check, true)
+            }
+        }
+    };
+    if leader {
+        let outcome = Session::connect(repository, None, false)
+            .map(|_| ())
+            .map_err(|error| format!("Cannot verify public access: {error:#}"));
+        *check.0.lock().unwrap() = Some(outcome);
+        CHECKS.lock().unwrap().remove(&key);
+        check.1.notify_all();
+    }
+    let mut outcome = check.0.lock().unwrap();
+    while outcome.is_none() {
+        outcome = check.1.wait(outcome).unwrap();
+    }
+    outcome
+        .as_ref()
+        .unwrap()
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
 fn agent() -> gix_protocol::command::Feature {
     ("agent", Some("sigla".into()))
 }
@@ -96,62 +133,31 @@ fn failure_reason(error: &anyhow::Error) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod access_tests {
-    use super::*;
-    #[test]
-    fn falls_back_and_retries_only_transient_errors() {
-        let endpoints = vec![
-            "https://example.invalid/repo".into(),
-            "git@example.invalid:repo".into(),
-        ];
-        let mut calls = Vec::new();
-        let (_, selected) = alternatives(&endpoints, |endpoint| {
-            calls.push(endpoint.to_owned());
-            if endpoint.starts_with("https:") {
-                anyhow::bail!("authentication required");
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(calls, endpoints);
-        assert_eq!(selected, endpoints[1]);
-        let mut attempts = 0;
-        alternatives(&endpoints, |_| {
-            attempts += 1;
-            if attempts == 1 {
-                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(attempts, 2);
-    }
-    #[test]
-    fn failure_output_identifies_causes_without_echoing_credentials() {
-        let error = alternatives::<()>(&["https://example.invalid/repo".into()], |_| {
-            anyhow::bail!(
-                "certificate failure at https://user:secret@example.invalid/repo?token=secret"
-            )
-        })
-        .unwrap_err();
-        let text = error.to_string();
-        assert!(text.contains("certificate"));
-        assert!(!text.contains("secret") && !text.contains("user"));
-    }
-}
-
 impl Session {
     /// Callers authorize the parsed repository before opening a session.
-    pub fn connect(repository: &super::Repository, preferred: Option<&str>) -> Result<Self> {
-        let (mut session, endpoint) =
-            alternatives(&repository.transports(preferred), Self::connect_one)
-                .with_context(|| format!("Cannot access {}", repository.identity))?;
+    pub fn connect(
+        repository: &super::Repository,
+        preferred: Option<&str>,
+        allow_private: bool,
+    ) -> Result<Self> {
+        let endpoints: Vec<_> = repository
+            .transports(if allow_private { preferred } else { None })
+            .into_iter()
+            .filter(|endpoint| allow_private || endpoint.starts_with("https://"))
+            .collect();
+        ensure!(
+            !endpoints.is_empty(),
+            "Cannot verify public access: repository requires authenticated transport"
+        );
+        let (mut session, endpoint) = alternatives(&endpoints, |endpoint| {
+            Self::connect_one(endpoint, allow_private)
+        })
+        .with_context(|| format!("Cannot access {}", repository.identity))?;
         session.endpoint = Some(endpoint);
         Ok(session)
     }
 
-    fn connect_one(endpoint: &str) -> Result<Self> {
+    fn connect_one(endpoint: &str, allow_private: bool) -> Result<Self> {
         let mut transport = blocking_io::connect::connect(endpoint, blocking_io::connect::Options {
             version: gix_transport::Protocol::V2,
             ssh: blocking_io::ssh::connect::Options {
@@ -171,14 +177,24 @@ impl Session {
                 })
                 .map_err(anyhow::Error::from_boxed)?;
         }
-        Self::handshake(transport)
+        Self::handshake(transport, allow_private)
     }
 
-    fn handshake(mut transport: Box<dyn Transport + Send>) -> Result<Self> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "The credential callback error type is defined by gix"
+    )]
+    fn handshake(mut transport: Box<dyn Transport + Send>, allow_private: bool) -> Result<Self> {
         let handshake = gix_protocol::handshake(
             &mut transport,
             gix_transport::Service::UploadPack,
-            gix_protocol::credentials::builtin,
+            |action| {
+                if allow_private {
+                    gix_protocol::credentials::builtin(action)
+                } else {
+                    Ok(None)
+                }
+            },
             Vec::new(),
             &mut gix_features::progress::Discard,
         )?;
@@ -191,13 +207,16 @@ impl Session {
 
     #[cfg(test)]
     pub(crate) fn local(path: &Path) -> Result<Self> {
-        Self::handshake(blocking_io::connect::connect(
-            path.to_str().unwrap(),
-            blocking_io::connect::Options {
-                version: gix_transport::Protocol::V2,
-                ..Default::default()
-            },
-        )?)
+        Self::handshake(
+            blocking_io::connect::connect(
+                path.to_str().unwrap(),
+                blocking_io::connect::Options {
+                    version: gix_transport::Protocol::V2,
+                    ..Default::default()
+                },
+            )?,
+            false,
+        )
     }
 
     pub fn refs(&mut self, prefixes: &[String]) -> Result<Vec<Ref>> {
@@ -306,5 +325,58 @@ impl fetch::Negotiate for Wants {
             },
             true,
         ))
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn falls_back_and_retries_only_transient_errors() {
+        let endpoints = vec![
+            "https://example.invalid/repo".into(),
+            "git@example.invalid:repo".into(),
+        ];
+        let mut calls = Vec::new();
+        let (_, selected) = alternatives(&endpoints, |endpoint| {
+            calls.push(endpoint.to_owned());
+            if endpoint.starts_with("https:") {
+                anyhow::bail!("authentication required");
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, endpoints);
+        assert_eq!(selected, endpoints[1]);
+        let mut attempts = 0;
+        alternatives(&endpoints, |_| {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+    #[test]
+    fn failure_output_identifies_causes_without_echoing_credentials() {
+        let error = alternatives::<()>(&["https://example.invalid/repo".into()], |_| {
+            anyhow::bail!(
+                "certificate failure at https://user:secret@example.invalid/repo?token=secret"
+            )
+        })
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("certificate"));
+        assert!(!text.contains("secret") && !text.contains("user"));
+    }
+
+    #[test]
+    fn public_access_never_attempts_a_custom_ssh_endpoint() {
+        let repository = super::super::Repository::parse("git@private.invalid:owner/repo")
+            .unwrap()
+            .unwrap();
+        assert!(Session::connect(&repository, Some(&repository.transport), false).is_err());
     }
 }
