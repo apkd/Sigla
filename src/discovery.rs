@@ -75,7 +75,7 @@ impl RemoteContext {
 impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         Ok(*blake3::hash(&serde_json::to_vec(&(
-            6u32,
+            7u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -470,8 +470,26 @@ fn collect_entries(
     let mut projects = Vec::new();
     let mut solutions = Vec::new();
     for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Cannot read entry in {}: {error}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Cannot inspect {}: {error}",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
         let path = entry.path();
         if kind.is_dir()
             && !matches!(
@@ -479,7 +497,12 @@ fn collect_entries(
                 Some(".git" | "target" | "bin" | "obj" | "node_modules" | ".vs")
             )
         {
-            children.push(policy.canonical(&path)?);
+            match policy.canonical(&path) {
+                Ok(path) => children.push(path),
+                Err(error) => {
+                    diagnostics.push(format!("Skipped directory {}: {error:#}", path.display()))
+                }
+            }
         } else if kind.is_file() {
             match path.extension().and_then(|e| e.to_str()) {
                 Some("sln" | "slnx") => solutions.push(path),
@@ -514,6 +537,11 @@ fn load_csharp(
     result: &mut Discovery,
 ) -> Result<()> {
     let snapshot = crate::msbuild::discover_in(entries, cache, policy.remote.as_ref())?;
+    result.diagnostics.extend(snapshot.diagnostics);
+    ensure!(
+        !snapshot.projects.is_empty(),
+        "No .NET projects could be evaluated"
+    );
     let cache = cache.canonicalize()?;
     let mut approved = policy.clone();
     if let Some(remote) = &policy.remote {
@@ -525,22 +553,52 @@ fn load_csharp(
     let policy = &approved;
     let source_projects: HashSet<_> = snapshot.projects.iter().map(|p| p.origin.clone()).collect();
     for project in snapshot.projects {
-        let origin = policy.canonical(&project.origin)?;
+        let origin = match policy.canonical(&project.origin) {
+            Ok(origin) => origin,
+            Err(error) => {
+                result.diagnostics.push(format!(
+                    "Skipped .NET project {}: {error:#}",
+                    project.origin.display()
+                ));
+                continue;
+            }
+        };
         result.metadata.insert(origin.clone());
         for path in project.imports {
-            let path = path.canonicalize()?;
+            let path = match path.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    result.diagnostics.push(format!(
+                        "Unavailable .NET import {}: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
             result.dependencies.insert(path.clone());
             result.metadata.insert(path);
         }
         for directory in project.globs {
-            watch_tree(&directory, policy, &mut result.metadata)?;
+            if let Err(error) = watch_tree(&directory, policy, &mut result.metadata) {
+                result.diagnostics.push(format!(
+                    "Cannot watch .NET sources {}: {error:#}",
+                    directory.display()
+                ));
+            }
         }
         if let Some(assets) = project
             .properties
             .get("ProjectAssetsFile")
             .filter(|p| !p.is_empty())
         {
-            result.metadata.insert(policy.canonical(Path::new(assets))?);
+            match policy.canonical(Path::new(assets)) {
+                Ok(path) => {
+                    result.metadata.insert(path);
+                }
+                Err(error) => result
+                    .diagnostics
+                    .push(format!("Unavailable .NET assets {assets}: {error:#}")),
+            }
         }
         let index = result.projects.len();
         for source in project.sources {
@@ -695,14 +753,37 @@ fn load_cargo(
             .unwrap_or_default();
         if let Some(members) = workspace.get("members").and_then(toml::Value::as_array) {
             for member in members.iter().filter_map(toml::Value::as_str) {
-                for dir in member_dirs(base, member)? {
+                let directories = match member_dirs(base, member) {
+                    Ok(directories) => directories,
+                    Err(error) => {
+                        result.diagnostics.push(format!(
+                            "Unavailable Rust workspace member {member}: {error:#}"
+                        ));
+                        continue;
+                    }
+                };
+                for dir in directories {
                     let relative = dir.strip_prefix(base).unwrap_or(&dir);
                     if excludes.iter().any(|e| {
                         globset::Glob::new(e).is_ok_and(|g| g.compile_matcher().is_match(relative))
                     }) {
                         continue;
                     }
-                    load_cargo(&dir.join("Cargo.toml"), policy, result, seen)?;
+                    if let Err(error) = load_cargo(&dir.join("Cargo.toml"), policy, result, seen) {
+                        if error.downcast_ref::<RequiredInputs>().is_some() {
+                            return Err(error);
+                        }
+                        result.diagnostics.push(format!(
+                            "Incomplete Rust workspace member {}: {error:#}",
+                            dir.display()
+                        ));
+                        if let Err(error) = fallback_sources(&dir, policy, result) {
+                            result.diagnostics.push(format!(
+                                "Cannot read Rust workspace member {}: {error:#}",
+                                dir.display()
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -779,7 +860,15 @@ fn load_cargo(
     for dir in ["src/bin", "tests", "examples", "benches"] {
         if let Ok(entries) = std::fs::read_dir(base.join(dir)) {
             for e in entries {
-                let p = e?.path();
+                let p = match e {
+                    Ok(entry) => entry.path(),
+                    Err(error) => {
+                        result
+                            .diagnostics
+                            .push(format!("Cannot read Rust target in {dir}: {error}"));
+                        continue;
+                    }
+                };
                 if p.extension().is_some_and(|e| e == "rs") {
                     roots.push((p, name.clone()));
                 } else if p.join("main.rs").exists() {

@@ -314,6 +314,11 @@ async fn missing_dependency_and_oversized_source_preserve_other_projects() {
     let cache = tempfile::tempdir().unwrap();
     write(
         root.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['broken','good']\nresolver='2'",
+    );
+    write(
+        root.path(),
         "good/Cargo.toml",
         "[package]\nname='good'\nversion='0.1.0'\n[dependencies]\nmissing={path='../absent'}",
     );
@@ -334,6 +339,38 @@ async fn missing_dependency_and_oversized_source_preserve_other_projects() {
             .await
             .unwrap();
         assert!(found.contains(symbol), "{found}");
+    }
+    write(root.path(), "broken/src/huge.rs", "pub struct Repaired;");
+    let found = a
+        .search(root.path().to_str().unwrap(), "Repaired")
+        .await
+        .unwrap();
+    assert!(found.contains("Repaired"), "{found}");
+}
+
+#[tokio::test]
+async fn failed_build_target_preserves_other_projects_and_evaluated_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "good/Good.csproj",
+        "<Project><ItemGroup><Compile Include=\"Code.cs\"/></ItemGroup></Project>",
+    );
+    write(root.path(), "good/Code.cs", "public class Healthy {}");
+    write(
+        root.path(),
+        "bad/Bad.csproj",
+        "<Project><ItemGroup><Compile Include=\"Code.cs\"/></ItemGroup><Target Name=\"ResolveReferences\"><Error Text=\"Broken dependency\"/></Target></Project>",
+    );
+    write(root.path(), "bad/Code.cs", "public class Recoverable {}");
+    let app = app(root.path(), cache.path());
+    for symbol in ["Healthy", "Recoverable"] {
+        let result = app
+            .search(root.path().to_str().unwrap(), symbol)
+            .await
+            .unwrap();
+        assert!(result.contains(symbol), "{result}");
     }
 }
 

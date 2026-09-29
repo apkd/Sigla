@@ -94,6 +94,9 @@ fn discover_with_editor(
         settings.backend,
     )?;
     result.metadata.extend(references.watched.iter().cloned());
+    result
+        .diagnostics
+        .extend(references.diagnostics.iter().cloned());
     let packages = Packages::local(root, policy, editor, cache)?;
     result.metadata.extend(packages.watched);
     result.metadata.extend([
@@ -153,7 +156,13 @@ fn discover_with_editor(
         if let Some(remote) = &policy.remote {
             remote.require_analysis_tree(&location.path)?;
         }
-        scan(&location.path, scope, &mut files, &mut result.metadata)?;
+        scan(
+            &location.path,
+            scope,
+            &mut files,
+            &mut result.metadata,
+            &mut result.diagnostics,
+        );
     }
     let mut plugins = Vec::new();
     for (_, path) in &files {
@@ -196,47 +205,72 @@ fn discover_with_editor(
         if file.extension().is_none_or(|x| x != "asmdef") {
             continue;
         }
-        let descriptor: Descriptor = super::settings::json(file)
-            .with_context(|| format!("Malformed assembly definition {}", file.display()))?;
-        ensure!(
-            !descriptor.name.is_empty() && !PREDEFINED.contains(&descriptor.name.as_str()),
-            "Invalid custom assembly name {}",
-            descriptor.name
-        );
-        ensure!(
-            descriptor.include_platforms.is_empty() || descriptor.exclude_platforms.is_empty(),
-            "Assembly {} has contradictory platform lists",
-            descriptor.name
-        );
-        let index = assemblies.len();
-        ensure!(
-            names.insert(descriptor.name.clone(), index).is_none(),
-            "Duplicate Unity assembly {}",
-            descriptor.name
-        );
+        result.metadata.insert(file.clone());
         let directory = file.parent().unwrap().to_owned();
-        ensure!(
-            boundaries.insert(directory.clone(), index).is_none(),
-            "Multiple assembly boundaries in {}",
-            directory.display()
-        );
+        let descriptor = (|| -> Result<Descriptor> {
+            let descriptor: Descriptor = super::settings::json(file)?;
+            ensure!(
+                !descriptor.name.is_empty() && !PREDEFINED.contains(&descriptor.name.as_str()),
+                "Invalid custom assembly name {}",
+                descriptor.name
+            );
+            ensure!(
+                descriptor.include_platforms.is_empty() || descriptor.exclude_platforms.is_empty(),
+                "Assembly {} has contradictory platform lists",
+                descriptor.name
+            );
+            ensure!(
+                !names.contains_key(&descriptor.name),
+                "Duplicate Unity assembly {}",
+                descriptor.name
+            );
+            ensure!(
+                !boundaries.contains_key(&directory),
+                "Multiple assembly boundaries in {}",
+                directory.display()
+            );
+            Ok(descriptor)
+        })();
+        let descriptor = match descriptor {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                result
+                    .diagnostics
+                    .push(format!("Excluded assembly {}: {error:#}", file.display()));
+                // Keep the boundary: these sources must not leak into a parent assembly.
+                boundaries.insert(directory, None);
+                continue;
+            }
+        };
+        let index = assemblies.len();
+        names.insert(descriptor.name.clone(), index);
+        boundaries.insert(directory.clone(), Some(index));
         let meta = PathBuf::from(format!("{}.meta", file.display()));
         let guid = if meta.is_file() {
             result.metadata.insert(meta.clone());
-            let yaml = super::settings::yaml(&meta)?;
-            let guid = yaml["guid"]
-                .as_str()
-                .context("Assembly metadata has no GUID")?
-                .to_owned();
-            ensure!(
-                guid.len() == 32 && guid.bytes().all(|c| c.is_ascii_hexdigit()),
-                "Invalid assembly GUID"
-            );
-            ensure!(
-                guids.insert(guid.clone(), index).is_none(),
-                "Duplicate assembly GUID {guid}"
-            );
-            Some(guid)
+            let parsed = (|| -> Result<String> {
+                let yaml = super::settings::yaml(&meta)?;
+                let guid = yaml["guid"]
+                    .as_str()
+                    .context("Assembly metadata has no GUID")?
+                    .to_owned();
+                ensure!(
+                    guid.len() == 32 && guid.bytes().all(|c| c.is_ascii_hexdigit()),
+                    "Invalid assembly GUID"
+                );
+                ensure!(!guids.contains_key(&guid), "Duplicate assembly GUID {guid}");
+                Ok(guid)
+            })();
+            match parsed {
+                Ok(guid) => {
+                    guids.insert(guid.clone(), index);
+                    Some(guid)
+                }
+                Err(error) => {
+                    result.diagnostics.push(format!("Unavailable assembly GUID {}: {error:#}. Name references remain available.", meta.display()));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -273,21 +307,34 @@ fn discover_with_editor(
     };
     for (_, file) in &files {
         if file.extension().is_some_and(|x| x == "asmref") {
-            let reference: AssemblyReference = super::settings::json(file)?;
-            let target = resolve(&reference.reference).with_context(|| {
-                format!(
-                    "Unresolved assembly ownership reference {}",
-                    reference.reference
-                )
-            })?;
-            ensure!(
-                boundaries
-                    .insert(file.parent().unwrap().to_owned(), target)
-                    .is_none(),
-                "Conflicting assembly boundaries in {}",
-                file.display()
-            );
             result.metadata.insert(file.clone());
+            let directory = file.parent().unwrap().to_owned();
+            let resolved = (|| -> Result<usize> {
+                let reference: AssemblyReference = super::settings::json(file)?;
+                let target = resolve(&reference.reference).with_context(|| {
+                    format!(
+                        "Unresolved assembly ownership reference {}",
+                        reference.reference
+                    )
+                })?;
+                ensure!(
+                    !boundaries.contains_key(&directory),
+                    "Conflicting assembly boundaries in {}",
+                    file.display()
+                );
+                Ok(target)
+            })();
+            let target = match resolved {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    result.diagnostics.push(format!(
+                        "Excluded assembly ownership {}: {error:#}",
+                        file.display()
+                    ));
+                    None
+                }
+            };
+            boundaries.insert(directory, target);
         }
     }
     let custom_count = assemblies.len();
@@ -319,6 +366,9 @@ fn discover_with_editor(
             .take_while(|p| p.starts_with(&scopes[*scope].path))
             .find_map(|p| boundaries.get(p).copied());
         let owner = if let Some(owner) = owner {
+            let Some(owner) = owner else {
+                continue;
+            };
             owner
         } else if scopes[*scope].package {
             continue;
@@ -342,163 +392,217 @@ fn discover_with_editor(
     }
     let mut active = BTreeMap::new();
     for (index, assembly) in assemblies.iter().enumerate() {
-        if assembly.sources.is_empty()
-            || assembly.editor_only && policy.unity_platform != Platform::EditorLinux
-        {
-            continue;
-        }
-        let platform = if policy.unity_platform == Platform::EditorLinux {
-            "Editor"
-        } else {
-            "LinuxStandalone64"
-        };
-        let descriptor = &assembly.descriptor;
-        if !descriptor.include_platforms.is_empty()
-            && !descriptor.include_platforms.iter().any(|p| p == platform)
-            || descriptor.exclude_platforms.iter().any(|p| p == platform)
-        {
-            continue;
-        }
-        let legacy_test = descriptor
-            .optional_unity_references
-            .iter()
-            .any(|r| r == "TestAssemblies");
-        let testable = scopes[assembly.scope].testable;
-        if legacy_test && (!testable || policy.unity_platform != Platform::EditorLinux) {
-            continue;
-        }
-        let response = assembly.directory.join("csc.rsp");
-        let mut response_refs = Vec::new();
-        let mut response_defines = BTreeSet::new();
-        if response.is_file() {
-            result.metadata.insert(response.clone());
-            response_file(
-                &response,
-                root,
-                policy,
-                &mut response_defines,
-                &mut response_refs,
-            )?;
-        }
-        let mut inputs = editor.compilation(
-            &references,
-            policy.unity_platform,
-            &settings,
-            super::catalog::AssemblyContext {
-                predefined: assembly.predefined,
-                editor_only: assembly.editor_only,
-                tests: true,
-                no_engine: descriptor.no_engine_references,
-                editor_compatible: constraints(&descriptor.define_constraints, &response_defines)?,
-            },
-            &modules,
-        )?;
-        for define in &descriptor.version_defines {
-            if let Some(version) = versions.get(&define.name)
-                && version_matches(version, &define.expression, define.name == "Unity")?
+        let prepared = (|| -> Result<Option<Project>> {
+            if assembly.sources.is_empty()
+                || assembly.editor_only && policy.unity_platform != Platform::EditorLinux
             {
-                inputs.defines.insert(define.define.clone());
+                return Ok(None);
             }
-        }
-        inputs.defines.extend(response_defines);
-        // Package testability controls activation. Unity still passes the Editor
-        // test symbol to participating runtime assemblies in unlisted packages.
-        let mut activation_defines = inputs.defines.clone();
-        if !testable {
-            activation_defines.remove("UNITY_INCLUDE_TESTS");
-        }
-        if !constraints(&descriptor.define_constraints, &activation_defines)? {
-            continue;
-        }
-        let mut metadata: Vec<_> = inputs
-            .references
-            .into_iter()
-            .map(|path| MetadataReference {
-                path,
-                aliases: Vec::new(),
-                provenance: format!("Unity editor {}", editor.selected),
-            })
-            .collect();
-        metadata.extend(response_refs.into_iter().map(|path| MetadataReference {
-            path,
-            aliases: Vec::new(),
-            provenance: "csc.rsp".into(),
-        }));
-        let mut selected_plugins = BTreeSet::new();
-        for (path, settings) in &plugins {
-            match plugin_enabled(settings.as_ref(), policy.unity_platform, &inputs.defines) {
-                Ok(true) => (),
-                Ok(false) => continue,
-                Err(error) => {
-                    let diagnostic = format!("Skipping plugin {}: {error:#}", path.display());
-                    if !result.diagnostics.contains(&diagnostic) {
-                        result.diagnostics.push(diagnostic);
-                    }
-                    continue;
-                }
-            }
-            let explicit = settings
-                .as_ref()
-                .is_some_and(|s| s["PluginImporter"]["isExplicitlyReferenced"].as_i64() == Some(1));
-            let filename = path.file_name().unwrap().to_string_lossy();
-            let selected = if descriptor.override_references {
-                descriptor
-                    .precompiled_references
-                    .iter()
-                    .any(|r| r == &filename)
+            let platform = if policy.unity_platform == Platform::EditorLinux {
+                "Editor"
             } else {
-                !explicit
+                "LinuxStandalone64"
             };
-            if selected {
-                selected_plugins.insert(filename.into_owned());
-                metadata.push(MetadataReference {
-                    path: path.canonicalize()?,
-                    aliases: Vec::new(),
-                    provenance: "Unity managed plugin".into(),
-                });
+            let descriptor = &assembly.descriptor;
+            if !descriptor.include_platforms.is_empty()
+                && !descriptor.include_platforms.iter().any(|p| p == platform)
+                || descriptor.exclude_platforms.iter().any(|p| p == platform)
+            {
+                return Ok(None);
             }
-        }
-        if descriptor.override_references {
-            for reference in &descriptor.precompiled_references {
-                if !selected_plugins.contains(reference) {
+            let legacy_test = descriptor
+                .optional_unity_references
+                .iter()
+                .any(|r| r == "TestAssemblies");
+            let testable = scopes[assembly.scope].testable;
+            if legacy_test && (!testable || policy.unity_platform != Platform::EditorLinux) {
+                return Ok(None);
+            }
+            let response = assembly.directory.join("csc.rsp");
+            let mut response_refs = Vec::new();
+            let mut response_defines = BTreeSet::new();
+            if response.is_file() {
+                result.metadata.insert(response.clone());
+                if let Err(error) = response_file(
+                    &response,
+                    root,
+                    policy,
+                    &mut response_defines,
+                    &mut response_refs,
+                ) {
+                    response_defines.clear();
+                    response_refs.clear();
                     result.diagnostics.push(format!(
-                        "Unresolved managed plugin {reference} in assembly {}.",
-                        descriptor.name
+                        "Ignored response file {}: {error:#}",
+                        response.display()
                     ));
                 }
             }
-        }
-        let mut options = BTreeMap::from([
-            ("rootNamespace".into(), descriptor.root_namespace.clone()),
-            ("UnityVersion".into(), editor.selected.to_string()),
-            ("DeclaredUnityVersion".into(), editor.declared.to_string()),
-            ("UnityPlatform".into(), policy.unity_platform.name().into()),
-            ("UnityPackages".into(), serde_json::to_string(&provenance)?),
-        ]);
-        if let Some(revision) = &editor.declared_revision {
-            options.insert("DeclaredUnityRevision".into(), revision.clone());
-        }
-        if let Some(revision) = &editor.selected_revision {
-            options.insert("UnityRevision".into(), revision.clone());
-        }
-        for reference in &metadata {
-            result.dependencies.insert(reference.path.clone());
-        }
+            let mut inputs = editor.compilation(
+                &references,
+                policy.unity_platform,
+                &settings,
+                super::catalog::AssemblyContext {
+                    predefined: assembly.predefined,
+                    editor_only: assembly.editor_only,
+                    tests: true,
+                    no_engine: descriptor.no_engine_references,
+                    editor_compatible: constraints(
+                        &descriptor.define_constraints,
+                        &response_defines,
+                    )?,
+                },
+                &modules,
+            )?;
+            for diagnostic in inputs.diagnostics.drain(..) {
+                if !result.diagnostics.contains(&diagnostic) {
+                    result.diagnostics.push(diagnostic);
+                }
+            }
+            for define in &descriptor.version_defines {
+                if let Some(version) = versions.get(&define.name) {
+                    match version_matches(version, &define.expression, define.name == "Unity") {
+                        Ok(true) => {
+                            inputs.defines.insert(define.define.clone());
+                        }
+                        Ok(false) => (),
+                        Err(error) => result.diagnostics.push(format!(
+                            "Ignored version define {} in {}: {error:#}",
+                            define.define, descriptor.name
+                        )),
+                    }
+                }
+            }
+            inputs.defines.extend(response_defines);
+            // Package testability controls activation. Unity still passes the Editor
+            // test symbol to participating runtime assemblies in unlisted packages.
+            let mut activation_defines = inputs.defines.clone();
+            if !testable {
+                activation_defines.remove("UNITY_INCLUDE_TESTS");
+            }
+            if !constraints(&descriptor.define_constraints, &activation_defines)? {
+                return Ok(None);
+            }
+            let mut metadata: Vec<_> = inputs
+                .references
+                .into_iter()
+                .map(|path| MetadataReference {
+                    path,
+                    aliases: Vec::new(),
+                    provenance: format!("Unity editor {}", editor.selected),
+                })
+                .collect();
+            metadata.extend(response_refs.into_iter().map(|path| MetadataReference {
+                path,
+                aliases: Vec::new(),
+                provenance: "csc.rsp".into(),
+            }));
+            let mut selected_plugins = BTreeSet::new();
+            for (path, settings) in &plugins {
+                match plugin_enabled(settings.as_ref(), policy.unity_platform, &inputs.defines) {
+                    Ok(true) => (),
+                    Ok(false) => continue,
+                    Err(error) => {
+                        let diagnostic = format!("Skipping plugin {}: {error:#}", path.display());
+                        if !result.diagnostics.contains(&diagnostic) {
+                            result.diagnostics.push(diagnostic);
+                        }
+                        continue;
+                    }
+                }
+                let explicit = settings.as_ref().is_some_and(|s| {
+                    s["PluginImporter"]["isExplicitlyReferenced"].as_i64() == Some(1)
+                });
+                let filename = path.file_name().unwrap().to_string_lossy();
+                let selected = if descriptor.override_references {
+                    descriptor
+                        .precompiled_references
+                        .iter()
+                        .any(|r| r == &filename)
+                } else {
+                    !explicit
+                };
+                if selected {
+                    let path = match path.canonicalize() {
+                        Ok(path) => path,
+                        Err(error) => {
+                            result
+                                .diagnostics
+                                .push(format!("Skipped plugin {}: {error}", path.display()));
+                            continue;
+                        }
+                    };
+                    selected_plugins.insert(filename.into_owned());
+                    metadata.push(MetadataReference {
+                        path,
+                        aliases: Vec::new(),
+                        provenance: "Unity managed plugin".into(),
+                    });
+                }
+            }
+            if descriptor.override_references {
+                for reference in &descriptor.precompiled_references {
+                    if !selected_plugins.contains(reference) {
+                        result.diagnostics.push(format!(
+                            "Unresolved managed plugin {reference} in assembly {}.",
+                            descriptor.name
+                        ));
+                    }
+                }
+            }
+            let mut options = BTreeMap::from([
+                ("rootNamespace".into(), descriptor.root_namespace.clone()),
+                ("UnityVersion".into(), editor.selected.to_string()),
+                ("DeclaredUnityVersion".into(), editor.declared.to_string()),
+                ("UnityPlatform".into(), policy.unity_platform.name().into()),
+                ("UnityPackages".into(), serde_json::to_string(&provenance)?),
+            ]);
+            if let Some(revision) = &editor.declared_revision {
+                options.insert("DeclaredUnityRevision".into(), revision.clone());
+            }
+            if let Some(revision) = &editor.selected_revision {
+                options.insert("UnityRevision".into(), revision.clone());
+            }
+            Ok(Some(Project {
+                identity: assembly.identity.clone(),
+                origin: assembly.origin.clone(),
+                name: descriptor.name.clone(),
+                defines: inputs.defines.into_iter().collect(),
+                references: Vec::new(),
+                assemblies: metadata,
+                edition: String::new(),
+                compiler_options: options,
+                source_roots: mappings.clone(),
+            }))
+        })();
+        let project = match prepared {
+            Ok(Some(project)) => project,
+            Ok(None) => continue,
+            Err(error) => {
+                result.diagnostics.push(format!(
+                    "Excluded assembly {}: {error:#}",
+                    assembly.descriptor.name
+                ));
+                continue;
+            }
+        };
+        result
+            .dependencies
+            .extend(project.assemblies.iter().map(|r| r.path.clone()));
         active.insert(index, result.projects.len());
-        result.projects.push(Project {
-            identity: assembly.identity.clone(),
-            origin: assembly.origin.clone(),
-            name: descriptor.name.clone(),
-            defines: inputs.defines.into_iter().collect(),
-            references: Vec::new(),
-            assemblies: metadata,
-            edition: String::new(),
-            compiler_options: options,
-            source_roots: mappings.clone(),
-        });
+        result.projects.push(project);
         for path in &assembly.sources {
+            let path = match path.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    result
+                        .diagnostics
+                        .push(format!("Skipped source {}: {error}", path.display()));
+                    continue;
+                }
+            };
             result.sources.push(SourceInput {
-                path: path.canonicalize()?,
+                path,
                 project: result.projects.len() - 1,
                 module: String::new(),
                 language: Language::CSharp,
@@ -544,10 +648,13 @@ fn discover_with_editor(
                 }
             }
             for reference in &assembly.descriptor.references {
-                ensure!(
-                    !PREDEFINED.contains(&reference.as_str()),
-                    "Custom assembly cannot reference predefined assembly {reference}"
-                );
+                if PREDEFINED.contains(&reference.as_str()) {
+                    result.diagnostics.push(format!(
+                        "Invalid reference to predefined assembly {reference} in {}.",
+                        assembly.descriptor.name
+                    ));
+                    continue;
+                }
                 let target = reference
                     .strip_prefix("GUID:")
                     .and_then(|g| guids.get(g))
@@ -583,25 +690,23 @@ fn scan(
     scope: usize,
     files: &mut Vec<(usize, PathBuf)>,
     watched: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
+    diagnostics: &mut Vec<String>,
+) {
     watched.insert(directory.to_owned());
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if super::ignored_name(&name) {
+    for (path, kind) in super::entries(directory, diagnostics) {
+        if super::ignored_name(path.file_name().unwrap()) {
             continue;
         }
-        if entry.file_type()?.is_dir() {
-            scan(&entry.path(), scope, files, watched)?;
-        } else if entry.file_type()?.is_file()
-            && entry.path().extension().is_some_and(|e| {
+        if kind.is_dir() {
+            scan(&path, scope, files, watched, diagnostics);
+        } else if kind.is_file()
+            && path.extension().is_some_and(|e| {
                 matches!(e.to_str(), Some("cs" | "asmdef" | "asmref" | "dll" | "rsp"))
             })
         {
-            files.push((scope, entry.path()));
+            files.push((scope, path));
         }
     }
-    Ok(())
 }
 
 fn constraints(entries: &[String], defines: &BTreeSet<String>) -> Result<bool> {
@@ -918,6 +1023,7 @@ mod tests {
                         "version https://git-lfs.github.com/spec/v1\noid sha256:broken\nsize 1\n",
                     )
                     .unwrap();
+                    inject_bad_inputs(root.path());
                 }
                 let mut actual = Discovery {
                     root: root.path().into(),
@@ -1033,6 +1139,45 @@ mod tests {
         }
     }
 
+    fn inject_bad_inputs(root: &Path) {
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        for (name, descriptor) in [
+            (
+                "DuplicateField",
+                r#"{"name":"DuplicateField","versionDefines":[],"versionDefines":[]}"#,
+            ),
+            ("InvalidJson", "{"),
+            (
+                "Platforms",
+                r#"{"name":"Platforms","includePlatforms":["Editor"],"excludePlatforms":["Editor"]}"#,
+            ),
+            (
+                "Constraint",
+                r#"{"name":"Constraint","defineConstraints":["INVALID && SYMBOL"]}"#,
+            ),
+        ] {
+            write(
+                &format!("Assets/Broken/{name}/Code.cs"),
+                "class MustNotLeakIntoParent {}",
+            );
+            write(&format!("Assets/Broken/{name}/Assembly.asmdef"), descriptor);
+        }
+        write(
+            "Assets/Broken/Ownership/Assembly.asmref",
+            r#"{"reference":"MissingAssembly"}"#,
+        );
+        write(
+            "Assets/Broken/Ownership/Code.cs",
+            "class MustNotLeakIntoParent {}",
+        );
+        write("Packages/com.example.broken/package.json", "{");
+        // A package failure must not discard the independently valid embedded packages.
+    }
+
     fn check_module_selection(editor: &Editor, root: &Path) {
         let settings = Settings::read(&root.join("ProjectSettings/ProjectSettings.asset")).unwrap();
         let layout = super::super::catalog::References::read(
@@ -1081,7 +1226,15 @@ mod tests {
         );
         // A selected module must not silently disappear from an incomplete bundle.
         std::fs::remove_file(&physics).unwrap();
-        assert!(compile(&module, false).is_err());
+        let partial = compile(&module, false).unwrap();
+        assert!(!partial.diagnostics.is_empty());
+        assert!(!partial.references.contains(&physics));
+        assert!(
+            partial
+                .references
+                .iter()
+                .any(|p| p.file_name().unwrap() == "UnityEngine.CoreModule.dll")
+        );
         std::fs::write(&physics, []).unwrap();
 
         // The editor's descriptor, rather than a compiled package list, controls

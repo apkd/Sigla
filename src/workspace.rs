@@ -281,12 +281,22 @@ impl Workspace {
                     manifest.diagnostics.push(format!("Reference is unavailable: {}. References to this assembly remain unresolved.", assembly.path.display()));
                 }
                 if assembly.path.is_file() {
+                    let path = if manifest.dependencies.contains(&assembly.path) {
+                        assembly.path.clone()
+                    } else {
+                        match self.policy.canonical(&assembly.path) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                manifest.diagnostics.push(format!(
+                                    "Excluded reference {}: {error:#}",
+                                    assembly.path.display()
+                                ));
+                                continue;
+                            }
+                        }
+                    };
                     queue.push_back(SourceInput {
-                        path: if manifest.dependencies.contains(&assembly.path) {
-                            assembly.path.clone()
-                        } else {
-                            self.policy.canonical(&assembly.path)?
-                        },
+                        path,
                         project,
                         module: String::new(),
                         language: Language::CSharp,
@@ -349,6 +359,7 @@ impl Workspace {
                 continue;
             }
             if !input.metadata && stamp.size as usize > MAX_SOURCE_BYTES {
+                manifest.metadata.insert(input.path.clone(), stamp);
                 manifest.diagnostics.push(format!(
                     "Skipped source exceeding {} MiB: {}",
                     MAX_SOURCE_BYTES / 1024 / 1024,
@@ -400,6 +411,9 @@ impl Workspace {
             let (changed, modules) = match extracted {
                 Ok(value) => value,
                 Err(error) => {
+                    // A repaired input must trigger another refresh even though it
+                    // has no searchable record in the current manifest.
+                    manifest.metadata.insert(input.path.clone(), stamp);
                     manifest
                         .diagnostics
                         .push(format!("Skipped {}: {error:#}", input.path.display()));
@@ -438,7 +452,16 @@ impl Workspace {
                         // watch the nearest existing parent so later module creation
                         // triggers discovery, even when its directory is created first.
                         if let Some(parent) = path.ancestors().skip(1).find(|p| p.is_dir()) {
-                            let parent = self.policy.canonical(parent)?;
+                            let parent = match self.policy.canonical(parent) {
+                                Ok(parent) => parent,
+                                Err(error) => {
+                                    manifest.diagnostics.push(format!(
+                                        "Cannot watch Rust module {}: {error:#}",
+                                        path.display()
+                                    ));
+                                    continue;
+                                }
+                            };
                             directories.insert(parent.clone());
                             if self.directories.insert(parent.clone()) {
                                 self.monitor.register(&parent);

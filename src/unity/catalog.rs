@@ -25,6 +25,7 @@ pub struct References {
     framework: Vec<PathBuf>,
     modules: BTreeMap<String, bool>,
     pub watched: BTreeSet<PathBuf>,
+    pub diagnostics: Vec<String>,
 }
 
 impl References {
@@ -46,20 +47,33 @@ impl References {
             name: String,
             controlled_by_builtin_package: u8,
         }
-        let records: Vec<Module> =
+        let records: Vec<serde_yaml::Value> =
             serde_yaml::from_value(document["PlatformModuleSetup"]["modules"].clone())?;
         let mut modules = BTreeMap::new();
-        for module in records {
-            ensure!(
-                module.controlled_by_builtin_package <= 1 && !module.name.is_empty(),
-                "Invalid Unity module descriptor"
-            );
-            ensure!(
-                modules
-                    .insert(module.name, module.controlled_by_builtin_package == 1)
-                    .is_none(),
-                "Duplicate Unity module descriptor"
-            );
+        let mut diagnostics = Vec::new();
+        for record in records {
+            let parsed = serde_yaml::from_value::<Module>(record)
+                .map_err(anyhow::Error::from)
+                .and_then(|module| {
+                    ensure!(
+                        module.controlled_by_builtin_package <= 1 && !module.name.is_empty(),
+                        "Invalid Unity module descriptor"
+                    );
+                    ensure!(
+                        !modules.contains_key(&module.name),
+                        "Duplicate Unity module descriptor {}",
+                        module.name
+                    );
+                    Ok(module)
+                });
+            match parsed {
+                Ok(module) => {
+                    modules.insert(module.name, module.controlled_by_builtin_package == 1);
+                }
+                Err(error) => {
+                    diagnostics.push(format!("Excluded Unity module descriptor: {error:#}"))
+                }
+            }
         }
         ensure!(
             modules.contains_key("Core"),
@@ -70,24 +84,21 @@ impl References {
             let path = data.join(relative);
             watched.insert(path.clone());
             let mut files = Vec::new();
-            for entry in std::fs::read_dir(&path)
-                .with_context(|| format!("Missing Unity reference directory {}", path.display()))?
-            {
-                let entry = entry?;
-                if entry.path().extension().is_some_and(|e| e == "dll") {
-                    ensure!(
-                        entry.file_type()?.is_file(),
-                        "Unity reference is not a regular file: {}",
-                        entry.path().display()
-                    );
-                    files.push(entry.path());
+            for (path, kind) in super::entries(&path, &mut diagnostics) {
+                if path.extension().is_some_and(|e| e == "dll") {
+                    if kind.is_file() {
+                        files.push(path);
+                    } else {
+                        diagnostics.push(format!(
+                            "Skipped non-regular Unity reference {}",
+                            path.display()
+                        ));
+                    }
                 }
             }
-            ensure!(
-                !files.is_empty(),
-                "Empty Unity reference directory {}",
-                path.display()
-            );
+            if files.is_empty() {
+                diagnostics.push(format!("No references available in {}", path.display()));
+            }
             files.sort();
             Ok(files)
         };
@@ -113,31 +124,39 @@ impl References {
                 .join(format!("{name}.dll"))
         }));
         for path in standard.iter().chain(&framework) {
-            ensure!(
-                path.is_file(),
-                "Missing Unity framework reference {}",
-                path.display()
-            );
+            if !path.is_file() {
+                diagnostics.push(format!(
+                    "Missing Unity framework reference {}",
+                    path.display()
+                ));
+            }
         }
-        ensure!(
-            engine.iter().any(|p| p
-                .file_name()
-                .is_some_and(|n| n == "UnityEngine.CoreModule.dll")),
-            "Unity reference layout lacks CoreModule"
-        );
+        if !engine.iter().any(|p| {
+            p.file_name()
+                .is_some_and(|n| n == "UnityEngine.CoreModule.dll")
+        }) {
+            diagnostics.push("Unity reference layout lacks CoreModule".into());
+        }
         Ok(Self {
             engine,
             standard,
             framework,
             modules,
             watched,
+            diagnostics,
         })
     }
 }
 
 pub(super) fn validate_references(data: &Path, version: UnityVersion) -> Result<()> {
-    References::read(data, version, Platform::EditorLinux, 0)?;
-    References::read(data, version, Platform::StandaloneLinux, 0)?;
+    for platform in [Platform::EditorLinux, Platform::StandaloneLinux] {
+        let references = References::read(data, version, platform, 0)?;
+        ensure!(
+            references.diagnostics.is_empty(),
+            "Incomplete Unity editor bundle: {}",
+            references.diagnostics.join("; ")
+        );
+    }
     for path in EDITOR_PRECOMPILED {
         ensure!(
             data.join(path).is_file(),
@@ -158,6 +177,7 @@ pub struct Editor {
 pub struct CompilationInputs {
     pub defines: BTreeSet<String>,
     pub references: Vec<PathBuf>,
+    pub diagnostics: Vec<String>,
 }
 pub struct AssemblyContext {
     pub predefined: bool,
@@ -290,25 +310,28 @@ impl Editor {
         .iter()
         .cloned()
         .collect();
+        let mut diagnostics = Vec::new();
         if !no_engine {
             for package in modules {
-                let module = layout
-                    .modules
-                    .keys()
-                    .find(|name| {
-                        package == &format!("com.unity.modules.{}", name.to_ascii_lowercase())
-                    })
-                    .with_context(|| {
-                        format!("Unity editor has no module descriptor for {package}")
-                    })?;
+                let module = layout.modules.keys().find(|name| {
+                    package == &format!("com.unity.modules.{}", name.to_ascii_lowercase())
+                });
+                let Some(module) = module else {
+                    diagnostics.push(format!(
+                        "Unity editor has no module descriptor for {package}"
+                    ));
+                    continue;
+                };
                 let filename = format!("UnityEngine.{module}Module.dll");
-                ensure!(
-                    layout
-                        .engine
-                        .iter()
-                        .any(|p| p.file_name().is_some_and(|n| n == filename.as_str())),
-                    "Unity editor lacks the managed reference for {package}"
-                );
+                if !layout
+                    .engine
+                    .iter()
+                    .any(|p| p.file_name().is_some_and(|n| n == filename.as_str()))
+                {
+                    diagnostics.push(format!(
+                        "Unity editor lacks the managed reference for {package}"
+                    ));
+                }
             }
             for path in &layout.engine {
                 let name = path.file_name().unwrap().to_string_lossy();
@@ -316,9 +339,12 @@ impl Editor {
                     .strip_prefix("UnityEngine.")
                     .and_then(|n| n.strip_suffix("Module.dll"))
                 {
-                    let controlled = layout.modules.get(module).with_context(|| {
-                        format!("Unity module {module} is absent from modules.asset")
-                    })?;
+                    let Some(controlled) = layout.modules.get(module) else {
+                        diagnostics.push(format!(
+                            "Excluded Unity module {module}: absent from modules.asset"
+                        ));
+                        continue;
+                    };
                     // AR and Insights are excluded from runtime code by Unity,
                     // independently of package control (observed in both layouts).
                     if !editor_only
@@ -346,16 +372,18 @@ impl Editor {
                 references.extend(EDITOR_PRECOMPILED.iter().map(|p| self.data.join(p)));
             }
         }
-        for path in &references {
-            ensure!(
-                path.is_file(),
-                "Unity editor bundle lacks required reference {}",
-                path.display()
-            );
-        }
+        references.retain(|path| {
+            if path.is_file() {
+                true
+            } else {
+                diagnostics.push(format!("Unavailable Unity reference {}", path.display()));
+                false
+            }
+        });
         Ok(CompilationInputs {
             defines,
             references: references.into_iter().collect(),
+            diagnostics,
         })
     }
 }

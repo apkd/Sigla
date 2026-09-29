@@ -7,10 +7,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Manifest {
-    dependencies: BTreeMap<String, String>,
+struct Manifest<T = String> {
+    dependencies: BTreeMap<String, T>,
     #[serde(default)]
     scoped_registries: Vec<Registry>,
     #[serde(default)]
@@ -22,8 +22,8 @@ struct Registry {
     scopes: Vec<String>,
 }
 #[derive(Deserialize)]
-struct Lock {
-    dependencies: BTreeMap<String, Locked>,
+struct Lock<T> {
+    dependencies: BTreeMap<String, T>,
 }
 #[derive(Deserialize)]
 struct Locked {
@@ -94,57 +94,116 @@ impl Packages {
             .map_or(cache, |remote| remote.shared.as_path());
         let manifest_path = root.join("Packages/manifest.json");
         let lock_path = root.join("Packages/packages-lock.json");
-        let manifest: Manifest = read(&manifest_path)?;
-        let lock: Lock = read(&lock_path)?;
         let mut diagnostics = Vec::new();
-        let mut watched = BTreeSet::from([manifest_path, lock_path, root.join("Packages")]);
-        for (package, node) in &lock.dependencies {
-            ensure!(
-                name(package)
-                    && !node.version.is_empty()
-                    && matches!(
-                        node.source.as_str(),
-                        "registry" | "git" | "local" | "embedded" | "builtin"
-                    ),
-                "Invalid locked package {package}"
-            );
-            ensure!(
-                node.dependencies.keys().all(|d| name(d)),
-                "Invalid package dependency name in {package}"
-            );
+        let raw: Manifest<serde_json::Value> = read(&manifest_path).unwrap_or_else(|error| {
+            diagnostics.push(format!(
+                "Unavailable package manifest: {error:#}. Discovering embedded packages."
+            ));
+            Manifest::default()
+        });
+        let manifest = Manifest {
+            dependencies: raw
+                .dependencies
+                .into_iter()
+                .filter_map(|(package, value)| {
+                    match value
+                        .as_str()
+                        .filter(|request| !request.is_empty() && name(&package))
+                    {
+                        Some(request) => Some((package, request.to_owned())),
+                        None => {
+                            diagnostics.push(format!("Excluded invalid package request {package}"));
+                            None
+                        }
+                    }
+                })
+                .collect::<BTreeMap<_, _>>(),
+            scoped_registries: raw.scoped_registries,
+            testables: raw.testables,
+        };
+        let raw: Lock<serde_json::Value> = read(&lock_path).unwrap_or_else(|error| {
+            diagnostics.push(format!(
+                "Unavailable package lock: {error:#}. Locked dependencies remain unresolved."
+            ));
+            Lock {
+                dependencies: BTreeMap::new(),
+            }
+        });
+        let mut dependencies = BTreeMap::new();
+        for (package, value) in raw.dependencies {
+            let parsed = serde_json::from_value::<Locked>(value)
+                .map_err(anyhow::Error::from)
+                .and_then(|node| {
+                    ensure!(
+                        name(&package)
+                            && !node.version.is_empty()
+                            && matches!(
+                                node.source.as_str(),
+                                "registry" | "git" | "local" | "embedded" | "builtin"
+                            ),
+                        "Invalid locked package"
+                    );
+                    ensure!(
+                        node.dependencies.keys().all(|d| name(d)),
+                        "Invalid package dependency name"
+                    );
+                    Ok(node)
+                });
+            match parsed {
+                Ok(node) => {
+                    dependencies.insert(package, node);
+                }
+                Err(error) => diagnostics.push(format!("Excluded package {package}: {error:#}")),
+            }
         }
+        let lock = Lock { dependencies };
+        let mut watched = BTreeSet::from([manifest_path, lock_path, root.join("Packages")]);
         let mut embedded = BTreeMap::new();
-        for entry in std::fs::read_dir(root.join("Packages"))? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() && entry.path().join("package.json").is_file() {
-                let path = policy.canonical(&entry.path())?;
-                let info: PackageManifest = read(&path.join("package.json"))?;
-                ensure!(name(&info.name), "Invalid embedded package name");
-                let value = package(
-                    path,
-                    &info.name,
-                    None,
-                    format!("embedded:{}", info.name),
-                    true,
-                )?;
-                ensure!(
-                    embedded.insert(info.name.clone(), value).is_none(),
-                    "Duplicate embedded package {}",
-                    info.name
-                );
+        for (path, kind) in super::entries(&root.join("Packages"), &mut diagnostics) {
+            if kind.is_dir() && path.join("package.json").is_file() {
+                watched.insert(path.join("package.json"));
+                let loaded = (|| -> Result<Package> {
+                    let path = policy.canonical(&path)?;
+                    let info: PackageManifest = read(&path.join("package.json"))?;
+                    ensure!(name(&info.name), "Invalid embedded package name");
+                    package(
+                        path,
+                        &info.name,
+                        None,
+                        format!("embedded:{}", info.name),
+                        true,
+                    )
+                })();
+                match loaded {
+                    Ok(value) => {
+                        if embedded.contains_key(&value.manifest.name) {
+                            diagnostics.push(format!(
+                                "Excluded duplicate embedded package {} at {}",
+                                value.manifest.name,
+                                path.display()
+                            ));
+                        } else {
+                            embedded.insert(value.manifest.name.clone(), value);
+                        }
+                    }
+                    Err(error) => diagnostics.push(format!(
+                        "Excluded embedded package {}: {error:#}",
+                        path.display()
+                    )),
+                }
             }
         }
         for (package, request) in &manifest.dependencies {
-            ensure!(
-                name(package) && !request.is_empty(),
-                "Invalid direct package request"
-            );
+            if !name(package) || request.is_empty() {
+                diagnostics.push(format!("Invalid direct package request {package}"));
+                continue;
+            }
             if embedded.contains_key(package) {
                 continue;
             }
-            let node = lock.dependencies.get(package).with_context(|| {
-                format!("Package lock has no selection for direct dependency {package}")
-            })?;
+            let Some(node) = lock.dependencies.get(package) else {
+                continue;
+            };
             if node.depth != 0 || &node.version != request {
                 diagnostics.push(format!("Manifest and package lock disagree for {package}; using available locked contents."));
             }
@@ -153,12 +212,11 @@ impl Packages {
         let mut candidates = Vec::new();
         if cache_root.is_dir() {
             watched.insert(cache_root.clone());
-            for entry in std::fs::read_dir(&cache_root)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && let Ok(info) = read::<PackageManifest>(&entry.path().join("package.json"))
+            for (path, kind) in super::entries(&cache_root, &mut diagnostics) {
+                if kind.is_dir()
+                    && let Ok(info) = read::<PackageManifest>(&path.join("package.json"))
                 {
-                    candidates.push((info, entry.path()));
+                    candidates.push((info, path));
                 }
             }
         } else if root.join("Library").is_dir() {
@@ -182,10 +240,10 @@ impl Packages {
                 selected.push(package);
                 continue;
             }
-            let node = lock
-                .dependencies
-                .get(&package_name)
-                .with_context(|| format!("Package lock is disconnected at {package_name}"))?;
+            let Some(node) = lock.dependencies.get(&package_name) else {
+                diagnostics.push(format!("Excluded package {package_name}: no usable lock entry. References to this package remain unresolved."));
+                continue;
+            };
             pending.extend(node.dependencies.keys().cloned());
             let registry = manifest
                 .scoped_registries
@@ -197,11 +255,10 @@ impl Packages {
                 .unwrap_or("https://packages.unity.com");
             if node.source == "registry"
                 && let Some(url) = &node.url
+                && url.trim_end_matches('/') != registry.trim_end_matches('/')
             {
-                ensure!(
-                    url.trim_end_matches('/') == registry.trim_end_matches('/'),
-                    "Locked registry disagrees with scoped registry for {package_name}"
-                );
+                diagnostics.push(format!("Excluded package {package_name}: locked registry disagrees with scoped registry."));
+                continue;
             }
             let identity = serde_json::to_string(&(
                 node.source.as_str(),
@@ -384,5 +441,30 @@ mod tests {
                 .iter()
                 .all(|package| package.root.is_dir())
         );
+        write("Packages/broken/package.json", "{");
+        write(
+            "Packages/packages-lock.json",
+            r#"{"dependencies":{"com.example.core":{"version":"1.0","source":"builtin","depth":0,"dependencies":{"com.example.dep":"1.0","com.example.absent":"1.0"}},"com.example.dep":{"version":"1.0","source":"registry","depth":1},"com.example.malformed":{"version":false}}}"#,
+        );
+        let partial = Packages::local(
+            root.path(),
+            &Policy::new(vec![root.path().into()]).unwrap(),
+            &editor,
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            partial
+                .selected
+                .iter()
+                .map(|p| &p.manifest.name)
+                .collect::<BTreeSet<_>>(),
+            packages
+                .selected
+                .iter()
+                .map(|p| &p.manifest.name)
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(partial.diagnostics.len() > packages.diagnostics.len());
     }
 }

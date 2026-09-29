@@ -41,6 +41,8 @@ pub struct Snapshot {
     pub dependency_state: BTreeMap<String, String>,
     #[serde(default)]
     pub required_inputs: Vec<PathBuf>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
@@ -236,10 +238,17 @@ pub fn discover_in(
             .as_str(),
     );
     let previous: BTreeMap<String, String> = if state_file.is_file() {
-        serde_json::from_slice(&fs::read(&state_file)?)?
+        fs::read(&state_file)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
+            .unwrap_or_else(|error| {
+                tracing::warn!("Ignoring unreadable restore state: {error:#}");
+                BTreeMap::new()
+            })
     } else {
         BTreeMap::new()
     };
+    let mut diagnostics = Vec::new();
     for restored in [false, true] {
         crate::sandbox::write_job_file(
             &request,
@@ -299,6 +308,7 @@ pub fn discover_in(
             anyhow::bail!("MSBuild returned an invalid tracked-input request");
         }
         if !snapshot.needs_restore {
+            snapshot.diagnostics.extend(diagnostics);
             let mut state = tempfile::NamedTempFile::new_in(&state_dir)?;
             serde_json::to_writer(&mut state, &snapshot.dependency_state)?;
             state.persist(&state_file)?;
@@ -344,26 +354,33 @@ pub fn discover_in(
                     .arg(format!("-p:ArtifactsPath={path}"));
             }
             let mut log = tempfile::tempfile()?;
-            let result = process::capture(
+            let captured = process::capture(
                 &mut restore,
                 Duration::from_secs(300),
                 None,
                 Some(log.try_clone()?),
-            )?;
+            );
+            if let Some(sandbox) = &sandbox {
+                sandbox.validate_writes()?;
+            }
+            let result = match captured {
+                Ok(result) => result,
+                Err(error) => {
+                    diagnostics.push(format!("Dependency restore could not finish for {}: {error:#}. Using available project details.", entry.display()));
+                    continue;
+                }
+            };
             if !result.status.success() {
                 let stdout = restore_log_tail(&mut log)
                     .unwrap_or_else(|error| format!("Cannot read restore log: {error}"));
                 let stderr = diagnostic_tail(&result.stderr);
                 tracing::warn!(project = %entry.display(), status = %result.status, %stdout, %stderr, "Dependency restore failed");
                 let detail = format!("{stdout}\n{stderr}");
-                anyhow::bail!(
-                    "Dependency restore failed for {}: {}",
+                diagnostics.push(format!(
+                    "Dependency restore failed for {}: {}. Using available project details.",
                     entry.display(),
                     restore_reason(&detail),
-                );
-            }
-            if let Some(sandbox) = &sandbox {
-                sandbox.validate_writes()?;
+                ));
             }
         }
     }
@@ -441,20 +458,50 @@ fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> R
             project.origin.starts_with(&sandbox.source),
             "A project origin must belong to the canonical workspace"
         );
-        for path in project.sources.iter_mut().chain(project.imports.iter_mut()) {
-            *path = sandbox
-                .output(path)
-                .with_context(|| format!("Invalid returned discovery input {}", path.display()))?;
-        }
-        for path in &mut project.globs {
-            *path = sandbox.watch_directory(path)?;
+        for (paths, directory) in [
+            (&mut project.sources, false),
+            (&mut project.imports, false),
+            (&mut project.globs, true),
+        ] {
+            paths.retain_mut(|path| {
+                let mapped = if directory {
+                    sandbox.watch_directory(path)
+                } else {
+                    sandbox.output(path)
+                };
+                match mapped {
+                    Ok(mapped) => {
+                        *path = mapped;
+                        true
+                    }
+                    Err(error) => {
+                        snapshot.diagnostics.push(format!(
+                            "Excluded discovery input {}: {error:#}",
+                            path.display()
+                        ));
+                        false
+                    }
+                }
+            });
         }
         project
             .assemblies
             .retain(|a| !known.contains(Path::new(&a.source_project)));
-        for assembly in &mut project.assemblies {
-            assembly.path = sandbox.output(&assembly.path)?;
-        }
+        project
+            .assemblies
+            .retain_mut(|assembly| match sandbox.output(&assembly.path) {
+                Ok(path) => {
+                    assembly.path = path;
+                    true
+                }
+                Err(error) => {
+                    snapshot.diagnostics.push(format!(
+                        "Excluded reference {}: {error:#}",
+                        assembly.path.display()
+                    ));
+                    false
+                }
+            });
         for reference in &mut project.references {
             reference.identity = format!("{prefix}:{}", reference.identity);
         }
@@ -463,10 +510,15 @@ fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> R
             .get_mut("ProjectAssetsFile")
             .filter(|s| !s.is_empty())
         {
-            *assets = sandbox
-                .output(Path::new(assets))?
-                .to_string_lossy()
-                .into_owned();
+            match sandbox.output(Path::new(assets)) {
+                Ok(path) => *assets = path.to_string_lossy().into_owned(),
+                Err(error) => {
+                    snapshot
+                        .diagnostics
+                        .push(format!("Unavailable dependency assets {assets}: {error:#}"));
+                    assets.clear();
+                }
+            }
         }
     }
     Ok(())

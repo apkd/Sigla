@@ -15,6 +15,36 @@ pub(crate) fn ignored_name(name: &std::ffi::OsStr) -> bool {
     name.starts_with('.') || name.ends_with('~') || name == "CVS"
 }
 
+/// Enumerate readable entries without losing siblings to one filesystem error.
+fn entries(
+    directory: &std::path::Path,
+    diagnostics: &mut Vec<String>,
+) -> Vec<(std::path::PathBuf, std::fs::FileType)> {
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            diagnostics.push(format!(
+                "Cannot read directory {}: {error}",
+                directory.display()
+            ));
+            return result;
+        }
+    };
+    for entry in entries {
+        let entry = entry.and_then(|entry| Ok((entry.path(), entry.file_type()?)));
+        match entry {
+            Ok(entry) => result.push(entry),
+            Err(error) => diagnostics.push(format!(
+                "Cannot read entry in {}: {error}",
+                directory.display()
+            )),
+        }
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
 #[derive(
     Clone,
     Copy,

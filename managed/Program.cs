@@ -108,8 +108,14 @@ static class Discovery
                 entries.Add(new(entry, properties));
                 collection.UnloadProject(project);
             }
+            var diagnostics = new List<string>();
+            void TryAddEntry(string path, Dictionary<string, string> properties) {
+                try { AddEntry(path, properties); }
+                catch (Exception e) when (required.Count == 0) { diagnostics.Add($"Excluded project {path}: {e.Message}"); }
+            }
             foreach (var entry in request.Entries)
             {
+                try {
                 if (Path.GetExtension(entry) is ".sln" or ".slnx")
                 {
                     var solution = Microsoft.Build.Construction.SolutionFile.Parse(entry);
@@ -123,16 +129,16 @@ static class Discovery
                             properties["Configuration"] = mapping.ConfigurationName;
                             properties["Platform"] = mapping.PlatformName;
                         }
-                        AddEntry(project.AbsolutePath, properties);
+                        TryAddEntry(project.AbsolutePath, properties);
                     }
                     continue;
                 }
-                AddEntry(entry, defaults);
+                TryAddEntry(entry, defaults);
+                } catch (Exception e) when (required.Count == 0) { diagnostics.Add($"Excluded entry {entry}: {e.Message}"); }
             }
             if (required.Count != 0) return Missing();
-            Microsoft.Build.Graph.ProjectGraph graph;
-            try {
-                graph = new Microsoft.Build.Graph.ProjectGraph(entries, collection, (path, properties, projects) => {
+            Microsoft.Build.Graph.ProjectGraph CreateGraph(IEnumerable<Microsoft.Build.Graph.ProjectGraphEntryPoint> roots) =>
+                new(roots, collection, (path, properties, projects) => {
                     Probe(path, properties);
                     if (required.Count != 0) throw new IOException("Tracked inputs require materialization");
                     var project = new Microsoft.Build.Evaluation.Project(path, properties, null, projects);
@@ -140,12 +146,23 @@ static class Discovery
                     projects.UnloadProject(project);
                     return instance;
                 }, 1, CancellationToken.None);
-            } catch when (required.Count != 0) { return Missing(); }
+            var nodes = new List<Microsoft.Build.Graph.ProjectGraphNode>();
+            try { nodes.AddRange(CreateGraph(entries).ProjectNodesTopologicallySorted); }
+            catch when (required.Count != 0) { return Missing(); }
+            catch (Exception e) {
+                diagnostics.Add($"Combined project graph is incomplete: {e.Message}. Evaluating entries separately.");
+                foreach (var entry in entries) {
+                    try { nodes.AddRange(CreateGraph([entry]).ProjectNodesTopologicallySorted); }
+                    catch when (required.Count != 0) { return Missing(); }
+                    catch (Exception error) { diagnostics.Add($"Excluded project graph {entry.ProjectFile}: {error.Message}"); }
+                }
+            }
+            nodes = nodes.DistinctBy(node => Identity(node.ProjectInstance)).ToList();
             if (required.Count != 0) return Missing();
             var dependencyState = new Dictionary<string, string>();
             var outputOwners = new Dictionary<string, string>(StringComparer.Ordinal);
             var restore = false;
-            foreach (var node in graph.ProjectNodes)
+            foreach (var node in nodes)
             {
                 var project = node.ProjectInstance;
                 var assets = project.GetPropertyValue("ProjectAssetsFile");
@@ -169,18 +186,24 @@ static class Discovery
                 bool usable = false;
                 if (File.Exists(assets))
                 {
+                    try {
                     using var parsed = JsonDocument.Parse(File.ReadAllText(assets));
                     usable = parsed.RootElement.TryGetProperty("targets", out var targets)
                         && targets.TryGetProperty(project.GetPropertyValue("TargetFramework"), out _);
+                    } catch (Exception e) when (e is IOException or JsonException) {
+                        diagnostics.Add($"Unavailable dependency assets {assets}: {e.Message}");
+                    }
                 }
                 if (!usable || !request.Restored && request.DependencyState.TryGetValue(identity, out var previous) && previous != fingerprint)
                     restore = true;
             }
             if (restore)
             {
-                if (request.Restored) throw new InvalidOperationException("Restore did not produce usable dependency assets for the selected project framework");
+                if (request.Restored) diagnostics.Add("Restore did not produce all dependency assets. Using available project details.");
+                else {
                 File.WriteAllText(resultFile, JsonSerializer.Serialize(new { Version = 1, NeedsRestore = true, DependencyState = dependencyState, Projects = Array.Empty<object>() }));
                 return 0;
+                }
             }
             var errors = new List<string>();
             using var manager = new Microsoft.Build.Execution.BuildManager();
@@ -191,9 +214,11 @@ static class Discovery
             var projects = new List<object>();
             try
             {
-                foreach (var node in graph.ProjectNodesTopologicallySorted)
+                foreach (var node in nodes)
                 {
                     var initial = node.ProjectInstance;
+                    try {
+                    errors.Clear();
                     if (initial.GetPropertyValue("IsCrossTargetingBuild") == "true") continue;
                     var targets = Targets.Where(initial.Targets.ContainsKey).ToArray();
                     var final = initial;
@@ -202,8 +227,8 @@ static class Discovery
                         var result = manager.BuildRequest(new Microsoft.Build.Execution.BuildRequestData(
                             initial, targets, null, Microsoft.Build.Execution.BuildRequestDataFlags.ProvideProjectStateAfterBuild));
                         if (result.OverallResult != Microsoft.Build.Execution.BuildResultCode.Success)
-                            throw new InvalidOperationException($"Discovery failed for {initial.FullPath}: {string.Join("; ", errors)}");
-                        final = result.ProjectStateAfterBuild ?? throw new InvalidOperationException("MSBuild returned no post-target state");
+                            diagnostics.Add($"Incomplete build details for {initial.FullPath}: {string.Join("; ", errors)}");
+                        final = result.ProjectStateAfterBuild ?? initial;
                     }
                     var evaluated = new Microsoft.Build.Evaluation.Project(initial.FullPath,
                         initial.GlobalProperties.ToDictionary(p => p.Key, p => p.Value), null, collection);
@@ -229,10 +254,11 @@ static class Discovery
                             .Select(g => Microsoft.Build.Globbing.MSBuildGlob.Parse(evaluated.DirectoryPath, g).FixedDirectoryPart).Distinct().ToArray()
                     });
                     collection.UnloadProject(evaluated);
+                    } catch (Exception e) { diagnostics.Add($"Excluded project {initial.FullPath}: {e.Message}"); }
                 }
             }
             finally { manager.EndBuild(); }
-            File.WriteAllText(resultFile, JsonSerializer.Serialize(new { Version = 1, NeedsRestore = false, DependencyState = dependencyState, Projects = projects }));
+            File.WriteAllText(resultFile, JsonSerializer.Serialize(new { Version = 1, NeedsRestore = false, DependencyState = dependencyState, Projects = projects, Diagnostics = diagnostics }));
             return 0;
         }
         catch (Exception e)
