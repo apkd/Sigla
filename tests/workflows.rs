@@ -861,11 +861,138 @@ fn result_limits_preserve_complete_units_and_report_the_total() {
         small.lines().filter(|l| l.starts_with("File.cs:")).count(),
         5
     );
-    assert!(small.contains(&format!("`limit:{}`", units.len())));
+    assert!(small.contains(&format!("of {} matches", units.len())));
     assert!(!large.contains("omitted"));
     for line in small.lines().filter(|l| l.starts_with("File.cs:")) {
         assert!(large.contains(line));
     }
+}
+
+#[tokio::test]
+async fn equivalent_signature_types_preserve_namespace_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "Test.csproj",
+        r#"<Project><ItemGroup><Compile Include="Test.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        dir.path(),
+        "Test.cs",
+        r#"
+using System;
+using Alias = System.Type;
+namespace System { public class Type {} }
+namespace Other { public class Type {} }
+class Inspector {
+ void Inspect(Type value) {}
+ void Inspect(Other.Type value) {}
+ void Aliased(Alias value) {}
+}
+"#,
+    );
+    let a = app(dir.path(), cache.path());
+    let project = dir.path().to_str().unwrap();
+    let short = a
+        .search(project, "method:Inspector.Inspect(Type)")
+        .await
+        .unwrap();
+    let full = a
+        .search(project, "method:Inspector.Inspect(System.Type)")
+        .await
+        .unwrap();
+    assert_eq!(short, full);
+    assert!(full.contains("Inspect(Type value)"), "{full}");
+    assert!(!full.contains("Other.Type"), "{full}");
+    let alias = a
+        .search(project, "method:Inspector.Aliased(System.Type)")
+        .await
+        .unwrap();
+    assert!(alias.contains("Aliased(Alias value)"), "{alias}");
+}
+
+#[tokio::test]
+async fn call_groups_keep_targets_and_overloads_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "Test.csproj",
+        r#"<Project><ItemGroup><Compile Include="Test.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        dir.path(),
+        "Test.cs",
+        r#"
+class Writer {
+ void Write(int n) {} void Write(string s) {} void Flush() {}
+ void Save() { Write(1); Write(2); Write("s"); Flush(); }
+}
+"#,
+    );
+    let a = app(dir.path(), cache.path());
+    let project = dir.path().to_str().unwrap();
+    let result = a.search(project, "calls:* in:Writer.Save").await.unwrap();
+    assert_eq!(
+        result.lines().filter(|l| l.contains(" → ")).count(),
+        3,
+        "{result}"
+    );
+    assert!(
+        result.contains("Write(int)")
+            && result.contains("Write(string)")
+            && result.contains("Flush()"),
+        "{result}"
+    );
+    assert!(result.contains("(2 occurrences)"), "{result}");
+    let limited = a
+        .search(project, "calls:* in:Writer.Save limit:1")
+        .await
+        .unwrap();
+    assert!(limited.contains("of 3 matches"), "{limited}");
+}
+
+#[tokio::test]
+async fn local_function_references_stay_in_their_lexical_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "Test.csproj",
+        r#"<Project><ItemGroup><Compile Include="*.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        dir.path(),
+        "Test.cs",
+        r#"
+class Save {
+ void Run() { void Capture() {} Capture(); }
+ void Other() { void Capture() {} Capture(); }
+}
+"#,
+    );
+    for i in 0..32 {
+        write(
+            dir.path(),
+            &format!("Other{i}.cs"),
+            &format!("class Other{i} {{ void Capture() {{}} void Run() {{ Capture(); }} }}"),
+        );
+    }
+    let a = app(dir.path(), cache.path());
+    let project = dir.path().to_str().unwrap();
+    let result = a.search(project, "uses:Save.Run.Capture").await.unwrap();
+    assert!(result.contains("Save.Run"), "{result}");
+    assert!(
+        !result.contains("Save.Other") && !result.contains("Other0"),
+        "{result}"
+    );
+    assert_eq!(
+        result,
+        a.search(project, "uses:Save.Run.Capture path:Test.cs")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -899,7 +1026,7 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
             .count(),
         8
     );
-    assert!(limited.contains("`limit:8`"), "{limited}");
+    assert!(limited.contains("of 8 matches"), "{limited}");
     assert!(!full.contains("omitted"), "{full}");
     let directory = a
         .search(path, "text:Unknown path:Scripts limit:3")

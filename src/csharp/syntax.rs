@@ -145,6 +145,7 @@ pub enum ExpressionKind {
     },
     Await(ExprId),
     Wrapped(ExprId),
+    TypeOf,
     Unsupported(String),
     OutVariable {
         name: String,

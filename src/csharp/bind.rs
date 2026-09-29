@@ -42,6 +42,41 @@ pub(crate) struct Binder {
 }
 
 impl Binder {
+    pub fn local_scope(
+        &mut self,
+        view: &View<'_>,
+        site: &Site<'_>,
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        Ok(self
+            .site(view, site)?
+            .filter(|s| s.header().local)
+            .map(|s| s.declaration().scope.clone()))
+    }
+
+    pub fn signature_matches(
+        &mut self,
+        view: &View<'_>,
+        site: &Site<'_>,
+        parameters: &[Parameter],
+    ) -> Result<bool> {
+        let Some(symbol) = self.site(view, site)? else {
+            return Ok(false);
+        };
+        if parameters.len() != symbol.header().parameters.len() {
+            return Ok(false);
+        }
+        for (query, declared) in parameters.iter().zip(&symbol.header().parameters) {
+            if query.mode != declared.mode {
+                return Ok(false);
+            }
+            let query = self.resolve_type(view, &query.ty, &symbol, 0)?;
+            let declared = self.resolve_type(view, &declared.ty, &symbol, 0)?;
+            if matches!(query, Type::Unsupported | Type::Unresolved { .. }) || query != declared {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     #[cfg(test)]
     pub(super) fn definition_symbol(&self, id: &DefinitionId) -> Option<&Symbol> {
         self.definitions.get(id)
@@ -666,6 +701,24 @@ impl Binder {
         for base in self.base_types(view, &owner, ty, depth + 1)? {
             result.extend(self.members(view, &base, name, project, depth + 1)?);
         }
+        // Interface values expose Object's public instance members, although
+        // Object is not a base interface and must not enter inheritance results.
+        if result.is_empty() && owner.declaration().kind == "interface" {
+            result.extend(
+                self.members(
+                    view,
+                    &Type::Primitive(Primitive::Object),
+                    name,
+                    project,
+                    depth + 1,
+                )?
+                .into_iter()
+                .filter(|(s, _)| {
+                    s.declaration().access == "public"
+                        && !s.declaration().modifiers.iter().any(|m| m == "static")
+                }),
+            );
+        }
         Ok(result)
     }
     fn member_value(
@@ -791,12 +844,32 @@ impl Binder {
         if let Some(targets) = super::cache::get(&key) {
             let mut result = Vec::new();
             for target in targets {
-                if let Some(symbol) = self
-                    .lookup(view, &target.name, project)?
-                    .into_iter()
-                    .find(|s| s.id == target.id && s.file == target.file)
-                {
-                    result.push((symbol, target.uncertain));
+                let symbol = if view.manifest.files[&target.file].metadata {
+                    self.lookup(view, &target.name, project)?
+                        .into_iter()
+                        .find(|s| s.id == target.id && s.file == target.file)
+                } else {
+                    let facts = self.catalog.headers(view, &target.file)?;
+                    let mut found = None;
+                    for (index, declaration) in facts.declarations.iter().enumerate() {
+                        if declaration.name != target.name {
+                            continue;
+                        }
+                        let symbol = self.catalog.symbol(
+                            view,
+                            &target.file,
+                            target.project,
+                            index as u32,
+                        )?;
+                        if symbol.id == target.id {
+                            found = Some(symbol);
+                            break;
+                        }
+                    }
+                    found
+                };
+                if let Some(symbol) = symbol {
+                    result.push((self.remember(symbol), target.uncertain));
                 }
             }
             #[cfg(test)]
@@ -909,6 +982,7 @@ impl Binder {
                     .symbols
                     .iter()
                     .map(|s| super::cache::Target {
+                        project: s.project,
                         id: s.id.clone(),
                         file: s.file.clone(),
                         name: s.declaration().name.clone(),
@@ -953,6 +1027,27 @@ impl Binder {
         self.catalog.check(view)?;
         let expression = &body.expressions[id as usize];
         Ok(match &expression.kind {
+            ExpressionKind::TypeOf => Bound {
+                ty: Some(self.resolve_type(
+                    view,
+                    &WrittenType::Name {
+                        alias: Some("global".into()),
+                        parts: vec![
+                            NamePart {
+                                name: "System".into(),
+                                arguments: vec![],
+                            },
+                            NamePart {
+                                name: "Type".into(),
+                                arguments: vec![],
+                            },
+                        ],
+                    },
+                    context,
+                    depth + 1,
+                )?),
+                ..Default::default()
+            },
             ExpressionKind::ImplicitCall { name, receiver } => {
                 let Some(receiver) = receiver else {
                     return Ok(Bound::default());

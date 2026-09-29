@@ -83,6 +83,13 @@ async fn browse_find_and_read_use_the_same_refreshed_sources() {
         .unwrap();
     assert_eq!(absolute, exact);
     assert!(app.view(project, "../outside.rs", "exact").await.is_err());
+    for suffix in [":1-abc", ":-1-5"] {
+        let error = app
+            .view(project, &format!("first/mod.rs{suffix}"), "exact")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("range"), "{error}");
+    }
     assert!(app.view(project, "lib.rs:999", "exact").await.is_err());
     let fuzzy = app.view(project, "firs/mod.rs:2", "exact").await.unwrap();
     assert!(fuzzy.contains("Changed"), "{fuzzy}");

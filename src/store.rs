@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 
-const FORMAT: &[u8] = b"sigla-facts-12";
+const FORMAT: &[u8] = b"sigla-facts-13";
+static STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<Store>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 // Shared across every workspace; immutable record bytes are the revision key.
@@ -77,8 +79,25 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Arc<Self>> {
         std::fs::create_dir_all(path)?;
+        let path = std::fs::canonicalize(path)?;
+        let mut stores = STORES.lock().unwrap();
+        if let Some(store) = stores.get(&path).and_then(Weak::upgrade) {
+            return Ok(store);
+        }
+        // A final Arc may be dropping on another thread. Wait for its environment
+        // to close before opening the replacement, while serializing new opens.
+        if let Some(closing) = heed::env_closing_event(&path) {
+            closing.wait();
+        }
+        stores.retain(|_, store| store.strong_count() > 0);
+        let store = Arc::new(Self::open_new(&path).context("Cannot open repository index")?);
+        stores.insert(path, Arc::downgrade(&store));
+        Ok(store)
+    }
+
+    fn open_new(path: &Path) -> Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

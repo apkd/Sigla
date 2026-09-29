@@ -2,6 +2,33 @@ use sigla::{discovery::Policy, service::App};
 use std::sync::Arc;
 
 #[tokio::test]
+async fn reflection_receivers_resolve_inside_interpolation_and_loops() {
+    check(
+        r#"
+using System;
+namespace System { public class Type {} public class Object { public Type GetType() => null; } }
+static class Extensions { public static string GetNameCached(this Type value) => ""; }
+interface Item {}
+class Enumerator { public Item Current => null; public bool MoveNext() => false; }
+class Items { public Enumerator GetEnumerator() => null; }
+class Usage<T> { void Run(Items items) {
+ var text = $"{typeof(T)./*typeof*/GetNameCached()} {typeof(Item)./*second*/GetNameCached()}";
+ foreach (var item in items) { item.GetType()./*outer*/GetNameCached();
+  void Nested() { foreach (var other in items) other.GetType()./*inner*/GetNameCached(); }
+ }
+} }
+"#,
+        &[
+            ("/*typeof*/", "Extensions.GetNameCached"),
+            ("/*second*/", "Extensions.GetNameCached"),
+            ("/*outer*/", "Extensions.GetNameCached"),
+            ("/*inner*/", "Extensions.GetNameCached"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn implicit_iteration_await_and_disposal_calls_are_retrievable() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

@@ -69,6 +69,8 @@ pub struct SearchResult {
     pub source: String,
     pub language: Language,
     pub uncertain: bool,
+    pub target: Option<String>,
+    pub occurrences: BTreeSet<usize>,
 }
 
 impl SearchResult {
@@ -78,7 +80,16 @@ impl SearchResult {
             None => self.path,
         };
         let symbol = self.symbol.map(|(kind, name)| format!("{kind}:{name}"));
+        let symbol = match (symbol, self.target) {
+            (Some(caller), Some(target)) => Some(format!("{caller} → {target}")),
+            (None, target @ Some(_)) => target,
+            (symbol, None) => symbol,
+        };
         let mut text = result(symbol.as_deref(), &location, &self.source, self.language);
+        if self.occurrences.len() > 1 {
+            let end = text.find('\n').unwrap_or(text.len());
+            text.insert_str(end, &format!(" ({} occurrences)", self.occurrences.len()));
+        }
         if self.uncertain {
             text.push_str("\n\nPossible match; the target could not be determined uniquely.");
         }
@@ -114,7 +125,12 @@ pub fn excerpt(source: &str) -> String {
         return source.into();
     }
     let text = source.lines().take(12).collect::<Vec<_>>().join("\n");
-    let text: String = text.chars().take(1500).collect();
+    let mut text: String = text.chars().take(1500).collect();
+    if text.len() < source.len()
+        && let Some(end) = text.rfind('\n')
+    {
+        text.truncate(end);
+    }
     let mut text = dedent(&text);
     text.push_str("\n// ...");
     text
@@ -130,6 +146,17 @@ pub fn source_excerpt(source: &str, span: std::ops::Range<usize>) -> String {
     } else {
         excerpt(&source[span])
     }
+}
+
+pub fn declaration_excerpt(source: &str, declaration: &crate::model::Declaration) -> String {
+    if source[declaration.span.clone()].chars().count() <= 1500 {
+        return source_excerpt(source, declaration.span.clone());
+    }
+    let header = &source[declaration.header.clone()];
+    if header.chars().count() <= 1500 {
+        return format!("{}\n// ...", dedent(header));
+    }
+    source_excerpt(source, declaration.header.clone())
 }
 
 fn dedent(source: &str) -> String {
@@ -179,7 +206,7 @@ pub fn error(error: &anyhow::Error) -> String {
 pub fn omission(total: Option<usize>) -> String {
     match total {
         Some(total) => {
-            format!("More matches omitted. Repeat with `limit:{total}` to retrieve all results.")
+            format!("{total} matches in total. Narrow the query or increase `limit:` to see more.")
         }
         None => "More matches omitted. Repeat with a higher `limit:` value.".into(),
     }

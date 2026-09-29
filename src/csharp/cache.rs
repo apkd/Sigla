@@ -9,6 +9,7 @@ use std::{
 pub(super) struct Target {
     pub id: DefinitionId,
     pub file: String,
+    pub project: usize,
     pub name: String,
     pub uncertain: bool,
 }

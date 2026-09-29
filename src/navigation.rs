@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::LazyLock};
 
-#[derive(Clone, Copy, Default, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Exact,
@@ -226,6 +226,13 @@ pub fn location(path: &str) -> Result<(&str, Option<(usize, usize)>)> {
         r"^(.*?)(?::L?(\d+)(?::\d+)?(?:(?:-|\.\.)L?(\d+)(?::\d+)?)?|#L?(\d+)(?:-L?(\d+))?|\((\d+)(?:,\s*\d+)?\))$").unwrap()
     });
     let Some(c) = SUFFIX.captures(path) else {
+        if path
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| suffix.starts_with(|c: char| c.is_ascii_digit() || c == '-'))
+            || path.contains("#L")
+        {
+            anyhow::bail!("Invalid line range; use path:1-20 (1-based, inclusive)");
+        }
         return Ok((path, None));
     };
     let first = c

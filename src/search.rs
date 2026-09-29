@@ -256,6 +256,7 @@ impl<'a> Search<'a> {
             return Ok(());
         }
         let simple = simple_name(&target.name);
+        let mut parsed_parameters = None;
         let keys = match restricted_files {
             Some(files) => files.clone(),
             None => self.candidates(simple, loose, false)?,
@@ -323,12 +324,35 @@ impl<'a> Search<'a> {
                         qualified_name_rank(&target.name, compared, loose)
                     };
                     if let Some(rank) = rank {
-                        if target
-                            .parameters
-                            .as_ref()
-                            .is_some_and(|p| !signature_matches(p, &decl.parameters))
+                        if let Some(p) = &target.parameters
+                            && !signature_matches(p, &decl.parameters)
                         {
-                            continue;
+                            if file.language != Language::CSharp {
+                                continue;
+                            }
+                            if parsed_parameters.is_none() {
+                                parsed_parameters =
+                                    Some(crate::csharp::lower::query_parameters(p)?);
+                            }
+                            let view = crate::csharp::catalog::View {
+                                source: self.store,
+                                assemblies: self.assemblies,
+                                source_tx: &self.source_tx,
+                                assembly_tx: &self.assembly_tx,
+                                manifest: self.manifest,
+                                cancel: self.cancel,
+                            };
+                            if !self.csharp.signature_matches(
+                                &view,
+                                &crate::csharp::catalog::Site {
+                                    file: &key,
+                                    project: membership.project,
+                                    declaration: decl,
+                                },
+                                parsed_parameters.as_ref().unwrap(),
+                            )? {
+                                continue;
+                            }
                         }
                         visit(
                             self,
@@ -1207,6 +1231,8 @@ impl<'a> Search<'a> {
                         source: data.source[start..end].to_owned(),
                         language: file.language,
                         uncertain: false,
+                        target: None,
+                        occurrences: BTreeSet::new(),
                     },
                 );
             }
@@ -1223,6 +1249,7 @@ impl<'a> Search<'a> {
             return self.hierarchy(q, targets, inside);
         }
         let mut targets = targets.to_vec();
+        let mut local_scopes = Vec::new();
         for target in &mut targets {
             if self.manifest.files[&target.file].language == Language::CSharp {
                 let view = crate::csharp::catalog::View {
@@ -1240,8 +1267,19 @@ impl<'a> Search<'a> {
                     target.decl.name_span.start,
                     &target.decl.name,
                 )?;
+                local_scopes.push(self.csharp.local_scope(
+                    &view,
+                    &crate::csharp::catalog::Site {
+                        file: &target.file,
+                        project: target.membership.project,
+                        declaration: &target.decl,
+                    },
+                )?);
+            } else {
+                local_scopes.push(target.decl.local().then(|| target.decl.scope.clone()));
             }
         }
+        let only_local = !targets.is_empty() && local_scopes.iter().all(Option::is_some);
         let outgoing = q.target.name == "*";
         let files = self.containment_files(inside)?;
         let files = self.filtered_files(q, files);
@@ -1270,6 +1308,9 @@ impl<'a> Search<'a> {
         if let Some(files) = files {
             keys.retain(|key| files.contains(key));
         }
+        if only_local {
+            keys.retain(|key| targets.iter().any(|t| &t.file == key));
+        }
         // alias imports supply additional candidate spellings; binding still decides truth.
         for key in keys.clone() {
             let data = self.data(&key)?;
@@ -1291,9 +1332,19 @@ impl<'a> Search<'a> {
         }
         let mut units = crate::selection::Selection::new(q.limit);
         for key in keys {
+            if only_local && !targets.iter().any(|t| t.file == key) {
+                continue;
+            }
             let file = &self.manifest.files[&key];
             let data = self.data(&key)?;
             for o in &data.facts.occurrences {
+                if only_local
+                    && !targets.iter().zip(&local_scopes).any(|(t, scope)| {
+                        t.file == key && scope.as_ref().unwrap().contains(&o.span.start)
+                    })
+                {
+                    continue;
+                }
                 if (!outgoing && !names.contains(&o.name))
                     || (q.selector == "calls" && !o.call)
                     || (q.selector == "writes" && !o.write)
@@ -1313,16 +1364,12 @@ impl<'a> Search<'a> {
                     if !self.filters(q, file, m, containing.as_ref(), o.span.start, inside) {
                         continue;
                     }
-                    // Outgoing wildcard searches ask for explicit call sites, not a
-                    // particular callee. Their syntax already establishes the match.
-                    let uncertain = if outgoing {
-                        o.opaque
-                    } else {
-                        let bindings = self.bind(&key, m, o, &data)?;
-                        let relevant = bindings
-                            .iter()
-                            .filter(|(b, _)| {
-                                targets.iter().any(|t| {
+                    let bindings = self.bind(&key, m, o, &data)?;
+                    let relevant = bindings
+                        .into_iter()
+                        .filter(|(b, _)| {
+                            outgoing
+                                || targets.iter().any(|t| {
                                     self.same_domain(t, b)
                                         && (self.same_symbol(t, b)
                                             || (o.construction
@@ -1333,29 +1380,70 @@ impl<'a> Search<'a> {
                                             || (t.file == b.file
                                                 && t.decl.name_span == b.decl.name_span))
                                 })
+                        })
+                        .map(|(b, uncertain)| (Some(b), uncertain))
+                        .collect::<Vec<_>>();
+                    // Keep syntactically known outgoing calls when dependencies
+                    // are unavailable, but do not present their spelling as a binding.
+                    let relevant = if outgoing && relevant.is_empty() {
+                        vec![(None, true)]
+                    } else {
+                        relevant
+                    };
+                    for (target, uncertain) in relevant {
+                        let display = self.manifest.display(file, m);
+                        let lines = crate::render::lines(&data.source, o.span.clone());
+                        let label = target
+                            .as_ref()
+                            .map(|t| {
+                                let signature = if t.decl.callable() {
+                                    format!("({})", t.decl.parameters.join(", "))
+                                } else {
+                                    String::new()
+                                };
+                                format!("{}:{}{signature}", t.decl.kind, t.decl.qualified)
                             })
-                            .collect::<Vec<_>>();
-                        if relevant.is_empty() {
+                            .unwrap_or_else(|| format!("unresolved:{}", o.name));
+                        let identity = target
+                            .as_ref()
+                            .map(|t| {
+                                t.semantic_id
+                                    .as_ref()
+                                    .map(|id| (id.context.clone(), id.key.clone()))
+                                    .unwrap_or_else(|| {
+                                        (t.file.clone(), t.decl.name_span.start.to_string())
+                                    })
+                            })
+                            .unwrap_or_else(|| (label.clone(), o.span.start.to_string()));
+                        let rank = (
+                            uncertain,
+                            display.to_string(),
+                            lines,
+                            containing.as_ref().map(|d| d.name_span.start),
+                            identity,
+                        );
+                        if let Some(unit) = units.get_mut(&rank) {
+                            let unit: &mut crate::render::SearchResult = unit;
+                            unit.occurrences.insert(o.span.start);
                             continue;
                         }
-                        relevant.iter().all(|(_, p)| *p)
-                    };
-                    let display = self.manifest.display(file, m);
-                    let rank = (uncertain, display.to_string(), o.span.start);
-                    if !units.accepts(&rank) {
-                        continue;
+                        if !units.accepts(&rank) {
+                            continue;
+                        }
+                        let unit = crate::render::SearchResult {
+                            symbol: containing
+                                .as_ref()
+                                .map(|d| (d.kind.clone(), d.qualified.clone())),
+                            path: display.to_string(),
+                            lines: Some(lines),
+                            source: line(&data.source, o.span.start).to_owned(),
+                            language: file.language,
+                            uncertain,
+                            target: Some(label),
+                            occurrences: BTreeSet::from([o.span.start]),
+                        };
+                        units.insert(rank, unit);
                     }
-                    let unit = crate::render::SearchResult {
-                        symbol: containing
-                            .as_ref()
-                            .map(|d| (d.kind.clone(), d.qualified.clone())),
-                        path: display.to_string(),
-                        lines: Some(crate::render::lines(&data.source, o.span.clone())),
-                        source: line(&data.source, o.span.start).to_owned(),
-                        language: file.language,
-                        uncertain,
-                    };
-                    units.insert(rank, unit);
                 }
             }
         }
@@ -1702,9 +1790,11 @@ impl<'a> Search<'a> {
                 source: signature,
                 language: f.language,
                 uncertain: false,
+                target: None,
+                occurrences: BTreeSet::new(),
             })
         } else {
-            let source = crate::render::source_excerpt(&data.source, h.decl.span.clone());
+            let source = crate::render::declaration_excerpt(&data.source, &h.decl);
             Ok(crate::render::SearchResult {
                 symbol: Some((h.decl.kind.clone(), h.decl.qualified.clone())),
                 path: self.manifest.display(f, &h.membership).into_owned(),
@@ -1712,6 +1802,8 @@ impl<'a> Search<'a> {
                 source,
                 language: f.language,
                 uncertain: false,
+                target: None,
+                occurrences: BTreeSet::new(),
             })
         }
     }
@@ -1943,7 +2035,7 @@ pub(crate) fn render_selected(units: Vec<String>, total: usize) -> String {
     let mut out = units.join("\n\n").trim_end().to_owned();
     if total > shown {
         out.push_str("\n\n");
-        out.push_str(&crate::render::omission(Some(total)));
+        out.push_str(&format!("Showing {shown} of {total} matches; {} omitted. Narrow the query or increase `limit:`.", total - shown));
     }
     out
 }

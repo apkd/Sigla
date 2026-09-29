@@ -18,6 +18,7 @@ struct WorkspaceSlot {
     state: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     used: Instant,
 }
+#[derive(Debug)]
 enum Request {
     Search(String),
     Browse(String),
@@ -101,7 +102,7 @@ impl App {
         ownership
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
-        let assemblies = Arc::new(crate::store::Store::open(&cache.join("assemblies"))?);
+        let assemblies = crate::store::Store::open(&cache.join("assemblies"))?;
         Ok(Self {
             _ownership: ownership,
             policy,
@@ -286,7 +287,10 @@ impl App {
 
     async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<String> {
         let query = match &request {
-            Request::Search(query) => Some(Query::parse(query)?),
+            Request::Search(query) => Some(
+                Query::parse(query)
+                    .map_err(|error| anyhow::anyhow!("Invalid search query: {error}"))?,
+            ),
             _ => None,
         };
         self.ready().await?;
@@ -677,6 +681,7 @@ file:src/**/*.cs"#,
     }
 }
 impl Mcp {
+    #[tracing::instrument(skip(self, context), fields(request_id = ?context.id))]
     async fn execute(
         &self,
         project: &str,
@@ -719,7 +724,10 @@ impl Mcp {
         };
         match result {
             Ok(result) => result,
-            Err(e) => CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))]),
+            Err(e) => {
+                tracing::error!(project, error = %format!("{e:#}"), "Tool request failed");
+                CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))])
+            }
         }
     }
 }

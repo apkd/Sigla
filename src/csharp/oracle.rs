@@ -48,7 +48,7 @@ fn compiler_agrees_on_source_and_framework_generic_chains() {
         "<Project><PropertyGroup><AssemblyName>Fixture</AssemblyName></PropertyGroup><ItemGroup><Compile Include=\"Source.cs\"/>{references}</ItemGroup></Project>",
     )).unwrap();
     let policy = Policy::new(vec![PathBuf::from("/")]).unwrap();
-    let assemblies = Arc::new(Store::open(&cache.path().join("assemblies")).unwrap());
+    let assemblies = Store::open(&cache.path().join("assemblies")).unwrap();
     let mut workspace = Workspace::open(
         directory.path().into(),
         cache.path(),

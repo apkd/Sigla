@@ -15,7 +15,7 @@ fn body_only_refresh_reuses_binding_but_refreshes_target_location() {
         root.path().into(),
         cache.path(),
         Policy::new(vec![root.path().into()]).unwrap(),
-        Arc::new(Store::open(&cache.path().join("assemblies")).unwrap()),
+        Store::open(&cache.path().join("assemblies")).unwrap(),
         Arc::new(crate::watch::Monitor::default()),
     )
     .unwrap();

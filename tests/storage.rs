@@ -8,6 +8,27 @@ use std::sync::{
 };
 
 #[test]
+fn concurrent_opens_share_a_store_and_can_reopen_after_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let barrier = Barrier::new(8);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    Store::open(dir.path()).unwrap()
+                })
+            })
+            .collect();
+        let stores: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for store in &stores {
+            assert!(std::sync::Arc::ptr_eq(&stores[0], store));
+        }
+    });
+    Store::open(dir.path()).unwrap().read().unwrap();
+}
+
+#[test]
 fn reader_keeps_source_and_declarations_from_one_revision() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
@@ -71,7 +92,7 @@ fn running_search_keeps_its_revision_while_workspace_publishes_an_edit() {
         root.path().into(),
         cache.path(),
         Policy::new(vec![root.path().into()]).unwrap(),
-        Arc::new(Store::open(&cache.path().join("assemblies")).unwrap()),
+        Store::open(&cache.path().join("assemblies")).unwrap(),
         Arc::new(sigla::watch::Monitor::default()),
     )
     .unwrap();

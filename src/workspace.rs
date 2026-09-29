@@ -145,7 +145,7 @@ impl Workspace {
         ))?)
         .to_hex()
         .to_string();
-        let store = Arc::new(Store::open(&cache.join(key))?);
+        let store = Store::open(&cache.join(key))?;
         let manifest = store.get_manifest()?.unwrap_or_default();
         Ok(Self {
             entry,

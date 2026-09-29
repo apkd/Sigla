@@ -4,6 +4,33 @@ use crate::model::Declaration;
 use std::collections::HashMap;
 use tree_sitter::Node;
 
+pub fn query_parameters(parameters: &[String]) -> anyhow::Result<Vec<Parameter>> {
+    let source = format!(
+        "class Query {{ void Match({}) {{}} }}",
+        parameters
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{p} p{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow::anyhow!("Cannot parse signature"))?;
+    anyhow::ensure!(!tree.root_node().has_error(), "Invalid parameter signature");
+    let class = child(tree.root_node(), "class_declaration").unwrap();
+    let body = child(class, "declaration_list").unwrap();
+    let method = child(body, "method_declaration").unwrap();
+    let list = method.child_by_field_name("parameters").unwrap();
+    Ok(children(list)
+        .into_iter()
+        .filter(|n| n.kind() == "parameter")
+        .map(|n| parameter(n, &source))
+        .collect())
+}
+
 /// Postorder lowering gives children stable arena IDs without recursive traversal.
 pub fn bodies(root: Node<'_>, source: &str, syntax: &mut FileSyntax) {
     let mut ids = HashMap::new();
@@ -44,6 +71,7 @@ pub fn bodies(root: Node<'_>, source: &str, syntax: &mut FileSyntax) {
             .unwrap_or_default()
         };
         let kind = match node.kind() {
+            "typeof_expression" => Some(ExpressionKind::TypeOf),
             "declaration_expression" => Some(ExpressionKind::OutVariable {
                 name: node
                     .child_by_field_name("name")

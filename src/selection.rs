@@ -29,6 +29,9 @@ impl<K: Ord + Clone, V> Selection<K, V> {
         }
         true
     }
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
     pub fn insert(&mut self, key: K, unit: V) {
         if !self.accepts(&key) {
             return;
