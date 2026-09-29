@@ -174,7 +174,10 @@ impl Manager {
         let mut running = {
             let mut operations = self.default_running.lock().unwrap();
             let reuse = operations.get(&key).is_some_and(|(started, receive)| {
-                receive.borrow().is_none() || now().saturating_sub(*started) < 30_000
+                let outcome = receive.borrow();
+                outcome.is_none()
+                    || outcome.as_ref().is_some_and(Result::is_ok)
+                        && now().saturating_sub(*started) < 30_000
             });
             if !reuse {
                 let (send, receive) = watch::channel(None);
@@ -186,6 +189,7 @@ impl Manager {
                     let result = async {
                         let request = Request {
                             repository: repository.transport.clone(),
+                            preferred_transport: None,
                             target: Target::DefaultBranch,
                             store: PathBuf::new(),
                             staging: PathBuf::new(),
@@ -250,7 +254,7 @@ impl Manager {
                 if now().saturating_sub(state.refreshed)
                     >= self.options.refresh_interval.as_millis() as u64
                 {
-                    self.schedule(branch.clone());
+                    self.schedule(branch.clone(), false);
                 }
             }
         }
@@ -359,7 +363,7 @@ impl Manager {
         });
         drop(state);
         if !usable || due {
-            self.schedule(branch.clone());
+            self.schedule(branch.clone(), !usable);
         }
         if !usable {
             let mut running = branch
@@ -382,10 +386,10 @@ impl Manager {
         Ok(branch)
     }
 
-    fn schedule(self: &Arc<Self>, branch: Arc<Branch>) {
+    fn schedule(self: &Arc<Self>, branch: Arc<Branch>, requested: bool) {
         let mut operation = branch.running.lock().unwrap();
         if operation.as_ref().is_some_and(|r| r.borrow().is_none())
-            || now() < branch.retry_after.load(Ordering::Relaxed)
+            || !requested && now() < branch.retry_after.load(Ordering::Relaxed)
         {
             return;
         }
@@ -429,6 +433,7 @@ impl Manager {
             .tempdir_in(&branch.root)?;
         let request = Request {
             repository: branch.repository.transport.clone(),
+            preferred_transport: None,
             target: Target::Commit(revision.to_owned()),
             store: branch.root.join("git"),
             staging: stage.path().to_owned(),
@@ -503,6 +508,7 @@ impl Manager {
             .unwrap_or_default();
         let request = Request {
             repository: branch.repository.transport.clone(),
+            preferred_transport: None,
             target: Target::Branch(branch.name.clone()),
             store: replacement
                 .as_ref()

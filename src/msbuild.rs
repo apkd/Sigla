@@ -319,12 +319,13 @@ pub fn discover_in(
             if !result.status.success() {
                 let stdout = restore_log_tail(&mut log)
                     .unwrap_or_else(|error| format!("Cannot read restore log: {error}"));
+                let stderr = diagnostic_tail(&result.stderr);
+                tracing::warn!(project = %entry.display(), status = %result.status, %stdout, %stderr, "Dependency restore failed");
+                let detail = format!("{stdout}\n{stderr}");
                 anyhow::bail!(
-                    "Dependency restore failed for {} ({}).\nstdout:\n{}\nstderr:\n{}",
+                    "Dependency restore failed for {}: {}",
                     entry.display(),
-                    result.status,
-                    stdout,
-                    diagnostic_tail(&result.stderr),
+                    restore_reason(&detail),
                 );
             }
             if let Some(sandbox) = &sandbox {
@@ -336,6 +337,18 @@ pub fn discover_in(
 }
 
 const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+
+fn restore_reason(detail: &str) -> &'static str {
+    if detail.contains("UntrustedRoot") || detail.contains("certificate chain") {
+        "TLS certificate trust failed"
+    } else if detail.contains("NU1301") {
+        "package feed is unavailable"
+    } else if detail.contains("NU1101") || detail.contains("NU1102") {
+        "a required package or version was not found"
+    } else {
+        "see server logs for details"
+    }
+}
 
 fn diagnostic_tail(bytes: &[u8]) -> String {
     let start = bytes.len().saturating_sub(DIAGNOSTIC_LIMIT);
@@ -406,6 +419,14 @@ fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> R
 
 #[cfg(test)]
 mod diagnostic_tests {
+    #[test]
+    fn restore_summaries_keep_the_cause_without_repeating_logs() {
+        let verbose = "error NU1301: Unable to load service index\nThe SSL connection could not be established: UntrustedRoot\n".repeat(100);
+        let summary = super::restore_reason(&verbose);
+        assert!(summary.contains("certificate"));
+        assert!(!summary.contains('\n'));
+        assert!(summary.len() < verbose.len());
+    }
     use super::*;
     use std::io::Write;
 

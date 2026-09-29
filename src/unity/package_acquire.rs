@@ -277,6 +277,7 @@ impl GitSource {
             let sources = stage.path().join("sources");
             let request = crate::repository::materialize::Request {
                 repository: self.repository.transport.clone(),
+                preferred_transport: None,
                 target: crate::repository::materialize::Target::Commit(self.commit.clone()),
                 store: stage.path().join("git"),
                 staging: sources.clone(),

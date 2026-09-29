@@ -71,6 +71,60 @@ class Task {
 }
 
 #[tokio::test]
+async fn top_level_calls_resolve_sibling_forward_and_shadowed_functions() {
+    let source = r#"
+Start();
+void Start() { Configure(); Create(1); Nested(); }
+void Configure() { }
+int Create(int value) => value;
+void Nested() { void Configure() { } Configure(); }
+"#;
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Test.csproj"),
+        "<Project><ItemGroup><Compile Include=\"Program.cs\" /></ItemGroup></Project>",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("Program.cs"), source).unwrap();
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap(),
+    );
+    let project = root.path().to_str().unwrap();
+    for name in ["Start", "Create", "Configure"] {
+        let result = app
+            .search(project, &format!("calls:{name} path:Program.cs"))
+            .await
+            .unwrap();
+        assert!(result.contains(&format!("{name}(")), "{result}");
+    }
+    let outgoing = app
+        .search(project, "calls:* in:Start path:Program.cs")
+        .await
+        .unwrap();
+    assert!(
+        outgoing.contains("Configure()") && outgoing.contains("Create(1)"),
+        "{outgoing}"
+    );
+    let top = app.search(project, "calls:@Program.cs:4:6").await.unwrap();
+    assert!(top.contains("Start() { Configure();"), "{top}");
+    assert!(!top.contains("void Nested()"), "{top}");
+    check(
+        source,
+        &[
+            ("void Start() { ", "Configure"),
+            ("void Nested() { void Configure() { } ", "Nested.Configure"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn partial_bases_keep_their_own_import_context() {
     check_extra(r#"
 partial class Split<T> { }

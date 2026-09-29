@@ -295,6 +295,9 @@ impl<'a> Search<'a> {
                     }
                 }
                 for decl in declarations.iter() {
+                    if decl.kind == "scope" {
+                        continue;
+                    }
                     if !loose && !simple.contains('*') && decl.name != simple {
                         continue;
                     }
@@ -916,11 +919,43 @@ impl<'a> Search<'a> {
             return self.text(q, &inside);
         }
         if q.relationship() {
-            let targets = if q.selector == "calls" && q.target.name == "*" {
+            let mut targets = if q.selector == "calls" && q.target.name == "*" {
                 Vec::new()
             } else {
                 self.declarations(&q.target, q.loose)?
             };
+            let files = self.containment_files(&inside)?;
+            let files = self.filtered_files(q, files);
+            let contexts: Vec<_> = self
+                .manifest
+                .files
+                .iter()
+                .filter(|(key, file)| {
+                    !file.metadata && files.as_ref().is_none_or(|files| files.contains(*key))
+                })
+                .flat_map(|(_, file)| {
+                    file.memberships
+                        .iter()
+                        .filter(|m| {
+                            q.filters.iter().filter(|f| f.key == "project").all(|f| {
+                                wildcard(&f.value, &self.manifest.projects[m.project].name)
+                                    != f.negate
+                            })
+                        })
+                        .map(|m| (file.language, m.project))
+                })
+                .collect();
+            targets.retain(|target| {
+                contexts.iter().any(|&(language, project)| {
+                    let file = &self.manifest.files[&target.file];
+                    file.language == language
+                        && if file.metadata {
+                            self.manifest.metadata_visible(file, project)
+                        } else {
+                            self.visible(project, target.membership.project)
+                        }
+                })
+            });
             return self.relationship(q, &targets, &inside);
         }
         let mut units = crate::selection::Selection::new(q.limit);
@@ -1255,7 +1290,9 @@ impl<'a> Search<'a> {
                         .facts
                         .declarations
                         .iter()
-                        .filter(|d| !d.local() && d.span.contains(&o.span.start))
+                        .filter(|d| {
+                            !d.local() && d.kind != "scope" && d.span.contains(&o.span.start)
+                        })
                         .min_by_key(|d| d.span.end - d.span.start)
                         .map(|d| contextual(d, m));
                     if !self.filters(q, file, m, containing.as_ref(), o.span.start, inside) {
@@ -1322,6 +1359,9 @@ impl<'a> Search<'a> {
         targets: &[Hit],
         inside: &[(bool, Vec<Hit>)],
     ) -> Result<String> {
+        if targets.is_empty() {
+            return Ok("No matches.".into());
+        }
         if q.selector == "derived"
             && targets
                 .iter()
@@ -1357,6 +1397,19 @@ impl<'a> Search<'a> {
                     },
                     false,
                 )? {
+                    let f = &self.manifest.files[&candidate.file];
+                    if f.language != self.manifest.files[&target.file].language
+                        || !self.filters(
+                            q,
+                            f,
+                            &candidate.membership,
+                            Some(&candidate.decl),
+                            candidate.decl.name_span.start,
+                            inside,
+                        )
+                    {
+                        continue;
+                    }
                     if !candidate.decl.callable()
                         || candidate.decl.owner == target.decl.owner
                         || (!interface && !candidate.decl.modifiers.iter().any(|m| m == "override"))
@@ -1389,16 +1442,6 @@ impl<'a> Search<'a> {
                         }
                     }
                     let f = &self.manifest.files[&candidate.file];
-                    if !self.filters(
-                        q,
-                        f,
-                        &candidate.membership,
-                        Some(&candidate.decl),
-                        candidate.decl.name_span.start,
-                        inside,
-                    ) {
-                        continue;
-                    }
                     let rank = (
                         self.manifest.display(f, &candidate.membership).into_owned(),
                         candidate.decl.name_span.start,
@@ -1412,45 +1455,81 @@ impl<'a> Search<'a> {
         }
         let mut selected = targets.to_vec();
         let mut units = crate::selection::Selection::new(q.limit);
-        let mut seen: BTreeSet<_> = targets
+        // C# binding follows transitive bases from each eligible result; traversing
+        // every descendant first defeats path filters and repeats the same work.
+        let csharp_targets: Vec<_> = targets
             .iter()
-            .map(|h| (h.file.clone(), h.decl.name_span.start, h.membership.project))
+            .filter(|t| self.manifest.files[&t.file].language == Language::CSharp)
             .collect();
-        loop {
-            let mut added = Vec::new();
-            let names: BTreeSet<_> = selected.iter().map(|h| h.decl.name.as_str()).collect();
-            let csharp = selected
-                .iter()
-                .all(|h| self.manifest.files[&h.file].language == Language::CSharp);
-            let mut candidate_files = BTreeSet::new();
-            if csharp {
-                for target in &selected {
-                    candidate_files.extend(self.candidates(
-                        &format!("@base:{}", target.decl.name),
-                        false,
-                        false,
-                    )?);
-                    for alias_file in
-                        self.candidates(&format!("@alias:{}", target.decl.name), false, false)?
-                    {
-                        let data = self.data(&alias_file)?;
-                        for import in &data.facts.imports {
-                            if !import.alias.is_empty()
-                                && (type_path(&import.path) == type_path(&target.decl.qualified)
-                                    || import.path == target.decl.name)
+        if !csharp_targets.is_empty() {
+            let candidates = self.hierarchy_candidates(&csharp_targets)?;
+            let files = self.containment_files(inside)?;
+            let files = self.filtered_files(q, files);
+            for (key, file) in &self.manifest.files {
+                if file.language != Language::CSharp
+                    || files.as_ref().is_some_and(|files| !files.contains(key))
+                {
+                    continue;
+                }
+                let Some(positions) = candidates.get(key) else {
+                    continue;
+                };
+                let declarations = self.summary(key)?;
+                for decl in declarations.iter().filter(|d| {
+                    positions.contains(&d.name_span.start)
+                        && !matches!(d.kind.as_str(), "interface" | "trait")
+                }) {
+                    for membership in &file.memberships {
+                        if !self.filters(
+                            q,
+                            file,
+                            membership,
+                            Some(decl),
+                            decl.name_span.start,
+                            inside,
+                        ) {
+                            continue;
+                        }
+                        let candidate = Hit {
+                            semantic_id: None,
+                            file: key.clone(),
+                            membership: membership.clone(),
+                            decl: contextual(decl, membership),
+                            rank: 0,
+                        };
+                        for target in &csharp_targets {
+                            if (q.selector != "derived"
+                                || candidate.decl.kind == "class" && target.decl.kind == "class")
+                                && self.base_matches(&candidate, target)?
                             {
-                                candidate_files.extend(self.candidates(
-                                    &format!("@base:{}", import.alias),
-                                    false,
-                                    false,
-                                )?);
+                                let rank = (
+                                    file.metadata,
+                                    self.manifest.display(file, membership).into_owned(),
+                                    decl.name_span.start,
+                                );
+                                if units.accepts(&rank) {
+                                    units.insert(rank, self.declaration_unit(&candidate)?);
+                                }
+                                break;
                             }
                         }
                     }
                 }
             }
+        }
+        selected.retain(|t| self.manifest.files[&t.file].language == Language::Rust);
+        let mut seen: BTreeSet<_> = targets
+            .iter()
+            .map(|h| (h.file.clone(), h.decl.name_span.start, h.membership.project))
+            .collect();
+        loop {
+            if selected.is_empty() {
+                break;
+            }
+            let mut added = Vec::new();
+            let names: BTreeSet<_> = selected.iter().map(|h| h.decl.name.as_str()).collect();
             for (key, file) in &self.manifest.files {
-                if csharp && !candidate_files.contains(key) {
+                if file.language != Language::Rust {
                     continue;
                 }
                 self.check()?;
@@ -1468,13 +1547,9 @@ impl<'a> Search<'a> {
                     key,
                 )?;
                 for declaration in declarations.iter().filter(|d| {
-                    if csharp {
-                        !d.bases.is_empty()
-                    } else {
-                        d.bases.iter().any(|base| {
-                            names.contains(simple_name(base.split('<').next().unwrap_or(base)))
-                        })
-                    }
+                    d.bases.iter().any(|base| {
+                        names.contains(simple_name(base.split('<').next().unwrap_or(base)))
+                    })
                 }) {
                     for membership in &file.memberships {
                         if seen.contains(&(
@@ -1537,6 +1612,49 @@ impl<'a> Search<'a> {
             selected = added;
         }
         Ok(units.finish())
+    }
+    fn hierarchy_candidates(
+        &mut self,
+        targets: &[&Hit],
+    ) -> Result<BTreeMap<String, BTreeSet<usize>>> {
+        let mut pending: Vec<_> = targets.iter().map(|t| t.decl.name.clone()).collect();
+        let mut seen = BTreeSet::new();
+        let mut result: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        while let Some(name) = pending.pop() {
+            self.check()?;
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            for key in self.candidates(&format!("@alias:{name}"), false, false)? {
+                if self.manifest.files[&key].language != Language::CSharp {
+                    continue;
+                }
+                for import in &self.data(&key)?.facts.imports {
+                    if !import.alias.is_empty() && simple_name(&type_path(&import.path)) == name {
+                        pending.push(import.alias.clone());
+                    }
+                }
+            }
+            for key in self.candidates(&format!("@base:{name}"), false, false)? {
+                if self.manifest.files[&key].language != Language::CSharp {
+                    continue;
+                }
+                for declaration in self.summary(&key)?.iter().filter(|d| d.named_type()) {
+                    if declaration
+                        .bases
+                        .iter()
+                        .any(|base| simple_name(&type_path(base)) == name)
+                    {
+                        result
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(declaration.name_span.start);
+                        pending.push(declaration.name.clone());
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
     fn declaration_unit(&mut self, h: &Hit) -> Result<String> {
         let f = &self.manifest.files[&h.file];

@@ -11,6 +11,54 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn implementation_filters_keep_external_ancestors_and_separate_languages() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Dotnet/Test.csproj",
+        "<Project><ItemGroup><Compile Include=\"Base.cs\"/><Compile Include=\"Leaf.cs\"/></ItemGroup></Project>",
+    );
+    write(
+        root.path(),
+        "Dotnet/Base.cs",
+        "public interface Contract { void Run(); } public class Parent : Contract { public virtual void Run() {} } public interface Read {} public class Reader: Read {}",
+    );
+    write(
+        root.path(),
+        "Dotnet/Leaf.cs",
+        "using Alias = Parent; public class Leaf : Alias { public override void Run() {} }",
+    );
+    write(
+        root.path(),
+        "Rust/Cargo.toml",
+        "[package]\nname='rust_fixture'\nversion='0.1.0'\n",
+    );
+    write(
+        root.path(),
+        "Rust/src/lib.rs",
+        "pub trait Read {} pub struct Reader; impl Read for Reader {}",
+    );
+    let app = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    for query in [
+        "impl:Contract path:Dotnet/Leaf.cs",
+        "impl:Contract.Run path:Dotnet/Leaf.cs",
+        "derived:Parent path:Dotnet/Leaf.cs",
+    ] {
+        let result = app.search(project, query).await.unwrap();
+        assert!(result.contains("Leaf"), "{query}: {result}");
+        assert!(!result.contains("Base.cs:"), "{result}");
+    }
+    let rust = app
+        .search(project, "impl:Read path:Rust/src/lib.rs")
+        .await
+        .unwrap();
+    assert!(rust.contains("Reader") && rust.contains("rust"), "{rust}");
+    assert!(!rust.contains("Dotnet/"), "{rust}");
+}
+
+#[tokio::test]
 async fn missing_dependency_and_oversized_source_preserve_other_projects() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

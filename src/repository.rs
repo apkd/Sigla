@@ -81,12 +81,21 @@ impl Repository {
     /// Local paths, including paths containing '#', return None unchanged.
     /// A malformed remote name is an error rather than a local-path fallback.
     pub fn parse(input: &str) -> Result<Option<Self>> {
+        let input = input.trim();
+        let expanded;
+        let input = if input.to_ascii_lowercase().starts_with("github.com/") {
+            expanded = format!("https://{input}");
+            expanded.as_str()
+        } else {
+            input
+        };
         if !looks_remote(input) {
             return Ok(None);
         }
         let (transport, fragment) = input
             .split_once('#')
             .map_or((input, None), |(a, b)| (a, Some(b)));
+        let transport = transport.trim_end_matches('/');
         let branch = fragment.map(decode).transpose()?;
         if let Some(branch) = &branch {
             validate_branch(branch)?;
@@ -96,6 +105,39 @@ impl Repository {
             transport: transport.to_owned(),
             branch,
         }))
+    }
+
+    pub fn project(input: &str, remote: bool) -> Result<Option<Self>> {
+        if let Some(repository) = Self::parse(input)? {
+            return Ok(Some(repository));
+        }
+        let input = input.trim();
+        let path = input.split_once('#').map_or(input, |(path, _)| path);
+        if remote
+            && !std::path::Path::new(input).exists()
+            && !path.starts_with('.')
+            && path.split('/').count() == 2
+            && !path.starts_with('/')
+        {
+            return Self::parse(&format!("https://github.com/{input}"));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn transports(&self, preferred: Option<&str>) -> Vec<String> {
+        let mut transports = if self.identity.endpoint == Endpoint::Github {
+            let path = self.identity.components.join("/");
+            vec![
+                format!("https://github.com/{path}.git"),
+                format!("git@github.com:{path}.git"),
+            ]
+        } else {
+            vec![self.transport.clone()]
+        };
+        if let Some(index) = preferred.and_then(|p| transports.iter().position(|t| t == p)) {
+            transports.swap(0, index);
+        }
+        transports
     }
 }
 
@@ -360,6 +402,36 @@ mod tests {
             assert_eq!(parsed.identity, canonical);
             assert_eq!(parsed.transport, input);
         }
+    }
+
+    #[test]
+    fn common_github_inputs_share_access_candidates() {
+        let expected = repo("https://github.com/owner/repo.git");
+        for input in [
+            "ssh://git@github.com/Owner/Repo.git",
+            "https://github.com/Owner/Repo",
+            "Owner/Repo",
+            "git@github.com:Owner/Repo.git",
+            "https://github.com/Owner/Repo.git",
+            " github.com/Owner/Repo/ ",
+        ] {
+            let parsed = Repository::project(input, true).unwrap().unwrap();
+            assert_eq!(parsed.identity, expected.identity, "{input}");
+            assert_eq!(parsed.transports(None), expected.transports(None));
+            assert!(parsed.transports(None)[0].starts_with("https://"));
+        }
+        assert!(Repository::project("Owner/Repo", false).unwrap().is_none());
+        assert!(Repository::project("./Owner/Repo", true).unwrap().is_none());
+        let candidates = expected.transports(None);
+        assert_eq!(expected.transports(Some(&candidates[1]))[0], candidates[1]);
+        assert_eq!(
+            expected.transports(Some("https://untrusted.invalid/repo")),
+            candidates
+        );
+        let branch = Repository::project("Owner/Repo#Feature/topic", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch.branch.as_deref(), Some("Feature/topic"));
     }
 
     #[test]

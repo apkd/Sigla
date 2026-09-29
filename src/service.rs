@@ -19,7 +19,7 @@ struct WorkspaceSlot {
     used: Instant,
 }
 enum Request {
-    Search(Query),
+    Search(String),
     Browse(String),
     View(String, crate::navigation::Mode),
 }
@@ -33,6 +33,7 @@ pub struct App {
     assemblies: Arc<crate::store::Store>,
     monitor: Arc<crate::watch::Monitor>,
     remote: Option<Arc<crate::repository::manager::Manager>>,
+    upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
 }
 impl App {
@@ -41,11 +42,11 @@ impl App {
         path: &str,
         request: Request,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<String> {
+    ) -> Result<CallToolResult> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => anyhow::bail!("Query cancelled"),
-            result = self.request(path, request) => result,
+            result = self.dispatch(path, request) => result,
         }
     }
     fn trim_idle(&self) {
@@ -110,6 +111,7 @@ impl App {
             assemblies,
             monitor: Arc::new(crate::watch::Monitor::default()),
             remote: None,
+            upstream: None,
             startup: Mutex::new(None),
         })
     }
@@ -124,6 +126,25 @@ impl App {
         let manager = crate::repository::manager::Manager::new(cache, options)?;
         app.remote = Some(manager);
         Ok(app)
+    }
+
+    pub fn hybrid(
+        policy: Policy,
+        cache: PathBuf,
+        workers: usize,
+        endpoint: &str,
+        token_file: Option<&Path>,
+    ) -> Result<Self> {
+        let upstream = crate::upstream::Upstream::new(endpoint, token_file)?;
+        let mut app = Self::new(policy, cache, workers)?;
+        app.upstream = Some(upstream);
+        Ok(app)
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(upstream) = &self.upstream {
+            upstream.shutdown().await;
+        }
     }
 
     pub fn start_setup(self: &Arc<Self>) {
@@ -212,27 +233,65 @@ impl App {
     }
     pub async fn search(self: &Arc<Self>, path: &str, query: &str) -> Result<String> {
         ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit");
-        self.request(path, Request::Search(Query::parse(query)?))
-            .await
+        result_text(self.dispatch(path, Request::Search(query.into())).await?)
     }
     pub async fn browse(self: &Arc<Self>, project: &str, path: &str) -> Result<String> {
-        self.request(project, Request::Browse(path.into())).await
+        result_text(self.dispatch(project, Request::Browse(path.into())).await?)
     }
     pub async fn view(self: &Arc<Self>, project: &str, path: &str, mode: &str) -> Result<String> {
-        self.request(project, Request::View(path.into(), mode.parse()?))
-            .await
+        result_text(
+            self.dispatch(project, Request::View(path.into(), mode.parse()?))
+                .await?,
+        )
     }
-    async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<String> {
+    async fn dispatch(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
         ensure!(path.len() <= 4096, "Project exceeds request size limit");
         match &request {
             Request::Browse(path) | Request::View(path, _) => {
                 ensure!(path.len() <= 4096, "Path exceeds request size limit")
             }
-            Request::Search(_) => (),
+            Request::Search(query) => {
+                ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit")
+            }
         }
+        if let Some(upstream) = &self.upstream {
+            if let Some(repository) = crate::repository::Repository::project(path, true)? {
+                let mut project = repository.transport;
+                if let Some(branch) = repository.branch {
+                    project.push('#');
+                    project.push_str(&branch);
+                }
+                let (name, args) = match request {
+                    Request::Search(query) => (
+                        "search",
+                        serde_json::json!({"project":project,"query":query}),
+                    ),
+                    Request::Browse(path) => {
+                        ("browse", serde_json::json!({"project":project,"path":path}))
+                    }
+                    Request::View(path, mode) => (
+                        "view",
+                        serde_json::json!({"project":project,"path":path,"mode":match mode {
+                            crate::navigation::Mode::Exact => "exact",
+                            crate::navigation::Mode::Minified => "minified",
+                        }}),
+                    ),
+                };
+                return upstream.call(name, args.as_object().unwrap().clone()).await;
+            }
+        }
+        let text = self.request(path, request).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<String> {
+        let query = match &request {
+            Request::Search(query) => Some(Query::parse(query)?),
+            _ => None,
+        };
         self.ready().await?;
         self.expire_idle().await?;
-        let repository = crate::repository::Repository::parse(path)?;
+        let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
         let branch = match repository {
             Some(repository) => Some(
                 self.remote
@@ -448,14 +507,23 @@ impl App {
                 drop(state);
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
                 let mut text = match request {
-                    Request::Search(query) if query.selector == "file" => {
-                        search.files(&query, root)
+                    Request::Search(_) => {
+                        let query = query.as_ref().unwrap();
+                        if query.selector == "file" {
+                            search.files(query, root)
+                        } else {
+                            search.run(query)
+                        }
                     }
-                    Request::Search(query) => search.run(&query),
                     Request::Browse(path) => search.browse(root, &path, allow_absolute),
                     Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
                 }?;
-                for diagnostic in &manifest.diagnostics {
+                let mut diagnostics = std::collections::HashSet::new();
+                for diagnostic in manifest
+                    .diagnostics
+                    .iter()
+                    .filter(|d| diagnostics.insert(d.as_str()))
+                {
                     text.push_str("\n\n");
                     text.push_str(diagnostic);
                 }
@@ -471,6 +539,17 @@ impl App {
         guard.disarm();
         result
     }
+}
+
+fn result_text(result: CallToolResult) -> Result<String> {
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ensure!(result.is_error != Some(true), "{text}");
+    Ok(text)
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -557,14 +636,8 @@ file:src/**/*.cs"#,
         Parameters(args): Parameters<Arguments>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        let request = (|| {
-            ensure!(
-                args.query.len() <= 16 * 1024,
-                "Query exceeds request size limit"
-            );
-            Ok(Request::Search(Query::parse(&args.query)?))
-        })();
-        self.execute(&args.project, request, context).await
+        self.execute(&args.project, Ok(Request::Search(args.query)), context)
+            .await
     }
 
     #[tool(
@@ -639,7 +712,7 @@ impl Mcp {
             error = heartbeat => Err(error),
         };
         match result {
-            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Ok(result) => result,
             Err(e) => CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))]),
         }
     }
@@ -799,6 +872,10 @@ mod tests {
             )
             .unwrap(),
         );
+        // Measure cancellation of queued work independently of cold .NET discovery.
+        app.search(root.path().to_str().unwrap(), "type:X limit:1")
+            .await
+            .unwrap();
         let permit = app.workers.clone().acquire_owned().await.unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         let request = {
@@ -806,12 +883,8 @@ mod tests {
             let path = root.path().to_str().unwrap().to_owned();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                app.request_cancellable(
-                    &path,
-                    Request::Search(Query::parse("type:X limit:1").unwrap()),
-                    &cancel,
-                )
-                .await
+                app.request_cancellable(&path, Request::Search("type:X limit:1".into()), &cancel)
+                    .await
             })
         };
         tokio::task::yield_now().await;

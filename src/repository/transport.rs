@@ -1,33 +1,166 @@
 //! Git wire operations. A pack is requested only after the same session advertises filtering.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use gix_protocol::{
     fetch::{self, negotiate},
     handshake::Ref,
 };
+use gix_transport::IsSpuriousError;
 use gix_transport::client::blocking_io::{self, Transport};
 use std::{io::Write, path::Path, sync::atomic::AtomicBool, time::Duration};
 
 pub struct Session {
     transport: Box<dyn Transport + Send>,
     handshake: gix_protocol::Handshake,
+    pub endpoint: Option<String>,
 }
 
 fn agent() -> gix_protocol::command::Feature {
     ("agent", Some("sigla".into()))
 }
 
+fn alternatives<T>(
+    endpoints: &[String],
+    mut connect: impl FnMut(&str) -> Result<T>,
+) -> Result<(T, String)> {
+    let mut failures = Vec::new();
+    for endpoint in endpoints {
+        let mut result = connect(endpoint);
+        if result.as_ref().is_err_and(transient) {
+            std::thread::sleep(Duration::from_millis(250));
+            result = connect(endpoint);
+        }
+        match result {
+            Ok(session) => return Ok((session, endpoint.clone())),
+            Err(error) => failures.push(format!(
+                "{}: {}",
+                if endpoint.starts_with("https:") {
+                    "HTTPS"
+                } else {
+                    "SSH"
+                },
+                failure_reason(&error)
+            )),
+        }
+    }
+    anyhow::bail!("{}", failures.join("; "))
+}
+
+fn transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|error| {
+        error
+            .downcast_ref::<gix_protocol::handshake::Error>()
+            .is_some_and(IsSpuriousError::is_spurious)
+            || error
+                .downcast_ref::<gix_transport::client::Error>()
+                .is_some_and(IsSpuriousError::is_spurious)
+            || error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(IsSpuriousError::is_spurious)
+    })
+}
+
+// Do not return raw transport errors: they can contain credential URLs or helper output.
+fn failure_reason(error: &anyhow::Error) -> &'static str {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("certificate")
+        || message.contains("unknownissuer")
+        || message.contains("untrustedroot")
+    {
+        "certificate verification failed"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "connection timed out"
+    } else if message.contains("resolve") || message.contains("dns") {
+        "host lookup failed"
+    } else if message.contains("404")
+        || message.contains("not found")
+        || message.contains("notfound")
+    {
+        "repository unavailable or authentication required"
+    } else if message.contains("401")
+        || message.contains("403")
+        || message.contains("permission denied")
+        || message.contains("authentication")
+        || message.contains("credential")
+    {
+        "authentication failed or access denied"
+    } else if message.contains("redirect") {
+        "repository redirected to another address"
+    } else if message.contains("host key") {
+        "SSH host key verification failed"
+    } else if transient(error) {
+        "temporary connection or server failure"
+    } else if message.contains("connection") {
+        "connection failed"
+    } else {
+        "Git protocol negotiation failed"
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn falls_back_and_retries_only_transient_errors() {
+        let endpoints = vec![
+            "https://example.invalid/repo".into(),
+            "git@example.invalid:repo".into(),
+        ];
+        let mut calls = Vec::new();
+        let (_, selected) = alternatives(&endpoints, |endpoint| {
+            calls.push(endpoint.to_owned());
+            if endpoint.starts_with("https:") {
+                anyhow::bail!("authentication required");
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, endpoints);
+        assert_eq!(selected, endpoints[1]);
+        let mut attempts = 0;
+        alternatives(&endpoints, |_| {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+    #[test]
+    fn failure_output_identifies_causes_without_echoing_credentials() {
+        let error = alternatives::<()>(&["https://example.invalid/repo".into()], |_| {
+            anyhow::bail!(
+                "certificate failure at https://user:secret@example.invalid/repo?token=secret"
+            )
+        })
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("certificate"));
+        assert!(!text.contains("secret") && !text.contains("user"));
+    }
+}
+
 impl Session {
     /// Callers authorize the parsed repository before opening a session.
-    pub fn connect(repository: &super::Repository) -> Result<Self> {
-        let mut transport = blocking_io::connect::connect(repository.transport.as_str(), blocking_io::connect::Options {
+    pub fn connect(repository: &super::Repository, preferred: Option<&str>) -> Result<Self> {
+        let (mut session, endpoint) =
+            alternatives(&repository.transports(preferred), Self::connect_one)
+                .with_context(|| format!("Cannot access {}", repository.identity))?;
+        session.endpoint = Some(endpoint);
+        Ok(session)
+    }
+
+    fn connect_one(endpoint: &str) -> Result<Self> {
+        let mut transport = blocking_io::connect::connect(endpoint, blocking_io::connect::Options {
             version: gix_transport::Protocol::V2,
             ssh: blocking_io::ssh::connect::Options {
                 command: Some("ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=30 -oServerAliveInterval=15 -oServerAliveCountMax=2".into()),
                 ..Default::default()
             },
             trace: false,
-        }).map_err(|_| anyhow::anyhow!("Cannot connect to repository transport"))?;
-        if repository.transport.starts_with("https://") {
+        })?;
+        if endpoint.starts_with("https://") {
             transport
                 .configure(&blocking_io::http::Options {
                     follow_redirects: blocking_io::http::options::FollowRedirects::None,
@@ -36,7 +169,7 @@ impl Session {
                     low_speed_time_seconds: 30,
                     ..Default::default()
                 })
-                .map_err(|_| anyhow::anyhow!("Cannot configure repository transport"))?;
+                .map_err(anyhow::Error::from_boxed)?;
         }
         Self::handshake(transport)
     }
@@ -48,15 +181,11 @@ impl Session {
             gix_protocol::credentials::builtin,
             Vec::new(),
             &mut gix_features::progress::Discard,
-        )
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Repository handshake failed; check access and noninteractive authentication"
-            )
-        })?;
+        )?;
         Ok(Self {
             transport,
             handshake,
+            endpoint: None,
         })
     }
 

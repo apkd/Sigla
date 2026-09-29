@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 
-const FORMAT: &[u8] = b"sigla-facts-11";
+const FORMAT: &[u8] = b"sigla-facts-12";
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 // Shared across every workspace; immutable record bytes are the revision key.

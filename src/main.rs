@@ -57,12 +57,20 @@ async fn main() -> Result<()> {
     policy.unity_platform = cli.options.unity_platform;
     let app = Arc::new(match remote {
         Some(remote) => App::remote(policy, cli.options.cache_dir, cli.workers as usize, remote)?,
+        None if cli.options.mode == sigla::config::Mode::Hybrid => App::hybrid(
+            policy,
+            cli.options.cache_dir,
+            cli.workers as usize,
+            cli.options.upstream.as_deref().unwrap(),
+            cli.options.upstream_token_file.as_deref(),
+        )?,
         None => App::new(policy, cli.options.cache_dir, cli.workers as usize)?,
     });
     match cli.command {
         Command::GitJob { .. } => unreachable!(),
         Command::Query { project, query } => {
             let result = app.search(&project, &query).await;
+            app.shutdown().await;
             sigla::shutdown();
             println!("{}", result?);
         }
@@ -135,6 +143,7 @@ async fn main() -> Result<()> {
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     ct.cancel();
+                    app.shutdown().await;
                     sigla::shutdown();
                 })
                 .await?;

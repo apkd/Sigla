@@ -130,6 +130,17 @@ pub fn discover(entry: &Path, policy: &Policy) -> Result<Discovery> {
     discover_cached(entry, policy, Path::new("/tmp/sigla"))
 }
 
+fn project_failure(error: &anyhow::Error) -> String {
+    tracing::warn!(error = %format!("{error:#}"), "Project discovery is incomplete");
+    let text = error.to_string();
+    let first = text.lines().next().unwrap_or("Project discovery failed");
+    let mut summary: String = first.chars().take(240).collect();
+    if first.chars().count() > 240 {
+        summary.push('…');
+    }
+    summary.trim_end_matches('.').into()
+}
+
 pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Discovery> {
     let entry = policy.canonical(entry)?;
     let root = if entry.is_dir() {
@@ -189,7 +200,7 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
             }
             result.projects.truncate(projects);
             result.sources.truncate(sources);
-            result.diagnostics.push(format!("Incomplete project details for {}: {error:#}. Searching readable sources; references may be incomplete.", input.display()));
+            result.diagnostics.push(format!("Incomplete project details for {}: {}. Searching readable sources; references may be incomplete.", input.display(), project_failure(&error)));
             fallback_sources(&input, policy, &mut result)?;
         }
     }
@@ -202,7 +213,7 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
             }
             result.projects.truncate(projects);
             result.sources.truncate(sources);
-            result.diagnostics.push(format!("Incomplete .NET project details: {error:#}. Searching readable sources; references may be incomplete."));
+            result.diagnostics.push(format!("Incomplete .NET project details: {}. Searching readable sources; references may be incomplete.", project_failure(&error)));
             for input in &managed {
                 if managed.len() > 1 {
                     let projects = result.projects.len();

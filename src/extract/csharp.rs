@@ -43,6 +43,42 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
         errors: tree.root_node().has_error(),
         ..Facts::default()
     };
+    let root = tree.root_node();
+    let globals: Vec<_> = root
+        .named_children(&mut root.walk())
+        .filter(|n| n.kind() == "global_statement")
+        .collect();
+    if let (Some(first), Some(last)) = (globals.first(), globals.last()) {
+        let span = first.start_byte()..last.end_byte();
+        // An internal lexical context for top-level statements, not a searchable symbol.
+        facts.declarations.push(Declaration {
+            name: String::new(),
+            qualified: String::new(),
+            kind: "scope".into(),
+            namespace: String::new(),
+            owner: String::new(),
+            name_span: span.start..span.start,
+            header: span.start..span.start,
+            scope: span.clone(),
+            span,
+            parameters: vec![],
+            ty: String::new(),
+            access: "internal".into(),
+            attributes: vec![],
+            modifiers: vec![],
+            bases: vec![],
+        });
+        facts
+            .csharp
+            .as_mut()
+            .unwrap()
+            .headers
+            .push(crate::csharp::lower::header(
+                root,
+                &analysis,
+                &facts.declarations,
+            ));
+    }
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -306,6 +342,7 @@ fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
                 "for_statement",
                 "foreach_statement",
                 "switch_section",
+                "compilation_unit",
             ],
         )
         .map_or(span.clone(), |n| n.byte_range())

@@ -11,6 +11,7 @@ mod msbuild;
 mod navigation;
 mod process;
 mod sandbox;
+mod upstream;
 
 pub fn shutdown() {
     process::shutdown();

@@ -11,12 +11,19 @@ pub enum Mode {
     #[default]
     Local,
     Remote,
+    Hybrid,
 }
 
 #[derive(Args, Debug)]
 pub struct Options {
     #[arg(long, global = true, default_value = "local")]
     pub mode: Mode,
+    /// HTTP MCP endpoint used by hybrid mode.
+    #[arg(long, global = true)]
+    pub upstream: Option<String>,
+    /// File containing the upstream bearer token.
+    #[arg(long, global = true)]
+    pub upstream_token_file: Option<PathBuf>,
     #[arg(long, global = true, alias = "cache", default_value = "/tmp/sigla")]
     pub cache_dir: PathBuf,
     /// Permitted local roots. Remote mode has no implicit local roots.
@@ -51,7 +58,19 @@ pub struct RemoteOptions {
 
 impl Options {
     pub fn validate(&self) -> Result<Option<RemoteOptions>> {
-        if self.mode == Mode::Local {
+        if self.mode == Mode::Hybrid {
+            crate::upstream::validate_endpoint(
+                self.upstream
+                    .as_deref()
+                    .context("Hybrid mode requires --upstream")?,
+            )?;
+        } else {
+            ensure!(
+                self.upstream.is_none() && self.upstream_token_file.is_none(),
+                "--upstream and --upstream-token-file require --mode hybrid"
+            );
+        }
+        if self.mode != Mode::Remote {
             ensure!(
                 self.allow_repo.is_empty()
                     && self.refresh_interval.is_none()
@@ -88,7 +107,7 @@ impl Options {
     }
 
     pub fn local_roots(&self) -> Vec<PathBuf> {
-        if self.mode == Mode::Local && self.root.is_empty() {
+        if self.mode != Mode::Remote && self.root.is_empty() {
             vec![PathBuf::from("/")]
         } else {
             self.root.clone()
@@ -153,6 +172,60 @@ mod tests {
             "--unity",
         ] {
             assert!(Cli::try_parse_from(["sigla", flag, "value"]).is_err());
+        }
+    }
+    #[test]
+    fn hybrid_requires_endpoint_and_keeps_local_roots() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().options;
+        let hybrid = parse(&[
+            "sigla",
+            "--mode",
+            "hybrid",
+            "--upstream",
+            "https://example.com/mcp",
+        ]);
+        assert!(hybrid.validate().unwrap().is_none());
+        assert_eq!(hybrid.local_roots(), parse(&["sigla"]).local_roots());
+        for args in [
+            vec!["sigla", "--mode", "hybrid"],
+            vec!["sigla", "--upstream", "https://example.com/mcp"],
+            vec!["sigla", "--upstream-token-file", "token"],
+            vec![
+                "sigla",
+                "--mode",
+                "hybrid",
+                "--upstream",
+                "http://example.com/mcp",
+            ],
+            vec![
+                "sigla",
+                "--mode",
+                "hybrid",
+                "--upstream",
+                "https://user:secret@example.com/mcp",
+            ],
+            vec![
+                "sigla",
+                "--mode",
+                "hybrid",
+                "--upstream",
+                "https://example.com/mcp",
+                "--allow-repo",
+                "https://github.com/owner/*",
+            ],
+        ] {
+            assert!(parse(&args).validate().is_err(), "{args:?}");
+        }
+        for endpoint in [
+            "http://127.0.0.1:7331/mcp",
+            "http://[::1]:7331/mcp",
+            "http://localhost/mcp",
+        ] {
+            assert!(
+                parse(&["sigla", "--mode", "hybrid", "--upstream", endpoint])
+                    .validate()
+                    .is_ok()
+            );
         }
     }
     #[test]

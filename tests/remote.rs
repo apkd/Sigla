@@ -73,6 +73,15 @@ impl Server {
         Self::launch(root, Duration::from_secs(30), false)
     }
     fn launch(root: &Path, timeout: Duration, live_unity: bool) -> Result<Self> {
+        // The fixture uses a local SSH executable, never a public GitHub endpoint.
+        let repository =
+            sigla::repository::Repository::parse("git@github.com:fixture/repo.git")?.unwrap();
+        let transports = root.join("cache/transports");
+        fs::create_dir_all(&transports)?;
+        fs::write(
+            transports.join(repository.identity.storage_key()),
+            "git@github.com:fixture/repo.git",
+        )?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         drop(listener);
@@ -95,6 +104,8 @@ impl Server {
                 "remote",
                 "--allow-repo",
                 "https://github.com/fixture/repo",
+                "--allow-repo",
+                "ssh://git@fixture.invalid/repo",
                 "--refresh-interval",
                 "1s",
                 "--repo-ttl",
@@ -267,6 +278,33 @@ fn lifecycle() -> Result<()> {
     fs::create_dir(root.path().join("bin"))?;
     std::os::unix::fs::symlink(std::env::current_exe()?, root.path().join("bin/ssh"))?;
     let server = Server::start(root.path())?;
+    fs::write(root.path().join("offline"), "")?;
+    ensure!(
+        server
+            .query("ssh://git@fixture.invalid/repo", "type:Main")?
+            .0,
+        "Offline lookup unexpectedly succeeded"
+    );
+    fs::remove_file(root.path().join("offline"))?;
+    let recovered = server.query("ssh://git@fixture.invalid/repo", "type:Main")?;
+    ensure!(
+        !recovered.0 && recovered.1.contains("Main"),
+        "Failed lookup blocked immediate recovery: {}",
+        recovered.1
+    );
+    ensure!(
+        server
+            .query("ssh://git@fixture.invalid/repo#recovered", "type:Main")?
+            .0,
+        "Missing branch unexpectedly succeeded"
+    );
+    git(&upstream, &["branch", "recovered"])?;
+    let recovered = server.query("ssh://git@fixture.invalid/repo#recovered", "type:Main")?;
+    ensure!(
+        !recovered.0 && recovered.1.contains("Main"),
+        "Failed preparation blocked immediate recovery: {}",
+        recovered.1
+    );
     let main = "git@github.com:fixture/repo.git#main";
     let feature = "git@github.com:fixture/repo.git#feature/search";
     ensure!(
@@ -303,6 +341,19 @@ fn lifecycle() -> Result<()> {
         !cached.0 && cached.1.contains("Main"),
         "Canonical alias did not share a workspace"
     );
+    for alias in [
+        "ssh://git@github.com/fixture/repo.git#main",
+        "https://github.com/fixture/repo#main",
+        "fixture/repo#main",
+        "git@github.com:fixture/repo.git#main",
+        "https://github.com/fixture/repo.git#main",
+    ] {
+        let (error, text) = server.query(alias, "type:Main")?;
+        ensure!(
+            !error && text.contains("Main"),
+            "Repository alias failed: {alias}: {text}"
+        );
+    }
     ensure!(
         fs::read(root.path().join("requests.log"))?.len() == count,
         "Unchanged query performed acquisition"
