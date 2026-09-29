@@ -14,6 +14,21 @@ pub enum Mode {
 mod tests {
     use super::*;
     #[test]
+    fn windows_separators_preserve_literal_names_and_path_boundaries() {
+        let root = Path::new("/repo");
+        let literal = r"src\File.cs";
+        assert_eq!(
+            normalize_indexed(literal, root, false, |p| p == literal || p == "src/File.cs")
+                .unwrap(),
+            literal
+        );
+        assert_eq!(
+            normalize_indexed(literal, root, false, |p| p == "src/File.cs").unwrap(),
+            "src/File.cs"
+        );
+        assert!(normalize_indexed(r"..\outside.cs", root, false, |_| false).is_err());
+    }
+    #[test]
     fn path_tiers_do_not_hide_ambiguity() {
         let paths = ["a/Model.cs", "b/Model.cs", "a/Models.cs", "a/Other.cs"];
         assert_eq!(matches(paths.into_iter(), "a/Model.cs"), vec!["a/Model.cs"]);
@@ -86,7 +101,7 @@ impl std::str::FromStr for Mode {
         match value {
             "exact" => Ok(Self::Exact),
             "minified" => Ok(Self::Minified),
-            _ => anyhow::bail!("Use mode exact or minified"),
+            _ => anyhow::bail!("Use mode `exact` or `minified`"),
         }
     }
 }
@@ -123,6 +138,25 @@ pub fn normalize(path: &str, root: &Path, absolute: bool) -> Result<String> {
         }
     }
     Ok(parts.join("/"))
+}
+
+/// Prefer literal indexed names before interpreting pasted path separators.
+pub fn normalize_indexed(
+    path: &str,
+    root: &Path,
+    absolute: bool,
+    exists: impl Fn(&str) -> bool,
+) -> Result<String> {
+    let literal = normalize(path, root, absolute)?;
+    if exists(&literal) || !path.contains('\\') {
+        return Ok(literal);
+    }
+    let converted = normalize(&path.replace('\\', "/"), root, absolute)?;
+    Ok(if exists(&converted) {
+        converted
+    } else {
+        literal
+    })
 }
 
 /// All matches from the best qualifying tier; ranking never hides ambiguity.
@@ -231,7 +265,7 @@ pub fn location(path: &str) -> Result<(&str, Option<(usize, usize)>)> {
             .is_some_and(|(_, suffix)| suffix.starts_with(|c: char| c.is_ascii_digit() || c == '-'))
             || path.contains("#L")
         {
-            anyhow::bail!("Invalid line range; use path:1-20 (1-based, inclusive)");
+            anyhow::bail!("Invalid line range; use `path:1-20` (1-based, inclusive)");
         }
         return Ok((path, None));
     };

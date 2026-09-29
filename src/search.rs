@@ -924,6 +924,14 @@ impl<'a> Search<'a> {
         true
     }
     pub fn run(&mut self, q: &Query) -> Result<String> {
+        let result = self.run_query(q)?;
+        if result == "No matches." {
+            return Ok(self.filter_hint(q, &self.manifest.root).unwrap_or(result));
+        }
+        Ok(result)
+    }
+
+    fn run_query(&mut self, q: &Query) -> Result<String> {
         if q.selector == "file" {
             return self.files(q, &self.manifest.root);
         }
@@ -991,6 +999,7 @@ impl<'a> Search<'a> {
         let mut units = crate::selection::Selection::new(q.limit);
         let files = self.containment_files(&inside)?;
         let files = self.filtered_files(q, files);
+        let mut other_kinds = BTreeSet::new();
         self.visit_declarations(
             &q.target,
             q.loose,
@@ -1000,7 +1009,6 @@ impl<'a> Search<'a> {
             |this, h| {
                 let file = &this.manifest.files[&h.file];
                 if (q.selector == "operator" && h.decl.name != q.target.name)
-                    || !selector_matches(&q.selector, &h.decl)
                     || !this.filters(
                         q,
                         file,
@@ -1010,6 +1018,15 @@ impl<'a> Search<'a> {
                         &inside,
                     )
                 {
+                    return Ok(());
+                }
+                if !selector_matches(&q.selector, &h.decl) {
+                    if !q.loose && !q.target.name.contains('*') && q.target.parameters.is_none() {
+                        other_kinds.insert(format!("{}:{}", h.decl.kind, h.decl.qualified));
+                        if other_kinds.len() > 4 {
+                            other_kinds.pop_last();
+                        }
+                    }
                     return Ok(());
                 }
                 let rank = (
@@ -1027,7 +1044,82 @@ impl<'a> Search<'a> {
                 Ok(())
             },
         )?;
-        Ok(self.finish_results(units))
+        let result = self.finish_results(units);
+        if result == "No matches." && !other_kinds.is_empty() {
+            return Ok(format!(
+                "No {} matched. Found {}.",
+                q.selector,
+                other_kinds
+                    .iter()
+                    .map(|s| crate::render::inline(s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(result)
+    }
+
+    fn filter_hint(&self, q: &Query, root: &std::path::Path) -> Option<String> {
+        for filter in q.filters.iter().filter(|f| !f.negate) {
+            if filter.key == "project"
+                && !self
+                    .manifest
+                    .projects
+                    .iter()
+                    .any(|p| wildcard(&filter.value, &p.name))
+            {
+                let names: BTreeSet<_> = self
+                    .manifest
+                    .projects
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect();
+                if names.is_empty() {
+                    continue;
+                }
+                return Some(format!(
+                    "No build project matched {}. `project:` filters build-project names. Available: {}{}.",
+                    crate::render::inline(&filter.value),
+                    names
+                        .iter()
+                        .take(4)
+                        .map(|s| crate::render::inline(s))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if names.len() > 4 { ", …" } else { "" }
+                ));
+            }
+        }
+        for filter in q.filters.iter().filter(|f| {
+            q.selector == "file" && f.key == "path" && !f.negate && f.value.ends_with('/')
+        }) {
+            let has_descendants =
+                self.manifest
+                    .files
+                    .values()
+                    .filter(|f| !f.metadata)
+                    .any(|file| {
+                        file.path
+                            .strip_prefix(root)
+                            .is_ok_and(|p| p.to_string_lossy().starts_with(&filter.value))
+                    });
+            if has_descendants {
+                let value = format!("{}**", filter.value);
+                let value = if value
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\\'))
+                {
+                    serde_json::to_string(&value).unwrap()
+                } else {
+                    value
+                };
+                return Some(format!(
+                    "No matches. For files beneath this directory, use {}.",
+                    crate::render::inline(&format!("path:{value}"))
+                ));
+            }
+        }
+        None
     }
     fn source_paths(&self, root: &std::path::Path) -> BTreeMap<String, String> {
         self.manifest
@@ -1088,7 +1180,9 @@ impl<'a> Search<'a> {
             }
         }
         if total == 0 {
-            return Ok("No matches.".into());
+            return Ok(self
+                .filter_hint(q, root)
+                .unwrap_or_else(|| "No matches.".into()));
         }
         let mut text = found.join("\n");
         if total > found.len() {
@@ -1098,13 +1192,23 @@ impl<'a> Search<'a> {
     }
     pub fn browse(&self, root: &std::path::Path, path: &str, absolute: bool) -> Result<String> {
         self.check()?;
-        let path = crate::navigation::normalize(path, root, absolute)?;
         let files = self.source_paths(root);
         let tree = crate::navigation::Directory::new(files.keys().map(String::as_str));
+        let dirs = tree.paths();
+        let path = crate::navigation::normalize_indexed(path, root, absolute, |p| {
+            files.contains_key(p) || dirs.iter().any(|d| d == p)
+        })?;
+        if files.contains_key(&path) {
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            return Ok(format!(
+                "This is a file. Use {}, or {}.",
+                crate::render::inline(&format!("view({})", serde_json::to_string(&path)?)),
+                crate::render::inline(&format!("browse({})", serde_json::to_string(parent)?))
+            ));
+        }
         if path.is_empty() {
             return Ok(tree.render(""));
         }
-        let dirs = tree.paths();
         let matches = crate::navigation::matches(dirs.iter().map(String::as_str), &path);
         if matches.len() != 1 {
             return Ok(crate::navigation::choices(&matches, "directories"));
@@ -1120,7 +1224,14 @@ impl<'a> Search<'a> {
     ) -> Result<String> {
         self.check()?;
         let files = self.source_paths(root);
-        let literal = crate::navigation::normalize(path, root, absolute)?;
+        let indexed = |p: &str| {
+            files.contains_key(p)
+                || files.keys().any(|f| {
+                    f.strip_suffix(p)
+                        .is_some_and(|prefix| prefix.ends_with('/'))
+                })
+        };
+        let literal = crate::navigation::normalize_indexed(path, root, absolute, indexed)?;
         let (path, requested) = if files.contains_key(&literal)
             || files.keys().any(|p| {
                 p.strip_suffix(&literal)
@@ -1134,7 +1245,10 @@ impl<'a> Search<'a> {
             } else {
                 path.strip_prefix("…/").unwrap_or(path)
             };
-            (crate::navigation::normalize(path, root, absolute)?, lines)
+            (
+                crate::navigation::normalize_indexed(path, root, absolute, indexed)?,
+                lines,
+            )
         };
         let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
         if matches.len() != 1 {

@@ -10,7 +10,7 @@ pub mod materialize;
 pub mod selection;
 pub mod transport;
 
-const SYNTAX: &str = "Use https://host/owner/repo.git, ssh://git@host/owner/repo.git, or git@host:owner/repo.git, optionally followed by #branch";
+const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Endpoint {
@@ -390,7 +390,7 @@ pub fn validate_branch(branch: &str) -> Result<()> {
             && branch
                 .split('/')
                 .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock")),
-        "Invalid branch selector; supply a branch name, such as #feature/search, rather than a revision expression"
+        "Invalid branch selector; supply a branch name, such as `#feature/search`, rather than a revision expression"
     );
     Ok(())
 }

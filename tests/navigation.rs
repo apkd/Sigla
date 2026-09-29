@@ -82,6 +82,30 @@ async fn browse_find_and_read_use_the_same_refreshed_sources() {
         .await
         .unwrap();
     assert_eq!(absolute, exact);
+    assert_eq!(
+        app.view(project, r"src\first\mod.rs", "exact")
+            .await
+            .unwrap(),
+        exact
+    );
+    assert_eq!(
+        app.view(project, r"src\first\mod.rs:2", "exact")
+            .await
+            .unwrap(),
+        app.view(project, "src/first/mod.rs:2", "exact")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        app.browse(project, r"src\first").await.unwrap(),
+        app.browse(project, "src/first").await.unwrap()
+    );
+    let file_hint = app.browse(project, "src/first/mod.rs").await.unwrap();
+    assert!(
+        file_hint.contains("`view(\"src/first/mod.rs\")`")
+            && file_hint.contains("`browse(\"src/first\")`"),
+        "{file_hint}"
+    );
     assert!(app.view(project, "../outside.rs", "exact").await.is_err());
     for suffix in [":1-abc", ":-1-5"] {
         let error = app

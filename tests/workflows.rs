@@ -11,6 +11,93 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn empty_queries_offer_only_supported_corrections() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Navigation.csproj",
+        r#"<Project><ItemGroup><Compile Include="Src/Parser.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        root.path(),
+        "Src/Parser.cs",
+        "class Parser { public int Parse { get; } }\n",
+    );
+    let a = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    let wrong_kind = a.search(project, "method:Parser.Parse").await.unwrap();
+    assert!(
+        wrong_kind.contains("`property:Parser.Parse`"),
+        "{wrong_kind}"
+    );
+    let corrected = a.search(project, "property:Parser.Parse").await.unwrap();
+    assert!(corrected.contains("public int Parse"), "{corrected}");
+    assert_eq!(
+        a.search(project, "method:Parser.Missing").await.unwrap(),
+        "No matches."
+    );
+    assert_eq!(
+        a.search(project, "method:Parser.Parse path:Missing/**")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+    let wrong_project = a
+        .search(project, "file:*.cs project:owner/repo")
+        .await
+        .unwrap();
+    assert!(
+        wrong_project.contains("`project:`") && wrong_project.contains("`Navigation`"),
+        "{wrong_project}"
+    );
+    assert!(
+        a.search(project, "file:*.cs project:Navigation")
+            .await
+            .unwrap()
+            .contains("Parser.cs")
+    );
+    let directory = a.search(project, "file:*.cs path:Src/").await.unwrap();
+    assert!(directory.contains("`path:Src/**`"), "{directory}");
+    assert!(
+        a.search(project, "file:*.cs path:Src/**")
+            .await
+            .unwrap()
+            .contains("Parser.cs")
+    );
+    // Source queries already accept recursive directory paths; no misleading hint.
+    assert_eq!(
+        a.search(project, "method:Missing path:Src/").await.unwrap(),
+        "No matches."
+    );
+    assert!(
+        a.search(project, "property:Parser.Parse path:Src/")
+            .await
+            .unwrap()
+            .contains("public int Parse")
+    );
+}
+
+#[test]
+fn query_syntax_corrections_are_usable() {
+    use sigla::query::Query;
+    let error = Query::parse("text:'hello world'").unwrap_err().to_string();
+    assert!(error.contains("`text:\"hello world\"`"), "{error}");
+    assert_eq!(
+        Query::parse("text:\"hello world\"").unwrap().target.name,
+        "hello world"
+    );
+    assert_eq!(Query::parse("text:\"don't\"").unwrap().target.name, "don't");
+    let error = Query::parse("method:Parse offset:20")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("`offset:`") && error.contains("`limit:`"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn concrete_kinds_and_declaration_line_ranges() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -184,11 +271,13 @@ partial class Worker {
             .unwrap(),
         app.search(project, "file:*Members*.cs").await.unwrap()
     );
-    assert_eq!(
-        app.search(project, "file:*Members*.cs project:owner/repo")
-            .await
-            .unwrap(),
-        "No matches."
+    let correction = app
+        .search(project, "file:*Members*.cs project:owner/repo")
+        .await
+        .unwrap();
+    assert!(
+        correction.contains("`project:`") && correction.contains("`Test`"),
+        "{correction}"
     );
 }
 

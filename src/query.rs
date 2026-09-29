@@ -99,6 +99,9 @@ impl Query {
                 "Only metadata and containment filters can be negated."
             );
             match key {
+                "offset" => bail!(
+                    "`offset:` is unsupported. Narrow the query with `path:` or `in:`, or increase `limit:`."
+                ),
                 "match" => {
                     ensure!(loose.is_none(), "Duplicate `match:` control.");
                     loose = Some(match value {
@@ -207,7 +210,7 @@ impl Target {
                 let column = column.parse::<usize>()?;
                 ensure!(
                     line > 0 && column > 0 && !path.is_empty(),
-                    "Locations use @path:line:column with positive coordinates."
+                    "Locations use `@path:line:column` with positive coordinates."
                 );
                 ensure!(
                     !std::path::Path::new(path)
@@ -306,6 +309,22 @@ fn lex(input: &str) -> Result<Vec<String>> {
         if c == '"' {
             quoted = true;
             continue;
+        }
+        if c == '\'' && (token.is_empty() || token.ends_with(':')) {
+            let mut value = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '\'' {
+                    closed = true;
+                    break;
+                }
+                value.push(next);
+            }
+            if closed {
+                let suggestion = format!("{token}{}", serde_json::to_string(&value)?);
+                bail!("Use double quotes: {}.", crate::render::inline(&suggestion));
+            }
+            bail!("Use double quotes around query values, for example `text:\"hello world\"`.");
         }
         let literal =
             token.starts_with("operator:") || token.starts_with("text:") || token.starts_with("x:");
