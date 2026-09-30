@@ -188,7 +188,7 @@ pub struct AssemblyContext {
 }
 
 impl Editor {
-    pub fn local(project: &Path) -> Result<Self> {
+    pub fn local(project: &Path, installations: Option<&Path>) -> Result<Self> {
         let version = std::fs::read_to_string(project.join("ProjectSettings/ProjectVersion.txt"))?;
         let declared: UnityVersion = version
             .lines()
@@ -200,14 +200,17 @@ impl Editor {
             .lines()
             .find_map(|l| l.strip_prefix("m_EditorVersionWithRevision:"))
             .map(|s| s.trim().to_owned());
-        let home = std::env::var_os("HOME")
-            .context("Cannot locate installed Unity editors without the user's home directory")?;
-        Self::from_installations(
-            project,
-            &PathBuf::from(home).join("Unity/Hub/Editor"),
-            declared,
-            revision,
-        )
+        let default;
+        let installations = match installations {
+            Some(path) => path,
+            None => {
+                let home = std::env::var_os("HOME")
+                    .context("Set --unity-editors when the user's home directory is unavailable")?;
+                default = PathBuf::from(home).join("Unity/Hub/Editor");
+                &default
+            }
+        };
+        Self::from_installations(project, installations, declared, revision)
     }
 
     fn from_installations(
@@ -217,25 +220,26 @@ impl Editor {
         revision: Option<String>,
     ) -> Result<Self> {
         let mut candidates = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(installations) {
-            for entry in entries {
-                let entry = entry?;
-                let Ok(selected) = entry.file_name().to_string_lossy().parse::<UnityVersion>()
-                else {
-                    continue;
-                };
-                let data = entry.path().join("Editor/Data");
-                if supported(selected)
-                    && data
-                        .join("Managed/UnityEngine/UnityEngine.CoreModule.dll")
-                        .is_file()
-                    && data.join("NetStandard/ref/2.1.0/netstandard.dll").is_file()
-                    && data
-                        .join("UnityReferenceAssemblies/unity-4.8-api/mscorlib.dll")
-                        .is_file()
-                {
-                    candidates.push((selected == declared, selected, data));
-                }
+        let entries = std::fs::read_dir(installations).with_context(|| format!(
+            "Cannot read Unity editors at {}; set --unity-editors to a readable installation directory",
+            installations.display()
+        ))?;
+        for entry in entries {
+            let entry = entry?;
+            let Ok(selected) = entry.file_name().to_string_lossy().parse::<UnityVersion>() else {
+                continue;
+            };
+            let data = entry.path().join("Editor/Data");
+            if supported(selected)
+                && data
+                    .join("Managed/UnityEngine/UnityEngine.CoreModule.dll")
+                    .is_file()
+                && data.join("NetStandard/ref/2.1.0/netstandard.dll").is_file()
+                && data
+                    .join("UnityReferenceAssemblies/unity-4.8-api/mscorlib.dll")
+                    .is_file()
+            {
+                candidates.push((selected == declared, selected, data));
             }
         }
         let (_, selected, data) = candidates
@@ -404,3 +408,36 @@ System.Data System.Drawing System.IO.Compression.FileSystem System.IO.Compressio
 System.Net.Http System.Numerics.Vectors System.Numerics System.Runtime.Serialization
 System.Transactions System.Xml.Linq System.Xml System mscorlib
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_installations_select_the_projects_editor() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let installations = root.path().join("editors");
+        std::fs::create_dir_all(project.join("ProjectSettings")).unwrap();
+        let version = "6000.3.10f1";
+        std::fs::write(
+            project.join("ProjectSettings/ProjectVersion.txt"),
+            format!("m_EditorVersion: {version}\n"),
+        )
+        .unwrap();
+        let data = installations.join(version).join("Editor/Data");
+        for reference in [
+            "Managed/UnityEngine/UnityEngine.CoreModule.dll",
+            "NetStandard/ref/2.1.0/netstandard.dll",
+            "UnityReferenceAssemblies/unity-4.8-api/mscorlib.dll",
+        ] {
+            let path = data.join(reference);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        let editor = Editor::local(&project, Some(&installations)).unwrap();
+        assert_eq!(editor.selected, editor.declared);
+        assert_eq!(editor.data, data.canonicalize().unwrap());
+        assert!(Editor::local(&project, Some(&root.path().join("missing"))).is_err());
+    }
+}

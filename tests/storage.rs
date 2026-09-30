@@ -8,6 +8,64 @@ use std::sync::{
 };
 
 #[test]
+fn compatible_cache_reopens_without_rebuilding_and_detects_offline_edits() {
+    use sigla::{discovery::Policy, workspace::Workspace};
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    let source = root.path().join("src/lib.rs");
+    std::fs::write(&source, "pub struct Before;\n").unwrap();
+    let open = || {
+        Workspace::open(
+            root.path().into(),
+            cache.path(),
+            Policy::new(vec![root.path().into()]).unwrap(),
+            Store::open(&cache.path().join("assemblies")).unwrap(),
+            Default::default(),
+        )
+        .unwrap()
+    };
+    let mut first = open();
+    first.refresh().unwrap();
+    let files = first.manifest.files.len();
+    assert!(files > 0);
+    drop(first);
+    let mut reopened = open();
+    assert!(reopened.prepare().unwrap().is_none());
+    assert_eq!(reopened.manifest.files.len(), files);
+    drop(reopened);
+    std::fs::write(&source, "pub struct After;\n").unwrap();
+    let mut changed = open();
+    let update = changed
+        .prepare()
+        .unwrap()
+        .expect("offline edit must invalidate the cache");
+    changed.apply(update).unwrap();
+    let read = changed.store.read().unwrap();
+    let key = changed
+        .manifest
+        .files
+        .iter()
+        .find(|(_, file)| file.path == source)
+        .unwrap()
+        .0;
+    assert!(
+        changed
+            .store
+            .load(&read, key)
+            .unwrap()
+            .unwrap()
+            .source
+            .contains("After")
+    );
+}
+
+#[test]
 fn concurrent_opens_share_a_store_and_can_reopen_after_drop() {
     let dir = tempfile::tempdir().unwrap();
     let barrier = Barrier::new(8);

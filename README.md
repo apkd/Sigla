@@ -22,6 +22,8 @@ Sigla helps coding agents find their way around C# and Rust projects. It finds d
 
 Sigla runs on Linux and works with Cargo workspaces and Unity-generated C# projects. It reads your project files directly, so there's no Unity package to install or editor to keep running.
 
+Local Unity discovery uses `~/Unity/Hub/Editor` by default. If the editor belongs to another account or lives elsewhere, pass `--unity-editors /path/to/Unity/Hub/Editor`. The Sigla service account must be able to read that directory and its editor files.
+
 ## A few examples
 
 | To find... | Query |
@@ -59,7 +61,7 @@ Connect your coding agent to `http://127.0.0.1:7331/mcp`. For Codex, add this to
 url = "http://127.0.0.1:7331/mcp"
 ```
 
-The agent gets three tools. Each takes `project`, a local project path or, in remote mode, a repository URL with an optional `#branch`.
+The agent gets three tools. Each takes `project`, a local project path or, in remote mode, a repository URL with an optional `#branch`, `#tag`, or full `#commit` ID. Tags take precedence over branches with the same name, as in Git revision lookup. Use `#refs/heads/name` or `#refs/tags/name` to select one explicitly. Lightweight and annotated tags must point to commits. Branches and tags refresh periodically; commit IDs stay pinned. Fetching a historical commit requires the server to allow fetching that object. Abbreviated commit IDs and revision expressions such as `main~1` are not supported.
 
 | Tool | Other arguments | Result |
 |---|---|---|

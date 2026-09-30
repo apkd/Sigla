@@ -31,6 +31,9 @@ pub struct Options {
     pub root: Vec<PathBuf>,
     #[arg(long, global = true, default_value = "UNITY_EDITOR_LINUX")]
     pub unity_platform: Platform,
+    /// Local Unity Hub editors directory, containing version subdirectories.
+    #[arg(long, global = true)]
+    pub unity_editors: Option<PathBuf>,
     /// Allow anonymous access to matching public repositories.
     #[arg(long, global = true)]
     pub allow_repo: Vec<String>,

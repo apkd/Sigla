@@ -121,11 +121,14 @@ pub struct Workspace {
     directories: BTreeSet<PathBuf>,
     fence: u64,
     initialized: bool,
+    materialization: Option<u64>,
 }
 pub struct Preparation {
     discovery: discovery::Discovery,
     fence: u64,
     started: std::time::Instant,
+    validation: std::time::Duration,
+    discovery_time: std::time::Duration,
 }
 impl Workspace {
     pub fn update_policy(&mut self, policy: Policy) {
@@ -159,6 +162,7 @@ impl Workspace {
             directories: BTreeSet::new(),
             fence: 0,
             initialized: false,
+            materialization: None,
         })
     }
     pub fn refresh(&mut self) -> Result<()> {
@@ -169,12 +173,16 @@ impl Workspace {
     }
 
     /// Managed materialization bypasses watcher timing, while still comparing input stamps.
-    pub fn materialized(&mut self) {
-        self.initialized = false;
+    pub fn materialized(&mut self, generation: u64) {
+        if self.materialization != Some(generation) {
+            self.initialized = false;
+            self.materialization = Some(generation);
+        }
     }
 
     /// Dependency preparation does not consume an indexing worker.
     pub fn prepare(&mut self) -> Result<Option<Preparation>> {
+        let start = std::time::Instant::now();
         if !self.initialized {
             for p in self
                 .manifest
@@ -197,25 +205,34 @@ impl Workspace {
         if self.initialized && !dirty {
             return Ok(None);
         }
-        let metadata_changed = !self.store.manifest_current()?
-            || self.manifest.discovery_policy != self.policy.identity()?
-            || self.manifest.projects.is_empty()
-            || self
-                .manifest
-                .metadata
-                .iter()
-                .any(|(p, s)| Stamp::read(p).as_ref().ok() != Some(s));
-        let sources_changed = self
+        let cache_current = self.store.manifest_current()?;
+        let policy_current = self.manifest.discovery_policy == self.policy.identity()?;
+        let changed_metadata = self
+            .manifest
+            .metadata
+            .iter()
+            .find(|(p, s)| Stamp::read(p).as_ref().ok() != Some(s))
+            .map(|(path, _)| path);
+        let changed_source = self
             .manifest
             .files
             .values()
-            .any(|f| Stamp::read(&f.path).as_ref().ok() != Some(&f.stamp));
+            .find(|f| Stamp::read(&f.path).as_ref().ok() != Some(&f.stamp))
+            .map(|file| &file.path);
+        let metadata_changed = !cache_current
+            || !policy_current
+            || self.manifest.projects.is_empty()
+            || changed_metadata.is_some();
+        let sources_changed = changed_source.is_some();
         if !metadata_changed && !sources_changed {
             self.fence = fence;
             self.initialized = true;
+            tracing::debug!(workspace = %self.entry.display(), elapsed_ms = start.elapsed().as_millis(), "workspace cache validated");
             return Ok(None);
         }
-        let start = std::time::Instant::now();
+        let validation = start.elapsed();
+        let discovery_started = std::time::Instant::now();
+        tracing::debug!(workspace = %self.entry.display(), cache_current, policy_current, ?changed_metadata, ?changed_source, "workspace refresh required");
         let discovery = if metadata_changed {
             discovery::discover_cached(&self.entry, &self.policy, &self.cache)?
         } else {
@@ -232,6 +249,8 @@ impl Workspace {
             discovery,
             fence,
             started: start,
+            validation,
+            discovery_time: discovery_started.elapsed(),
         }))
     }
 
@@ -240,6 +259,8 @@ impl Workspace {
             discovery,
             fence,
             started: start,
+            validation,
+            discovery_time,
         } = prepared;
         let mut directories = BTreeSet::new();
         let mut manifest = Manifest {
@@ -307,6 +328,10 @@ impl Workspace {
         }
         let mut visited = BTreeSet::new();
         let mut parsed = 0;
+        let mut extraction_time = std::time::Duration::ZERO;
+        let mut storage_time = std::time::Duration::ZERO;
+        let indexing_started = std::time::Instant::now();
+        let mut indexed = index_sources(&self.store, &queue, &manifest.projects)?;
         while let Some(input) = queue.pop_front() {
             if let Some(dir) = input.path.parent() {
                 directories.insert(dir.to_owned());
@@ -324,15 +349,6 @@ impl Workspace {
                 break;
             }
             let project = &manifest.projects[input.project];
-            let profile = if input.metadata {
-                String::new()
-            } else if input.language.document() {
-                "document".into()
-            } else if input.language == Language::CSharp {
-                project.defines.join(";")
-            } else {
-                format!("rust-2:{}", project.edition)
-            };
             let stamp = match Stamp::read(&input.path) {
                 Ok(stamp) => stamp,
                 Err(error) => {
@@ -342,17 +358,7 @@ impl Workspace {
                     continue;
                 }
             };
-            // Assembly records are immutable. Another workspace may publish a newer
-            // revision without invalidating this workspace's pinned catalog.
-            let revision = if input.metadata {
-                format!("{stamp:?}")
-            } else {
-                String::new()
-            };
-            let key =
-                blake3::hash(format!("{}\0{profile}\0{revision}", input.path.display()).as_bytes())
-                    .to_hex()
-                    .to_string();
+            let key = input_key(&input, project, &stamp);
             if let Some(f) = manifest.files.get_mut(&key) {
                 f.memberships.push(Membership {
                     project: input.project,
@@ -374,43 +380,19 @@ impl Workspace {
             } else {
                 &self.store
             };
-            let admission = crate::memory::admit_file(stamp.size, input.metadata);
-            let extracted = store.ensure_revision(&key, &stamp, || {
-                let data = if input.metadata {
-                    crate::metadata::file_data(&input.path).with_context(|| {
-                        format!(
-                            "Cannot extract metadata {}",
-                            crate::render::inline(&input.path.to_string_lossy())
-                        )
-                    })?
-                } else {
-                    let source = read_stable(&input.path, input.language)?;
-                    let facts = crate::extract::extract(
-                        &source,
-                        input.language,
-                        &project.defines,
-                        &project.edition,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Cannot extract {}",
-                            crate::render::inline(&input.path.to_string_lossy())
-                        )
-                    })?;
-                    FileData {
-                        source,
-                        facts,
-                        assembly: None,
-                    }
-                };
-                ensure!(
-                    Stamp::read(&input.path)? == stamp,
-                    "File changed during extraction; retry query"
+            let extracted = indexed
+                .remove(&key)
+                .filter(|(before, _)| before == &stamp)
+                .map_or_else(
+                    || index_input(store, &key, &input, project, &stamp),
+                    |(_, result)| result,
                 );
-                Ok(data)
-            });
-            drop(admission);
-            let (changed, modules) = match extracted {
+            let Indexed {
+                changed,
+                modules,
+                extraction,
+                storage,
+            } = match extracted {
                 Ok(value) => value,
                 Err(error) => {
                     // A repaired input must trigger another refresh even though it
@@ -422,6 +404,8 @@ impl Workspace {
                     continue;
                 }
             };
+            extraction_time += extraction;
+            storage_time += storage;
             parsed += usize::from(changed);
             if input.language == Language::Rust {
                 let base = input.path.parent().unwrap();
@@ -558,9 +542,15 @@ impl Workspace {
         self.initialized = true;
         self.builds += 1;
         tracing::info!(
+            workspace = %self.entry.display(),
             files = self.manifest.files.len(),
             projects = self.manifest.projects.len(),
             parsed,
+            validation_ms = validation.as_millis(),
+            discovery_ms = discovery_time.as_millis(),
+            indexing_ms = indexing_started.elapsed().as_millis(),
+            extraction_worker_ms = extraction_time.as_millis(),
+            storage_worker_ms = storage_time.as_millis(),
             elapsed_ms = start.elapsed().as_millis(),
             "workspace refreshed"
         );
@@ -579,6 +569,152 @@ impl Drop for Workspace {
 #[cfg(test)]
 #[path = "workspace_validation.rs"]
 mod validation;
+
+fn input_key(input: &SourceInput, project: &Project, stamp: &Stamp) -> String {
+    let profile = if input.metadata {
+        String::new()
+    } else if input.language.document() {
+        "document".into()
+    } else if input.language == Language::CSharp {
+        project.defines.join(";")
+    } else {
+        format!("rust-2:{}", project.edition)
+    };
+    // Shared assembly records remain immutable across workspace revisions.
+    let revision = if input.metadata {
+        format!("{stamp:?}")
+    } else {
+        String::new()
+    };
+    blake3::hash(format!("{}\0{profile}\0{revision}", input.path.display()).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+struct Indexed {
+    changed: bool,
+    modules: Vec<ModuleFile>,
+    extraction: std::time::Duration,
+    storage: std::time::Duration,
+}
+
+fn index_input(
+    store: &Store,
+    key: &str,
+    input: &SourceInput,
+    project: &Project,
+    stamp: &Stamp,
+) -> Result<Indexed> {
+    let _admission = crate::memory::admit_file(stamp.size, input.metadata);
+    let started = std::time::Instant::now();
+    let mut extraction = std::time::Duration::ZERO;
+    let (changed, modules) = store
+        .ensure_revision(key, stamp, || {
+            let extraction_started = std::time::Instant::now();
+            let data = if input.metadata {
+                crate::metadata::file_data(&input.path)?
+            } else {
+                let source = read_stable(&input.path, input.language)?;
+                let facts = crate::extract::extract(
+                    &source,
+                    input.language,
+                    &project.defines,
+                    &project.edition,
+                )?;
+                FileData {
+                    source,
+                    facts,
+                    assembly: None,
+                }
+            };
+            ensure!(
+                Stamp::read(&input.path)? == *stamp,
+                "File changed during extraction; retry query"
+            );
+            extraction = extraction_started.elapsed();
+            Ok(data)
+        })
+        .with_context(|| {
+            format!(
+                "Cannot index {}",
+                crate::render::inline(&input.path.to_string_lossy())
+            )
+        })?;
+    Ok(Indexed {
+        changed,
+        modules,
+        extraction,
+        storage: started.elapsed().saturating_sub(extraction),
+    })
+}
+
+type IndexedSources = BTreeMap<String, (Stamp, Result<Indexed>)>;
+
+/// C# discovery already supplies all sources. Extract independent compilation
+/// contexts concurrently, then assemble the manifest in discovery order.
+fn index_sources(
+    store: &Store,
+    inputs: &VecDeque<SourceInput>,
+    projects: &[Project],
+) -> Result<IndexedSources> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut jobs = BTreeMap::new();
+    for input in inputs
+        .iter()
+        .filter(|i| !i.metadata && i.language == Language::CSharp)
+        .take(1_000_000)
+    {
+        let Ok(stamp) = Stamp::read(&input.path) else {
+            continue;
+        };
+        if stamp.size as usize > MAX_SOURCE_BYTES {
+            continue;
+        }
+        let project = &projects[input.project];
+        let key = input_key(input, project, &stamp);
+        jobs.entry(key).or_insert((stamp, input, project));
+    }
+    let jobs: Vec<_> = jobs.into_iter().collect();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4)
+        .min(jobs.len());
+    let build = |(key, (stamp, input, project)): &(String, (Stamp, &SourceInput, &Project))| {
+        (
+            key.clone(),
+            (
+                stamp.clone(),
+                index_input(store, key, input, project, stamp),
+            ),
+        )
+    };
+    if workers <= 1 {
+        return Ok(jobs.iter().map(build).collect());
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut results = Vec::new();
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        results.push(build(job));
+                    }
+                    results
+                })
+            })
+            .collect();
+        let mut indexed = BTreeMap::new();
+        for handle in handles {
+            indexed.extend(
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Source indexing worker panicked"))?,
+            );
+        }
+        Ok(indexed)
+    })
+}
 
 fn read_stable(path: &Path, language: Language) -> Result<String> {
     for _ in 0..2 {

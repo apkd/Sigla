@@ -15,11 +15,34 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
     DefaultBranch,
     Branch(String),
+    Tag(String),
+    Named(String),
     Commit(String),
+}
+
+impl Target {
+    pub fn selector(value: &str) -> Result<Self> {
+        super::validate_branch(value)?;
+        if let Some(name) = value.strip_prefix("refs/heads/") {
+            super::validate_branch(name)?;
+            Ok(Self::Branch(name.into()))
+        } else if let Some(name) = value.strip_prefix("refs/tags/") {
+            super::validate_branch(name)?;
+            Ok(Self::Tag(name.into()))
+        } else if matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(Self::Commit(value.to_ascii_lowercase()))
+        } else {
+            ensure!(
+                !value.starts_with("refs/"),
+                "Only refs/heads/ and refs/tags/ selectors are supported"
+            );
+            Ok(Self::Named(value.into()))
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -121,27 +144,44 @@ fn prepare_with(
     let repository =
         Repository::parse(&request.repository)?.context("Expected a repository identifier")?;
     ensure!(
-        repository.branch.is_none(),
+        repository.selector.is_none(),
         "Internal transport must not contain a fragment"
     );
     let mut session = connect(&repository)?;
     let (branch, revision) = match &request.target {
         Target::Commit(id) => (None, parse_id(id)?),
-        Target::Branch(branch) => {
-            super::validate_branch(branch)?;
-            let name = format!("refs/heads/{branch}");
-            let refs = session.refs(std::slice::from_ref(&name))?;
-            let id = refs
-                .into_iter()
-                .find_map(|r| match r {
-                    gix_protocol::handshake::Ref::Direct {
-                        full_ref_name,
-                        object,
-                    } if full_ref_name.as_slice() == name.as_bytes() => Some(object),
-                    _ => None,
+        Target::Branch(name) | Target::Tag(name) | Target::Named(name) => {
+            super::validate_branch(name)?;
+            let names = match &request.target {
+                Target::Branch(_) => vec![format!("refs/heads/{name}")],
+                Target::Tag(_) => vec![format!("refs/tags/{name}")],
+                // Match Git's short-name precedence: tags before branches.
+                _ => vec![format!("refs/tags/{name}"), format!("refs/heads/{name}")],
+            };
+            let refs = session.refs(&names)?;
+            let (resolved, id) = names
+                .iter()
+                .find_map(|name| {
+                    refs.iter().find_map(|r| match r {
+                        gix_protocol::handshake::Ref::Direct {
+                            full_ref_name,
+                            object,
+                        }
+                        | gix_protocol::handshake::Ref::Peeled {
+                            full_ref_name,
+                            object,
+                            ..
+                        }
+                        | gix_protocol::handshake::Ref::Symbolic {
+                            full_ref_name,
+                            object,
+                            ..
+                        } if full_ref_name.as_slice() == name.as_bytes() => Some((name, *object)),
+                        _ => None,
+                    })
                 })
-                .context("Requested upstream branch is unavailable")?;
-            (Some(branch.clone()), id)
+                .context("Requested upstream branch or tag is unavailable")?;
+            (resolved.strip_prefix("refs/heads/").map(str::to_owned), id)
         }
         Target::DefaultBranch => {
             let refs = session.refs(&["HEAD".into()])?;
@@ -184,9 +224,16 @@ fn prepare_with(
             })
             .arg(&request.store))?;
     }
-    receive(&mut session, &request.store, vec![revision], true)?;
+    receive(&mut session, &request.store, vec![revision], true).context(
+        "Cannot fetch selected revision; the server may disallow fetching unadvertised commits",
+    )?;
     let transport = session.endpoint.clone();
     drop(session);
+    let kind = run(git(&request.store).args(["cat-file", "-t", &revision.to_string()]))?;
+    ensure!(
+        kind == b"commit\n",
+        "Selected revision does not point to a commit"
+    );
     let listing = tempfile::tempfile()?;
     let outcome = crate::process::capture(
         git(&request.store)
@@ -421,6 +468,69 @@ mod tests {
             additional: vec![],
             previous: BTreeMap::new(),
             subdirectory: None,
+        }
+    }
+
+    #[test]
+    fn selectors_materialize_the_selected_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let execute = |args: &[&str]| {
+            run(Command::new("git")
+                .arg("-C")
+                .arg(&upstream_path)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args))
+            .unwrap()
+        };
+        let old = String::from_utf8(execute(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        execute(&["tag", "release"]);
+        execute(&["tag", "-a", "annotated", "-m", "release"]);
+        execute(&["tag", "-a", "nested", "annotated", "-m", "nested release"]);
+        fs::write(upstream_path.join("Code.cs"), "class Updated {}\n").unwrap();
+        execute(&["commit", "--quiet", "-am", "update"]);
+        execute(&["branch", "release"]);
+        let current = String::from_utf8(execute(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        for (index, (selector, expected, revision)) in [
+            ("release", "class Searchable {}\n", old.as_str()),
+            ("refs/tags/release", "class Searchable {}\n", old.as_str()),
+            ("annotated", "class Searchable {}\n", old.as_str()),
+            ("nested", "class Searchable {}\n", old.as_str()),
+            (old.as_str(), "class Searchable {}\n", old.as_str()),
+            ("refs/heads/release", "class Updated {}\n", current.as_str()),
+            ("main", "class Updated {}\n", current.as_str()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = request(&root.path().join(index.to_string()));
+            request.target = Target::selector(selector).unwrap();
+            let prepared = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+            assert_eq!(prepared.revision, revision);
+            assert_eq!(
+                fs::read_to_string(request.staging.join("Code.cs")).unwrap(),
+                expected
+            );
+        }
+        let tree = String::from_utf8(execute(&["rev-parse", "HEAD^{tree}"])).unwrap();
+        execute(&["tag", "tree", tree.trim()]);
+        for selector in ["missing", "tree"] {
+            let mut request = request(&root.path().join(selector));
+            request.target = Target::selector(selector).unwrap();
+            assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
+            assert!(!request.staging.exists());
         }
     }
 

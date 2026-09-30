@@ -65,6 +65,27 @@ pub struct Sandbox {
     hidden: Vec<(PathBuf, bool)>,
 }
 
+/// Remove generated outputs after all sandbox processes have stopped.
+pub fn remove_outputs(writable: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Overlayfs leaves its private work directory at mode 000 after unmounting.
+    // It is outside the mounted workspace and is never exposed to project code.
+    let work = writable.join("overlay-work/work");
+    match fs::symlink_metadata(&work) {
+        Ok(metadata) => {
+            ensure!(metadata.is_dir(), "Invalid overlay work directory");
+            fs::set_permissions(&work, fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::remove_dir_all(writable) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Sandbox {
     pub fn new(
         context: &crate::discovery::RemoteContext,
@@ -455,6 +476,20 @@ pub fn read_job_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_outputs_remove_private_overlay_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let outputs = root.path().join("generated");
+        let work = outputs.join("overlay-work/work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("leftover"), "scratch").unwrap();
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).unwrap();
+        remove_outputs(&outputs).unwrap();
+        assert!(!outputs.exists());
+        remove_outputs(&outputs).unwrap();
+    }
 
     #[test]
     fn ca_bundle_follows_symlinks_to_the_file() {

@@ -45,7 +45,10 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("sigla=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "sigla=info".into()),
+        )
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
@@ -59,6 +62,7 @@ async fn main() -> Result<()> {
     let remote = cli.options.validate()?;
     let mut policy = Policy::new(cli.options.local_roots())?;
     policy.unity_platform = cli.options.unity_platform;
+    policy.unity_editors = cli.options.unity_editors;
     let app = Arc::new(match remote {
         Some(remote) => App::remote(policy, cli.options.cache_dir, cli.workers as usize, remote)?,
         None if cli.options.mode == sigla::config::Mode::Hybrid => App::hybrid(

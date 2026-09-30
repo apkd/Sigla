@@ -9,6 +9,7 @@ use std::{
 pub struct Policy {
     pub roots: Vec<PathBuf>,
     pub unity_platform: crate::unity::Platform,
+    pub unity_editors: Option<PathBuf>,
     pub remote: Option<RemoteContext>,
 }
 
@@ -74,19 +75,24 @@ impl RemoteContext {
 
 impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
-        Ok(*blake3::hash(&serde_json::to_vec(&(
+        let mut hash = blake3::Hasher::new();
+        hash.update(&serde_json::to_vec(&(
             8u32,
             &self.roots,
             self.unity_platform,
             self.remote
                 .as_ref()
                 .map(|r| (&r.repositories, &r.selection_identity)),
-        ))?)
-        .as_bytes())
+        ))?);
+        if let Some(editors) = &self.unity_editors {
+            hash.update(&serde_json::to_vec(editors)?);
+        }
+        Ok(*hash.finalize().as_bytes())
     }
     pub fn new(roots: Vec<PathBuf>) -> Result<Self> {
         Ok(Self {
             unity_platform: Default::default(),
+            unity_editors: None,
             remote: None,
             roots: roots
                 .into_iter()

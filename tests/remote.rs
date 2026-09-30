@@ -111,7 +111,7 @@ impl Server {
                 "--repo-ttl",
                 if live_unity { "7d" } else { "60s" },
                 "--branch-ttl",
-                if live_unity { "1d" } else { "2s" },
+                if live_unity { "1d" } else { "60s" },
                 "--listen",
             ])
             .arg(address.to_string())
@@ -275,9 +275,21 @@ fn lifecycle() -> Result<()> {
     fs::write(upstream.join("asset.bin"), vec![123; 1024 * 1024])?;
     git(&upstream, &["add", "."])?;
     git(&upstream, &["commit", "--quiet", "-m", "main"])?;
+    let original_commit = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args(["rev-parse", "HEAD"])
+            .output()?
+            .stdout,
+    )?
+    .trim()
+    .to_owned();
+    git(&upstream, &["tag", "-a", "release", "-m", "release"])?;
     git(&upstream, &["switch", "--quiet", "-c", "feature/search"])?;
     fs::write(upstream.join("src/lib.rs"), "pub struct Feature;\n")?;
     git(&upstream, &["commit", "--quiet", "-am", "feature"])?;
+    git(&upstream, &["branch", "release"])?;
     git(&upstream, &["switch", "--quiet", "main"])?;
     fs::create_dir(root.path().join("bin"))?;
     std::os::unix::fs::symlink(std::env::current_exe()?, root.path().join("bin/ssh"))?;
@@ -395,6 +407,15 @@ fn lifecycle() -> Result<()> {
         "Remote mode exposed an implicit local root"
     );
     server.until(feature, "type:Feature", "Feature")?;
+    let tag = "git@github.com:fixture/repo.git#release";
+    let pinned = format!("git@github.com:fixture/repo.git#{original_commit}");
+    server.until(tag, "type:Main", "Main")?;
+    server.until(&pinned, "type:Main", "Main")?;
+    server.until(
+        "git@github.com:fixture/repo.git#refs/heads/release",
+        "type:Feature",
+        "Feature",
+    )?;
     ensure!(
         !server.query(main, "type:Main")?.0,
         "Branches did not remain independent"
@@ -425,6 +446,9 @@ fn lifecycle() -> Result<()> {
     )?;
     server.until(main, "type:Changed", "Changed")?;
     server.until(main, "type:MaterializedInput", "MaterializedInput")?;
+    git(&upstream, &["tag", "--force", "release"])?;
+    server.until(tag, "type:Changed", "Changed")?;
+    server.until(&pinned, "type:Main", "Main")?;
     fs::write(root.path().join("offline"), "")?;
     std::thread::sleep(Duration::from_millis(1200));
     let (error, cached) = server.query(main, "type:Changed")?;
@@ -434,6 +458,8 @@ fn lifecycle() -> Result<()> {
     );
     drop(server);
     let server = Server::start(root.path())?;
+    server.until(tag, "type:Changed", "Changed")?;
+    server.until(&pinned, "type:Main", "Main")?;
     let (error, cached) = server.query(main, "type:Changed")?;
     ensure!(
         !error && cached.contains("Changed"),

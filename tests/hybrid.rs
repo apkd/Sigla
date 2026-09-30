@@ -269,6 +269,10 @@ async fn forwards_all_tools_and_preserves_results_and_cancellation() {
             serde_json::json!({"project":"https://github.com/owner/repo","query":"fail"}),
         ),
         (
+            "search",
+            serde_json::json!({"project":"https://github.com/owner/repo#refs%2Ftags%2Frelease%2520literal","query":"type:Example"}),
+        ),
+        (
             "browse",
             serde_json::json!({"project":"git@github.com:owner/repo.git","path":"src"}),
         ),

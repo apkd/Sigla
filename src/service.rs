@@ -274,9 +274,10 @@ impl App {
             && let Some(repository) = crate::repository::Repository::project(path, true)?
         {
             let mut project = repository.transport;
-            if let Some(branch) = repository.branch {
+            if let Some((_, selector)) = path.trim().split_once('#') {
                 project.push('#');
-                project.push_str(&branch);
+                // Preserve encoding so the upstream decodes the selector exactly once.
+                project.push_str(selector);
             }
             let (name, args) = match request {
                 Request::Search(query) => (
@@ -409,7 +410,6 @@ impl App {
         drop(retired);
         // The service owns preparation. Dropping a caller only drops its wait.
         let preparing_app = self.clone();
-        let managed = branch.is_some();
         let preparing_branch = branch.clone();
         let (mut state, mut branch_state) = tokio::spawn(async move {
             let mut state = workspace.lock_owned().await;
@@ -420,6 +420,9 @@ impl App {
                 let entry = entry.clone();
                 let cache = cache.clone();
                 let current_policy = policy.clone();
+                let generation = preparing_branch
+                    .as_ref()
+                    .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
                 let (next, result) = tokio::task::spawn_blocking(move || -> Result<_> {
                     if state.is_none() {
                         *state = Some(Workspace::open(
@@ -431,8 +434,8 @@ impl App {
                         )?);
                     }
                     state.as_mut().unwrap().update_policy(current_policy);
-                    if managed {
-                        state.as_mut().unwrap().materialized();
+                    if let Some(generation) = generation {
+                        state.as_mut().unwrap().materialized(generation);
                     }
                     let result = state.as_mut().unwrap().prepare();
                     crate::memory::reclaim();
@@ -513,7 +516,7 @@ impl App {
             let prepared = &branch_state.as_ref().unwrap().as_ref().unwrap().prepared;
             (
                 branch.repository.identity.clone(),
-                branch.name.clone(),
+                branch.selector(prepared),
                 prepared.revision.clone(),
                 prepared.tracked.len(),
             )

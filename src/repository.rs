@@ -10,7 +10,7 @@ pub mod materialize;
 pub mod selection;
 pub mod transport;
 
-const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`";
+const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`, `#tag`, or a full `#commit` ID";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Endpoint {
@@ -77,9 +77,9 @@ impl fmt::Display for Identity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repository {
     pub identity: Identity,
-    /// The supplied transport, without a branch selector or credentials.
+    /// The supplied transport, without a revision selector or credentials.
     pub transport: String,
-    pub branch: Option<String>,
+    pub selector: Option<String>,
 }
 
 impl Repository {
@@ -101,14 +101,14 @@ impl Repository {
             .split_once('#')
             .map_or((input, None), |(a, b)| (a, Some(b)));
         let transport = transport.trim_end_matches('/');
-        let branch = fragment.map(decode).transpose()?;
-        if let Some(branch) = &branch {
-            validate_branch(branch)?;
+        let selector = fragment.map(decode).transpose()?;
+        if let Some(selector) = &selector {
+            materialize::Target::selector(selector)?;
         }
         Ok(Some(Self {
             identity: parse_identity(transport, false)?,
             transport: transport.to_owned(),
-            branch,
+            selector,
         }))
     }
 
@@ -390,7 +390,7 @@ pub fn validate_branch(branch: &str) -> Result<()> {
             && branch
                 .split('/')
                 .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock")),
-        "Invalid branch selector; supply a branch name, such as `#feature/search`, rather than a revision expression"
+        "Invalid revision selector; supply a branch, tag, or full commit ID rather than a revision expression"
     );
     Ok(())
 }
@@ -444,7 +444,7 @@ mod tests {
         let branch = Repository::project("Owner/Repo#Feature/topic", true)
             .unwrap()
             .unwrap();
-        assert_eq!(branch.branch.as_deref(), Some("Feature/topic"));
+        assert_eq!(branch.selector.as_deref(), Some("Feature/topic"));
     }
 
     #[test]
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn fragments_are_decoded_once_and_preserve_case() {
         let r = repo("https://github.com/o/r#Feature%2Fsearch%2520literal");
-        assert_eq!(r.branch.as_deref(), Some("Feature/search%20literal"));
+        assert_eq!(r.selector.as_deref(), Some("Feature/search%20literal"));
         assert!(!r.transport.contains('#'));
         for path in [
             "/tmp/project#branch",
@@ -495,6 +495,8 @@ mod tests {
             "https://github.com/o/%2e%2e",
             "https://github.com/o/r%2fs",
             "https://github.com/o/r#main~1",
+            "https://github.com/o/r#refs/remotes/origin/main",
+            "https://github.com/o/r#refs/tags/",
             "https://github.com/o/r#branch%",
             "https://github.com/o/r#",
             "file:///tmp/repo",

@@ -67,6 +67,8 @@ fn highland_keep_full_context() {
             },
             fence: 0,
             started: std::time::Instant::now(),
+            validation: std::time::Duration::ZERO,
+            discovery_time: std::time::Duration::ZERO,
         })
         .unwrap();
     eprintln!(

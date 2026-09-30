@@ -27,12 +27,19 @@ fn now() -> u64 {
 type Outcome = std::result::Result<(), String>;
 type Running = watch::Receiver<Option<Outcome>>;
 
+fn remove_branch(root: &Path) -> Result<()> {
+    crate::sandbox::remove_outputs(&root.join("generated"))?;
+    fs::remove_dir_all(root).context("Cannot remove expired repository cache")
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     pub schema: u32,
     pub repository: Identity,
     pub transport: String,
     pub branch: String,
+    #[serde(default)]
+    pub target: Option<Target>,
     pub last_use: u64,
     pub refreshed: u64,
     pub store_created: u64,
@@ -48,6 +55,7 @@ pub struct Branch {
     pub root: PathBuf,
     pub repository: Repository,
     pub name: String,
+    pub target: Target,
     pub state: Arc<AsyncMutex<Option<State>>>,
     pub last_use: AtomicU64,
     pub generation: AtomicU64,
@@ -57,6 +65,16 @@ pub struct Branch {
 }
 
 impl Branch {
+    pub fn selector(&self, prepared: &Prepared) -> String {
+        if let Some(branch) = &prepared.branch {
+            return format!("refs/heads/{branch}");
+        }
+        match &self.target {
+            Target::Tag(name) | Target::Named(name) => format!("refs/tags/{name}"),
+            Target::Commit(id) => id.clone(),
+            _ => self.name.clone(),
+        }
+    }
     pub fn source(&self) -> PathBuf {
         self.root.join("source")
     }
@@ -135,7 +153,7 @@ impl Manager {
                 true
             };
             if expired {
-                fs::remove_dir_all(entry.path())?;
+                remove_branch(&entry.path())?;
             }
         }
         Ok(Arc::new(Self {
@@ -252,8 +270,9 @@ impl Manager {
                     state.last_use = last_use;
                     branch.persist(state)?;
                 }
-                if now().saturating_sub(state.refreshed)
-                    >= self.options.refresh_interval.as_millis() as u64
+                if !matches!(branch.target, Target::Commit(_))
+                    && now().saturating_sub(state.refreshed)
+                        >= self.options.refresh_interval.as_millis() as u64
                 {
                     self.schedule(branch.clone(), false);
                 }
@@ -288,7 +307,7 @@ impl Manager {
         {
             return Ok(());
         }
-        fs::remove_dir_all(&branch.root)?;
+        remove_branch(&branch.root)?;
         branches.retain(|_, value| !Arc::ptr_eq(value, branch));
         Ok(())
     }
@@ -299,13 +318,22 @@ impl Manager {
             tokio::task::spawn_blocking(move || super::transport::verify_public(&repository))
                 .await??;
         }
-        let name = match &repository.branch {
-            Some(name) => name.clone(),
-            None => self.default_branch(&repository).await?,
+        let target = match &repository.selector {
+            Some(name) => Target::selector(name)?,
+            None => Target::Branch(self.default_branch(&repository).await?),
         };
-        let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, &name))?)
-            .to_hex()
-            .to_string();
+        let name = match &target {
+            Target::Branch(name) | Target::Named(name) | Target::Commit(name) => name.clone(),
+            Target::Tag(name) => format!("refs/tags/{name}"),
+            Target::DefaultBranch => unreachable!(),
+        };
+        let identity = if matches!(target, Target::Branch(_)) {
+            // Preserve existing default-branch caches across the selector upgrade.
+            serde_json::to_vec(&(&repository.identity, &name))?
+        } else {
+            serde_json::to_vec(&(&repository.identity, &target))?
+        };
+        let key = blake3::hash(&identity).to_hex().to_string();
         let branch = {
             let mut branches = self.branches.lock().unwrap();
             if let Some(branch) = branches.get(&key) {
@@ -321,9 +349,14 @@ impl Manager {
                 };
                 if let Some(value) = &mut state {
                     ensure!(
-                        matches!(value.schema, 2 | 3)
+                        matches!(value.schema, 2..=4)
                             && value.repository == repository.identity
-                            && value.branch == name,
+                            && value.branch == name
+                            && value
+                                .target
+                                .clone()
+                                .unwrap_or_else(|| Target::Branch(value.branch.clone()))
+                                == target,
                         "Cached branch identity is invalid"
                     );
                     if value.schema < 3 {
@@ -335,7 +368,7 @@ impl Manager {
                         self.options.branch_ttl
                     };
                     if now().saturating_sub(value.last_use) >= ttl.as_millis() as u64 {
-                        fs::remove_dir_all(&root)?;
+                        remove_branch(&root)?;
                         state = None;
                     }
                 }
@@ -344,6 +377,7 @@ impl Manager {
                     root,
                     repository: repository.clone(),
                     name,
+                    target,
                     last_use: AtomicU64::new(now()),
                     generation: AtomicU64::new(0),
                     state: Arc::new(AsyncMutex::new(state)),
@@ -366,7 +400,9 @@ impl Manager {
                 })
         });
         let due = state.as_ref().is_none_or(|s| {
-            now().saturating_sub(s.refreshed) >= self.options.refresh_interval.as_millis() as u64
+            !matches!(branch.target, Target::Commit(_))
+                && now().saturating_sub(s.refreshed)
+                    >= self.options.refresh_interval.as_millis() as u64
         });
         drop(state);
         if !usable || due {
@@ -461,7 +497,7 @@ impl Manager {
         let cache = self.cache.clone();
         let mut prepared =
             tokio::task::spawn_blocking(move || job::execute(&request, &cache)).await??;
-        prepared.branch = Some(branch.name.clone());
+        prepared.branch = before.prepared.branch.clone();
         let mut state = branch.state.lock().await;
         let mut next = before;
         next.additional.extend(paths);
@@ -525,7 +561,7 @@ impl Manager {
             allow_private: authorize(&self.options.rules, &branch.repository)?,
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
-            target: Target::Branch(branch.name.clone()),
+            target: branch.target.clone(),
             store: replacement
                 .as_ref()
                 .map_or_else(|| branch.root.join("git"), |r| r.path().join("git")),
@@ -546,10 +582,11 @@ impl Manager {
             tokio::task::spawn_blocking(move || job::execute(&request, &cache)).await??;
         let mut state = branch.state.lock().await;
         let mut next = State {
-            schema: 3,
+            schema: 4,
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),
+            target: Some(branch.target.clone()),
             last_use: branch.last_use.load(Ordering::Relaxed),
             refreshed: now(),
             store_created: before.as_ref().map_or(now(), |s| s.store_created),

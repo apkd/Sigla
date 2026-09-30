@@ -146,7 +146,7 @@ async fn concrete_kinds_and_declaration_line_ranges() {
     assert!(text.starts_with("`Src/Core/Types.cs:1`"), "{text}");
     let limited = app.search(project, "type:* limit:2").await.unwrap();
     assert!(
-        limited.contains("`Src/Core/Types.cs:") && limited.contains("`…/Core/Types.cs:"),
+        limited.contains("`Src/Core/Types.cs:") && limited.contains("`…/Types.cs:"),
         "{limited}"
     );
 }
@@ -1222,14 +1222,14 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
     assert_eq!(
         limited
             .lines()
-            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `") && l.contains("/Code.cs:"))
             .count(),
         3
     );
     let full = a.search(path, "calls:* in:Example limit:8").await.unwrap();
     assert_eq!(
         full.lines()
-            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `") && l.contains("/Code.cs:"))
             .count(),
         8
     );
@@ -1242,7 +1242,7 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
     assert_eq!(
         directory
             .lines()
-            .filter(|l| l.contains(" in `Scripts/Code.cs:"))
+            .filter(|l| l.contains(" in `") && l.contains("/Code.cs:"))
             .count(),
         3
     );

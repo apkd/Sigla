@@ -74,7 +74,7 @@ pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discove
     }
     let editor = match &policy.remote {
         Some(remote) => super::acquire::editor(root, &remote.shared)?,
-        None => Editor::local(root)?,
+        None => Editor::local(root, policy.unity_editors.as_deref())?,
     };
     discover_with_editor(root, policy, cache, result, &editor)
 }
