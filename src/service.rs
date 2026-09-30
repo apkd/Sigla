@@ -52,6 +52,7 @@ impl App {
         }
     }
     fn trim_idle(&self) {
+        crate::memory::reclaim();
         loop {
             match crate::memory::resident_bytes() {
                 Ok(bytes) if bytes > crate::memory::IDLE_CACHE_HIGH_WATER => {}
@@ -75,6 +76,7 @@ impl App {
             }
             // release the LMDB mapping outside the registry lock before measuring again.
             drop(retired);
+            crate::memory::reclaim();
         }
     }
 
@@ -104,6 +106,7 @@ impl App {
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
         let assemblies = crate::store::Store::open(&cache.join("assemblies"))?;
+        crate::memory::start_reclaimer()?;
         Ok(Self {
             _ownership: ownership,
             policy,
@@ -432,6 +435,7 @@ impl App {
                         state.as_mut().unwrap().materialized();
                     }
                     let result = state.as_mut().unwrap().prepare();
+                    crate::memory::reclaim();
                     Ok((state, result))
                 })
                 .await??;
@@ -489,6 +493,7 @@ impl App {
                 state = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
                     state.as_mut().unwrap().apply(prepared)?;
+                    crate::memory::reclaim();
                     Ok(state)
                 })
                 .await??;

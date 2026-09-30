@@ -1,4 +1,4 @@
-//! linux resident-memory accounting for eviction of idle, rebuildable caches.
+//! memory admission and reclamation for completed work and idle caches.
 use std::io;
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -52,14 +52,60 @@ pub fn admit_file(bytes: u64, assembly: bool) -> Reservation<'static> {
 }
 
 pub fn resident_bytes() -> io::Result<u64> {
+    resident("VmRSS:")
+}
+
+fn resident(field: &str) -> io::Result<u64> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let kib = status
         .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .find_map(|line| line.strip_prefix(field))
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| io::Error::other("Missing resident memory accounting"))?;
     Ok(kib * 1024)
+}
+
+pub fn reclaim() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Ok(resident) = resident("RssAnon:") {
+        // Allocated bytes may include untouched mappings, so they cannot be
+        // subtracted from resident bytes to estimate reclaimable memory.
+        if resident > IDLE_CACHE_HIGH_WATER {
+            release_unused_pages();
+        }
+    }
+}
+
+pub fn start_reclaimer() -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static STARTED: OnceLock<io::Result<()>> = OnceLock::new();
+        STARTED
+            .get_or_init(|| {
+                std::thread::Builder::new()
+                    .name("sigla-memory".into())
+                    .spawn(|| {
+                        loop {
+                            // An active request can stall before reaching its cleanup.
+                            // Reclaim independently of request completion and Tokio.
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            reclaim();
+                        }
+                    })
+                    .map(drop)
+            })
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_unused_pages() {
+    // freeing parser and query buffers leaves pages in glibc's thread arenas.
+    // return those pages while requests are active and before evicting caches.
+    unsafe { libc::malloc_trim(0) };
 }
 
 #[cfg(test)]
@@ -87,5 +133,74 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) <= budget.capacity);
         assert_eq!(*budget.available.lock().unwrap(), budget.capacity);
         let _oversized = budget.reserve(budget.capacity + 1);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn freed_worker_pages_are_returned_to_kernel() {
+        const CHILD: &str = "SIGLA_MEMORY_RECLAIM_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory::tests::freed_worker_pages_are_returned_to_kernel",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // isolate allocator settings from other tests and force free arena pages
+        // to remain resident until reclamation, as with fragmented worker heaps.
+        unsafe {
+            assert_eq!(libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024 * 1024), 1);
+            assert_eq!(libc::mallopt(libc::M_TRIM_THRESHOLD, -1), 1);
+        }
+        release_unused_pages();
+        let baseline = resident("RssAnon:").unwrap();
+        let per_worker = IDLE_CACHE_HIGH_WATER as usize / (64 * 1024);
+        let pins = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(move || {
+                        let buffers: Vec<_> =
+                            (0..per_worker).map(|_| vec![1u8; 64 * 1024]).collect();
+                        let pin = vec![7u8; 1024 * 1024];
+                        std::hint::black_box(&buffers);
+                        drop(buffers);
+                        pin
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let retained = resident("RssAnon:").unwrap();
+        let released = 2 * per_worker as u64 * 64 * 1024;
+        assert!(retained > baseline + released / 2);
+        // A large untouched live allocation must not hide the freed pages.
+        let sparse = unsafe { libc::malloc(released as usize * 2) };
+        assert!(!sparse.is_null());
+        start_reclaimer().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while resident("RssAnon:").unwrap() + released / 2 >= retained
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let reclaimed = resident("RssAnon:").unwrap();
+        unsafe { libc::free(sparse) };
+        assert!(reclaimed + released / 2 < retained);
+        assert!(pins.iter().all(|pin| pin.iter().all(|&byte| byte == 7)));
     }
 }

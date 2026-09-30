@@ -47,10 +47,15 @@ async fn main() -> Result<()> {
                     .unwrap_or("")
                     .trim()
             };
-            println!(
-                "{}",
-                serde_json::json!({"iteration":iteration,"project":case.project,"query":case.query,"elapsed_us":start.elapsed().as_micros(),"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string(),"rss":memory("VmRSS:"),"anonymous_rss":memory("RssAnon:"),"file_rss":memory("RssFile:"),"peak_rss":memory("VmHWM:"),"threads":memory("Threads:")})
-            );
+            let sample = serde_json::json!({"iteration":iteration,"project":case.project,"query":case.query,"elapsed_us":start.elapsed().as_micros(),"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string(),"rss":memory("VmRSS:"),"anonymous_rss":memory("RssAnon:"),"file_rss":memory("RssFile:"),"peak_rss":memory("VmHWM:"),"threads":memory("Threads:")});
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            let sample = {
+                let heap = unsafe { libc::mallinfo2() };
+                let mut sample = sample;
+                sample["heap"] = serde_json::json!({"used":heap.uordblks,"free":heap.fordblks,"mapped":heap.hblkhd});
+                sample
+            };
+            println!("{sample}");
             Ok::<_, anyhow::Error>(())
             });
             }
