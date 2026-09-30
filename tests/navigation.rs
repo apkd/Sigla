@@ -8,6 +8,79 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 #[tokio::test]
+async fn documents_are_searchable_preserved_and_refreshed_without_build_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let source = "# Guide\n\n- example\n\n```cs\n  int x = 1;\n```\n";
+    write(root.path(), "README.md", source);
+    write(
+        root.path(),
+        ".github/instructions/review.md",
+        "Review carefully",
+    );
+    write(root.path(), "target/ignored.txt", "Must not be indexed");
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            2,
+        )
+        .unwrap(),
+    );
+    let project = root.path().to_str().unwrap();
+    for mode in ["exact", "minified"] {
+        assert!(
+            app.view(project, "README.md", mode)
+                .await
+                .unwrap()
+                .contains(source)
+        );
+        assert!(
+            app.view(project, "README.md:3", mode)
+                .await
+                .unwrap()
+                .contains("- example\n")
+        );
+    }
+    assert!(app.browse(project, "").await.unwrap().contains("README.md"));
+    assert!(
+        app.search(project, "file:*.md")
+            .await
+            .unwrap()
+            .contains("review.md")
+    );
+    assert!(
+        app.search(project, "text:\"Review carefully\"")
+            .await
+            .unwrap()
+            .contains("review.md")
+    );
+    assert_eq!(
+        app.search(project, "file:ignored.txt").await.unwrap(),
+        "No matches."
+    );
+    write(root.path(), "docs/New.TXT", "New searchable document");
+    assert!(
+        app.search(project, "text:\"New searchable\"")
+            .await
+            .unwrap()
+            .contains("New.TXT")
+    );
+    write(root.path(), "docs/New.TXT", "Changed document");
+    assert!(
+        app.view(project, "New.TXT", "minified")
+            .await
+            .unwrap()
+            .contains("Changed document")
+    );
+    std::fs::remove_file(root.path().join("docs/New.TXT")).unwrap();
+    assert_eq!(
+        app.search(project, "file:New.TXT").await.unwrap(),
+        "No matches."
+    );
+}
+
+#[tokio::test]
 async fn browse_find_and_read_use_the_same_refreshed_sources() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -23,7 +96,8 @@ async fn browse_find_and_read_use_the_same_refreshed_sources() {
     );
     write(root.path(), "src/first/mod.rs", "pub struct First;\n");
     write(root.path(), "src/second/mod.rs", "pub struct Second;\n");
-    write(root.path(), "README.md", "Not indexed");
+    write(root.path(), "README.md", "Repository documentation");
+    write(root.path(), "docs/guide.md", "Project guide");
     let app = Arc::new(
         App::new(
             Policy::new(vec![root.path().into()]).unwrap(),
@@ -34,12 +108,45 @@ async fn browse_find_and_read_use_the_same_refreshed_sources() {
     );
     let project = root.path().to_str().unwrap();
     let tree = app.browse(project, "").await.unwrap();
+    assert_eq!(
+        app.search(project, "file:README.md project:*")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+    assert!(
+        app.search(project, "text:\"Project guide\" project:navigation")
+            .await
+            .unwrap()
+            .contains("guide.md")
+    );
+    assert_eq!(
+        app.search(
+            project,
+            "text:\"Repository documentation\" project:navigation"
+        )
+        .await
+        .unwrap(),
+        "No matches."
+    );
+    assert_eq!(
+        app.search(project, "text:\"Project guide\" -project:navigation")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+    assert_eq!(
+        app.search(project, "file:guide.md -project:navigation")
+            .await
+            .unwrap(),
+        "No matches."
+    );
     assert!(
         tree.contains("first/") && tree.contains("second/") && tree.contains("lib.rs"),
         "{tree}"
     );
     assert!(
-        !tree.contains("struct") && !tree.contains("README"),
+        !tree.contains("struct") && tree.contains("README.md"),
         "{tree}"
     );
     let files = app.search(project, "file:mod.rs").await.unwrap();
@@ -107,13 +214,33 @@ async fn browse_find_and_read_use_the_same_refreshed_sources() {
         "{file_hint}"
     );
     assert!(app.view(project, "../outside.rs", "exact").await.is_err());
-    for suffix in [":1-abc", ":-1-5"] {
+    for suffix in [
+        ":1-abc", ":-1-5", ":", ":abc", ":21:", ":20-25:", ":1:2:3", "()", "(abc)", "#L",
+    ] {
         let error = app
             .view(project, &format!("first/mod.rs{suffix}"), "exact")
             .await
             .unwrap_err();
         assert!(error.to_string().contains("range"), "{error}");
     }
+    let spaced = app
+        .view(project, "first/mod.rs: 2 - 2 ", "exact")
+        .await
+        .unwrap();
+    assert!(spaced.contains("pub struct Changed;"), "{spaced}");
+    write(root.path(), "notes:20.txt", "Literal colon filename");
+    assert!(
+        app.view(project, "notes:20.txt:1", "exact")
+            .await
+            .unwrap()
+            .contains("Literal colon filename")
+    );
+    assert!(
+        app.view(project, "notes:20.txt", "exact")
+            .await
+            .unwrap()
+            .contains("Literal colon filename")
+    );
     assert!(app.view(project, "lib.rs:999", "exact").await.is_err());
     let fuzzy = app.view(project, "firs/mod.rs:2", "exact").await.unwrap();
     assert!(fuzzy.contains("Changed"), "{fuzzy}");

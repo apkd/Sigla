@@ -9,9 +9,14 @@ using System;
 namespace System { public class Type {} public class Object { public Type GetType() => null; } }
 static class Extensions { public static string GetNameCached(this Type value) => ""; }
 interface Item {}
+class Base : Object, Item {}
+class Derived : Base {}
+class Container { internal class Slot { public int Count; } internal class Data { public Slot Slot; }
+ static void Capture(Data data) { data./*parameter*/Slot./*field*/Count = 2; } }
 class Enumerator { public Item Current => null; public bool MoveNext() => false; }
 class Items { public Enumerator GetEnumerator() => null; }
-class Usage<T> { void Run(Items items) {
+class Usage<T> : Base { void Run(Items items, Derived derived) {
+ var inherited = $"{GetType()./*implicit*/GetNameCached()} {derived.GetType()./*inherited*/GetNameCached()}";
  var text = $"{typeof(T)./*typeof*/GetNameCached()} {typeof(Item)./*second*/GetNameCached()}";
  foreach (var item in items) { item.GetType()./*outer*/GetNameCached();
   void Nested() { foreach (var other in items) other.GetType()./*inner*/GetNameCached(); }
@@ -23,6 +28,10 @@ class Usage<T> { void Run(Items items) {
             ("/*second*/", "Extensions.GetNameCached"),
             ("/*outer*/", "Extensions.GetNameCached"),
             ("/*inner*/", "Extensions.GetNameCached"),
+            ("/*implicit*/", "Extensions.GetNameCached"),
+            ("/*inherited*/", "Extensions.GetNameCached"),
+            ("/*parameter*/", "Container.Data.Slot"),
+            ("/*field*/", "Container.Slot.Count"),
         ],
     )
     .await;
@@ -446,10 +455,20 @@ async fn check_extra(source: &str, extra: &str, cases: &[(&str, &str)]) {
             )
             .await
             .unwrap();
-        assert!(
-            result.contains(expected),
-            "{marker}: expected {expected}, got {result}"
-        );
+        if *expected == "No matches." {
+            // Negative binding controls may now return recovery candidates,
+            // but must never present a candidate as a resolved declaration.
+            assert!(!result.contains("```"), "{marker}: {result}");
+            assert!(
+                result == "No matches." || result.contains("could not"),
+                "{marker}: {result}"
+            );
+        } else {
+            assert!(
+                result.contains(expected),
+                "{marker}: expected {expected}, got {result}"
+            );
+        }
     }
 }
 

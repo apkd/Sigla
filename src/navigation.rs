@@ -89,6 +89,10 @@ mod tests {
         }
         assert!(location("Code.cs:0").is_err());
         assert!(location("Code.cs:9-2").is_err());
+        for suffix in [":", ":abc", ":21:", ":20-25:", ":1:2:3", ":20-abc"] {
+            assert!(location(&format!("Code.cs{suffix}")).is_err(), "{suffix}");
+        }
+        assert_eq!(location("Code.cs: 20 - 25 ").unwrap().1, Some((20, 25)));
         let source = "one\r\ntwo\r\nthree";
         let (range, first, last) = lines(source, Some((2, 2))).unwrap();
         assert_eq!(&source[range], "two\r\n");
@@ -257,14 +261,10 @@ pub fn choices(paths: &[&str], kind: &str) -> String {
 pub fn location(path: &str) -> Result<(&str, Option<(usize, usize)>)> {
     static SUFFIX: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
-        r"^(.*?)(?::L?(\d+)(?::\d+)?(?:(?:-|\.\.)L?(\d+)(?::\d+)?)?|#L?(\d+)(?:-L?(\d+))?|\((\d+)(?:,\s*\d+)?\))$").unwrap()
+        r"^([^:]*?)(?::\s*L?(\d+)\s*(?::\s*\d+\s*)?(?:(?:-|\.\.)\s*L?(\d+)\s*(?::\s*\d+\s*)?)?|#L?(\d+)(?:-L?(\d+))?|\((\d+)(?:,\s*\d+)?\))$").unwrap()
     });
     let Some(c) = SUFFIX.captures(path) else {
-        if path
-            .rsplit_once(':')
-            .is_some_and(|(_, suffix)| suffix.starts_with(|c: char| c.is_ascii_digit() || c == '-'))
-            || path.contains("#L")
-        {
+        if path.contains(':') || path.contains("#L") {
             anyhow::bail!("Invalid line range; use `path:1-20` (1-based, inclusive)");
         }
         return Ok((path, None));

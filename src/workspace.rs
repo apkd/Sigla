@@ -326,6 +326,8 @@ impl Workspace {
             let project = &manifest.projects[input.project];
             let profile = if input.metadata {
                 String::new()
+            } else if input.language.document() {
+                "document".into()
             } else if input.language == Language::CSharp {
                 project.defines.join(";")
             } else {
@@ -573,6 +575,10 @@ impl Drop for Workspace {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_validation.rs"]
+mod validation;
 
 fn read_stable(path: &Path, language: Language) -> Result<String> {
     for _ in 0..2 {

@@ -572,7 +572,7 @@ impl<'a> Search<'a> {
         if o.call {
             candidates.retain(|h| h.decl.callable() || h.decl.named_type());
         }
-        if o.write {
+        if o.write != WriteKind::None {
             candidates.retain(|h| {
                 matches!(
                     h.decl.kind.as_str(),
@@ -875,6 +875,15 @@ impl<'a> Search<'a> {
         }
         files
     }
+    fn project_membership(&self, q: &Query, file: &FileEntry, m: &Membership) -> bool {
+        // A document's repository context is not a build project. It must not
+        // satisfy project wildcards or bypass its real project memberships.
+        !(file.language.document()
+            && self.manifest.projects[m.project].name.is_empty()
+            && q.filters
+                .iter()
+                .any(|f| f.key == "project" && (!f.negate || file.memberships.len() > 1)))
+    }
     fn filters(
         &mut self,
         q: &Query,
@@ -884,6 +893,9 @@ impl<'a> Search<'a> {
         at: usize,
         inside: &[(bool, Vec<Hit>)],
     ) -> bool {
+        if !self.project_membership(q, file, m) {
+            return false;
+        }
         for f in &q.filters {
             if f.key == "in" {
                 continue;
@@ -924,11 +936,124 @@ impl<'a> Search<'a> {
         true
     }
     pub fn run(&mut self, q: &Query) -> Result<String> {
+        if let Some(hint) = self.position_hint(&q.target)? {
+            return Ok(hint);
+        }
         let result = self.run_query(q)?;
         if result == "No matches." {
-            return Ok(self.filter_hint(q, &self.manifest.root).unwrap_or(result));
+            return Ok(self.filter_hint(q).unwrap_or(result));
         }
         Ok(result)
+    }
+    fn position_hint(&mut self, target: &Target) -> Result<Option<String>> {
+        let Some(loc) = &target.location else {
+            return Ok(None);
+        };
+        let keys: Vec<_> = self
+            .manifest
+            .files
+            .iter()
+            .filter(|(_, f)| {
+                !f.metadata
+                    && f.memberships
+                        .iter()
+                        .any(|m| self.manifest.display(f, m) == loc.path)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut candidates = BTreeMap::new();
+        let mut recognized = false;
+        let mut possible = false;
+        for key in keys {
+            let data = self.data(&key)?;
+            let Some(pos) = offset(&data.source, loc.line, loc.column) else {
+                continue;
+            };
+            if data
+                .facts
+                .declarations
+                .iter()
+                .any(|d| d.name_span.contains(&pos))
+            {
+                return Ok(None);
+            }
+            let Some(o) = data
+                .facts
+                .occurrences
+                .iter()
+                .find(|o| o.span.contains(&pos))
+            else {
+                continue;
+            };
+            recognized = true;
+            for m in &self.manifest.files[&key].memberships {
+                for (hit, uncertain) in self.bind(&key, m, o, &data)? {
+                    possible |= uncertain;
+                    let label = Self::target_label(&hit);
+                    let file = &self.manifest.files[&hit.file];
+                    let location = if file.metadata {
+                        file.path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        let data = self.data(&hit.file)?;
+                        let (first, last) =
+                            crate::render::lines(&data.source, hit.decl.name_span.clone());
+                        crate::render::location(
+                            &self.manifest.display(file, &hit.membership),
+                            first,
+                            last,
+                        )
+                    };
+                    let identity = hit
+                        .semantic_id
+                        .as_ref()
+                        .map(|id| (id.context.clone(), id.key.clone()));
+                    candidates.insert(
+                        (identity, hit.file.clone(), hit.decl.name_span.start),
+                        (label, location),
+                    );
+                }
+            }
+        }
+        if recognized && candidates.is_empty() {
+            return Ok(Some(
+                "The source occurrence exists, but its target could not be resolved.".into(),
+            ));
+        }
+        if possible || candidates.len() > 1 {
+            let total = candidates.len();
+            let mut labels: Vec<_> = candidates.into_values().collect();
+            labels.sort();
+            let mut text = format!(
+                "Target could not be determined uniquely. Query a declaration explicitly:\n{}",
+                labels
+                    .iter()
+                    .take(8)
+                    .map(|(label, location)| format!(
+                        "{} in {}",
+                        crate::render::inline(label),
+                        crate::render::inline(location)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            if total > 8 {
+                text.push_str(&format!("\n… (+{} candidates)", total - 8));
+            }
+            return Ok(Some(text));
+        }
+        Ok(None)
+    }
+    fn target_label(hit: &Hit) -> String {
+        let signature = if hit.decl.callable() {
+            format!("({})", hit.decl.parameters.join(", "))
+        } else {
+            String::new()
+        };
+        format!("{}:{}{signature}", hit.decl.kind, hit.decl.qualified)
     }
 
     fn run_query(&mut self, q: &Query) -> Result<String> {
@@ -1059,7 +1184,7 @@ impl<'a> Search<'a> {
         Ok(result)
     }
 
-    fn filter_hint(&self, q: &Query, root: &std::path::Path) -> Option<String> {
+    fn filter_hint(&self, q: &Query) -> Option<String> {
         for filter in q.filters.iter().filter(|f| !f.negate) {
             if filter.key == "project"
                 && !self
@@ -1072,6 +1197,7 @@ impl<'a> Search<'a> {
                     .manifest
                     .projects
                     .iter()
+                    .filter(|p| !p.name.is_empty())
                     .map(|p| p.name.as_str())
                     .collect();
                 if names.is_empty() {
@@ -1087,35 +1213,6 @@ impl<'a> Search<'a> {
                         .collect::<Vec<_>>()
                         .join(", "),
                     if names.len() > 4 { ", …" } else { "" }
-                ));
-            }
-        }
-        for filter in q.filters.iter().filter(|f| {
-            q.selector == "file" && f.key == "path" && !f.negate && f.value.ends_with('/')
-        }) {
-            let has_descendants =
-                self.manifest
-                    .files
-                    .values()
-                    .filter(|f| !f.metadata)
-                    .any(|file| {
-                        file.path
-                            .strip_prefix(root)
-                            .is_ok_and(|p| p.to_string_lossy().starts_with(&filter.value))
-                    });
-            if has_descendants {
-                let value = format!("{}**", filter.value);
-                let value = if value
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\\'))
-                {
-                    serde_json::to_string(&value).unwrap()
-                } else {
-                    value
-                };
-                return Some(format!(
-                    "No matches. For files beneath this directory, use {}.",
-                    crate::render::inline(&format!("path:{value}"))
                 ));
             }
         }
@@ -1144,7 +1241,12 @@ impl<'a> Search<'a> {
             .filters
             .iter()
             .filter(|f| f.key == "path")
-            .map(|f| Ok((f, globset::Glob::new(&f.value)?.compile_matcher())))
+            .map(|f| {
+                Ok((
+                    f,
+                    globset::Glob::new(f.value.trim_end_matches('/'))?.compile_matcher(),
+                ))
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut found = Vec::new();
         let mut total = 0;
@@ -1159,7 +1261,7 @@ impl<'a> Search<'a> {
                 || !paths.iter().all(|(f, p)| {
                     (p.is_match(&path)
                         || path
-                            .strip_prefix(&f.value)
+                            .strip_prefix(f.value.trim_end_matches('/'))
                             .is_some_and(|suffix| suffix.starts_with('/')))
                         != f.negate
                 })
@@ -1168,6 +1270,9 @@ impl<'a> Search<'a> {
             }
             let file = &self.manifest.files[&key];
             if !file.memberships.iter().any(|m| {
+                if !self.project_membership(q, file, m) {
+                    return false;
+                }
                 q.filters.iter().filter(|f| f.key == "project").all(|f| {
                     wildcard(&f.value, &self.manifest.projects[m.project].name) != f.negate
                 })
@@ -1180,9 +1285,7 @@ impl<'a> Search<'a> {
             }
         }
         if total == 0 {
-            return Ok(self
-                .filter_hint(q, root)
-                .unwrap_or_else(|| "No matches.".into()));
+            return Ok(self.filter_hint(q).unwrap_or_else(|| "No matches.".into()));
         }
         let mut text = found.join("\n");
         if total > found.len() {
@@ -1239,7 +1342,21 @@ impl<'a> Search<'a> {
             }) {
             (literal, None)
         } else {
-            let (path, lines) = crate::navigation::location(path)?;
+            // An indexed filename can itself contain location delimiters.
+            // Split after the longest known filename before validating a suffix.
+            let boundary = literal.char_indices().rev().find_map(|(i, c)| {
+                (matches!(c, ':' | '#' | '(') && indexed(&literal[..i])).then_some(i)
+            });
+            let (path, lines) = if let Some(i) = boundary {
+                let (_, lines) = crate::navigation::location(&format!("file{}", &literal[i..]))?;
+                ensure!(
+                    lines.is_some(),
+                    "Invalid line range; use `path:1-20` (1-based, inclusive)"
+                );
+                (&literal[..i], lines)
+            } else {
+                crate::navigation::location(path)?
+            };
             let path = if files.contains_key(path) {
                 path
             } else {
@@ -1265,6 +1382,8 @@ impl<'a> Search<'a> {
                 match language {
                     Language::Rust => "rust",
                     Language::CSharp => "cs",
+                    Language::Markdown => "md",
+                    Language::Text => "text",
                 },
             ),
             crate::navigation::Mode::Minified => {
@@ -1347,6 +1466,8 @@ impl<'a> Search<'a> {
                         uncertain: false,
                         target: None,
                         occurrences: BTreeSet::new(),
+                        candidates: Vec::new(),
+                        possible_write: false,
                     },
                 );
             }
@@ -1461,7 +1582,7 @@ impl<'a> Search<'a> {
                 }
                 if (!outgoing && !names.contains(&o.name))
                     || (q.selector == "calls" && !o.call)
-                    || (q.selector == "writes" && !o.write)
+                    || (q.selector == "writes" && o.write == WriteKind::None)
                 {
                     continue;
                 }
@@ -1504,41 +1625,57 @@ impl<'a> Search<'a> {
                     } else {
                         relevant
                     };
-                    for (target, uncertain) in relevant {
+                    {
                         let display = self.manifest.display(file, m);
                         let lines = crate::render::lines(&data.source, o.span.clone());
-                        let label = target
-                            .as_ref()
-                            .map(|t| {
-                                let signature = if t.decl.callable() {
-                                    format!("({})", t.decl.parameters.join(", "))
-                                } else {
-                                    String::new()
-                                };
-                                format!("{}:{}{signature}", t.decl.kind, t.decl.qualified)
+                        if relevant.is_empty() {
+                            continue;
+                        }
+                        let labels: BTreeSet<_> = relevant
+                            .iter()
+                            .filter_map(|(t, _)| t.as_ref().map(Self::target_label))
+                            .collect();
+                        let identities: std::collections::HashSet<_> = relevant
+                            .iter()
+                            .filter_map(|(hit, _)| hit.as_ref())
+                            .map(|hit| {
+                                (
+                                    hit.semantic_id.clone(),
+                                    hit.file.clone(),
+                                    hit.decl.name_span.start,
+                                )
                             })
-                            .unwrap_or_else(|| format!("unresolved:{}", o.name));
-                        let identity = target
-                            .as_ref()
-                            .map(|t| {
-                                t.semantic_id
-                                    .as_ref()
-                                    .map(|id| (id.context.clone(), id.key.clone()))
-                                    .unwrap_or_else(|| {
-                                        (t.file.clone(), t.decl.name_span.start.to_string())
-                                    })
-                            })
-                            .unwrap_or_else(|| (label.clone(), o.span.start.to_string()));
+                            .collect();
+                        let uncertain = relevant.iter().any(|(_, u)| *u) || identities.len() > 1;
+                        let label = if labels.len() > 1 {
+                            o.name.clone()
+                        } else {
+                            labels
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| format!("unresolved:{}", o.name))
+                        };
                         let rank = (
-                            uncertain,
                             display.to_string(),
-                            lines,
+                            o.span.start,
                             containing.as_ref().map(|d| d.name_span.start),
-                            identity,
                         );
                         if let Some(unit) = units.get_mut(&rank) {
                             let unit: &mut crate::render::SearchResult = unit;
-                            unit.occurrences.insert(o.span.start);
+                            unit.uncertain |= uncertain;
+                            if unit.target.as_ref() != Some(&label) || !unit.candidates.is_empty() {
+                                let mut combined: BTreeSet<_> =
+                                    unit.candidates.iter().cloned().collect();
+                                if combined.is_empty()
+                                    && let Some(target) = &unit.target
+                                {
+                                    combined.insert(target.clone());
+                                }
+                                combined.extend(labels);
+                                unit.candidates = combined.into_iter().collect();
+                                unit.target = Some(o.name.clone());
+                                unit.uncertain = true;
+                            }
                             continue;
                         }
                         if !units.accepts(&rank) {
@@ -1555,13 +1692,19 @@ impl<'a> Search<'a> {
                             uncertain,
                             target: Some(label),
                             occurrences: BTreeSet::from([o.span.start]),
+                            candidates: if labels.len() > 1 {
+                                labels.into_iter().collect()
+                            } else {
+                                Vec::new()
+                            },
+                            possible_write: q.selector == "writes" && o.write == WriteKind::Ref,
                         };
                         units.insert(rank, unit);
                     }
                 }
             }
         }
-        Ok(self.finish_results(units))
+        Ok(self.finish_relationship(units, &q.selector))
     }
     fn hierarchy(
         &mut self,
@@ -1883,6 +2026,62 @@ impl<'a> Search<'a> {
         );
         units.finish_with(|_, unit| unit.render(&mut paths))
     }
+    fn finish_relationship<K: Ord + Clone>(
+        &self,
+        units: crate::selection::Selection<K, crate::render::SearchResult>,
+        selector: &str,
+    ) -> String {
+        let (entries, total) = units.into_parts();
+        if entries.is_empty() {
+            return "No matches.".into();
+        }
+        let shown = entries.len();
+        let mut groups = BTreeMap::new();
+        let mut results: Vec<crate::render::SearchResult> = Vec::new();
+        for unit in entries.into_values() {
+            if !unit.uncertain && unit.candidates.is_empty() {
+                let key = (
+                    unit.path.clone(),
+                    unit.lines,
+                    unit.symbol.clone(),
+                    unit.target.clone(),
+                    unit.possible_write,
+                );
+                if let Some(&index) = groups.get(&key) {
+                    let existing: &mut crate::render::SearchResult = &mut results[index];
+                    existing.occurrences.extend(unit.occurrences);
+                    continue;
+                }
+                groups.insert(key, results.len());
+            }
+            results.push(unit);
+        }
+        let mut paths = crate::render::Paths::new(
+            self.manifest
+                .files
+                .values()
+                .filter(|f| !f.metadata)
+                .flat_map(|f| {
+                    f.memberships
+                        .iter()
+                        .map(|m| self.manifest.display(f, m).into_owned())
+                }),
+        );
+        let mut text = results
+            .into_iter()
+            .map(|u| u.render(&mut paths))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if total > shown {
+            let kind = if selector == "calls" {
+                "call sites"
+            } else {
+                "occurrences"
+            };
+            text.push_str(&format!("\n\nShowing {shown} of {total} {kind}; {} omitted. Narrow the query or increase `limit:`.", total - shown));
+        }
+        text
+    }
     fn declaration_unit(&mut self, h: &Hit) -> Result<crate::render::SearchResult> {
         let f = &self.manifest.files[&h.file];
         let data = self.data(&h.file)?;
@@ -1906,9 +2105,27 @@ impl<'a> Search<'a> {
                 uncertain: false,
                 target: None,
                 occurrences: BTreeSet::new(),
+                candidates: Vec::new(),
+                possible_write: false,
             })
         } else {
-            let source = crate::render::declaration_excerpt(&data.source, &h.decl);
+            let source = if f.language == Language::CSharp
+                && matches!(h.decl.kind.as_str(), "field" | "const" | "event")
+                && h.decl.span.start == h.decl.name_span.start
+            {
+                let mut prefix = h.decl.modifiers.clone();
+                if h.decl.kind == "event" {
+                    prefix.push("event".into());
+                }
+                prefix.push(h.decl.ty.clone());
+                format!(
+                    "{} {};",
+                    prefix.join(" "),
+                    &data.source[h.decl.span.clone()]
+                )
+            } else {
+                crate::render::declaration_excerpt(&data.source, &h.decl)
+            };
             Ok(crate::render::SearchResult {
                 symbol: Some((h.decl.kind.clone(), h.decl.qualified.clone())),
                 path: self.manifest.display(f, &h.membership).into_owned(),
@@ -1918,6 +2135,8 @@ impl<'a> Search<'a> {
                 uncertain: false,
                 target: None,
                 occurrences: BTreeSet::new(),
+                candidates: Vec::new(),
+                possible_write: false,
             })
         }
     }

@@ -73,6 +73,7 @@ impl Query {
         let mut filters = Vec::new();
         let mut loose = None;
         let mut limit = None;
+        let mut offset = false;
         for token in tokens {
             let split = token.find(':').filter(|&i| {
                 !token.starts_with('@')
@@ -99,9 +100,7 @@ impl Query {
                 "Only metadata and containment filters can be negated."
             );
             match key {
-                "offset" => bail!(
-                    "`offset:` is unsupported. Narrow the query with `path:` or `in:`, or increase `limit:`."
-                ),
+                "offset" => offset = true,
                 "match" => {
                     ensure!(loose.is_none(), "Duplicate `match:` control.");
                     loose = Some(match value {
@@ -148,6 +147,16 @@ impl Query {
         let (selector, value) = primary.ok_or_else(|| {
             anyhow::anyhow!("Provide a search target; use `symbol:*` with filters.")
         })?;
+        if offset {
+            let filters = if selector == "file" {
+                "`path:` or `project:`"
+            } else {
+                "`path:` or `in:`"
+            };
+            bail!(
+                "`offset:` is unsupported. Narrow the query with {filters}, or increase `limit:`."
+            );
+        }
         for f in &filters {
             if f.key == "path" {
                 globset::Glob::new(&f.value)?;
@@ -453,6 +462,24 @@ pub fn qualified_name_rank(pattern: &str, value: &str, loose: bool) -> Option<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offset_recovery_respects_selector_in_any_order() {
+        for query in ["file:*.cs offset:1", "offset:1 file:*.cs"] {
+            let message = Query::parse(query).unwrap_err().to_string();
+            assert!(
+                message.contains("`path:`")
+                    && message.contains("`project:`")
+                    && !message.contains("`in:`"),
+                "{message}"
+            );
+        }
+        assert!(
+            Query::parse("calls:Run offset:1")
+                .unwrap_err()
+                .to_string()
+                .contains("`in:`")
+        );
+    }
     #[test]
     fn concrete_type_selectors_and_aliases() {
         for (selector, kind) in [

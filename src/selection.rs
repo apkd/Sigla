@@ -50,6 +50,9 @@ impl<K: Ord + Clone, V> Selection<K, V> {
             self.seen.len(),
         )
     }
+    pub fn into_parts(self) -> (BTreeMap<K, V>, usize) {
+        (self.entries, self.seen.len())
+    }
 }
 
 #[cfg(test)]

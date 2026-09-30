@@ -25,6 +25,7 @@ mod selection;
 pub mod service;
 pub mod signature;
 pub mod store;
+mod summary;
 pub mod unity;
 pub mod watch;
 pub mod workspace;

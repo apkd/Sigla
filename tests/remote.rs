@@ -268,6 +268,10 @@ fn lifecycle() -> Result<()> {
         "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n",
     )?;
     fs::write(upstream.join("src/lib.rs"), "pub struct Main;\n")?;
+    fs::write(
+        upstream.join("README.md"),
+        "# Remote fixture\n\nKeep  document spacing.\n",
+    )?;
     fs::write(upstream.join("asset.bin"), vec![123; 1024 * 1024])?;
     git(&upstream, &["add", "."])?;
     git(&upstream, &["commit", "--quiet", "-m", "main"])?;
@@ -307,11 +311,25 @@ fn lifecycle() -> Result<()> {
     );
     let main = "git@github.com:fixture/repo.git#main";
     let feature = "git@github.com:fixture/repo.git#feature/search";
+    let (error, first) = server.query(main, "type:Main")?;
     ensure!(
-        !server.query(main, "type:Main")?.0,
-        "Initial acquisition failed"
+        !error && first.contains("| Repository |") && first.contains("fixture/repo"),
+        "Initial summary missing: {first}"
     );
     let count = fs::read(root.path().join("requests.log"))?.len();
+    let (error, document) = server.call(
+        "view",
+        json!({"project":main,"path":"README.md","mode":"minified"}),
+    )?;
+    ensure!(
+        !error && document.contains("Keep  document spacing."),
+        "Remote document missing: {document}"
+    );
+    let (error, document_match) = server.query(main, "text:\"document spacing\"")?;
+    ensure!(
+        !error && document_match.contains("README.md"),
+        "Remote text search missed document: {document_match}"
+    );
     let (error, tree) = server.call("browse", json!({"project":main}))?;
     ensure!(
         !error && tree.contains("lib.rs") && !tree.contains("asset.bin"),
@@ -328,8 +346,8 @@ fn lifecycle() -> Result<()> {
     let (error, paths) = server.query(main, "file:*.rs")?;
     for response in [&tree, &viewed, &paths] {
         ensure!(
-            response.starts_with("`repo #main`\n\n"),
-            "Unexpected remote header: {response}"
+            !response.contains("| Repository |"),
+            "Repository summary repeated: {response}"
         );
     }
     ensure!(

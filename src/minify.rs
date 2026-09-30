@@ -16,6 +16,7 @@ pub fn render(source: &str, language: Language, range: Range<usize>) -> String {
     let (tokens, mut edits) = match language {
         Language::Rust => rust(source),
         Language::CSharp => csharp(source, &range),
+        Language::Markdown | Language::Text => return source[range].into(),
     };
     edits.extend(spacing(source, &tokens));
     if let Some(first) = tokens.iter().find(|t| t.range.end > range.start)
@@ -313,6 +314,32 @@ fn csharp(source: &str, selection: &Range<usize>) -> (Vec<Token>, Vec<Edit>) {
     }
     visit(tree.root_node(), &mut tokens);
     let mut edits = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let start = tokens[index].range.start;
+        let text = &source[tokens[index].range.clone()];
+        if text.starts_with("///") || text.starts_with("/**") {
+            let mut end = tokens[index].range.end;
+            if text.starts_with("///") {
+                while let Some(next) = tokens.get(index + 1)
+                    && source[end..next.range.start]
+                        .chars()
+                        .all(char::is_whitespace)
+                    && source[next.range.clone()].starts_with("///")
+                {
+                    index += 1;
+                    end = next.range.end;
+                }
+            }
+            if let Some(text) = xml_doc(&source[start..end]) {
+                edits.push(Edit {
+                    range: start..end,
+                    text,
+                });
+            }
+        }
+        index += 1;
+    }
     fn walk(
         node: tree_sitter::Node<'_>,
         source: &str,
@@ -367,6 +394,55 @@ fn simplify_cs(
     selection: &Range<usize>,
 ) {
     let text = |n: tree_sitter::Node<'_>| &source[n.byte_range()];
+    // Merge only adjacent lists with identical targets. Gaps containing comments
+    // or directives are boundaries, as are selections cutting through a list.
+    let mut previous = None;
+    for child in node.named_children(&mut node.walk()) {
+        if child.kind() != "attribute_list"
+            || !clean_cs(child)
+            || child.start_byte() < selection.start
+            || child.end_byte() > selection.end
+        {
+            previous = None;
+            continue;
+        }
+        let target = child
+            .named_children(&mut child.walk())
+            .find(|n| n.kind() == "attribute_target_specifier");
+        let start = tokens.partition_point(|t| t.range.end <= child.start_byte());
+        let end = tokens.partition_point(|t| t.range.start < child.end_byte());
+        for pair in tokens[start..end].windows(2) {
+            let gap = pair[0].range.end..pair[1].range.start;
+            if source[gap.clone()].contains('\n')
+                && source[gap.clone()].chars().all(char::is_whitespace)
+            {
+                edits.push(Edit {
+                    range: gap,
+                    text: if separator(
+                        &source[pair[0].range.clone()],
+                        &source[pair[1].range.clone()],
+                    ) {
+                        " "
+                    } else {
+                        ""
+                    }
+                    .into(),
+                });
+            }
+        }
+        if let Some((end, old_target)) = previous
+            && old_target == target.map(text)
+            && source[end..child.start_byte()]
+                .chars()
+                .all(char::is_whitespace)
+        {
+            edits.push(Edit {
+                range: end - 1..target.map_or(child.start_byte() + 1, |n| n.end_byte()),
+                text: ",".into(),
+            });
+        }
+        previous = Some((child.end_byte(), target.map(text)));
+    }
     match node.kind() {
         "method_declaration" => {
             if let Some(body) = node.child_by_field_name("body")
@@ -505,52 +581,182 @@ fn simplify_cs(
                 }
             }
         }
-        "comment" if text(node).starts_with("///") => {
-            if let Some(doc) = xml_doc(text(node)) {
-                edits.push(Edit {
-                    range: node.byte_range(),
-                    text: doc,
-                });
-            }
-        }
         _ => (),
     }
 }
 
 fn xml_doc(doc: &str) -> Option<String> {
     use std::sync::LazyLock;
-    static TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"</?(summary|remarks|para)>|<(param|typeparam) name="([^"]+)">|</(param|typeparam|returns|value)>|<(returns|value)>|<see cref="([^"]+)"\s*/>"#).unwrap()
-    });
-    let text = doc.strip_prefix("///")?.trim();
-    // Preserve code examples, inherited docs, includes and unknown markup verbatim.
-    let reduced = TAG.replace_all(text, |c: &regex::Captures<'_>| {
-        if let Some(name) = c.get(3) {
-            format!("{}: ", name.as_str())
-        } else if let Some(label) = c.get(5) {
-            format!("{}: ", label.as_str())
-        } else if let Some(reference) = c.get(6) {
-            reference.as_str().into()
-        } else {
-            " ".into()
+    static TAG: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"<[^>]*>"#).unwrap());
+    let text = if let Some(block) = doc.strip_prefix("/**") {
+        block
+            .strip_suffix("*/")?
+            .lines()
+            .map(|line| line.trim().strip_prefix('*').unwrap_or(line.trim()).trim())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        doc.lines()
+            .map(|line| line.trim().strip_prefix("///"))
+            .collect::<Option<Vec<_>>>()?
+            .join("\n")
+    };
+    let mut reduced = String::new();
+    let mut end = 0;
+    let mut elements = Vec::new();
+    for tag in TAG.find_iter(&text) {
+        let plain = &text[end..tag.start()];
+        if plain.contains(['<', '>']) {
+            return None;
         }
-    });
-    if reduced.contains('<') || reduced.contains('>') {
+        reduced.push_str(&quick_xml::escape::unescape(plain).ok()?);
+        let raw = tag.as_str();
+        let closing = raw.starts_with("</");
+        // Validate tags and nesting before replacing any part of the doc block.
+        let normalized = if closing {
+            raw.replacen("</", "<", 1)
+        } else {
+            raw.into()
+        };
+        let mut reader = quick_xml::Reader::from_str(&normalized);
+        let element = match reader.read_event().ok()? {
+            quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => e,
+            _ => return None,
+        };
+        let name = element.name();
+        let name = std::str::from_utf8(name.as_ref()).ok()?;
+        let empty = raw.ends_with("/>");
+        if closing {
+            if elements.pop().as_deref() != Some(name) {
+                return None;
+            }
+        } else if !empty {
+            elements.push(name.to_owned());
+        }
+        let mut argument = None;
+        for attr in element.attributes() {
+            let attr = attr.ok()?;
+            let allowed = match name {
+                "see" | "seealso" => matches!(attr.key.as_ref(), b"cref" | b"langword" | b"href"),
+                "param" | "typeparam" | "paramref" | "typeparamref" => attr.key.as_ref() == b"name",
+                "exception" => attr.key.as_ref() == b"cref",
+                "list" => attr.key.as_ref() == b"type",
+                _ => false,
+            };
+            if !allowed || closing || argument.is_some() {
+                return None;
+            }
+            argument = Some(attr.unescape_value().ok()?.into_owned());
+        }
+        match name {
+            "summary" | "remarks" | "para" | "list" | "listheader" => reduced.push('\n'),
+            "param" | "typeparam" | "exception" if !closing => {
+                reduced.push('\n');
+                reduced.push_str(&argument?);
+                reduced.push_str(": ");
+            }
+            "returns" | "value" if !closing => {
+                reduced.push('\n');
+                reduced.push_str(name);
+                reduced.push_str(": ");
+            }
+            "see" | "seealso" | "paramref" | "typeparamref" if empty => {
+                reduced.push_str(&argument?)
+            }
+            "see" | "seealso" | "paramref" | "typeparamref" if !closing => {
+                reduced.push_str(&argument?);
+                reduced.push_str(" (");
+            }
+            "see" | "seealso" | "paramref" | "typeparamref" => reduced.push(')'),
+            "item" if !closing => reduced.push_str("\n- "),
+            "term" if closing => reduced.push_str(": "),
+            "c" | "description" | "term" | "item" | "param" | "typeparam" | "returns" | "value"
+            | "exception" => (),
+            // Code examples and unknown/inherited/included docs stay verbatim.
+            _ => return None,
+        }
+        end = tag.end();
+    }
+    let tail = &text[end..];
+    if !elements.is_empty() || tail.contains(['<', '>']) {
         return None;
     }
-    Some(if reduced.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "// {}",
-            reduced.split_whitespace().collect::<Vec<_>>().join(" ")
-        )
-    })
+    reduced.push_str(&quick_xml::escape::unescape(tail).ok()?);
+    Some(
+        reduced
+            .lines()
+            .filter_map(|line| {
+                let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+                (!line.is_empty()).then(|| format!("// {line}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn xml_docs_keep_meaning_and_preserve_unsupported_markup() {
+        let source = r#"class C {
+/// <summary>Returns <see langword="null"/> &amp; <paramref name="value"/>.</summary>
+/// <exception cref="InvalidOperationException">When unavailable.</exception>
+/// <seealso cref="Other"/>
+/** <summary>Block documentation.</summary>
+ * <returns>A <c>value</c>.</returns> */
+int Value;
+/// <include file="docs.xml" path="x"/>
+/// <unknown>Preserve this.</unknown>
+int Other;
+}"#;
+        let output = min(source, Language::CSharp);
+        assert!(output.contains("Returns null & value."), "{output}");
+        assert!(
+            output.contains("InvalidOperationException: When unavailable."),
+            "{output}"
+        );
+        assert!(output.contains("// Other"), "{output}");
+        assert!(output.contains("// Block documentation."), "{output}");
+        assert!(output.contains("returns: A value."), "{output}");
+        assert!(output.contains("<include file=\"docs.xml\""), "{output}");
+        assert!(
+            output.contains("<unknown>Preserve this.</unknown>"),
+            "{output}"
+        );
+        let code = "/// <code>\n///   var x =  1;\n/// </code>\nclass C {}";
+        assert!(min(code, Language::CSharp).contains("///   var x =  1;"));
+        assert!(xml_doc("/// <see cref='Broken></see>").is_none());
+        assert!(xml_doc("/// <summary>Broken</remarks>").is_none());
+        let list = xml_doc("/// <list type='bullet'><item><term>A</term><description>First</description></item><item>Second</item></list>").unwrap();
+        assert!(
+            list.contains("- A: First") && list.contains("- Second"),
+            "{list}"
+        );
+        let link = xml_doc("/// <see href='https://example.com'>The guide</see>").unwrap();
+        assert!(link.contains("The guide") && link.contains("https://example.com"));
+    }
+
+    #[test]
+    fn attributes_merge_without_changing_arguments_targets_or_boundaries() {
+        let source = "[A(\"a,b\")]\n[B(typeof(int))]\nclass C {\n[return: A]\n[return: B]\nint M()=>1;\n[field: A]\n[property: B]\nint P{get;set;}\n[A]\n// keep\n[B]\nint X;\n}";
+        let output = min(source, Language::CSharp);
+        assert!(output.contains("[A(\"a,b\"),B(typeof(int))]"), "{output}");
+        assert!(output.contains("[return:A,B]"), "{output}");
+        assert!(output.contains("[field:A]\n[property:B]"), "{output}");
+        assert!(output.contains("[A]\n// keep\n[B]"), "{output}");
+        let range = source.find("[B(typeof").unwrap()..source.len();
+        assert!(render(source, Language::CSharp, range).starts_with("[B(typeof(int))]"));
+        let multiline = "[A(\n1,\n2)]\n[B(@\"first\n  second\")]\nclass C {}";
+        let output = min(multiline, Language::CSharp);
+        assert!(
+            output.contains("[A(1,2),B(@\"first\n  second\")]"),
+            "{output}"
+        );
+        let directives = "[A]\n#if DEBUG\n[B]\n#endif\nclass C {}";
+        let output = min(directives, Language::CSharp);
+        assert!(output.contains("#if DEBUG\n[B]\n#endif"), "{output}");
+    }
     #[test]
     #[ignore = "manual token measurement; requires m-count-tokens"]
     fn measure_tokens() {
@@ -579,6 +785,11 @@ mod tests {
                 .unwrap()
         }
         for (name, source, language) in [
+            (
+                "C# documentation and attributes",
+                "/// <summary>Returns <see langword=\"null\"/>.</summary>\n[Serializable]\n[Obsolete(\"Use NewType\")]\nclass Example {}\n",
+                Language::CSharp,
+            ),
             ("Rust search", include_str!("search.rs"), Language::Rust),
             ("Rust service", include_str!("service.rs"), Language::Rust),
             (

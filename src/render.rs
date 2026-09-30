@@ -71,6 +71,8 @@ pub struct SearchResult {
     pub uncertain: bool,
     pub target: Option<String>,
     pub occurrences: BTreeSet<usize>,
+    pub candidates: Vec<String>,
+    pub possible_write: bool,
 }
 
 impl SearchResult {
@@ -90,8 +92,25 @@ impl SearchResult {
             let end = text.find('\n').unwrap_or(text.len());
             text.insert_str(end, &format!(" ({} occurrences)", self.occurrences.len()));
         }
-        if self.uncertain {
+        if !self.candidates.is_empty() {
+            text.push_str("\n\nPossible targets: ");
+            text.push_str(
+                &self
+                    .candidates
+                    .iter()
+                    .take(8)
+                    .map(|s| inline(s))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            if self.candidates.len() > 8 {
+                text.push_str(&format!(", … (+{})", self.candidates.len() - 8));
+            }
+        } else if self.uncertain {
             text.push_str("\n\nPossible match; the target could not be determined uniquely.");
+        }
+        if self.possible_write {
+            text.push_str("\n\nPossible write through `ref`.");
         }
         text
     }
@@ -112,6 +131,8 @@ pub fn result(symbol: Option<&str>, location: &str, source: &str, language: Lang
     let language = match language {
         Language::CSharp => "cs",
         Language::Rust => "rust",
+        Language::Markdown => "md",
+        Language::Text => "text",
     };
     let heading = symbol.map_or_else(
         || inline(location),

@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 
-const FORMAT: &[u8] = b"sigla-facts-13";
+const FORMAT: &[u8] = b"sigla-facts-15";
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<Store>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;

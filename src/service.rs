@@ -43,11 +43,12 @@ impl App {
         path: &str,
         request: Request,
         cancel: &tokio_util::sync::CancellationToken,
+        upstream: Option<&crate::upstream::Upstream>,
     ) -> Result<CallToolResult> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => anyhow::bail!("Query cancelled"),
-            result = self.dispatch(path, request) => result,
+            result = self.dispatch_with_upstream(path, request, upstream) => result,
         }
     }
     fn trim_idle(&self) {
@@ -246,6 +247,17 @@ impl App {
         )
     }
     async fn dispatch(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
+        let result = self
+            .dispatch_with_upstream(path, request, self.upstream.as_ref())
+            .await?;
+        Ok(crate::summary::Session::default().present(result))
+    }
+    async fn dispatch_with_upstream(
+        self: &Arc<Self>,
+        path: &str,
+        request: Request,
+        upstream: Option<&crate::upstream::Upstream>,
+    ) -> Result<CallToolResult> {
         ensure!(path.len() <= 4096, "Project exceeds request size limit");
         match &request {
             Request::Browse(path) | Request::View(path, _) => {
@@ -255,7 +267,7 @@ impl App {
                 ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit")
             }
         }
-        if let Some(upstream) = &self.upstream
+        if let Some(upstream) = upstream
             && let Some(repository) = crate::repository::Repository::project(path, true)?
         {
             let mut project = repository.transport;
@@ -281,11 +293,10 @@ impl App {
             };
             return upstream.call(name, args.as_object().unwrap().clone()).await;
         }
-        let text = self.request(path, request).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        self.request(path, request).await
     }
 
-    async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<String> {
+    async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
         let query = match &request {
             Request::Search(query) => Some(
                 Query::parse(query)
@@ -494,11 +505,13 @@ impl App {
             }
         }
         let context = branch.as_ref().map(|branch| {
-            crate::render::inline(&format!(
-                "{} #{}",
-                branch.repository.identity.name(),
-                branch.name
-            ))
+            let prepared = &branch_state.as_ref().unwrap().as_ref().unwrap().prepared;
+            (
+                branch.repository.identity.clone(),
+                branch.name.clone(),
+                prepared.revision.clone(),
+                prepared.tracked.len(),
+            )
         });
         let repository_root = branch
             .as_ref()
@@ -523,7 +536,7 @@ impl App {
                 let mut search = Search::new(&store, &assemblies, &manifest, &cancel)?;
                 drop(state);
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
-                let mut text = match request {
+                let text = match request {
                     Request::Search(_) => {
                         let query = query.as_ref().unwrap();
                         if query.selector == "file" {
@@ -535,10 +548,14 @@ impl App {
                     Request::Browse(path) => search.browse(root, &path, allow_absolute),
                     Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
                 }?;
-                if let Some(context) = context {
-                    text = format!("{context}\n\n{text}");
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                if let Some((identity, branch, revision, tracked)) = context {
+                    crate::summary::Summary::build(
+                        &identity, &branch, &revision, tracked, root, &manifest,
+                    )
+                    .attach(&mut result);
                 }
-                Ok(text)
+                Ok(result)
             })();
             app.trim_idle();
             result
@@ -587,10 +604,14 @@ pub struct Mcp {
     app: Arc<App>,
     tool_router: ToolRouter<Self>,
     heartbeat_period: std::time::Duration,
+    session: Arc<crate::summary::Session>,
+    upstream: Option<Arc<crate::upstream::Upstream>>,
 }
 impl Mcp {
     pub fn new(app: Arc<App>) -> Self {
         Self {
+            session: Arc::default(),
+            upstream: app.upstream.as_ref().map(|u| Arc::new(u.session())),
             app,
             tool_router: Self::tool_router(),
             heartbeat_period: rmcp::transport::streamable_http_server::session::local::SessionConfig::DEFAULT_KEEP_ALIVE / 2,
@@ -605,6 +626,7 @@ impl Mcp {
 
 Declarations
 Bare names find declarations. Qualified names and signatures narrow targets.
+writes: includes out arguments and possible writes through ref.
 
 Kinds
 t: type: c: class: i: interface: struct: enum: delegate: m: method: function: property: field: trait: module:
@@ -651,7 +673,7 @@ file:src/**/*.cs"#,
     }
 
     #[tool(
-        description = "Browse indexed source files. Omit path for the repository root; pass a directory path to explore it.",
+        description = "Browse indexed files. Omit path for the repository root; pass a directory path to explore it.",
         annotations(read_only_hint = true)
     )]
     async fn browse(
@@ -690,7 +712,7 @@ impl Mcp {
     ) -> CallToolResult {
         let search = async {
             self.app
-                .request_cancellable(project, request?, &context.ct)
+                .request_cancellable(project, request?, &context.ct, self.upstream.as_deref())
                 .await
         };
         let heartbeat = async {
@@ -723,7 +745,7 @@ impl Mcp {
             error = heartbeat => Err(error),
         };
         match result {
-            Ok(result) => result,
+            Ok(result) => self.session.present(result),
             Err(e) => {
                 tracing::error!(project, error = %format!("{e:#}"), "Tool request failed");
                 CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))])
@@ -897,8 +919,13 @@ mod tests {
             let path = root.path().to_str().unwrap().to_owned();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                app.request_cancellable(&path, Request::Search("type:X limit:1".into()), &cancel)
-                    .await
+                app.request_cancellable(
+                    &path,
+                    Request::Search("type:X limit:1".into()),
+                    &cancel,
+                    None,
+                )
+                .await
             })
         };
         tokio::task::yield_now().await;

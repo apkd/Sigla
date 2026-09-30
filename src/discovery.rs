@@ -75,7 +75,7 @@ impl RemoteContext {
 impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         Ok(*blake3::hash(&serde_json::to_vec(&(
-            7u32,
+            8u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -173,8 +173,10 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         inputs.insert(entry.clone());
     }
     if inputs.is_empty() {
-        result.diagnostics.push("No usable project files found. Searching readable sources; build settings and references are unavailable.".into());
         fallback_sources(&entry, policy, &mut result)?;
+        if !result.sources.is_empty() {
+            result.diagnostics.push("No usable project files found. Searching readable sources; build settings and references are unavailable.".into());
+        }
     }
     let mut seen = HashSet::new();
     let mut managed = Vec::new();
@@ -304,6 +306,7 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
             }
         }
     }
+    discover_documents(policy, &mut result);
     result
         .sources
         .sort_by(|a, b| (&a.path, a.project, &a.module).cmp(&(&b.path, b.project, &b.module)));
@@ -311,6 +314,137 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         .sources
         .dedup_by(|a, b| a.path == b.path && a.project == b.project && a.module == b.module);
     Ok(result)
+}
+
+/// Documents have a repository context plus memberships in enclosing build
+/// projects. The repository context is not a build project or a declaration.
+fn discover_documents(policy: &Policy, result: &mut Discovery) {
+    let mut pending = vec![result.root.clone()];
+    let mut documents = Vec::new();
+    while let Some(directory) = pending.pop() {
+        result.metadata.insert(directory.clone());
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                result.diagnostics.push(format!(
+                    "Cannot read documents in {}: {error}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    result
+                        .diagnostics
+                        .push(format!("Cannot read directory entry: {error}"));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    result
+                        .diagnostics
+                        .push(format!("Cannot inspect {}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if kind.is_dir() {
+                if matches!(
+                    entry.file_name().to_str(),
+                    Some("Library" | "Build" | "Builds")
+                ) && directory.join("Assets").is_dir()
+                {
+                    continue;
+                }
+                if (!crate::unity::ignored_name(&entry.file_name())
+                    || entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(".github")))
+                    && !matches!(
+                        entry.file_name().to_str(),
+                        Some(
+                            "target"
+                                | "bin"
+                                | "obj"
+                                | "node_modules"
+                                | "Temp"
+                                | "Logs"
+                                | "UserSettings"
+                        )
+                    )
+                {
+                    pending.push(path);
+                }
+            } else if kind.is_file() {
+                let language = match path.extension().and_then(|e| e.to_str()) {
+                    Some(ext) if ext.eq_ignore_ascii_case("md") => Language::Markdown,
+                    Some(ext) if ext.eq_ignore_ascii_case("txt") => Language::Text,
+                    _ => continue,
+                };
+                if let Some(remote) = &policy.remote
+                    && !path
+                        .strip_prefix(&remote.workspace)
+                        .ok()
+                        .and_then(Path::to_str)
+                        .is_some_and(|p| remote.tracked.contains(p))
+                {
+                    continue;
+                }
+                match policy.canonical(&path) {
+                    Ok(path) => documents.push((path, language)),
+                    Err(error) => result
+                        .diagnostics
+                        .push(format!("Skipped document {}: {error}", path.display())),
+                }
+            }
+        }
+    }
+    if documents.is_empty() {
+        return;
+    }
+    let context = result.projects.len();
+    result.projects.push(Project {
+        identity: format!("documents:{}", result.root.display()),
+        origin: None,
+        name: String::new(),
+        defines: Vec::new(),
+        references: Vec::new(),
+        assemblies: Vec::new(),
+        edition: String::new(),
+        compiler_options: Default::default(),
+        source_roots: Vec::new(),
+    });
+    for (path, language) in documents {
+        let projects = std::iter::once(context).chain(
+            result.projects[..context]
+                .iter()
+                .enumerate()
+                .filter(|(_, project)| {
+                    path.parent() != Some(result.root.as_path())
+                        && project
+                            .origin
+                            .as_ref()
+                            .and_then(|p| p.parent())
+                            .is_some_and(|dir| path.starts_with(dir))
+                })
+                .map(|(i, _)| i),
+        );
+        for project in projects {
+            result.sources.push(SourceInput {
+                path: path.clone(),
+                project,
+                module: String::new(),
+                language,
+                metadata: false,
+            });
+        }
+    }
 }
 
 /// Recover source facts without claiming that build settings or references are known.

@@ -41,6 +41,14 @@ pub(crate) struct Upstream {
 }
 
 impl Upstream {
+    /// Reuse transport configuration, never another downstream session's state.
+    pub fn session(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            connection: Mutex::new(None),
+        }
+    }
     pub fn new(endpoint: &str, token_file: Option<&Path>) -> Result<Self> {
         validate_endpoint(endpoint)?;
         let token = token_file
@@ -126,6 +134,14 @@ impl Upstream {
 
     pub async fn shutdown(&self) {
         if let Some(connection) = self.connection.lock().await.take() {
+            connection.cancellation_token().cancel();
+        }
+    }
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.get_mut().take() {
             connection.cancellation_token().cancel();
         }
     }

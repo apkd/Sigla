@@ -77,6 +77,102 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
     available: Arc<AtomicBool>,
 }
+
+#[derive(Clone)]
+struct SummaryProbe;
+
+impl ServerHandler for SummaryProbe {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+    async fn call_tool(
+        &self,
+        _: CallToolRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        Ok(serde_json::from_value::<CallToolResult>(serde_json::json!({
+            "content":[
+                {"type":"text","text":"summary", "_meta":{"sigla/repository-summary":true}},
+                {"type":"text","text":"body"}
+            ],
+            "_meta":{"sigla/repository":{"key":"owner/repo#main","table":"summary"}}
+        }))
+        .unwrap()
+        .into())
+    }
+}
+
+#[tokio::test]
+async fn repository_summaries_follow_downstream_sessions_and_survive_upstream_reconnects() {
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = serve_factory(
+        {
+            let connections = connections.clone();
+            move || {
+                connections.fetch_add(1, Ordering::SeqCst);
+                SummaryProbe
+            }
+        },
+        None,
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let app = Arc::new(
+        App::hybrid(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            2,
+            &upstream.url,
+            None,
+        )
+        .unwrap(),
+    );
+    let hybrid = serve_factory(
+        {
+            let app = app.clone();
+            move || Mcp::new(app.clone())
+        },
+        None,
+    )
+    .await;
+    let first =
+        ().serve(StreamableHttpClientTransport::from_uri(hybrid.url.clone()))
+            .await
+            .unwrap();
+    let second =
+        ().serve(StreamableHttpClientTransport::from_uri(hybrid.url.clone()))
+            .await
+            .unwrap();
+    let request = || {
+        CallToolRequestParams::new("search").with_arguments(
+            serde_json::json!({"project":"owner/repo", "query":"type:X"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    for client in [&first, &second] {
+        assert_eq!(client.call_tool(request()).await.unwrap().content.len(), 2);
+        let result = client.call_tool(request()).await.unwrap();
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].as_text().unwrap().text, "body");
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 2);
+    upstream.available.store(false, Ordering::SeqCst);
+    assert_eq!(
+        first.call_tool(request()).await.unwrap().is_error,
+        Some(true)
+    );
+    upstream.available.store(true, Ordering::SeqCst);
+    let result = first.call_tool(request()).await.unwrap();
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(connections.load(Ordering::SeqCst), 3);
+    first.cancel().await.unwrap();
+    second.cancel().await.unwrap();
+    app.shutdown().await;
+}
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
@@ -86,11 +182,18 @@ async fn serve<S: ServerHandler + Clone + Send + Sync + 'static>(
     handler: S,
     token: Option<String>,
 ) -> Server {
+    serve_factory(move || handler.clone(), token).await
+}
+
+async fn serve_factory<S: ServerHandler + Send + Sync + 'static>(
+    factory: impl Fn() -> S + Send + Sync + 'static,
+    token: Option<String>,
+) -> Server {
     use axum::response::IntoResponse;
     let mut sessions = LocalSessionManager::default();
     sessions.session_config.keep_alive = Some(Duration::from_millis(500));
     let service = StreamableHttpService::new(
-        move || Ok(handler.clone()),
+        move || Ok(factory()),
         Arc::new(sessions),
         StreamableHttpServerConfig::default().with_json_response(true),
     );

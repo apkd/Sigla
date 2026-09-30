@@ -5,6 +5,14 @@ use std::{ops::Range, path::PathBuf};
 pub enum Language {
     CSharp,
     Rust,
+    Markdown,
+    Text,
+}
+
+impl Language {
+    pub fn document(self) -> bool {
+        matches!(self, Self::Markdown | Self::Text)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,10 +58,19 @@ pub struct Occurrence {
     pub span: Range<usize>,
     pub call: bool,
     pub construction: bool,
-    pub write: bool,
+    pub write: WriteKind,
     pub receiver: String,
     pub arguments: Option<usize>,
     pub opaque: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum WriteKind {
+    #[default]
+    None,
+    Direct,
+    Out,
+    Ref,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,7 +174,7 @@ pub fn line(source: &str, byte: usize) -> &str {
 }
 
 pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
-    if language == Language::CSharp
+    if language != Language::Rust
         && (bytes.starts_with(&[0xff, 0xfe, 0, 0]) || bytes.starts_with(&[0, 0, 0xfe, 0xff]))
     {
         anyhow::ensure!(
@@ -178,7 +195,7 @@ pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
             })
             .collect();
     }
-    if language == Language::CSharp
+    if language != Language::Rust
         && (bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]))
     {
         anyhow::ensure!(

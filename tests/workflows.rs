@@ -58,7 +58,17 @@ async fn empty_queries_offer_only_supported_corrections() {
             .contains("Parser.cs")
     );
     let directory = a.search(project, "file:*.cs path:Src/").await.unwrap();
-    assert!(directory.contains("`path:Src/**`"), "{directory}");
+    assert!(directory.contains("Src/Parser.cs"), "{directory}");
+    assert_eq!(
+        a.search(project, "file:Missing.cs path:Src/")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+    assert_eq!(
+        a.search(project, "file:*.cs -path:Src/").await.unwrap(),
+        "No matches."
+    );
     assert!(
         a.search(project, "file:*.cs path:Src/**")
             .await
@@ -1039,7 +1049,115 @@ class Writer {
         .search(project, "calls:* in:Writer.Save limit:1")
         .await
         .unwrap();
-    assert!(limited.contains("of 3 matches"), "{limited}");
+    assert!(limited.contains("of 4 call sites"), "{limited}");
+}
+
+#[tokio::test]
+async fn mutation_categories_and_nested_field_previews_are_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "Test.csproj",
+        r#"<Project><ItemGroup><Compile Include="Test.cs" /></ItemGroup></Project>"#,
+    );
+    let source = r#"
+class Recorder {
+ internal class Slot { internal int Pending, Other = 9; }
+ class Data { internal Slot Slot; }
+ static void Poll(out int value) { value = 1; }
+ static void Change(ref int value) { value++; }
+ static void Read(in int value) {}
+ static void Run(Data data) {
+  data.Slot.Pending = 2;
+  Poll(out data.Slot.Pending);
+  Change(ref data.Slot.Pending);
+  Change(ref /*argument comment*/ data.Slot.Pending);
+  Read(in data.Slot.Pending);
+ }
+}
+"#;
+    write(dir.path(), "Test.cs", source);
+    let a = app(dir.path(), cache.path());
+    let project = dir.path().to_str().unwrap();
+    let writes = a
+        .search(project, "writes:Recorder.Slot.Pending")
+        .await
+        .unwrap();
+    assert!(
+        writes.contains("Pending = 2")
+            && writes.contains("Poll(out")
+            && writes.contains("Change(ref"),
+        "{writes}"
+    );
+    assert!(!writes.contains("Read(in"), "{writes}");
+    assert!(writes.contains("Possible write through `ref`"), "{writes}");
+    let uses = a
+        .search(project, "uses:Recorder.Slot.Pending")
+        .await
+        .unwrap();
+    assert!(uses.contains("Read(in"), "{uses}");
+    let field = a
+        .search(project, "field:Recorder.Slot.Pending")
+        .await
+        .unwrap();
+    assert!(
+        field.contains("internal int Pending;") && !field.contains("= 9"),
+        "{field}"
+    );
+    let other = a
+        .search(project, "field:Recorder.Slot.Other")
+        .await
+        .unwrap();
+    assert!(other.contains("internal int Other = 9;"), "{other}");
+}
+
+#[tokio::test]
+async fn ambiguous_calls_count_sites_and_preserve_position_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "Test.csproj",
+        r#"<Project><ItemGroup><Compile Include="Test.cs" /></ItemGroup></Project>"#,
+    );
+    let mut source = String::from("class Writer {\n");
+    for ty in [
+        "int", "string", "char", "bool", "double", "float", "long", "short", "byte", "decimal",
+    ] {
+        source.push_str(&format!("void Append({ty} value) {{}}\n"));
+    }
+    source.push_str("void Run(Missing value) { Append(value); Append(value); }\n}");
+    write(dir.path(), "Test.cs", &source);
+    let a = app(dir.path(), cache.path());
+    let project = dir.path().to_str().unwrap();
+    let result = a
+        .search(project, "calls:* in:Writer.Run limit:2")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.lines().filter(|l| l.contains(" → ")).count(),
+        2,
+        "{result}"
+    );
+    assert!(
+        result.contains("Possible targets:") && result.contains("(+2)"),
+        "{result}"
+    );
+    assert!(!result.contains("omitted. Narrow"), "{result}");
+    let pos = source.find("Append(value)").unwrap();
+    let (line, col) = sigla::model::position(&source, pos);
+    for prefix in ["", "uses:"] {
+        let result = a
+            .search(project, &format!("{prefix}@Test.cs:{line}:{col}"))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("method:Writer.Append(") && result.contains("(+2 candidates)"),
+            "{result}"
+        );
+        assert!(!result.contains(" → "), "{result}");
+    }
 }
 
 #[tokio::test]
@@ -1115,7 +1233,7 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
             .count(),
         8
     );
-    assert!(limited.contains("of 8 matches"), "{limited}");
+    assert!(limited.contains("of 8 call sites"), "{limited}");
     assert!(!full.contains("omitted"), "{full}");
     let directory = a
         .search(path, "text:Unknown path:Scripts limit:3")

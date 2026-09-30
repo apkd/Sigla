@@ -13,5 +13,6 @@ pub fn extract(
     match language {
         Language::CSharp => csharp::extract(source, defines),
         Language::Rust => rust::extract(source, edition),
+        Language::Markdown | Language::Text => Ok(Facts::default()),
     }
 }

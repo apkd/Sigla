@@ -323,7 +323,11 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
                 span: range(&n),
                 call,
                 construction: false,
-                write,
+                write: if write {
+                    crate::model::WriteKind::Direct
+                } else {
+                    crate::model::WriteKind::None
+                },
                 receiver,
                 arguments,
                 opaque,

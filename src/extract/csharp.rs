@@ -125,10 +125,14 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                 span: arguments.start_byte()..arguments.start_byte() + 1,
                 call: true,
                 construction: false,
-                write: node.parent().is_some_and(|p| {
+                write: if node.parent().is_some_and(|p| {
                     p.kind() == "assignment_expression"
                         && p.child_by_field_name("left") == Some(node)
-                }),
+                }) {
+                    crate::model::WriteKind::Direct
+                } else {
+                    crate::model::WriteKind::None
+                },
                 receiver: field(node, "expression", &analysis),
                 arguments: Some(arguments.named_child_count()),
                 opaque: node.has_error(),
@@ -166,7 +170,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                                 && name != "@operator"
                                 && name != "Current",
                             construction: false,
-                            write: false,
+                            write: crate::model::WriteKind::None,
                             receiver: String::new(),
                             arguments: Some(0),
                             opaque: true,
@@ -401,7 +405,7 @@ fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
     let mut call = false;
     let mut construction = false;
     let mut arguments = None;
-    let mut write = false;
+    let mut write = crate::model::WriteKind::None;
     if let Some(p) = current.parent() {
         if p.kind() == "invocation_expression"
             && p.child_by_field_name("function") == Some(current)
@@ -422,14 +426,24 @@ fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
                 .map(|a| a.named_child_count());
         }
         if p.kind() == "assignment_expression" && p.child_by_field_name("left") == Some(current) {
-            write = true;
+            write = crate::model::WriteKind::Direct;
         }
         if matches!(
             p.kind(),
             "postfix_unary_expression" | "prefix_unary_expression"
         ) && (text(p, s).contains("++") || text(p, s).contains("--"))
         {
-            write = true;
+            write = crate::model::WriteKind::Direct;
+        }
+        if p.kind() == "argument" {
+            write = p
+                .children(&mut p.walk())
+                .find_map(|token| match token.kind() {
+                    "out" => Some(crate::model::WriteKind::Out),
+                    "ref" => Some(crate::model::WriteKind::Ref),
+                    _ => None,
+                })
+                .unwrap_or(write);
         }
     }
     facts.occurrences.push(Occurrence {
@@ -461,7 +475,13 @@ mod tests {
             2
         );
         assert_eq!(f.occurrences.iter().filter(|o| o.call).count(), 1);
-        assert_eq!(f.occurrences.iter().filter(|o| o.write).count(), 2);
+        assert_eq!(
+            f.occurrences
+                .iter()
+                .filter(|o| o.write != crate::model::WriteKind::None)
+                .count(),
+            2
+        );
         assert!(
             !f.occurrences
                 .iter()

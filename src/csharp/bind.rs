@@ -640,10 +640,15 @@ impl Binder {
             };
             namespace = parent;
         }
-        if !context.declaration().owner.is_empty()
-            && qualified == format!("{}.{sought}", strip_arity(&context.declaration().owner))
-        {
-            return true;
+        let mut owner = context.declaration().owner.as_str();
+        while !owner.is_empty() {
+            if qualified == format!("{}.{sought}", strip_arity(owner)) {
+                return true;
+            }
+            let Some((parent, _)) = owner.rsplit_once('.') else {
+                break;
+            };
+            owner = parent;
         }
         imports.iter().any(|import| {
             matches!(import.kind, ImportKind::Namespace | ImportKind::Static)
@@ -698,12 +703,26 @@ impl Binder {
             return Ok(direct);
         }
         let mut result = Vec::new();
+        let mut class_base = false;
         for base in self.base_types(view, &owner, ty, depth + 1)? {
+            let interface = matches!(&base, Type::Named { definition, .. }
+                if self.definitions.get(definition).is_some_and(|s| s.declaration().kind == "interface"));
+            // Implementing an interface does not inherit its members. In
+            // particular, its Object fallback must not duplicate class members.
+            if interface && owner.declaration().kind != "interface" {
+                continue;
+            }
+            class_base |= !interface;
             result.extend(self.members(view, &base, name, project, depth + 1)?);
         }
         // Interface values expose Object's public instance members, although
         // Object is not a base interface and must not enter inheritance results.
-        if result.is_empty() && owner.declaration().kind == "interface" {
+        if result.is_empty()
+            && (owner.declaration().kind == "interface"
+                || owner.declaration().kind == "class"
+                    && !class_base
+                    && owner.declaration().qualified != "System.Object")
+        {
             result.extend(
                 self.members(
                     view,
@@ -719,6 +738,8 @@ impl Binder {
                 }),
             );
         }
+        let mut seen = std::collections::HashSet::new();
+        result.retain(|(symbol, receiver)| seen.insert((symbol.id.clone(), receiver.clone())));
         Ok(result)
     }
     fn member_value(
