@@ -48,16 +48,27 @@ impl Paths {
 
     pub fn display(&mut self, path: &str) -> String {
         let directories: Vec<_> = path.match_indices('/').map(|(i, _)| i).collect();
-        let shortened = directories.iter().rev().find_map(|&end| {
-            if !self.known.contains(&path[..end]) {
-                return None;
-            }
-            let start = path[..end].rfind('/')? + 1;
-            let suffix = &path[start..];
-            (self.suffixes.get(suffix) == Some(&1)).then(|| format!("…/{suffix}"))
+        let repeated = self
+            .known
+            .contains(path)
+            .then(|| {
+                let (_, filename) = path.rsplit_once('/')?;
+                (self.suffixes.get(filename) == Some(&1)).then(|| format!("…/{filename}"))
+            })
+            .flatten();
+        let shortened = repeated.or_else(|| {
+            directories.iter().rev().find_map(|&end| {
+                if !self.known.contains(&path[..end]) {
+                    return None;
+                }
+                let start = path[..end].rfind('/')? + 1;
+                let suffix = &path[start..];
+                (self.suffixes.get(suffix) == Some(&1)).then(|| format!("…/{suffix}"))
+            })
         });
         self.known
             .extend(directories.into_iter().map(|end| path[..end].to_owned()));
+        self.known.insert(path.to_owned());
         shortened.unwrap_or_else(|| path.to_owned())
     }
 }
@@ -334,9 +345,11 @@ mod tests {
         // The collision is indexed but has never appeared in this response.
         assert_eq!(paths.display(inventory[0]), "…/Scripts/GameCore/World.cs");
         assert_eq!(paths.display(inventory[3]), "…/GameCore/Unique.cs");
+        assert_eq!(paths.display(inventory[3]), "…/Unique.cs");
         assert_eq!(paths.display(inventory[1]), "…/Scripts/Inputs/Input.cs");
         let mut fresh = Paths::new(inventory.map(str::to_owned));
         assert_eq!(fresh.display(inventory[1]), inventory[1]);
+        assert_eq!(fresh.display(inventory[1]), "…/Input.cs");
     }
     #[test]
     fn code_preserves_relative_indentation_and_embedded_fences() {

@@ -15,7 +15,11 @@ cargo run --locked --example metadata_compare -- tests/metadata-fixture/bin/Rele
 
 test_command=(cargo test --locked)
 if [[ ${SIGLA_TEST_WITH_SUDO:-0} == 1 ]]; then
-    test_command=(sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+    # Sandboxed tests drop capabilities, so their .NET home must belong to root.
+    test_dotnet_home=$(sudo mktemp -d /tmp/sigla-ci-dotnet.XXXXXXXX)
+    trap 'sudo rm -r -- "$test_dotnet_home"' EXIT
+    test_command=(sudo env "PATH=$PATH" "HOME=$test_dotnet_home" "DOTNET_CLI_HOME=$test_dotnet_home"
+        "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
         "CARGO_PROFILE_DEV_DEBUG=$CARGO_PROFILE_DEV_DEBUG" "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG"
         "${test_command[@]}")
 fi
