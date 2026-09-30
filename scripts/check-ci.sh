@@ -13,10 +13,15 @@ dotnet build tests/metadata-oracle -c Release
 dotnet tests/metadata-oracle/bin/Release/net10.0/MetadataOracle.dll --signatures tests/metadata-fixture/bin/Release/net10.0/MetadataFixture.dll > target/signatures.json
 cargo run --locked --example metadata_compare -- tests/metadata-fixture/bin/Release/net10.0/MetadataFixture.dll target/signatures.json
 
+test_command=(cargo test --locked)
 if [[ ${SIGLA_TEST_WITH_SUDO:-0} == 1 ]]; then
-    sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-        "CARGO_PROFILE_DEV_DEBUG=$CARGO_PROFILE_DEV_DEBUG" "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG" \
-        cargo test --locked --all-targets -- --include-ignored
-else
-    cargo test --locked --all-targets -- --include-ignored
+    test_command=(sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+        "CARGO_PROFILE_DEV_DEBUG=$CARGO_PROFILE_DEV_DEBUG" "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG"
+        "${test_command[@]}")
 fi
+
+"${test_command[@]}" --all-targets
+# CI provides the fixtures and SDK for these ignored tests. Other ignored tests
+# require manual tools or external data and must be requested separately.
+"${test_command[@]}" --test metadata -- --ignored
+"${test_command[@]}" --lib csharp::oracle:: -- --ignored
