@@ -187,7 +187,7 @@ impl Catalog {
         if let Some(cached) = self.headers.get(key) {
             return Ok(cached.clone());
         }
-        let bytes = postcard::to_allocvec(data.as_ref())?.len() * 4;
+        let bytes = postcard::experimental::serialized_size(data.as_ref())? * 4;
         ensure!(
             self.bytes + bytes <= 128 * 1024 * 1024,
             "C# declaration memory limit reached; narrow the query"
@@ -203,7 +203,7 @@ impl Catalog {
             .csharp_body(view.source_tx, file, position)?
             .ok_or_else(|| anyhow::anyhow!("Missing C# body record"))?;
         ensure!(
-            postcard::to_allocvec(body.as_ref())?.len() * 4 <= 64 * 1024 * 1024,
+            postcard::experimental::serialized_size(body.as_ref())? * 4 <= 64 * 1024 * 1024,
             "C# body memory limit reached"
         );
         Ok(body)

@@ -4,6 +4,8 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 // leave room for two active jobs and temporary parser allocations.
 pub const IDLE_CACHE_HIGH_WATER: u64 = 640 * 1024 * 1024;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const INDEXING_FREE_HIGH_WATER: usize = 64 * 1024 * 1024;
 
 pub struct Budget {
     capacity: u64,
@@ -77,6 +79,15 @@ pub fn reclaim() {
     }
 }
 
+pub fn reclaim_after_indexing() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if unsafe { libc::mallinfo2().fordblks } >= INDEXING_FREE_HIGH_WATER {
+        // Run once after a batch: trimmed arena pages still count as free, so
+        // polling this counter would repeatedly trim the same arenas.
+        release_unused_pages();
+    }
+}
+
 pub fn start_reclaimer() -> io::Result<()> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -140,23 +151,26 @@ mod tests {
     fn freed_worker_pages_are_returned_to_kernel() {
         const CHILD: &str = "SIGLA_MEMORY_RECLAIM_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "memory::tests::freed_worker_pages_are_returned_to_kernel",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            for mode in ["indexing", "pressure"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "memory::tests::freed_worker_pages_are_returned_to_kernel",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             return;
         }
+        let indexing = std::env::var(CHILD).unwrap() == "indexing";
 
         // isolate allocator settings from other tests and force free arena pages
         // to remain resident until reclamation, as with fragmented worker heaps.
@@ -166,7 +180,11 @@ mod tests {
         }
         release_unused_pages();
         let baseline = resident("RssAnon:").unwrap();
-        let per_worker = IDLE_CACHE_HIGH_WATER as usize / (64 * 1024);
+        let per_worker = if indexing {
+            INDEXING_FREE_HIGH_WATER
+        } else {
+            IDLE_CACHE_HIGH_WATER as usize
+        } / (64 * 1024);
         let pins = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..2)
                 .map(|_| {
@@ -191,7 +209,12 @@ mod tests {
         // A large untouched live allocation must not hide the freed pages.
         let sparse = unsafe { libc::malloc(released as usize * 2) };
         assert!(!sparse.is_null());
-        start_reclaimer().unwrap();
+        if indexing {
+            assert!(retained < IDLE_CACHE_HIGH_WATER);
+            reclaim_after_indexing();
+        } else {
+            start_reclaimer().unwrap();
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while resident("RssAnon:").unwrap() + released / 2 >= retained
             && std::time::Instant::now() < deadline

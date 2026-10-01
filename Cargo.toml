@@ -22,7 +22,7 @@ gix-hash = { version = "0.26.2", features = ["sha1", "sha256"] }
 heed = "0.22"
 inotify = "0.11"
 libc = "0.2"
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", features = ["alloc", "use-std"] }
 zstd = "0.13"
 regex = "1"
 quick-xml = "0.39"

@@ -178,7 +178,7 @@ pub struct Local {
 /// Partition syntax by outer callable. Local functions and lambdas stay with
 /// their enclosing callable so lexical dependencies never cross records.
 pub fn split_bodies(
-    syntax: &FileSyntax,
+    syntax: FileSyntax,
     declarations: &[crate::model::Declaration],
     length: usize,
 ) -> anyhow::Result<Vec<(Range<usize>, BodyFile)>> {
@@ -219,9 +219,8 @@ pub fn split_bodies(
         .collect();
     let mut remap = Vec::with_capacity(syntax.expressions.len());
     let mut owners = Vec::with_capacity(syntax.expressions.len());
-    for expression in &syntax.expressions {
+    for mut expression in syntax.expressions {
         let owner = group(&expression.span);
-        let mut expression = expression.clone();
         let map = |id: &mut ExprId| -> anyhow::Result<()> {
             anyhow::ensure!(
                 owners.get(*id as usize) == Some(&owner),
@@ -276,9 +275,8 @@ pub fn split_bodies(
         owners.push(owner);
         groups[owner].1.expressions.push(expression);
     }
-    for local in &syntax.locals {
+    for mut local in syntax.locals {
         let owner = group(&local.span);
-        let mut local = local.clone();
         for id in [&mut local.value, &mut local.out_argument]
             .into_iter()
             .flatten()

@@ -95,11 +95,11 @@ fn reader_keeps_source_and_declarations_from_one_revision() {
         facts: sigla::extract::extract(source, sigla::model::Language::CSharp, &[], "").unwrap(),
         assembly: None,
     };
-    store.replace("file", &data("class Before {}"), &1).unwrap();
+    store.replace("file", data("class Before {}"), &1).unwrap();
     let read = store.read().unwrap();
     std::thread::scope(|scope| {
         scope
-            .spawn(|| store.replace("file", &data("class After {}"), &2).unwrap())
+            .spawn(|| store.replace("file", data("class After {}"), &2).unwrap())
             .join()
             .unwrap();
     });
@@ -186,7 +186,7 @@ fn semantic_revision_ignores_body_edits_and_locations_but_tracks_headers() {
                 .unwrap(),
             assembly: None,
         };
-        store.replace("file", &data, &source).unwrap();
+        store.replace("file", data, &source).unwrap();
         store.declaration_revision("file").unwrap()
     };
     let before = replace("class C { private int Count(int value = 1) { return value; } }");

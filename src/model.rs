@@ -173,6 +173,18 @@ pub fn line(source: &str, byte: usize) -> &str {
     source[start..end].trim()
 }
 
+pub(crate) fn decode_owned(bytes: Vec<u8>, language: Language) -> anyhow::Result<String> {
+    match String::from_utf8(bytes) {
+        Ok(mut text) => {
+            if text.starts_with('\u{feff}') {
+                text.drain(..'\u{feff}'.len_utf8());
+            }
+            Ok(text)
+        }
+        Err(error) => decode(error.as_bytes(), language),
+    }
+}
+
 pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
     if language != Language::Rust
         && (bytes.starts_with(&[0xff, 0xfe, 0, 0]) || bytes.starts_with(&[0, 0, 0xfe, 0xff]))
@@ -242,6 +254,39 @@ pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_source_decoding_preserves_encoding_rules() {
+        let text = "class Café {}";
+        let utf8 = text.as_bytes().to_vec();
+        let allocation = utf8.as_ptr();
+        let decoded = decode_owned(utf8, Language::CSharp).unwrap();
+        assert_eq!(decoded, text);
+        assert_eq!(decoded.as_ptr(), allocation);
+        let samples = [
+            text.as_bytes().to_vec(),
+            format!("\u{feff}{text}").into_bytes(),
+            text.chars().map(|c| c as u8).collect(),
+            [0xff, 0xfe]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+                .collect(),
+            [0, 0, 0xfe, 0xff]
+                .into_iter()
+                .chain(text.chars().flat_map(|c| (c as u32).to_be_bytes()))
+                .collect(),
+            vec![0xef, 0xbb, 0xbf, 0xff],
+            vec![0xff, 0xfe, 0],
+        ];
+        for bytes in samples {
+            for language in [Language::CSharp, Language::Rust] {
+                assert_eq!(
+                    decode_owned(bytes.clone(), language).map_err(|e| e.to_string()),
+                    decode(&bytes, language).map_err(|e| e.to_string())
+                );
+            }
+        }
+    }
+
     #[test]
     fn source_encoding_precedence_and_detection() {
         use super::{Language, decode};

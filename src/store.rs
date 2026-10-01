@@ -8,7 +8,7 @@ use heed::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
-    io::Read,
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
 };
@@ -175,22 +175,19 @@ impl Store {
             })
             .transpose()
     }
-    pub fn replace(&self, key: &str, data: &FileData, revision: &impl Serialize) -> Result<()> {
-        let encoded = zstd::stream::encode_all(postcard::to_allocvec(data)?.as_slice(), 1)?;
-        let summary = zstd::stream::encode_all(
-            postcard::to_allocvec(&data.facts.declarations)?.as_slice(),
-            1,
-        )?;
+    pub fn replace(&self, key: &str, mut data: FileData, revision: &impl Serialize) -> Result<()> {
+        let encoded = encode_record(&data)?;
+        let summary = encode_record(&data.facts.declarations)?;
         let mut tx = self.env.write_txn()?;
         if let Some(old) = self.load(&tx, key)? {
             self.remove_names(&mut tx, key, &old.facts)?;
         }
         self.files.put(&mut tx, key, &encoded)?;
         self.summaries.put(&mut tx, key, &summary)?;
-        let environment = declaration_revision(data)?;
+        let environment = declaration_revision(&data)?;
         self.metadata
             .put(&mut tx, &format!("environment:{key}"), &environment)?;
-        if let Some(syntax) = &data.facts.csharp {
+        if let Some(syntax) = data.facts.csharp.take() {
             self.metadata.put(
                 &mut tx,
                 &format!("forwarders:{key}"),
@@ -222,24 +219,13 @@ impl Store {
                         .map(|i| &data.facts.declarations[*i])
                         .collect();
                     let headers: Vec<_> = indices.iter().map(|i| &syntax.headers[*i]).collect();
-                    let bytes = zstd::stream::encode_all(
-                        postcard::to_allocvec(&(declarations, headers, &syntax.imports))?
-                            .as_slice(),
-                        1,
-                    )?;
+                    let bytes = encode_record(&(declarations, headers, &syntax.imports))?;
                     self.headers
                         .put(&mut tx, &format!("name:{key}:{name}"), &bytes)?;
                 }
             } else {
-                let headers = zstd::stream::encode_all(
-                    postcard::to_allocvec(&(
-                        &data.facts.declarations,
-                        &syntax.headers,
-                        &syntax.imports,
-                    ))?
-                    .as_slice(),
-                    1,
-                )?;
+                let headers =
+                    encode_record(&(&data.facts.declarations, &syntax.headers, &syntax.imports))?;
                 self.headers.put(&mut tx, key, &headers)?;
                 self.remove_bodies(&mut tx, key)?;
                 let groups = crate::csharp::syntax::split_bodies(
@@ -250,8 +236,7 @@ impl Store {
                 let mut index = Vec::new();
                 for (ordinal, (range, group)) in groups.into_iter().enumerate() {
                     let group_key = format!("group:{key}:{ordinal}");
-                    let encoded =
-                        zstd::stream::encode_all(postcard::to_allocvec(&group)?.as_slice(), 1)?;
+                    let encoded = encode_record(&group)?;
                     self.bodies.put(&mut tx, &group_key, &encoded)?;
                     index.push((range, group_key));
                 }
@@ -330,8 +315,9 @@ impl Store {
             return Ok((false, modules));
         }
         let data = build()?;
-        self.replace(key, &data, &(revision, &data.facts.modules))?;
-        Ok((true, data.facts.modules))
+        let modules = data.facts.modules.clone();
+        self.replace(key, data, &(revision, &modules))?;
+        Ok((true, modules))
     }
     fn remove_names(&self, tx: &mut heed::RwTxn<'_>, key: &str, f: &Facts) -> Result<()> {
         for name in relationship_names(f) {
@@ -575,6 +561,39 @@ impl Store {
         self.metadata.put(&mut tx, "manifest_revision", b"6")?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn encode_record(data: &(impl Serialize + ?Sized)) -> Result<Vec<u8>> {
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
+    {
+        // Buffer small serializer writes without retaining the full raw record.
+        let mut writer = BufWriter::with_capacity(64 * 1024, &mut encoder);
+        postcard::to_io(data, &mut writer)?;
+        writer.flush()?;
+    }
+    Ok(encoder.finish()?)
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_preserves_postcard_records_across_buffer_boundaries() {
+        for length in [0, 17, 200_000] {
+            let data = (
+                "source",
+                (0..length).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+            );
+            let compressed = encode_record(&data).unwrap();
+            let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+            assert_eq!(raw, postcard::to_allocvec(&data).unwrap());
+            let (decoded, size): ((String, Vec<u8>), _) = decode_record(&compressed).unwrap();
+            assert_eq!(decoded.0, data.0);
+            assert_eq!(decoded.1, data.1);
+            assert_eq!(size, raw.len());
+        }
     }
 }
 

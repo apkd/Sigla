@@ -541,6 +541,9 @@ impl Workspace {
         self.fence = fence;
         self.initialized = true;
         self.builds += 1;
+        if parsed > 0 {
+            crate::memory::reclaim_after_indexing();
+        }
         tracing::info!(
             workspace = %self.entry.display(),
             files = self.manifest.files.len(),
@@ -728,7 +731,7 @@ fn read_stable(path: &Path, language: Language) -> Result<String> {
         let after = Stamp::read(path)?;
         if before == after {
             return tracing::debug_span!("decode_source",path=%path.display())
-                .in_scope(|| decode(&bytes, language))
+                .in_scope(|| decode_owned(bytes, language))
                 .with_context(|| {
                     format!(
                         "Cannot decode source {}",
