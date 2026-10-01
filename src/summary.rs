@@ -3,7 +3,12 @@
 use crate::{model::Language, render::inline, workspace::Manifest};
 use rmcp::model::{CallToolResult, ContentBlock, MetaObject, TextContent};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::Path, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 const CONTEXT: &str = "sigla/repository";
 const PREAMBLE: &str = "sigla/repository-summary";
@@ -172,34 +177,62 @@ impl Summary {
 pub(crate) struct Session(Mutex<BTreeSet<String>>);
 
 impl Session {
-    pub fn present(&self, mut result: CallToolResult) -> CallToolResult {
-        if result.is_error == Some(true) {
-            return result;
-        }
-        let summary = result
-            .meta
-            .as_ref()
-            .and_then(|m| m.0.get(CONTEXT))
-            .and_then(|v| serde_json::from_value::<Summary>(v.clone()).ok());
-        let Some(summary) = summary else {
-            return result;
-        };
-        result.content.retain(|block| {
-            !block.as_text().is_some_and(|text| {
-                text.meta
-                    .as_ref()
-                    .is_some_and(|m| m.0.get(PREAMBLE) == Some(&serde_json::Value::Bool(true)))
-            })
-        });
-        if self.0.lock().unwrap().insert(summary.key) {
-            let meta = MetaObject(serde_json::Map::from_iter([(PREAMBLE.into(), true.into())]));
-            result.content.insert(
-                0,
-                ContentBlock::Text(TextContent::new(summary.table).with_meta(meta)),
-            );
-        }
-        result
+    pub fn present(&self, result: CallToolResult) -> CallToolResult {
+        present(result, |key| self.0.lock().unwrap().insert(key))
     }
+}
+
+const IDLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+pub(crate) struct Stateless(Mutex<BTreeMap<String, Instant>>);
+
+impl Stateless {
+    pub fn present(&self, result: CallToolResult) -> CallToolResult {
+        self.present_with_clock(result, Instant::now)
+    }
+
+    fn present_with_clock(
+        &self,
+        result: CallToolResult,
+        clock: impl FnOnce() -> Instant,
+    ) -> CallToolResult {
+        present(result, |key| {
+            let mut entries = self.0.lock().unwrap();
+            let now = clock();
+            entries.retain(|_, last| now.duration_since(*last) < IDLE_WINDOW);
+            entries.insert(key, now).is_none()
+        })
+    }
+}
+
+fn present(mut result: CallToolResult, first: impl FnOnce(String) -> bool) -> CallToolResult {
+    if result.is_error == Some(true) {
+        return result;
+    }
+    let summary = result
+        .meta
+        .as_ref()
+        .and_then(|m| m.0.get(CONTEXT))
+        .and_then(|v| serde_json::from_value::<Summary>(v.clone()).ok());
+    let Some(summary) = summary else {
+        return result;
+    };
+    result.content.retain(|block| {
+        !block.as_text().is_some_and(|text| {
+            text.meta
+                .as_ref()
+                .is_some_and(|m| m.0.get(PREAMBLE) == Some(&serde_json::Value::Bool(true)))
+        })
+    });
+    if first(summary.key) {
+        let meta = MetaObject(serde_json::Map::from_iter([(PREAMBLE.into(), true.into())]));
+        result.content.insert(
+            0,
+            ContentBlock::Text(TextContent::new(summary.table).with_meta(meta)),
+        );
+    }
+    result
 }
 
 #[cfg(test)]
@@ -214,6 +247,51 @@ mod tests {
         }
         .attach(&mut result);
         result
+    }
+
+    #[test]
+    fn stateless_window_slides_and_failures_do_not_extend_it() {
+        let state = Stateless::default();
+        let start = Instant::now();
+        let step = IDLE_WINDOW / 2;
+        let call = |key, time| state.present_with_clock(response(key, "summary"), || time);
+        assert_eq!(call("repo#refs/heads/main", start).content.len(), 2);
+        assert_eq!(call("repo#refs/heads/main", start + step).content.len(), 1);
+        assert_eq!(
+            call("repo#refs/heads/main", start + step * 2).content.len(),
+            1
+        );
+        for key in [
+            "repo#refs/tags/main",
+            "repo#commit",
+            "other#refs/heads/main",
+        ] {
+            assert_eq!(call(key, start + step * 2).content.len(), 2);
+        }
+        let mut failed = response("repo#refs/heads/main", "summary");
+        failed.is_error = Some(true);
+        state.present_with_clock(failed, || start + step * 3);
+        assert_eq!(
+            call("repo#refs/heads/main", start + step * 4).content.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn stateless_concurrent_results_strip_upstream_headers_and_emit_once() {
+        let state = Stateless::default();
+        let upstream = Session::default().present(response("repo", "summary"));
+        let count = std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let upstream = &upstream;
+                    let state = &state;
+                    scope.spawn(move || state.present(upstream.clone()).content.len() - 1)
+                })
+                .collect();
+            tasks.into_iter().map(|t| t.join().unwrap()).sum::<usize>()
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct App {
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
+    stateless_summaries: crate::summary::Stateless,
 }
 impl App {
     async fn request_cancellable(
@@ -118,6 +119,7 @@ impl App {
             remote: None,
             upstream: None,
             startup: Mutex::new(None),
+            stateless_summaries: Default::default(),
         })
     }
 
@@ -753,6 +755,19 @@ impl Mcp {
             error = heartbeat => Err(error),
         };
         match result {
+            Ok(result)
+                if context
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .is_some_and(|parts| {
+                        !parts.headers.contains_key("mcp-session-id")
+                            || context.protocol_version().is_some_and(|version| {
+                                version >= rmcp::model::ProtocolVersion::V_2026_07_28
+                            })
+                    }) =>
+            {
+                self.app.stateless_summaries.present(result)
+            }
             Ok(result) => self.session.present(result),
             Err(e) => {
                 tracing::error!(project, error = %format!("{e:#}"), "Tool request failed");

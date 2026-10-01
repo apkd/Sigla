@@ -169,6 +169,33 @@ async fn repository_summaries_follow_downstream_sessions_and_survive_upstream_re
     assert_ne!(result.is_error, Some(true));
     assert_eq!(result.content.len(), 1);
     assert_eq!(connections.load(Ordering::SeqCst), 3);
+    // Modern HTTP requests create a fresh Mcp per call, but share idle timers.
+    let http = reqwest::Client::new();
+    for expected in [2, 1] {
+        let response: serde_json::Value = http
+            .post(&hybrid.url)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "search")
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"search", "arguments":{"project":"owner/repo", "query":"type:X"},
+                    "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities":{}}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            response["result"]["content"].as_array().map(Vec::len),
+            Some(expected),
+            "{response}"
+        );
+    }
     first.cancel().await.unwrap();
     second.cancel().await.unwrap();
     app.shutdown().await;
