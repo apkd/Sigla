@@ -10,6 +10,10 @@ struct Workload {
     repeats: usize,
     #[serde(default = "serial")]
     concurrency: usize,
+    #[serde(default)]
+    idle_ms: u64,
+    #[serde(default)]
+    trim_idle: bool,
 }
 fn serial() -> usize {
     1
@@ -18,6 +22,29 @@ fn serial() -> usize {
 struct Case {
     project: String,
     query: String,
+}
+
+fn memory_sample() -> Result<serde_json::Value> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let memory = |prefix: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or("")
+            .trim()
+    };
+    let mut sample = serde_json::json!({
+        "rss":memory("VmRSS:"), "anonymous_rss":memory("RssAnon:"),
+        "file_rss":memory("RssFile:"), "shared_rss":memory("RssShmem:"),
+        "peak_rss":memory("VmHWM:"), "threads":memory("Threads:")
+    });
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let heap = unsafe { libc::mallinfo2() };
+        sample["heap"] =
+            serde_json::json!({"used":heap.uordblks,"free":heap.fordblks,"mapped":heap.hblkhd});
+    }
+    Ok(sample)
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,22 +70,9 @@ async fn main() -> Result<()> {
                 jobs.spawn(async move {
             let start = Instant::now();
             let output = app.search(&case.project, &case.query).await?;
-            let status = std::fs::read_to_string("/proc/self/status")?;
-            let memory = |prefix: &str| {
-                status
-                    .lines()
-                    .find_map(|line| line.strip_prefix(prefix))
-                    .unwrap_or("")
-                    .trim()
-            };
-            let sample = serde_json::json!({"iteration":iteration,"project":case.project,"query":case.query,"elapsed_us":start.elapsed().as_micros(),"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string(),"rss":memory("VmRSS:"),"anonymous_rss":memory("RssAnon:"),"file_rss":memory("RssFile:"),"peak_rss":memory("VmHWM:"),"threads":memory("Threads:")});
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            let sample = {
-                let heap = unsafe { libc::mallinfo2() };
-                let mut sample = sample;
-                sample["heap"] = serde_json::json!({"used":heap.uordblks,"free":heap.fordblks,"mapped":heap.hblkhd});
-                sample
-            };
+            let elapsed = start.elapsed().as_micros();
+            let mut sample = memory_sample()?;
+            sample.as_object_mut().unwrap().extend(serde_json::json!({"iteration":iteration,"project":case.project,"query":case.query,"elapsed_us":elapsed,"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string()}).as_object().unwrap().clone());
             println!("{sample}");
             Ok::<_, anyhow::Error>(())
             });
@@ -67,6 +81,22 @@ async fn main() -> Result<()> {
                 result??;
             }
         }
+    }
+    if workload.idle_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(workload.idle_ms)).await;
+        let mut sample = memory_sample()?;
+        sample["phase"] = "idle".into();
+        println!("{sample}");
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if workload.trim_idle {
+        let start = Instant::now();
+        unsafe { libc::malloc_trim(0) };
+        let elapsed = start.elapsed().as_micros();
+        let mut sample = memory_sample()?;
+        sample["phase"] = "trimmed".into();
+        sample["elapsed_us"] = serde_json::json!(elapsed);
+        println!("{sample}");
     }
     Ok(())
 }
