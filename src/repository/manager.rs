@@ -73,24 +73,24 @@ mod refresh_tests {
         let delay = options
             .refresh_delay(Duration::from_millis(refreshed))
             .as_millis() as u64;
-        assert!(!active.refresh_due(&options, refreshed, refreshed + delay - 1));
-        assert!(active.refresh_due(&options, refreshed, refreshed + delay + 1));
+        assert!(!active.refresh_due(&options, refreshed, refreshed + delay - 1, None));
+        assert!(active.refresh_due(&options, refreshed, refreshed + delay + 1, None));
         // A request makes only its selector active, even before the old deadline.
         let request = refreshed + options.refresh_delay(Duration::ZERO).as_millis() as u64 + 1;
         active.last_use.store(request, Ordering::Relaxed);
-        assert!(active.refresh_due(&options, refreshed, request));
-        assert!(!idle_tag.refresh_due(&options, refreshed, request));
+        assert!(active.refresh_due(&options, refreshed, request, None));
+        assert!(!idle_tag.refresh_due(&options, refreshed, request, None));
         // Successful publication starts a new interval; clock rollback cannot make it due.
-        assert!(!active.refresh_due(&options, request, request));
-        assert!(!active.refresh_due(&options, request, request - 1));
-        assert!(idle_tag.refresh_due(&options, refreshed, refreshed + delay + 1));
+        assert!(!active.refresh_due(&options, request, request, None));
+        assert!(!active.refresh_due(&options, request, request - 1, None));
+        assert!(idle_tag.refresh_due(&options, refreshed, refreshed + delay + 1, None));
     }
 
     #[test]
     fn commits_stay_pinned_and_fixed_intervals_ignore_activity() {
         let mut options = options();
         let pinned = branch(Target::Commit("a".repeat(40)), 0);
-        assert!(!pinned.refresh_due(&options, 0, u64::MAX));
+        assert!(!pinned.refresh_due(&options, 0, u64::MAX, None));
         let fixed = Duration::from_secs(23);
         options.refresh_interval = Some(fixed);
         let moving = branch(Target::Branch("main".into()), 0);
@@ -98,10 +98,36 @@ mod refresh_tests {
         let deadline = refreshed + fixed.as_millis() as u64;
         for last_use in [0, deadline] {
             moving.last_use.store(last_use, Ordering::Relaxed);
-            assert!(!moving.refresh_due(&options, refreshed, deadline - 1));
-            assert!(moving.refresh_due(&options, refreshed, deadline));
+            assert!(!moving.refresh_due(&options, refreshed, deadline - 1, None));
+            assert!(moving.refresh_due(&options, refreshed, deadline, None));
         }
-        assert!(!pinned.refresh_due(&options, 0, u64::MAX));
+        assert!(!pinned.refresh_due(&options, 0, u64::MAX, None));
+    }
+
+    #[test]
+    fn resolved_abbreviation_stays_pinned_without_expanding_display_selector() {
+        let options = options();
+        let mut short = branch(Target::Named("abcdef1".into()), 0);
+        short.name = "abcdef1".into();
+        let prepared = Prepared {
+            transfer_bytes: 0,
+            unavailable: Default::default(),
+            transport: None,
+            resolved_target: Some(Target::Commit("a".repeat(40))),
+            branch: None,
+            revision: "a".repeat(40),
+            selected: Default::default(),
+            tracked: Default::default(),
+            directories: Default::default(),
+        };
+        let prepared: Prepared =
+            serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+        assert!(!short.refresh_due(&options, 0, u64::MAX, Some(&prepared)));
+        assert!(matches!(
+            short.acquisition_target(Some(&prepared)),
+            Target::Commit(_)
+        ));
+        assert_eq!(short.selector(&prepared), "abcdef1");
     }
 }
 
@@ -137,16 +163,32 @@ pub struct Branch {
 }
 
 impl Branch {
-    fn refresh_due(&self, options: &RemoteOptions, refreshed: u64, now: u64) -> bool {
+    fn acquisition_target<'a>(&'a self, prepared: Option<&'a Prepared>) -> &'a Target {
+        prepared
+            .and_then(|prepared| prepared.resolved_target.as_ref())
+            .unwrap_or(&self.target)
+    }
+
+    fn refresh_due(
+        &self,
+        options: &RemoteOptions,
+        refreshed: u64,
+        now: u64,
+        prepared: Option<&Prepared>,
+    ) -> bool {
         // Anchor the delay to the last successful refresh. A later access
         // shortens it to the active interval without moving the deadline forward.
         let idle =
             Duration::from_millis(refreshed.saturating_sub(self.last_use.load(Ordering::Relaxed)));
-        !matches!(self.target, Target::Commit(_))
+        !matches!(self.acquisition_target(prepared), Target::Commit(_))
             && Duration::from_millis(now.saturating_sub(refreshed)) >= options.refresh_delay(idle)
     }
 
     pub fn selector(&self, prepared: &Prepared) -> String {
+        // Preserve the user's abbreviated selector in summaries; only refresh semantics expand it.
+        if matches!(prepared.resolved_target.as_ref(), Some(Target::Commit(_))) {
+            return self.name.clone();
+        }
         if let Some(branch) = &prepared.branch {
             return format!("refs/heads/{branch}");
         }
@@ -355,7 +397,8 @@ impl Manager {
                     state.last_use = last_use;
                     branch.persist(state)?;
                 }
-                if branch.refresh_due(&self.options, state.refreshed, now()) {
+                if branch.refresh_due(&self.options, state.refreshed, now(), Some(&state.prepared))
+                {
                     self.schedule(branch.clone(), false);
                 }
             }
@@ -520,9 +563,9 @@ impl Manager {
                     s.prepared.unavailable.contains(p) || branch.source().join(p).is_file()
                 })
         });
-        let due = state
-            .as_ref()
-            .is_none_or(|s| branch.refresh_due(&self.options, s.refreshed, now()));
+        let due = state.as_ref().is_none_or(|s| {
+            branch.refresh_due(&self.options, s.refreshed, now(), Some(&s.prepared))
+        });
         drop(state);
         if !usable || due {
             self.schedule(branch.clone(), !usable);
@@ -617,6 +660,7 @@ impl Manager {
         let (mut prepared, _pool_pin) =
             tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
         prepared.branch = before.prepared.branch.clone();
+        prepared.resolved_target = before.prepared.resolved_target.clone();
         let mut state = branch.state.lock().await;
         let mut next = before;
         next.additional.extend(paths);
@@ -666,11 +710,16 @@ impl Manager {
                     .collect()
             })
             .unwrap_or_default();
+        let resolved_target = before
+            .as_ref()
+            .and_then(|state| state.prepared.resolved_target.clone());
+        let target =
+            Target::clone(branch.acquisition_target(before.as_ref().map(|state| &state.prepared)));
         let request = Request {
             allow_private: authorize(&self.options.rules, &branch.repository)?,
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
-            target: branch.target.clone(),
+            target,
             store: PathBuf::new(),
             staging: stage.path().to_owned(),
             include: self.options.selection.patterns.0.clone(),
@@ -685,8 +734,11 @@ impl Manager {
         };
         let cache = self.cache.clone();
         // No publication lock is held while fetching or extracting objects.
-        let (prepared, _pool_pin) =
+        let (mut prepared, _pool_pin) =
             tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
+        if resolved_target.is_some() {
+            prepared.resolved_target = resolved_target;
+        }
         let mut state = branch.state.lock().await;
         let mut next = State {
             schema: 4,

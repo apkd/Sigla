@@ -391,6 +391,7 @@ mod tests {
             transfer_bytes: 0,
             unavailable: Default::default(),
             transport: None,
+            resolved_target: None,
             branch: None,
             revision: String::new(),
             selected: BTreeMap::from([(path.into(), "git-blob".into())]),

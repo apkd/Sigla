@@ -33,10 +33,12 @@ impl Target {
         };
         let mut message = format!("Requested upstream {kind} {name:?} is unavailable.");
         if matches!(self, Self::Named(_))
-            && (4..64).contains(&name.len())
+            && name.len() < 7
             && name.bytes().all(|b| b.is_ascii_hexdigit())
         {
-            message.push_str(" Abbreviated commit IDs are not supported; use the full commit ID.");
+            message.push_str(
+                " Cached commit abbreviations require at least 7 hexadecimal characters; use a branch, tag, or full SHA.",
+            );
         }
         if name.ends_with('"') {
             message.push_str(" The selector ends with a double quote, possibly encoded as %22; remove it when unintended.");
@@ -90,6 +92,9 @@ pub struct Prepared {
     pub unavailable: BTreeSet<String>,
     #[serde(default)]
     pub transport: Option<String>,
+    /// Fixed semantic target when a named selector resolves from the local object cache.
+    #[serde(default)]
+    pub resolved_target: Option<Target>,
     pub branch: Option<String>,
     pub revision: String,
     pub selected: BTreeMap<String, String>,
@@ -126,6 +131,63 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
 
 fn parse_id(value: &str) -> Result<gix_hash::ObjectId> {
     gix_hash::ObjectId::from_hex(value.as_bytes()).context("Invalid Git object identity")
+}
+
+fn is_cached_commit_prefix(value: &str) -> bool {
+    (7..64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn cached_commit(store: &Path, selector: &str) -> Result<gix_hash::ObjectId> {
+    let not_found = || {
+        anyhow::anyhow!(
+            "Cached commit prefix {selector:?} was not found; use a branch, tag, or full SHA."
+        )
+    };
+    if !store.join("HEAD").is_file() {
+        return Err(not_found());
+    }
+    let prefix = selector.to_ascii_lowercase();
+    let candidates = run(git(store)
+        .arg("rev-parse")
+        .arg(format!("--disambiguate={prefix}")))?;
+    if candidates.is_empty() {
+        return Err(not_found());
+    }
+    let objects = crate::process::capture(
+        git(store)
+            .arg("cat-file")
+            .arg("--batch-check=%(objectname) %(objecttype)"),
+        Duration::from_secs(120),
+        Some(candidates),
+        None,
+    )?;
+    ensure!(
+        objects.status.success(),
+        "Cannot inspect cached Git objects"
+    );
+    let mut commit = None;
+    for line in objects
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let line = std::str::from_utf8(line)?;
+        let Some((id, kind)) = line.split_once(' ') else {
+            anyhow::bail!("Invalid cached Git object record");
+        };
+        if kind != "commit" {
+            continue;
+        }
+        let id = parse_id(id)?;
+        ensure!(
+            id.to_string().starts_with(&prefix),
+            "Cached Git disambiguation returned an unrelated object"
+        );
+        if commit.replace(id).is_some() {
+            anyhow::bail!("Cached commit prefix {selector:?} is ambiguous; use a longer SHA.");
+        }
+    }
+    commit.ok_or_else(not_found)
 }
 
 fn receive(
@@ -207,8 +269,8 @@ fn prepare_with(
         "Internal transport must not contain a fragment"
     );
     let mut session = connect(&repository)?;
-    let (branch, revision) = match &request.target {
-        Target::Commit(id) => (None, parse_id(id)?),
+    let (branch, revision, resolved_target) = match &request.target {
+        Target::Commit(id) => (None, parse_id(id)?, None),
         Target::Branch(name) | Target::Tag(name) | Target::Named(name) => {
             super::validate_branch(name)?;
             let names = match &request.target {
@@ -218,29 +280,37 @@ fn prepare_with(
                 _ => vec![format!("refs/tags/{name}"), format!("refs/heads/{name}")],
             };
             let refs = session.refs(&names)?;
-            let (resolved, id) = names
-                .iter()
-                .find_map(|name| {
-                    refs.iter().find_map(|r| match r {
-                        gix_protocol::handshake::Ref::Direct {
-                            full_ref_name,
-                            object,
-                        }
-                        | gix_protocol::handshake::Ref::Peeled {
-                            full_ref_name,
-                            object,
-                            ..
-                        }
-                        | gix_protocol::handshake::Ref::Symbolic {
-                            full_ref_name,
-                            object,
-                            ..
-                        } if full_ref_name.as_slice() == name.as_bytes() => Some((name, *object)),
-                        _ => None,
-                    })
+            let resolved = names.iter().find_map(|name| {
+                refs.iter().find_map(|r| match r {
+                    gix_protocol::handshake::Ref::Direct {
+                        full_ref_name,
+                        object,
+                    }
+                    | gix_protocol::handshake::Ref::Peeled {
+                        full_ref_name,
+                        object,
+                        ..
+                    }
+                    | gix_protocol::handshake::Ref::Symbolic {
+                        full_ref_name,
+                        object,
+                        ..
+                    } if full_ref_name.as_slice() == name.as_bytes() => Some((name, *object)),
+                    _ => None,
                 })
-                .with_context(|| request.target.unavailable(name))?;
-            (resolved.strip_prefix("refs/heads/").map(str::to_owned), id)
+            });
+            if let Some((resolved, id)) = resolved {
+                (
+                    resolved.strip_prefix("refs/heads/").map(str::to_owned),
+                    id,
+                    None,
+                )
+            } else if matches!(&request.target, Target::Named(_)) && is_cached_commit_prefix(name) {
+                let id = cached_commit(&request.store, name)?;
+                (None, id, Some(Target::Commit(id.to_string())))
+            } else {
+                anyhow::bail!(request.target.unavailable(name));
+            }
         }
         Target::DefaultBranch => {
             let refs = session.refs(&["HEAD".into()])?;
@@ -265,6 +335,7 @@ fn prepare_with(
                 transfer_bytes: 0,
                 unavailable: BTreeSet::new(),
                 transport: session.endpoint.clone(),
+                resolved_target: None,
                 branch: Some(name),
                 revision: id.to_string(),
                 selected: BTreeMap::new(),
@@ -454,6 +525,7 @@ fn prepare_with(
         transfer_bytes,
         unavailable: BTreeSet::new(),
         transport,
+        resolved_target,
         branch,
         revision: revision.to_string(),
         selected,
@@ -465,6 +537,40 @@ fn prepare_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_object(store: &Path, kind: &str, contents: &[u8]) -> String {
+        let output = crate::process::capture(
+            git(store).args(["hash-object", "-t", kind, "-w", "--stdin"]),
+            Duration::from_secs(10),
+            Some(contents.to_vec()),
+            None,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit_object(store: &Path, nonce: u32, width: usize) -> String {
+        write_object(
+            store,
+            "commit",
+            format!(
+                "tree {}\nauthor A <a@a> 0 +0000\ncommitter A <a@a> 0 +0000\n\ncommit {nonce}\n",
+                "0".repeat(width)
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn bare_store(root: &Path, format: &str) -> PathBuf {
+        let store = root.join(format!("objects-{format}"));
+        run(Command::new("git")
+            .args(["init", "--bare", "--quiet", "--template="])
+            .arg(format!("--object-format={format}"))
+            .arg(&store))
+        .unwrap();
+        store
+    }
 
     fn upstream(path: &Path, filter: bool) {
         run(Command::new("git")
@@ -551,6 +657,7 @@ mod tests {
         execute(&["commit", "--quiet", "-am", "update"]);
         execute(&["branch", "release"]);
         execute(&["branch", "face1234"]);
+        execute(&["branch", "abc123"]);
         execute(&["branch", "quoted\""]);
         let current = String::from_utf8(execute(&["rev-parse", "HEAD"]))
             .unwrap()
@@ -565,6 +672,7 @@ mod tests {
             ("refs/heads/release", "class Updated {}\n", current.as_str()),
             ("main", "class Updated {}\n", current.as_str()),
             ("face1234", "class Updated {}\n", current.as_str()),
+            ("abc123", "class Updated {}\n", current.as_str()),
             ("quoted\"", "class Updated {}\n", current.as_str()),
         ]
         .into_iter()
@@ -587,16 +695,119 @@ mod tests {
             assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
             assert!(!request.staging.exists());
         }
-        for selector in ["deadbeef", "missing\"", "ordinary"] {
+        for selector in ["deadbeef", "abc12", "missing\"", "ordinary"] {
             let mut request = request(&root.path().join("unavailable"));
             request.target = Target::selector(selector).unwrap();
-            let error = prepare_with(&request, |_| Session::local(&upstream_path))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(&format!("{selector:?}")), "{error}");
-            assert_eq!(error.contains("Abbreviated"), selector == "deadbeef");
-            assert_eq!(error.contains("double quote"), selector.ends_with('"'));
+            assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
+            assert!(!request.staging.exists());
         }
+    }
+
+    #[test]
+    fn cached_abbreviations_resolve_only_after_named_refs_miss() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let execute = |args: &[&str]| {
+            run(Command::new("git")
+                .arg("-C")
+                .arg(&upstream_path)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args))
+            .unwrap()
+        };
+        let old = String::from_utf8(execute(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        fs::write(upstream_path.join("Code.cs"), "class Updated {}\n").unwrap();
+        execute(&["commit", "--quiet", "-am", "update"]);
+        let current = String::from_utf8(execute(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let prefix = &current[..7];
+        let mut request = request(root.path());
+        request.target = Target::Commit(current.clone());
+        let seeded = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(seeded.revision, current);
+
+        request.staging = root.path().join("stage-too-short");
+        request.target = Target::selector(&prefix[..prefix.len() - 1]).unwrap();
+        assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
+        assert!(!request.staging.exists());
+
+        request.staging = root.path().join("stage-prefix");
+        request.target = Target::selector(&prefix.to_ascii_uppercase()).unwrap();
+        let abbreviated = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(abbreviated.revision, current);
+        assert!(matches!(
+            abbreviated.resolved_target,
+            Some(Target::Commit(ref id)) if id == &current
+        ));
+        assert_eq!(abbreviated.transfer_bytes, 0);
+
+        execute(&["branch", prefix, &current]);
+        execute(&["tag", prefix, &old]);
+        request.staging = root.path().join("stage-named");
+        request.target = Target::selector(prefix).unwrap();
+        let named = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(named.revision, old);
+        assert!(named.resolved_target.is_none());
+
+        request.staging = root.path().join("stage-branch");
+        request.target = Target::selector(&format!("refs/heads/{prefix}")).unwrap();
+        let branch = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(branch.revision, current);
+
+        execute(&["branch", "-D", prefix]);
+        request.staging = root.path().join("stage-explicit-missing");
+        assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
+
+        execute(&["tag", "-d", prefix]);
+        request.target = Target::selector(&format!("refs/tags/{prefix}")).unwrap();
+        request.staging = root.path().join("stage-explicit-tag-missing");
+        assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
+    }
+
+    #[test]
+    fn cached_prefixes_are_commit_only_unique_and_object_format_aware() {
+        let root = tempfile::tempdir().unwrap();
+        let sha1 = bare_store(root.path(), "sha1");
+
+        // These deterministic objects share the same seven hexadecimal digits.
+        let commit = commit_object(&sha1, 5879, 40);
+        let blob = write_object(&sha1, "blob", b"blob 9994\n");
+        assert_eq!(&commit[..7], &blob[..7]);
+        assert_eq!(
+            cached_commit(&sha1, &commit[..7].to_ascii_uppercase())
+                .unwrap()
+                .to_string(),
+            commit
+        );
+
+        let first = commit_object(&sha1, 6785, 40);
+        let second = commit_object(&sha1, 18252, 40);
+        assert_eq!(&first[..7], &second[..7]);
+        let ambiguous = cached_commit(&sha1, &first[..7]).unwrap_err().to_string();
+        assert!(!ambiguous.contains(&first));
+        assert!(!ambiguous.contains(&second));
+        assert!(cached_commit(&sha1, "fffffff").is_err());
+
+        let sha256 = bare_store(root.path(), "sha256");
+        let id = commit_object(&sha256, 1, 64);
+        assert_eq!(id.len(), 64);
+        assert_eq!(
+            cached_commit(&sha256, &id[..7].to_ascii_uppercase())
+                .unwrap()
+                .to_string(),
+            id
+        );
     }
 
     #[test]

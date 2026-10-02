@@ -422,8 +422,10 @@ fn lifecycle() -> Result<()> {
     server.until(feature, "type:Feature", "Feature")?;
     let tag = "git@github.com:fixture/repo.git#release";
     let pinned = format!("git@github.com:fixture/repo.git#{original_commit}");
+    let abbreviated = format!("git@github.com:fixture/repo.git#{}", &original_commit[..8]);
     server.until(tag, "type:Main", "Main")?;
     server.until(&pinned, "type:Main", "Main")?;
+    server.until(&abbreviated, "type:Main", "Main")?;
     server.until(
         "git@github.com:fixture/repo.git#refs/heads/release",
         "type:Feature",
@@ -459,11 +461,13 @@ fn lifecycle() -> Result<()> {
         &upstream,
         &["commit", "--quiet", "--amend", "-am", "force push"],
     )?;
+    git(&upstream, &["branch", "-f", &original_commit[..8]])?;
     server.until(main, "type:Changed", "Changed")?;
     server.until(main, "type:MaterializedInput", "MaterializedInput")?;
     git(&upstream, &["tag", "--force", "release"])?;
     server.until(tag, "type:Changed", "Changed")?;
     server.until(&pinned, "type:Main", "Main")?;
+    server.until(&abbreviated, "type:Main", "Main")?;
     fs::write(root.path().join("offline"), "")?;
     std::thread::sleep(Duration::from_millis(1200));
     let (error, cached) = server.query(main, "type:Changed")?;
@@ -475,6 +479,7 @@ fn lifecycle() -> Result<()> {
     let server = Server::start(root.path())?;
     server.until(tag, "type:Changed", "Changed")?;
     server.until(&pinned, "type:Main", "Main")?;
+    server.until(&abbreviated, "type:Main", "Main")?;
     let (error, cached) = server.query(main, "type:Changed")?;
     ensure!(
         !error && cached.contains("Changed"),
@@ -505,6 +510,7 @@ fn lifecycle() -> Result<()> {
     }
     server.until(main, "type:Adaptive", "Adaptive")?;
     server.until(&pinned, "type:Main", "Main")?;
+    server.until(&abbreviated, "type:Main", "Main")?;
     Ok(())
 }
 

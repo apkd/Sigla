@@ -12,7 +12,7 @@ pub mod rebuild;
 pub mod selection;
 pub mod transport;
 
-const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`, `#tag`, or a full `#commit` ID";
+const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`, `#tag`, a full `#commit` ID, or a cached commit prefix of at least 7 hex characters";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Endpoint {
@@ -392,7 +392,7 @@ pub fn validate_branch(branch: &str) -> Result<()> {
             && branch
                 .split('/')
                 .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock")),
-        "Invalid revision selector; supply a branch, tag, or full commit ID rather than a revision expression"
+        "Invalid revision selector; supply a branch, tag, full commit ID, or cached commit prefix rather than a revision expression"
     );
     Ok(())
 }
