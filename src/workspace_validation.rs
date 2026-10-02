@@ -51,7 +51,8 @@ fn highland_keep_full_context() {
         root.clone(),
         cache.path(),
         Policy::new(roots).unwrap(),
-        Store::open(&cache.path().join("assemblies")).unwrap(),
+        &cache.path().join("analysis"),
+        None,
         Default::default(),
     )
     .unwrap();
@@ -77,13 +78,10 @@ fn highland_keep_full_context() {
         workspace.manifest.projects.len()
     );
     let source_tx = workspace.store.read().unwrap();
-    let assembly_tx = workspace.assemblies.read().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
     let view = crate::csharp::catalog::View {
-        source: &workspace.store,
-        assemblies: &workspace.assemblies,
-        source_tx: &source_tx,
-        assembly_tx: &assembly_tx,
+        store: &workspace.store,
+        tx: &source_tx,
         manifest: &workspace.manifest,
         cancel: &cancel,
     };
@@ -146,14 +144,8 @@ fn highland_keep_full_context() {
         "Reported fixture changed; review its source before changing this expectation"
     );
     drop(source_tx);
-    drop(assembly_tx);
-    let mut search = crate::search::Search::new(
-        &workspace.store,
-        &workspace.assemblies,
-        &workspace.manifest,
-        &cancel,
-    )
-    .unwrap();
+    let mut search =
+        crate::search::Search::new(&workspace.store, &workspace.manifest, &cancel).unwrap();
     let incoming = search
         .run(
             &crate::query::Query::parse(

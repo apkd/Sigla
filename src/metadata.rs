@@ -311,7 +311,14 @@ fn access(flags: u32) -> String {
 }
 
 pub fn file_data(path: &Path) -> Result<crate::store::FileData> {
-    let assembly = extract(path)?;
+    file_data_from(extract(path)?)
+}
+
+pub fn file_data_bytes(bytes: Vec<u8>, fallback_stem: &str) -> Result<crate::store::FileData> {
+    file_data_from(extract_bytes(bytes, fallback_stem)?)
+}
+
+fn file_data_from(assembly: AssemblyFacts) -> Result<crate::store::FileData> {
     let mut source = String::new();
     let mut facts = crate::model::Facts {
         csharp: Some(Default::default()),
@@ -440,12 +447,17 @@ pub fn extract(path: &Path) -> Result<AssemblyFacts> {
             crate::render::inline(&path.to_string_lossy())
         )
     })?;
-    let view = CilAssemblyView::from_mem(bytes).with_context(|| {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    extract_bytes(bytes, &stem).with_context(|| {
         format!(
             "Cannot parse assembly {}",
             crate::render::inline(&path.to_string_lossy())
         )
-    })?;
+    })
+}
+
+pub fn extract_bytes(bytes: Vec<u8>, fallback_stem: &str) -> Result<AssemblyFacts> {
+    let view = CilAssemblyView::from_mem(bytes).context("Cannot parse assembly bytes")?;
     let tables = view
         .tables()
         .ok_or_else(|| anyhow::anyhow!("Missing metadata tables"))?;
@@ -456,11 +468,7 @@ pub fn extract(path: &Path) -> Result<AssemblyFacts> {
         .blobs()
         .ok_or_else(|| anyhow::anyhow!("Missing metadata blobs"))?;
     let mut result = AssemblyFacts {
-        name: path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into(),
+        name: fallback_stem.into(),
         ..AssemblyFacts::default()
     };
     if let Some(table) = tables.table::<AssemblyRaw>() {

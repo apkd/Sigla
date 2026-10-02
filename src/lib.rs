@@ -1,7 +1,9 @@
 mod acquisition;
+mod cache_migration;
 pub mod config;
 pub mod csharp;
 pub mod discovery;
+mod documents;
 pub mod extract;
 mod memory;
 pub mod metadata;

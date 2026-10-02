@@ -220,17 +220,30 @@ fn same_named_projects_restore_to_separate_cached_outputs() {
         let assets: std::collections::HashSet<_> = result
             .projects
             .iter()
+            .filter(|p| p.origin.is_some())
             .map(|p| p.compiler_options["ProjectAssetsFile"].clone())
             .collect();
-        let origins: std::collections::HashSet<_> =
-            result.projects.iter().map(|p| p.origin.clone()).collect();
+        let origins: std::collections::HashSet<_> = result
+            .projects
+            .iter()
+            .filter(|p| p.origin.is_some())
+            .map(|p| p.origin.clone())
+            .collect();
         assert_eq!(assets.len(), origins.len());
         let intermediates: std::collections::HashSet<_> = result
             .projects
             .iter()
+            .filter(|p| p.origin.is_some())
             .map(|p| p.compiler_options["IntermediateOutputPath"].clone())
             .collect();
-        assert_eq!(intermediates.len(), result.projects.len());
+        assert_eq!(
+            intermediates.len(),
+            result
+                .projects
+                .iter()
+                .filter(|p| p.origin.is_some())
+                .count()
+        );
         for path in assets {
             assert!(Path::new(&path).starts_with(cache.path()));
             assert!(Path::new(&path).is_file());
@@ -324,8 +337,13 @@ fn msbuild_evaluates_conditions_imports_and_globs() {
     );
     let policy = Policy::new(vec![root.path().into()]).unwrap();
     let snapshot = discover_cached(root.path(), &policy, cache.path()).unwrap();
-    assert_eq!(snapshot.sources.len(), 1);
-    assert!(snapshot.sources[0].path.ends_with("Selected.cs"));
+    let sources: Vec<_> = snapshot
+        .sources
+        .iter()
+        .filter(|s| s.language == sigla::model::Language::CSharp)
+        .collect();
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].path.ends_with("Selected.cs"));
     assert!(
         snapshot
             .metadata
@@ -391,6 +409,11 @@ fn remote_requests_omitted_imports_and_evaluated_sources() {
     );
     write(root.path(), "Sources/Included.code", "class Included {}");
     let result = discover_cached(&entry, &policy, cache.path()).unwrap();
-    assert_eq!(result.sources.len(), 1);
-    assert!(result.sources[0].path.ends_with("Included.code"));
+    let sources: Vec<_> = result
+        .sources
+        .iter()
+        .filter(|s| s.language == sigla::model::Language::CSharp)
+        .collect();
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].path.ends_with("Included.code"));
 }

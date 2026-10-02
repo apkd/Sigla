@@ -7,6 +7,18 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+fn open(path: &std::path::Path) -> std::sync::Arc<Store> {
+    Store::open_workspace(path, [0; 32], path, None).unwrap()
+}
+
+fn install(store: &Store, file: &str, data: FileData) {
+    let id =
+        sigla::store::source_id(&data.source, sigla::model::Language::CSharp, &[], "").unwrap();
+    store
+        .install(file, &id, id, || Ok(()), || Ok(data))
+        .unwrap();
+}
+
 #[test]
 fn compatible_cache_reopens_without_rebuilding_and_detects_offline_edits() {
     use sigla::{discovery::Policy, workspace::Workspace};
@@ -25,7 +37,8 @@ fn compatible_cache_reopens_without_rebuilding_and_detects_offline_edits() {
             root.path().into(),
             cache.path(),
             Policy::new(vec![root.path().into()]).unwrap(),
-            Store::open(&cache.path().join("assemblies")).unwrap(),
+            &cache.path().join("analysis"),
+            None,
             Default::default(),
         )
         .unwrap()
@@ -74,32 +87,35 @@ fn concurrent_opens_share_a_store_and_can_reopen_after_drop() {
             .map(|_| {
                 scope.spawn(|| {
                     barrier.wait();
-                    Store::open(dir.path()).unwrap()
+                    open(dir.path())
                 })
             })
             .collect();
         let stores: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         for store in &stores {
-            assert!(std::sync::Arc::ptr_eq(&stores[0], store));
+            assert!(std::sync::Arc::ptr_eq(
+                &stores[0].scope.database,
+                &store.scope.database
+            ));
         }
     });
-    Store::open(dir.path()).unwrap().read().unwrap();
+    open(dir.path()).read().unwrap();
 }
 
 #[test]
 fn reader_keeps_source_and_declarations_from_one_revision() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     let data = |source: &str| FileData {
         source: source.into(),
         facts: sigla::extract::extract(source, sigla::model::Language::CSharp, &[], "").unwrap(),
         assembly: None,
     };
-    store.replace("file", data("class Before {}"), &1).unwrap();
+    install(&store, "file", data("class Before {}"));
     let read = store.read().unwrap();
     std::thread::scope(|scope| {
         scope
-            .spawn(|| store.replace("file", data("class After {}"), &2).unwrap())
+            .spawn(|| install(&store, "file", data("class After {}")))
             .join()
             .unwrap();
     });
@@ -150,16 +166,16 @@ fn running_search_keeps_its_revision_while_workspace_publishes_an_edit() {
         root.path().into(),
         cache.path(),
         Policy::new(vec![root.path().into()]).unwrap(),
-        Store::open(&cache.path().join("assemblies")).unwrap(),
+        &cache.path().join("analysis"),
+        None,
         Arc::new(sigla::watch::Monitor::default()),
     )
     .unwrap();
     workspace.refresh().unwrap();
     let source = workspace.store.clone();
-    let assemblies = workspace.assemblies.clone();
     let manifest = workspace.manifest.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
-    let mut reader = Search::new(&source, &assemblies, &manifest, &cancel).unwrap();
+    let mut reader = Search::new(&source, &manifest, &cancel).unwrap();
     let workspace = std::thread::spawn(move || {
         std::fs::write(path, "class Item { public string Read() => \"updated\"; } class Usage { void Run(Item item) { item.Read(); } }").unwrap();
         workspace.refresh().unwrap();
@@ -170,7 +186,7 @@ fn running_search_keeps_its_revision_while_workspace_publishes_an_edit() {
     assert!(old.contains("int Read()"), "{old}");
     assert!(!old.contains("updated"), "{old}");
     drop(reader);
-    let mut reader = Search::new(&source, &assemblies, &workspace.manifest, &cancel).unwrap();
+    let mut reader = Search::new(&source, &workspace.manifest, &cancel).unwrap();
     let updated = reader.run(&query).unwrap();
     assert!(updated.contains("string Read()"), "{updated}");
 }
@@ -178,7 +194,7 @@ fn running_search_keeps_its_revision_while_workspace_publishes_an_edit() {
 #[test]
 fn semantic_revision_ignores_body_edits_and_locations_but_tracks_headers() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     let replace = |source: &str| {
         let data = FileData {
             source: source.into(),
@@ -186,7 +202,7 @@ fn semantic_revision_ignores_body_edits_and_locations_but_tracks_headers() {
                 .unwrap(),
             assembly: None,
         };
-        store.replace("file", data, &source).unwrap();
+        install(&store, "file", data);
         store.declaration_revision("file").unwrap()
     };
     let before = replace("class C { private int Count(int value = 1) { return value; } }");
@@ -217,7 +233,9 @@ fn semantic_revision_ignores_body_edits_and_locations_but_tracks_headers() {
 #[test]
 fn concurrent_callers_share_a_cache_build() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
+    let source = " ".repeat(1024 * 1024);
+    let id = sigla::store::source_id(&source, sigla::model::Language::Text, &[], "").unwrap();
     let ready = Barrier::new(4);
     let builds = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -225,14 +243,20 @@ fn concurrent_callers_share_a_cache_build() {
             scope.spawn(|| {
                 ready.wait();
                 store
-                    .ensure_revision("shared", &1u64, || {
-                        builds.fetch_add(1, Ordering::SeqCst);
-                        Ok(FileData {
-                            source: " ".repeat(1024 * 1024),
-                            facts: Facts::default(),
-                            assembly: None,
-                        })
-                    })
+                    .install(
+                        "shared",
+                        &1u64,
+                        id,
+                        || Ok(()),
+                        || {
+                            builds.fetch_add(1, Ordering::SeqCst);
+                            Ok(FileData {
+                                source: " ".repeat(1024 * 1024),
+                                facts: Facts::default(),
+                                assembly: None,
+                            })
+                        },
+                    )
                     .unwrap();
             });
         }

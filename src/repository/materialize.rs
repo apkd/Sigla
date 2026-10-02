@@ -25,6 +25,25 @@ pub enum Target {
 }
 
 impl Target {
+    fn unavailable(&self, name: &str) -> String {
+        let kind = match self {
+            Self::Branch(_) => "branch",
+            Self::Tag(_) => "tag",
+            _ => "branch or tag",
+        };
+        let mut message = format!("Requested upstream {kind} {name:?} is unavailable.");
+        if matches!(self, Self::Named(_))
+            && (4..64).contains(&name.len())
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            message.push_str(" Abbreviated commit IDs are not supported; use the full commit ID.");
+        }
+        if name.ends_with('"') {
+            message.push_str(" The selector ends with a double quote, possibly encoded as %22; remove it when unintended.");
+        }
+        message
+    }
+
     pub fn selector(value: &str) -> Result<Self> {
         super::validate_branch(value)?;
         if let Some(name) = value.strip_prefix("refs/heads/") {
@@ -66,6 +85,8 @@ pub struct Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Prepared {
     #[serde(default)]
+    pub transfer_bytes: u64,
+    #[serde(default)]
     pub unavailable: BTreeSet<String>,
     #[serde(default)]
     pub transport: Option<String>,
@@ -91,7 +112,11 @@ fn git(store: &Path) -> Command {
         .arg("--git-dir")
         .arg(store)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_LAZY_FETCH", "1");
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_SHALLOW_FILE");
     command
 }
 
@@ -108,10 +133,11 @@ fn receive(
     store: &Path,
     objects: Vec<gix_hash::ObjectId>,
     depth_one: bool,
-) -> Result<()> {
+) -> Result<u64> {
     let scratch = tempfile::tempdir_in(store.join("objects/pack"))?;
     let pack = scratch.path().join("incoming.pack");
     session.pack(objects, store, depth_one, &mut File::create(&pack)?)?;
+    let bytes = fs::metadata(&pack)?.len();
     let index = scratch.path().join("incoming.idx");
     let result = run(git(store)
         .args(["index-pack", "--index-version=2", "-o"])
@@ -124,7 +150,40 @@ fn receive(
     File::create(destination.with_extension("promisor"))?;
     fs::rename(index, destination.with_extension("idx"))?;
     fs::rename(pack, destination.with_extension("pack"))?;
-    Ok(())
+    Ok(bytes)
+}
+
+/// Return false for absent commit/tree data; never confuse that with missing blobs.
+/// Reuse the temporary listing across a failed local check and a filtered fetch.
+fn cached_tree_inventory(store: &Path, revision: &str, listing: &File) -> Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    let kind = crate::process::capture(
+        git(store).args(["cat-file", "-t", revision]),
+        Duration::from_secs(120),
+        None,
+        None,
+    )?;
+    if !kind.status.success() {
+        return Ok(false);
+    }
+    ensure!(
+        kind.stdout == b"commit\n",
+        "Selected revision does not point to a commit"
+    );
+    let mut output = listing.try_clone()?;
+    output.set_len(0)?;
+    output.seek(SeekFrom::Start(0))?;
+    let result = crate::process::capture(
+        git(store).args(["ls-tree", "-r", "-t", "-z", revision]),
+        Duration::from_secs(120),
+        None,
+        Some(output),
+    )?;
+    ensure!(
+        listing.metadata()?.len() <= 256 * 1024 * 1024,
+        "Repository inventory exceeds size limit"
+    );
+    Ok(result.status.success())
 }
 
 pub fn prepare(request: &Request) -> Result<Prepared> {
@@ -180,7 +239,7 @@ fn prepare_with(
                         _ => None,
                     })
                 })
-                .context("Requested upstream branch or tag is unavailable")?;
+                .with_context(|| request.target.unavailable(name))?;
             (resolved.strip_prefix("refs/heads/").map(str::to_owned), id)
         }
         Target::DefaultBranch => {
@@ -203,6 +262,7 @@ fn prepare_with(
                 .to_owned();
             super::validate_branch(&name)?;
             return Ok(Prepared {
+                transfer_bytes: 0,
                 unavailable: BTreeSet::new(),
                 transport: session.endpoint.clone(),
                 branch: Some(name),
@@ -224,29 +284,19 @@ fn prepare_with(
             })
             .arg(&request.store))?;
     }
-    receive(&mut session, &request.store, vec![revision], true).context(
-        "Cannot fetch selected revision; the server may disallow fetching unadvertised commits",
-    )?;
+    let listing = tempfile::tempfile()?;
+    let mut transfer_bytes = 0;
+    if !cached_tree_inventory(&request.store, &revision.to_string(), &listing)? {
+        transfer_bytes += receive(&mut session, &request.store, vec![revision], true).context(
+            "Cannot fetch selected revision; the server may disallow fetching unadvertised commits",
+        )?;
+        ensure!(
+            cached_tree_inventory(&request.store, &revision.to_string(), &listing)?,
+            "Cannot enumerate fetched repository tree"
+        );
+    }
     let transport = session.endpoint.clone();
     drop(session);
-    let kind = run(git(&request.store).args(["cat-file", "-t", &revision.to_string()]))?;
-    ensure!(
-        kind == b"commit\n",
-        "Selected revision does not point to a commit"
-    );
-    let listing = tempfile::tempfile()?;
-    let outcome = crate::process::capture(
-        git(&request.store)
-            .args(["ls-tree", "-r", "-t", "-z"])
-            .arg(revision.to_string()),
-        Duration::from_secs(120),
-        None,
-        Some(listing.try_clone()?),
-    )?;
-    ensure!(
-        outcome.status.success(),
-        "Cannot enumerate fetched repository tree"
-    );
     use std::io::{Seek, SeekFrom};
     let mut listing = listing;
     listing.seek(SeekFrom::Start(0))?;
@@ -355,7 +405,7 @@ fn prepare_with(
             .collect::<Result<Vec<_>>>()?;
         if !missing.is_empty() {
             let mut session = connect(&repository)?;
-            receive(&mut session, &request.store, missing, false)?;
+            transfer_bytes += receive(&mut session, &request.store, missing, false)?;
         }
     }
     fs::create_dir_all(&request.staging)?;
@@ -401,6 +451,7 @@ fn prepare_with(
         }
     }
     Ok(Prepared {
+        transfer_bytes,
         unavailable: BTreeSet::new(),
         transport,
         branch,
@@ -499,6 +550,8 @@ mod tests {
         fs::write(upstream_path.join("Code.cs"), "class Updated {}\n").unwrap();
         execute(&["commit", "--quiet", "-am", "update"]);
         execute(&["branch", "release"]);
+        execute(&["branch", "face1234"]);
+        execute(&["branch", "quoted\""]);
         let current = String::from_utf8(execute(&["rev-parse", "HEAD"]))
             .unwrap()
             .trim()
@@ -511,6 +564,8 @@ mod tests {
             (old.as_str(), "class Searchable {}\n", old.as_str()),
             ("refs/heads/release", "class Updated {}\n", current.as_str()),
             ("main", "class Updated {}\n", current.as_str()),
+            ("face1234", "class Updated {}\n", current.as_str()),
+            ("quoted\"", "class Updated {}\n", current.as_str()),
         ]
         .into_iter()
         .enumerate()
@@ -531,6 +586,16 @@ mod tests {
             request.target = Target::selector(selector).unwrap();
             assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
             assert!(!request.staging.exists());
+        }
+        for selector in ["deadbeef", "missing\"", "ordinary"] {
+            let mut request = request(&root.path().join("unavailable"));
+            request.target = Target::selector(selector).unwrap();
+            let error = prepare_with(&request, |_| Session::local(&upstream_path))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("{selector:?}")), "{error}");
+            assert_eq!(error.contains("Abbreviated"), selector == "deadbeef");
+            assert_eq!(error.contains("double quote"), selector.ends_with('"'));
         }
     }
 
@@ -559,6 +624,38 @@ mod tests {
             "excluded contents must not reach the object database"
         );
         assert!(request.store.join("shallow").is_file());
+    }
+
+    #[test]
+    fn shared_objects_avoid_transfers_across_selectors() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&upstream_path)
+            .args(["tag", "release"]))
+        .unwrap();
+        let mut request = request(root.path());
+        let first = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert!(first.transfer_bytes > 0);
+        for (index, selector) in [
+            Target::Tag("release".into()),
+            Target::Commit(first.revision.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            request.target = selector;
+            request.staging = root.path().join(format!("stage-{index}"));
+            let next = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+            assert_eq!(next.transfer_bytes, 0);
+            assert_eq!(next.selected, first.selected);
+            assert_eq!(
+                fs::read(request.staging.join("Code.cs")).unwrap(),
+                fs::read(root.path().join("stage/Code.cs")).unwrap()
+            );
+        }
     }
 
     #[test]

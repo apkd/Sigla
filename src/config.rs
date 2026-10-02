@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use clap::{Args, ValueEnum};
 use std::{path::PathBuf, time::Duration};
+pub(crate) const DEFAULT_REPO_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -124,9 +125,7 @@ impl Options {
                 )
                 .collect::<Result<_>>()?,
             refresh_interval: self.refresh_interval,
-            repo_ttl: self
-                .repo_ttl
-                .unwrap_or(Duration::from_secs(7 * 24 * 60 * 60)),
+            repo_ttl: self.repo_ttl.unwrap_or(DEFAULT_REPO_TTL),
             branch_ttl: self.branch_ttl.unwrap_or(Duration::from_secs(24 * 60 * 60)),
             unity_versions: self.unity_version.clone(),
             selection: crate::repository::selection::Selection::new(

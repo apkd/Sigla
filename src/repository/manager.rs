@@ -115,7 +115,6 @@ pub struct State {
     pub target: Option<Target>,
     pub last_use: u64,
     pub refreshed: u64,
-    pub store_created: u64,
     pub policy: String,
     pub prepared: Prepared,
     pub indexed_revision: Option<String>,
@@ -377,10 +376,48 @@ impl Manager {
             .collect()
     }
 
-    pub async fn expire(&self, branch: &Arc<Branch>) -> Result<()> {
+    /// Retire persisted selectors that have not been opened in this process.
+    /// The registry lock excludes resolve() creating a handle during removal.
+    pub fn expire_unloaded(&self, mut retire: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+        let branches = self.branches.lock().unwrap();
+        for entry in fs::read_dir(self.cache.join("repositories"))? {
+            let entry = entry?;
+            if branches.values().any(|branch| branch.root == entry.path()) {
+                continue;
+            }
+            ensure!(
+                entry.file_type()?.is_dir(),
+                "Invalid selector cache directory"
+            );
+            let path = entry.path().join("state.json");
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let state: State = serde_json::from_slice(&bytes)?;
+            let ttl = if matches!(state.branch.as_str(), "main" | "master") {
+                self.options.repo_ttl
+            } else {
+                self.options.branch_ttl
+            };
+            if now().saturating_sub(state.last_use) >= ttl.as_millis() as u64 {
+                retire(&entry.path())?;
+                remove_branch(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn expire(
+        &self,
+        branch: &Arc<Branch>,
+        retire: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let mut branches = self.branches.lock().unwrap();
-        if now().saturating_sub(branch.last_use.load(Ordering::Relaxed))
-            < branch.ttl(&self.options).as_millis() as u64
+        if Arc::strong_count(branch) > 2
+            || now().saturating_sub(branch.last_use.load(Ordering::Relaxed))
+                < branch.ttl(&self.options).as_millis() as u64
             || branch
                 .running
                 .lock()
@@ -390,6 +427,7 @@ impl Manager {
         {
             return Ok(());
         }
+        retire()?;
         remove_branch(&branch.root)?;
         branches.retain(|_, value| !Arc::ptr_eq(value, branch));
         Ok(())
@@ -560,7 +598,7 @@ impl Manager {
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
             target: Target::Commit(revision.to_owned()),
-            store: branch.root.join("git"),
+            store: PathBuf::new(),
             staging: stage.path().to_owned(),
             include: self.options.selection.patterns.0.clone(),
             exclude: self.options.selection.patterns.1.clone(),
@@ -576,8 +614,8 @@ impl Manager {
             subdirectory: None,
         };
         let cache = self.cache.clone();
-        let mut prepared =
-            tokio::task::spawn_blocking(move || job::execute(&request, &cache)).await??;
+        let (mut prepared, _pool_pin) =
+            tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
         prepared.branch = before.prepared.branch.clone();
         let mut state = branch.state.lock().await;
         let mut next = before;
@@ -616,16 +654,6 @@ impl Manager {
         let stage = tempfile::Builder::new()
             .prefix("incoming-")
             .tempdir_in(&branch.root)?;
-        let rebuild = before
-            .as_ref()
-            .is_some_and(|s| now().saturating_sub(s.store_created) >= 7 * 24 * 60 * 60 * 1000);
-        let replacement = rebuild
-            .then(|| {
-                tempfile::Builder::new()
-                    .prefix("git-rebuild-")
-                    .tempdir_in(&branch.root)
-            })
-            .transpose()?;
         let previous = before
             .as_ref()
             .filter(|s| !s.repair)
@@ -643,9 +671,7 @@ impl Manager {
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
             target: branch.target.clone(),
-            store: replacement
-                .as_ref()
-                .map_or_else(|| branch.root.join("git"), |r| r.path().join("git")),
+            store: PathBuf::new(),
             staging: stage.path().to_owned(),
             include: self.options.selection.patterns.0.clone(),
             exclude: self.options.selection.patterns.1.clone(),
@@ -659,8 +685,8 @@ impl Manager {
         };
         let cache = self.cache.clone();
         // No publication lock is held while fetching or extracting objects.
-        let prepared =
-            tokio::task::spawn_blocking(move || job::execute(&request, &cache)).await??;
+        let (prepared, _pool_pin) =
+            tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
         let mut state = branch.state.lock().await;
         let mut next = State {
             schema: 4,
@@ -670,7 +696,6 @@ impl Manager {
             target: Some(branch.target.clone()),
             last_use: branch.last_use.load(Ordering::Relaxed),
             refreshed: now(),
-            store_created: before.as_ref().map_or(now(), |s| s.store_created),
             policy: self.options.selection.identity.clone(),
             prepared,
             indexed_revision: before.as_ref().and_then(|s| s.indexed_revision.clone()),
@@ -682,16 +707,6 @@ impl Manager {
         };
         branch.persist(&next)?;
         *state = Some(next.clone());
-        if let Some(replacement) = &replacement {
-            let old = replacement.path().join("old");
-            fs::rename(branch.root.join("git"), &old)?;
-            if let Err(error) = fs::rename(replacement.path().join("git"), branch.root.join("git"))
-            {
-                fs::rename(old, branch.root.join("git"))?;
-                return Err(error.into());
-            }
-            next.store_created = now();
-        }
         let source = branch.source();
         fs::create_dir_all(&source)?;
         if let Some(before) = &before {

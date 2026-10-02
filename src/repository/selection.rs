@@ -34,7 +34,7 @@ impl Selection {
         Ok(Self {
             includes: compile(includes)?,
             excludes: compile(excludes)?,
-            identity: blake3::hash(&serde_json::to_vec(&(3u32, includes, excludes))?)
+            identity: blake3::hash(&serde_json::to_vec(&(4u32, includes, excludes))?)
                 .to_hex()
                 .to_string(),
             patterns: (includes.to_vec(), excludes.to_vec()),
@@ -99,6 +99,9 @@ fn baseline(path: &str) -> bool {
         return false;
     }
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if crate::documents::language(path).is_some() {
+        return true;
+    }
     if path
         .extension()
         .and_then(|s| s.to_str())

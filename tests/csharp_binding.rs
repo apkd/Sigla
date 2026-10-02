@@ -427,6 +427,32 @@ async fn check(source: &str, cases: &[(&str, &str)]) {
     check_extra(source, "", cases).await;
 }
 
+#[tokio::test]
+async fn complete_ambiguous_calls_preserve_only_common_return_types() {
+    check(
+        r#"
+class Left {} class Right {}
+class Item { public void Run() {} }
+class Other { public void Run() {} }
+class Factory {
+ Item Same(Left x) => null; Item Same(Right x) => null;
+ Item Different(Left x) => null; Other Different(Right x) => null;
+ void Use() {
+  /*ambiguous*/Same(null);
+  Same(null)./*common*/Run();
+  Different(null)./*different*/Run();
+ }
+}
+"#,
+        &[
+            ("/*ambiguous*/", "No matches."),
+            ("/*common*/", "Item.Run"),
+            ("/*different*/", "No matches."),
+        ],
+    )
+    .await;
+}
+
 async fn check_extra(source: &str, extra: &str, cases: &[(&str, &str)]) {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

@@ -1,5 +1,5 @@
 use super::{bind::Binder, catalog::View};
-use crate::{discovery::Policy, store::Store, workspace::Workspace};
+use crate::{discovery::Policy, workspace::Workspace};
 use std::sync::Arc;
 
 #[test]
@@ -15,20 +15,18 @@ fn body_only_refresh_reuses_binding_but_refreshes_target_location() {
         root.path().into(),
         cache.path(),
         Policy::new(vec![root.path().into()]).unwrap(),
-        Store::open(&cache.path().join("assemblies")).unwrap(),
+        &cache.path().join("analysis"),
+        None,
         Arc::new(crate::watch::Monitor::default()),
     )
     .unwrap();
     workspace.refresh().unwrap();
     let bind = |workspace: &Workspace| {
         let source_tx = workspace.store.read().unwrap();
-        let assembly_tx = workspace.assemblies.read().unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         let view = View {
-            source: &workspace.store,
-            assemblies: &workspace.assemblies,
-            source_tx: &source_tx,
-            assembly_tx: &assembly_tx,
+            store: &workspace.store,
+            tx: &source_tx,
             manifest: &workspace.manifest,
             cancel: &cancel,
         };

@@ -37,7 +37,11 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
         .env("GCM_INTERACTIVE", "never")
         .env_remove("DISPLAY")
         .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE");
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_SHALLOW_FILE");
     let output_log = crate::process::capture(&mut command, Duration::from_secs(300), None, None)?;
     if !output_log.stderr.is_empty() {
         tracing::warn!("{}", String::from_utf8_lossy(&output_log.stderr).trim());
@@ -52,6 +56,10 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
     );
     let result: std::result::Result<Prepared, String> = serde_json::from_slice(&fs::read(output)?)?;
     let prepared = result.map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        git_pack_bytes = prepared.transfer_bytes,
+        "Repository acquisition completed"
+    );
     if let Some(endpoint) = &prepared.transport {
         fs::create_dir_all(preference.parent().unwrap())?;
         let mut temporary = tempfile::NamedTempFile::new_in(preference.parent().unwrap())?;

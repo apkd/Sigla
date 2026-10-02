@@ -353,7 +353,8 @@ mod tests {
             root.path().into(),
             cache.path(),
             crate::discovery::Policy::new(vec![root.path().into()]).unwrap(),
-            crate::store::Store::open(&cache.path().join("assemblies")).unwrap(),
+            &cache.path().join("analysis"),
+            None,
             Default::default(),
         )
         .unwrap();

@@ -21,11 +21,9 @@ struct Hit {
 
 pub struct Search<'a> {
     store: &'a Store,
-    assemblies: &'a Store,
     manifest: &'a Manifest,
     cancel: &'a tokio_util::sync::CancellationToken,
-    source_tx: heed::RoTxn<'a, heed::WithTls>,
-    assembly_tx: heed::RoTxn<'a, heed::WithTls>,
+    tx: heed::RoTxn<'a, heed::WithTls>,
     cache: HashMap<String, Arc<FileData>>,
     cache_bytes: usize,
     path_matchers: HashMap<String, globset::GlobMatcher>,
@@ -38,17 +36,14 @@ pub struct Search<'a> {
 impl<'a> Search<'a> {
     pub fn new(
         store: &'a Store,
-        assemblies: &'a Store,
         manifest: &'a Manifest,
         cancel: &'a tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
         Ok(Self {
             store,
-            assemblies,
             manifest,
             cancel,
-            source_tx: store.read()?,
-            assembly_tx: assemblies.read()?,
+            tx: store.query_read()?,
             cache: HashMap::new(),
             cache_bytes: 0,
             path_matchers: HashMap::new(),
@@ -68,16 +63,8 @@ impl<'a> Search<'a> {
         if let Some(d) = self.cache.get(key) {
             return Ok(d.clone());
         }
-        let store = if self.manifest.files[key].metadata {
-            self.assemblies
-        } else {
-            self.store
-        };
-        let tx = if self.manifest.files[key].metadata {
-            &self.assembly_tx
-        } else {
-            &self.source_tx
-        };
+        let store = self.store;
+        let tx = &self.tx;
         let d = Arc::new(
             store
                 .load(tx, key)?
@@ -105,37 +92,25 @@ impl<'a> Search<'a> {
                 .map(|(key, _)| key.clone())
                 .collect());
         }
-        let mut keys = self
+        Ok(self
             .store
-            .candidates(&self.source_tx, name, loose, occurrences)?
+            .candidates(&self.tx, name, loose, occurrences)?
             .into_iter()
-            .filter(|k| self.manifest.files.contains_key(k))
-            .collect::<BTreeSet<_>>();
-        if !occurrences {
-            keys.extend(
-                self.assemblies
-                    .candidates(&self.assembly_tx, name, loose, false)?
-                    .into_iter()
-                    .filter(|k| self.manifest.files.contains_key(k)),
-            );
-        }
-        Ok(keys)
+            .filter(|key| {
+                self.manifest
+                    .files
+                    .get(key)
+                    .is_some_and(|file| !occurrences || !file.metadata)
+            })
+            .collect())
     }
     fn summary(&mut self, key: &str) -> Result<Arc<Vec<Declaration>>> {
         self.check()?;
         if let Some(declarations) = self.summaries.get(key) {
             return Ok(declarations.clone());
         }
-        let store = if self.manifest.files[key].metadata {
-            self.assemblies
-        } else {
-            self.store
-        };
-        let tx = if self.manifest.files[key].metadata {
-            &self.assembly_tx
-        } else {
-            &self.source_tx
-        };
+        let store = self.store;
+        let tx = &self.tx;
         let declarations = Arc::new(store.declarations_in(tx, key)?);
         let bytes = declarations.len() * 768;
         if self.summary_bytes + bytes > 32 * 1024 * 1024 {
@@ -335,10 +310,8 @@ impl<'a> Search<'a> {
                                     Some(crate::csharp::lower::query_parameters(p)?);
                             }
                             let view = crate::csharp::catalog::View {
-                                source: self.store,
-                                assemblies: self.assemblies,
-                                source_tx: &self.source_tx,
-                                assembly_tx: &self.assembly_tx,
+                                store: self.store,
+                                tx: &self.tx,
                                 manifest: self.manifest,
                                 cancel: self.cancel,
                             };
@@ -410,8 +383,7 @@ impl<'a> Search<'a> {
             if !names.contains_key(&hit.file) {
                 names.insert(
                     hit.file.clone(),
-                    self.assemblies
-                        .assembly_name_in(&self.assembly_tx, &hit.file)?,
+                    self.store.assembly_name_in(&self.tx, &hit.file)?,
                 );
             }
         }
@@ -474,10 +446,8 @@ impl<'a> Search<'a> {
     ) -> Result<Vec<(Hit, bool)>> {
         if self.manifest.files[key].language == Language::CSharp {
             let view = crate::csharp::catalog::View {
-                source: self.store,
-                assemblies: self.assemblies,
-                source_tx: &self.source_tx,
-                assembly_tx: &self.assembly_tx,
+                store: self.store,
+                tx: &self.tx,
                 manifest: self.manifest,
                 cancel: self.cancel,
             };
@@ -1488,10 +1458,8 @@ impl<'a> Search<'a> {
         for target in &mut targets {
             if self.manifest.files[&target.file].language == Language::CSharp {
                 let view = crate::csharp::catalog::View {
-                    source: self.store,
-                    assemblies: self.assemblies,
-                    source_tx: &self.source_tx,
-                    assembly_tx: &self.assembly_tx,
+                    store: self.store,
+                    tx: &self.tx,
                     manifest: self.manifest,
                     cancel: self.cancel,
                 };
@@ -1886,19 +1854,7 @@ impl<'a> Search<'a> {
                     continue;
                 }
                 self.check()?;
-                let declarations = if file.metadata {
-                    self.assemblies
-                } else {
-                    self.store
-                }
-                .declarations_in(
-                    if file.metadata {
-                        &self.assembly_tx
-                    } else {
-                        &self.source_tx
-                    },
-                    key,
-                )?;
+                let declarations = self.store.declarations_in(&self.tx, key)?;
                 for declaration in declarations.iter().filter(|d| {
                     d.bases.iter().any(|base| {
                         names.contains(simple_name(base.split('<').next().unwrap_or(base)))
@@ -2195,10 +2151,8 @@ impl<'a> Search<'a> {
 
     fn csharp_relates(&mut self, target: &Hit, candidate: &Hit) -> Result<bool> {
         let view = crate::csharp::catalog::View {
-            source: self.store,
-            assemblies: self.assemblies,
-            source_tx: &self.source_tx,
-            assembly_tx: &self.assembly_tx,
+            store: self.store,
+            tx: &self.tx,
             manifest: self.manifest,
             cancel: self.cancel,
         };

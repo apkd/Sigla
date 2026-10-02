@@ -3,10 +3,12 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use url::Url;
+pub mod cache;
 pub mod job;
 mod lfs;
 pub mod manager;
 pub mod materialize;
+pub mod rebuild;
 pub mod selection;
 pub mod transport;
 

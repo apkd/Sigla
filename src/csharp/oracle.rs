@@ -4,7 +4,7 @@ use super::{
     catalog::View,
     types::{Primitive, Type},
 };
-use crate::{discovery::Policy, store::Store, workspace::Workspace};
+use crate::{discovery::Policy, workspace::Workspace};
 use std::{path::PathBuf, process::Command, sync::Arc};
 
 #[test]
@@ -48,24 +48,21 @@ fn compiler_agrees_on_source_and_framework_generic_chains() {
         "<Project><PropertyGroup><AssemblyName>Fixture</AssemblyName></PropertyGroup><ItemGroup><Compile Include=\"Source.cs\"/>{references}</ItemGroup></Project>",
     )).unwrap();
     let policy = Policy::new(vec![PathBuf::from("/")]).unwrap();
-    let assemblies = Store::open(&cache.path().join("assemblies")).unwrap();
     let mut workspace = Workspace::open(
         directory.path().into(),
         cache.path(),
         policy,
-        assemblies,
+        &cache.path().join("analysis"),
+        None,
         Arc::new(crate::watch::Monitor::default()),
     )
     .unwrap();
     workspace.refresh().unwrap();
     let source_tx = workspace.store.read().unwrap();
-    let assembly_tx = workspace.assemblies.read().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
     let view = View {
-        source: &workspace.store,
-        assemblies: &workspace.assemblies,
-        source_tx: &source_tx,
-        assembly_tx: &assembly_tx,
+        store: &workspace.store,
+        tx: &source_tx,
         manifest: &workspace.manifest,
         cancel: &cancel,
     };
@@ -73,7 +70,7 @@ fn compiler_agrees_on_source_and_framework_generic_chains() {
         .manifest
         .files
         .iter()
-        .find(|(_, f)| !f.metadata)
+        .find(|(_, f)| !f.metadata && f.language == crate::model::Language::CSharp)
         .unwrap();
     let mut binder = Binder::default();
     for case in oracle["results"].as_array().unwrap() {
@@ -122,8 +119,8 @@ fn compiler_agrees_on_source_and_framework_generic_chains() {
         );
         let assembly = if workspace.manifest.files[&symbol.file].metadata {
             workspace
-                .assemblies
-                .assembly_name_in(&assembly_tx, &symbol.file)
+                .store
+                .assembly_name_in(&source_tx, &symbol.file)
                 .unwrap()
                 .unwrap()
         } else {

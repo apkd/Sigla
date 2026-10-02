@@ -81,6 +81,48 @@ async fn documents_are_searchable_preserved_and_refreshed_without_build_projects
 }
 
 #[tokio::test]
+async fn project_configuration_scripts_and_shaders_are_viewable_as_text() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let files = [
+        "Cargo.lock",
+        ".cargo/config.toml",
+        ".editorconfig",
+        ".github/workflows/build.yml",
+        "Dockerfile",
+        "build.fish",
+        "shader.hlsl",
+        "package.json",
+    ];
+    for name in files {
+        write(root.path(), name, "fixture text\n");
+    }
+    write(root.path(), "target/build.json", "excluded");
+    write(root.path(), "texture.png", "excluded");
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            2,
+        )
+        .unwrap(),
+    );
+    let project = root.path().to_str().unwrap();
+    for name in files {
+        let result = app.view(project, name, "exact").await.unwrap();
+        assert!(result.contains("fixture text"), "{name}: {result}");
+    }
+    for name in ["target/build.json", "texture.png"] {
+        assert!(
+            !app.view(project, name, "exact")
+                .await
+                .unwrap()
+                .contains("excluded")
+        );
+    }
+}
+
+#[tokio::test]
 async fn browse_find_and_read_use_the_same_refreshed_sources() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

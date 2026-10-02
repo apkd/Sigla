@@ -2020,11 +2020,14 @@ impl Binder {
             self.observed
                 .extend(survivors[0].observations.iter().cloned());
         }
-        let ty = if uncertain {
-            None
-        } else {
-            survivors.first().map(|s| s.return_type.clone())
-        };
+        // A complete ambiguous group can still establish a common return type.
+        // Incomplete applicability must not turn an unknown call into a typed value.
+        let ty = survivors.first().and_then(|first| {
+            survivors
+                .iter()
+                .all(|candidate| !candidate.unknown && candidate.return_type == first.return_type)
+                .then(|| first.return_type.clone())
+        });
         Ok(Bound {
             symbols: survivors.iter().map(|c| c.symbol.clone()).collect(),
             ty: ty.map(|ty| {

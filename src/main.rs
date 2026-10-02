@@ -24,6 +24,8 @@ struct Cli {
 enum Command {
     #[command(name = "__git-job", hide = true)]
     GitJob { input: PathBuf, output: PathBuf },
+    #[command(name = "__git-rebuild", hide = true)]
+    GitRebuild { input: PathBuf, output: PathBuf },
     /// run the shared HTTP MCP service at /mcp.
     Serve {
         #[arg(long, default_value = "127.0.0.1:7331")]
@@ -59,6 +61,13 @@ async fn main() -> Result<()> {
         })
         .await?;
     }
+    if let Command::GitRebuild { input, output } = &cli.command {
+        let (input, output) = (input.clone(), output.clone());
+        return tokio::task::spawn_blocking(move || {
+            sigla::repository::rebuild::worker(&input, &output)
+        })
+        .await?;
+    }
     let remote = cli.options.validate()?;
     let mut policy = Policy::new(cli.options.local_roots())?;
     policy.unity_platform = cli.options.unity_platform;
@@ -75,7 +84,7 @@ async fn main() -> Result<()> {
         None => App::new(policy, cli.options.cache_dir, cli.workers as usize)?,
     });
     match cli.command {
-        Command::GitJob { .. } => unreachable!(),
+        Command::GitJob { .. } | Command::GitRebuild { .. } => unreachable!(),
         Command::Query { project, query } => {
             let result = app.search(&project, &query).await;
             app.shutdown().await;

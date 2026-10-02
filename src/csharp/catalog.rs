@@ -15,10 +15,8 @@ use std::{
 };
 
 pub(crate) struct View<'a> {
-    pub source: &'a Store,
-    pub assemblies: &'a Store,
-    pub source_tx: &'a heed::RoTxn<'a>,
-    pub assembly_tx: &'a heed::RoTxn<'a>,
+    pub store: &'a Store,
+    pub tx: &'a heed::RoTxn<'a>,
     pub manifest: &'a Manifest,
     pub cancel: &'a tokio_util::sync::CancellationToken,
 }
@@ -67,7 +65,7 @@ impl Catalog {
             let mut assemblies: HashMap<String, Vec<String>> = HashMap::new();
             for (key, file) in &view.manifest.files {
                 if file.metadata
-                    && let Some(name) = view.assemblies.assembly_name_in(view.assembly_tx, key)?
+                    && let Some(name) = view.store.assembly_name_in(view.tx, key)?
                 {
                     assemblies.entry(name).or_default().push(key.clone());
                 }
@@ -98,8 +96,7 @@ impl Catalog {
                 if !self.forwarders.contains_key(&file) {
                     self.forwarders.insert(
                         file.clone(),
-                        view.assemblies
-                            .assembly_forwarders(view.assembly_tx, &file)?,
+                        view.store.assembly_forwarders(view.tx, &file)?,
                     );
                 }
                 for (name, destination) in &self.forwarders[&file] {
@@ -127,7 +124,7 @@ impl Catalog {
     ) -> Result<Vec<super::syntax::Import>> {
         if self.globals.is_none() {
             let mut globals: HashMap<usize, Vec<super::syntax::Import>> = HashMap::new();
-            for (file, imports) in view.source.csharp_global_imports(view.source_tx)? {
+            for (file, imports) in view.store.csharp_global_imports(view.tx)? {
                 if let Some(file) = view.manifest.files.get(&file) {
                     for membership in &file.memberships {
                         globals
@@ -171,11 +168,7 @@ impl Catalog {
         if let Some(data) = self.headers.get(file) {
             return Ok(data.clone());
         }
-        let data = if view.manifest.files[file].metadata {
-            view.assemblies.csharp_headers(view.assembly_tx, file)?
-        } else {
-            view.source.csharp_headers(view.source_tx, file)?
-        };
+        let data = view.store.csharp_headers(view.tx, file)?;
         let data = data.ok_or_else(|| anyhow::anyhow!("Missing C# declaration record"))?;
         self.retain_headers(file, data)
     }
@@ -199,8 +192,8 @@ impl Catalog {
     pub fn body(&mut self, view: &View<'_>, file: &str, position: usize) -> Result<Arc<BodyFile>> {
         self.check(view)?;
         let body = view
-            .source
-            .csharp_body(view.source_tx, file, position)?
+            .store
+            .csharp_body(view.tx, file, position)?
             .ok_or_else(|| anyhow::anyhow!("Missing C# body record"))?;
         ensure!(
             postcard::experimental::serialized_size(body.as_ref())? * 4 <= 64 * 1024 * 1024,
@@ -217,8 +210,8 @@ impl Catalog {
     ) -> Result<Symbol> {
         let facts = if view.manifest.files[file].metadata {
             let facts = view
-                .assemblies
-                .csharp_declaration(view.assembly_tx, file, index)?
+                .store
+                .csharp_declaration(view.tx, file, index)?
                 .ok_or_else(|| anyhow::anyhow!("Missing metadata declaration"))?;
             let key = format!("name:{file}:{}", facts.declarations[0].name);
             self.retain_headers(&key, facts)?
@@ -302,11 +295,7 @@ impl Catalog {
         if let Some(cached) = self.lookups.get(&lookup_key) {
             return Ok(cached.clone());
         }
-        let mut keys = view.source.candidates(view.source_tx, name, false, false)?;
-        keys.extend(
-            view.assemblies
-                .candidates(view.assembly_tx, name, false, false)?,
-        );
+        let keys = view.store.candidates(view.tx, name, false, false)?;
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
         for key in keys {
@@ -327,8 +316,8 @@ impl Catalog {
             }
             let facts = if file.metadata {
                 let facts = view
-                    .assemblies
-                    .csharp_members(view.assembly_tx, &key, name)?
+                    .store
+                    .csharp_members(view.tx, &key, name)?
                     .ok_or_else(|| anyhow::anyhow!("Missing metadata name record"))?;
                 self.retain_headers(&format!("name:{key}:{name}"), facts)?
             } else {

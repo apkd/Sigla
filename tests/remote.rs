@@ -634,7 +634,16 @@ fn unity_lifecycle(root: &Path) -> Result<()> {
         );
         let stored = Command::new("git")
             .arg("--git-dir")
-            .arg(branch.join("git"))
+            .arg(
+                root.join("cache/git")
+                    .join(
+                        sigla::repository::Repository::parse(project)?
+                            .unwrap()
+                            .identity
+                            .storage_key(),
+                    )
+                    .join("current"),
+            )
             .args(["cat-file", "-e", excluded.trim()])
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdout(Stdio::null())

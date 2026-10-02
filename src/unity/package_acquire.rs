@@ -292,7 +292,7 @@ impl GitSource {
                 previous: Default::default(),
                 subdirectory: self.subdirectory.clone(),
             };
-            let prepared = crate::repository::job::execute(&request, cache)?;
+            let (prepared, _pool_pin) = crate::repository::cache::acquire(&request, cache)?;
             let package = self
                 .subdirectory
                 .as_ref()

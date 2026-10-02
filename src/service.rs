@@ -31,12 +31,13 @@ pub struct App {
     cache: PathBuf,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceSlot>>,
     workers: Arc<tokio::sync::Semaphore>,
-    assemblies: Arc<crate::store::Store>,
     monitor: Arc<crate::watch::Monitor>,
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
     stateless_summaries: crate::summary::Stateless,
+    #[cfg(test)]
+    preparation_started: tokio::sync::Notify,
 }
 impl App {
     async fn request_cancellable(
@@ -106,21 +107,24 @@ impl App {
         ownership
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
-        let assemblies = crate::store::Store::open(&cache.join("assemblies"))?;
+        crate::cache_migration::migrate(&cache)?;
         crate::memory::start_reclaimer()?;
-        Ok(Self {
+        let app = Self {
             _ownership: ownership,
             policy,
             cache,
             workspaces: Mutex::new(HashMap::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(workers)),
-            assemblies,
             monitor: Arc::new(crate::watch::Monitor::default()),
             remote: None,
             upstream: None,
             startup: Mutex::new(None),
             stateless_summaries: Default::default(),
-        })
+            #[cfg(test)]
+            preparation_started: tokio::sync::Notify::new(),
+        };
+        app.maintain_analysis(true)?;
+        Ok(app)
     }
 
     pub fn remote(
@@ -132,6 +136,7 @@ impl App {
         let mut app = Self::new(policy, cache.clone(), workers)?;
         let manager = crate::repository::manager::Manager::new(cache, options)?;
         app.remote = Some(manager);
+        app.maintain_analysis(true)?;
         Ok(app)
     }
 
@@ -166,10 +171,16 @@ impl App {
             .unwrap_or_default();
         let (send, receive) = tokio::sync::watch::channel(None);
         *startup = Some(receive);
-        if let Some(remote) = &self.remote {
+        {
             let weak = Arc::downgrade(self);
-            let interval = remote.options.maintenance_interval();
+            let interval = self
+                .remote
+                .as_ref()
+                .map_or(std::time::Duration::from_secs(60), |remote| {
+                    remote.options.maintenance_interval()
+                });
             tokio::spawn(async move {
+                let mut last_collection = Instant::now();
                 loop {
                     tokio::time::sleep(interval).await;
                     let Some(app) = weak.upgrade() else { return };
@@ -180,6 +191,35 @@ impl App {
                         }
                         if let Err(error) = app.expire_idle().await {
                             tracing::error!(%error, "Cannot expire repository storage");
+                        }
+                    }
+                    if last_collection.elapsed() < std::time::Duration::from_secs(60) {
+                        continue;
+                    }
+                    last_collection = Instant::now();
+                    let maintenance = app.clone();
+                    if let Err(error) =
+                        tokio::task::spawn_blocking(move || maintenance.maintain_analysis(false))
+                            .await
+                            .unwrap_or_else(|error| Err(error.into()))
+                    {
+                        tracing::error!(%error, "Cannot maintain analysis storage");
+                    }
+                    {
+                        let cache = app.cache.clone();
+                        let ttl = app
+                            .remote
+                            .as_ref()
+                            .map_or(crate::config::DEFAULT_REPO_TTL, |remote| {
+                                remote.options.repo_ttl
+                            });
+                        if let Err(error) = tokio::task::spawn_blocking(move || {
+                            crate::repository::cache::maintain_all(&cache, ttl)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.into()))
+                        {
+                            tracing::error!(%error, "Cannot maintain Git pools");
                         }
                     }
                 }
@@ -220,8 +260,72 @@ impl App {
                 registry.remove(&path)
             };
             drop(retired);
-            remote.expire(&branch).await?;
+            remote
+                .expire(&branch, || self.retire_owner(&branch.root))
+                .await?;
         }
+        Ok(())
+    }
+
+    fn retire_owner(&self, owner: &Path) -> Result<()> {
+        let analysis = self.cache.join("analysis");
+        if !analysis.try_exists()? {
+            return Ok(());
+        }
+        let database = crate::store::Database::open(&analysis)?;
+        for (key, info) in database.workspaces()? {
+            if info.owner.as_deref() == Some(owner) {
+                database.existing(key)?.unwrap().mark_deleting()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn maintain_analysis(&self, startup: bool) -> Result<()> {
+        use crate::store::shared::Phase;
+        if let Some(remote) = &self.remote {
+            remote.expire_unloaded(|owner| self.retire_owner(owner))?;
+        }
+        let analysis = self.cache.join("analysis");
+        if !analysis.try_exists()? {
+            return Ok(());
+        }
+        let database = crate::store::Database::open(&analysis)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        for (key, info) in database.workspaces()? {
+            let mut registry = self.workspaces.lock().unwrap();
+            if registry
+                .get(&info.entry)
+                .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
+            {
+                continue;
+            }
+            let missing =
+                match std::fs::symlink_metadata(info.owner.as_deref().unwrap_or(&info.entry)) {
+                    Ok(_) => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+            if info.phase != Phase::Deleting && !missing {
+                continue;
+            }
+            registry.remove(&info.entry);
+            let Some(scope) = database.existing(key)? else {
+                continue;
+            };
+            scope.mark_deleting()?;
+            // The registry lock prevents a request opening this scope during retirement.
+            // Persisted deleting state rejects new opens until the next batch completes.
+            loop {
+                if scope.delete_batch(now, 128)? || !startup {
+                    break;
+                }
+            }
+            drop(registry);
+        }
+        database.collect(now, 128)?;
         Ok(())
     }
 
@@ -320,31 +424,13 @@ impl App {
             ),
             None => None,
         };
-        let branch_state = match &branch {
-            Some(branch) => Some(branch.state.clone().lock_owned().await),
-            None => None,
-        };
         let (entry, policy, cache) = if let Some(branch) = &branch {
-            let state = branch_state
-                .as_ref()
-                .unwrap()
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
-            ensure!(!state.repair, "Repository materialization requires repair");
             let source = branch.source().canonicalize()?;
             let mut policy = Policy::new(vec![source.clone()])?;
             policy.unity_platform = self.policy.unity_platform;
             policy.remote = Some(crate::discovery::RemoteContext {
                 workspace: source.clone(),
-                tracked: Arc::new(
-                    state
-                        .prepared
-                        .tracked
-                        .keys()
-                        .filter(|p| !state.prepared.unavailable.contains(*p))
-                        .cloned()
-                        .collect(),
-                ),
+                tracked: Default::default(),
                 writable: branch.root.join("generated"),
                 shared: self.cache.clone(),
                 repositories: self.remote.as_ref().unwrap().options.rules.clone(),
@@ -411,14 +497,40 @@ impl App {
         let preparing_app = self.clone();
         let preparing_branch = branch.clone();
         let (mut state, mut branch_state) = tokio::spawn(async move {
+            #[cfg(test)]
+            preparing_app.preparation_started.notify_one();
+            // Request lock order: workspace -> branch state. RequiredInputs
+            // releases and reacquires branch state while retaining the workspace.
             let mut state = workspace.lock_owned().await;
-            let mut branch_state = branch_state;
+            let mut branch_state = match &preparing_branch {
+                Some(branch) => Some(branch.state.clone().lock_owned().await),
+                None => None,
+            };
             let mut policy = policy;
+            if let Some(gate) = &branch_state {
+                let applied = gate
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
+                ensure!(
+                    !applied.repair,
+                    "Repository materialization requires repair"
+                );
+                policy.remote.as_mut().unwrap().tracked = Arc::new(
+                    applied
+                        .prepared
+                        .tracked
+                        .keys()
+                        .filter(|p| !applied.prepared.unavailable.contains(*p))
+                        .cloned()
+                        .collect(),
+                );
+            }
             let prepared = loop {
                 let app = preparing_app.clone();
                 let entry = entry.clone();
                 let cache = cache.clone();
                 let current_policy = policy.clone();
+                let owner = preparing_branch.as_ref().map(|branch| branch.root.clone());
                 let generation = preparing_branch
                     .as_ref()
                     .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
@@ -428,7 +540,8 @@ impl App {
                             entry,
                             &cache,
                             current_policy.clone(),
-                            app.assemblies.clone(),
+                            &app.cache.join("analysis"),
+                            owner.as_deref(),
                             app.monitor.clone(),
                         )?);
                     }
@@ -536,11 +649,10 @@ impl App {
                 let _branch_state = branch_state;
                 let workspace = state.as_mut().unwrap();
                 let store = workspace.store.clone();
-                let assemblies = workspace.assemblies.clone();
                 let manifest = workspace.manifest.clone();
-                // Pin both LMDB snapshots under the publication gate. Transactions
-                // stay on this blocking thread through rendering and destruction.
-                let mut search = Search::new(&store, &assemblies, &manifest, &cancel)?;
+                // Pin the shared LMDB snapshot under the publication gate. It
+                // stays on this blocking thread through rendering and destruction.
+                let mut search = Search::new(&store, &manifest, &cancel)?;
                 drop(state);
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
                 let text = match request {
@@ -587,12 +699,14 @@ fn result_text(result: CallToolResult) -> Result<String> {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
+    /// Local project path or repository URL with optional #branch, #tag, or full commit ID. Explicit #refs/heads/name and #refs/tags/name are supported; abbreviated commit IDs are not.
     pub project: String,
     pub query: String,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseArguments {
+    /// Local project path or repository URL with optional #branch, #tag, or full commit ID. Explicit #refs/heads/name and #refs/tags/name are supported; abbreviated commit IDs are not.
     pub project: String,
     #[serde(default)]
     pub path: String,
@@ -600,6 +714,7 @@ pub struct BrowseArguments {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViewArguments {
+    /// Local project path or repository URL with optional #branch, #tag, or full commit ID. Explicit #refs/heads/name and #refs/tags/name are supported; abbreviated commit IDs are not.
     pub project: String,
     pub path: String,
     #[serde(default)]
@@ -779,6 +894,171 @@ impl ServerHandler for Mcp {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn queued_preparation_does_not_block_branch_reacquisition() {
+        use crate::repository::{Repository, Rule, materialize::Target};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let cache = tempfile::tempdir().unwrap();
+        let project = "https://github.com/fixture/repo#refs/heads/main";
+        let repository = Repository::parse(project).unwrap().unwrap();
+        let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, "main")).unwrap())
+            .to_hex()
+            .to_string();
+        let owner = cache.path().join("repositories").join(key);
+        let source = owner.join("source");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("src/lib.rs"), "pub struct Prepared;").unwrap();
+        let selection = crate::repository::selection::Selection::new(&[], &[]).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let saved = serde_json::json!({
+            "schema": 4, "repository": repository.identity, "transport": repository.transport,
+            "branch": "main", "target": Target::Branch("main".into()),
+            "last_use": now, "refreshed": now, "store_created": now,
+            "policy": selection.identity, "repair": false, "indexed_revision": null,
+            "prepared": {"branch": "main", "revision": "a".repeat(40),
+                "selected": {}, "tracked": {"Cargo.toml": "b", "src/lib.rs": "c"}, "directories": ["src"]}
+        });
+        std::fs::write(
+            owner.join("state.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        let app = Arc::new(
+            App::remote(
+                Policy::new(vec![source.clone()]).unwrap(),
+                cache.path().into(),
+                1,
+                crate::config::RemoteOptions {
+                    rules: vec![Rule::parse_private("https://github.com/fixture/repo").unwrap()],
+                    refresh_interval: Some(Duration::from_secs(3600)),
+                    repo_ttl: Duration::from_secs(86400),
+                    branch_ttl: Duration::from_secs(86400),
+                    unity_versions: vec![],
+                    selection,
+                },
+            )
+            .unwrap(),
+        );
+        let branch = app
+            .remote
+            .as_ref()
+            .unwrap()
+            .resolve(repository)
+            .await
+            .unwrap();
+        let workspace = Arc::new(tokio::sync::Mutex::new(None));
+        app.workspaces.lock().unwrap().insert(
+            source,
+            WorkspaceSlot {
+                state: workspace.clone(),
+                used: Instant::now(),
+            },
+        );
+        // Stand in for A's workspace guard while it releases branch state to
+        // handle RequiredInputs. B must not retain branch state while queued.
+        let held_workspace = workspace.lock().await;
+        let request = {
+            let app = app.clone();
+            tokio::spawn(async move { app.search(project, "Prepared").await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), app.preparation_started.notified())
+            .await
+            .unwrap();
+        let reacquired = branch.state.try_lock().is_ok();
+        drop(held_workspace);
+        let result = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(reacquired, "Queued preparation retained branch state");
+        assert!(result.contains("Prepared"), "{result}");
+        branch
+            .last_use
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        drop(branch);
+        drop(workspace);
+        app.expire_idle().await.unwrap();
+        assert!(!owner.exists());
+        app.maintain_analysis(false).unwrap();
+        assert!(
+            crate::store::Database::open(&cache.path().join("analysis"))
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_local_workspaces_retire_and_can_be_created_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("README.md"), "Before").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![directory.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        app.view(project.to_str().unwrap(), "README.md", "exact")
+            .await
+            .unwrap();
+        let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
+        let before = database.workspaces().unwrap()[0].1.id;
+        app.maintain_analysis(false).unwrap();
+        assert_eq!(database.workspaces().unwrap()[0].1.id, before);
+        std::fs::remove_file(project.join("README.md")).unwrap();
+        std::fs::remove_dir(&project).unwrap();
+        app.maintain_analysis(false).unwrap();
+        assert!(database.workspaces().unwrap().is_empty());
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("README.md"), "After").unwrap();
+        assert!(
+            app.view(project.to_str().unwrap(), "README.md", "exact")
+                .await
+                .unwrap()
+                .contains("After")
+        );
+        assert!(database.workspaces().unwrap()[0].1.id > before);
+    }
+
+    #[test]
+    fn startup_finishes_interrupted_namespace_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = database.workspace([1; 32], root.path(), None).unwrap();
+        scope.mark_deleting().unwrap();
+        drop(scope);
+        drop(database);
+        let app = App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap();
+        assert!(
+            crate::store::Database::open(&app.cache.join("analysis"))
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn preparation_survives_idle_timeout_but_idle_sessions_still_expire() {
         use rmcp::transport::streamable_http_server::{

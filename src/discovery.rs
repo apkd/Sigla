@@ -371,7 +371,7 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                     || entry
                         .file_name()
                         .to_str()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(".github")))
+                        .is_some_and(|n| matches!(n, ".github" | ".gitlab" | ".cargo" | ".config")))
                     && !matches!(
                         entry.file_name().to_str(),
                         Some(
@@ -388,10 +388,8 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                     pending.push(path);
                 }
             } else if kind.is_file() {
-                let language = match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext.eq_ignore_ascii_case("md") => Language::Markdown,
-                    Some(ext) if ext.eq_ignore_ascii_case("txt") => Language::Text,
-                    _ => continue,
+                let Some(language) = crate::documents::language(&path) else {
+                    continue;
                 };
                 if let Some(remote) = &policy.remote
                     && !path

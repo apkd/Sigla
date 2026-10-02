@@ -112,7 +112,6 @@ impl Manifest {
 pub struct Workspace {
     pub entry: PathBuf,
     pub store: Arc<Store>,
-    pub assemblies: Arc<Store>,
     pub manifest: Arc<Manifest>,
     policy: Policy,
     cache: PathBuf,
@@ -138,22 +137,21 @@ impl Workspace {
         entry: PathBuf,
         cache: &Path,
         policy: Policy,
-        assemblies: Arc<Store>,
+        analysis: &Path,
+        owner: Option<&Path>,
         monitor: Arc<crate::watch::Monitor>,
     ) -> Result<Self> {
-        let key = blake3::hash(&postcard::to_allocvec(&(
+        let key = *blake3::hash(&postcard::to_allocvec(&(
             &entry,
             policy.unity_platform,
             policy.remote.is_some(),
         ))?)
-        .to_hex()
-        .to_string();
-        let store = Store::open(&cache.join(key))?;
+        .as_bytes();
+        let store = Store::open_workspace(analysis, key, &entry, owner)?;
         let manifest = store.get_manifest()?.unwrap_or_default();
         Ok(Self {
             entry,
             store,
-            assemblies,
             manifest: Arc::new(manifest),
             policy,
             cache: cache.to_owned(),
@@ -202,7 +200,7 @@ impl Workspace {
             }
         }
         let (dirty, fence) = self.monitor.fence(&self.directories, self.fence);
-        if self.initialized && !dirty {
+        if self.initialized && !dirty && self.store.manifest_current()? {
             return Ok(None);
         }
         let cache_current = self.store.manifest_current()?;
@@ -255,6 +253,12 @@ impl Workspace {
     }
 
     pub fn apply(&mut self, prepared: Preparation) -> Result<()> {
+        self.initialized = false;
+        self.store.begin_refresh()?;
+        self.apply_inner(prepared)
+    }
+
+    fn apply_inner(&mut self, prepared: Preparation) -> Result<()> {
         let Preparation {
             discovery,
             fence,
@@ -328,6 +332,9 @@ impl Workspace {
         }
         let mut visited = BTreeSet::new();
         let mut parsed = 0;
+        let mut objects_reused = 0;
+        let mut new_object_bytes = 0u64;
+        let mut reused_object_bytes = 0u64;
         let mut extraction_time = std::time::Duration::ZERO;
         let mut storage_time = std::time::Duration::ZERO;
         let indexing_started = std::time::Instant::now();
@@ -375,11 +382,7 @@ impl Workspace {
                 ));
                 continue;
             }
-            let store = if input.metadata {
-                &self.assemblies
-            } else {
-                &self.store
-            };
+            let store = &self.store;
             let extracted = indexed
                 .remove(&key)
                 .filter(|(before, _)| before == &stamp)
@@ -389,6 +392,8 @@ impl Workspace {
                 );
             let Indexed {
                 changed,
+                reused,
+                encoded_bytes,
                 modules,
                 extraction,
                 storage,
@@ -407,6 +412,13 @@ impl Workspace {
             extraction_time += extraction;
             storage_time += storage;
             parsed += usize::from(changed);
+            objects_reused += usize::from(reused);
+            if changed {
+                new_object_bytes += encoded_bytes;
+            }
+            if reused {
+                reused_object_bytes += encoded_bytes;
+            }
             if input.language == Language::Rust {
                 let base = input.path.parent().unwrap();
                 let stem = input.path.file_stem().unwrap().to_string_lossy();
@@ -506,9 +518,7 @@ impl Workspace {
             .keys()
             .filter(|k| !manifest.files.contains_key(*k))
         {
-            if !self.manifest.files[key].metadata {
-                self.store.remove(key)?;
-            }
+            self.store.remove(key)?;
         }
         for directory in &directories {
             if let Ok(stamp) = Stamp::read(directory) {
@@ -517,14 +527,9 @@ impl Workspace {
         }
         let mut environment = blake3::Hasher::new();
         environment.update(&postcard::to_allocvec(&manifest.projects)?);
-        for (key, file) in &manifest.files {
+        for key in manifest.files.keys() {
             environment.update(key.as_bytes());
-            let store = if file.metadata {
-                &self.assemblies
-            } else {
-                &self.store
-            };
-            environment.update(&store.declaration_revision(key)?);
+            environment.update(&self.store.declaration_revision(key)?);
         }
         manifest.environment = *environment.finalize().as_bytes();
         self.store.save_manifest(&manifest)?;
@@ -549,6 +554,9 @@ impl Workspace {
             files = self.manifest.files.len(),
             projects = self.manifest.projects.len(),
             parsed,
+            objects_reused,
+            new_object_bytes,
+            reused_object_bytes,
             validation_ms = validation.as_millis(),
             discovery_ms = discovery_time.as_millis(),
             indexing_ms = indexing_started.elapsed().as_millis(),
@@ -579,7 +587,7 @@ fn input_key(input: &SourceInput, project: &Project, stamp: &Stamp) -> String {
     } else if input.language.document() {
         "document".into()
     } else if input.language == Language::CSharp {
-        project.defines.join(";")
+        crate::store::canonical_defines(&project.defines).join(";")
     } else {
         format!("rust-2:{}", project.edition)
     };
@@ -596,6 +604,8 @@ fn input_key(input: &SourceInput, project: &Project, stamp: &Stamp) -> String {
 
 struct Indexed {
     changed: bool,
+    reused: bool,
+    encoded_bytes: u64,
     modules: Vec<ModuleFile>,
     extraction: std::time::Duration,
     storage: std::time::Duration,
@@ -610,42 +620,74 @@ fn index_input(
 ) -> Result<Indexed> {
     let _admission = crate::memory::admit_file(stamp.size, input.metadata);
     let started = std::time::Instant::now();
+    let verify = || {
+        ensure!(
+            Stamp::read(&input.path)? == *stamp,
+            "File changed during extraction; retry query"
+        );
+        Ok(())
+    };
+    if let Some(modules) = store.current(key, stamp)? {
+        verify()?;
+        return Ok(Indexed {
+            changed: false,
+            reused: false,
+            encoded_bytes: 0,
+            modules,
+            extraction: std::time::Duration::ZERO,
+            storage: started.elapsed(),
+        });
+    }
     let mut extraction = std::time::Duration::ZERO;
-    let (changed, modules) = store
-        .ensure_revision(key, stamp, || {
-            let extraction_started = std::time::Instant::now();
-            let data = if input.metadata {
-                crate::metadata::file_data(&input.path)?
-            } else {
-                let source = read_stable(&input.path, input.language)?;
-                let facts = crate::extract::extract(
-                    &source,
-                    input.language,
-                    &project.defines,
-                    &project.edition,
-                )?;
-                FileData {
+    let installed = (|| -> Result<_> {
+        if input.metadata {
+            verify()?;
+            let bytes = std::fs::read(&input.path)?;
+            verify()?;
+            let stem = input
+                .path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let id = crate::store::metadata_id(&bytes, &stem)?;
+            store.install(key, stamp, id, verify, || {
+                let start = std::time::Instant::now();
+                let data = crate::metadata::file_data_bytes(bytes, &stem);
+                extraction = start.elapsed();
+                data
+            })
+        } else {
+            let source = read_stable(&input.path, input.language)?;
+            verify()?;
+            let defines = crate::store::canonical_defines(&project.defines);
+            let id = crate::store::source_id(&source, input.language, &defines, &project.edition)?;
+            store.install(key, stamp, id, verify, || {
+                let start = std::time::Instant::now();
+                let facts =
+                    crate::extract::extract(&source, input.language, &defines, &project.edition);
+                extraction = start.elapsed();
+                Ok(FileData {
                     source,
-                    facts,
+                    facts: facts?,
                     assembly: None,
-                }
-            };
-            ensure!(
-                Stamp::read(&input.path)? == *stamp,
-                "File changed during extraction; retry query"
-            );
-            extraction = extraction_started.elapsed();
-            Ok(data)
-        })
-        .with_context(|| {
-            format!(
-                "Cannot index {}",
-                crate::render::inline(&input.path.to_string_lossy())
-            )
-        })?;
+                })
+            })
+        }
+    })()
+    .with_context(|| {
+        format!(
+            "Cannot index {}",
+            crate::render::inline(&input.path.to_string_lossy())
+        )
+    })?;
+    // `changed` was only used to count parsing. It now counts genuinely built objects.
+    // Installed also provides reused/encoded_bytes for the existing aggregate refresh log.
     Ok(Indexed {
-        changed,
-        modules,
+        changed: installed.built,
+        reused: installed.reused,
+        encoded_bytes: installed.encoded_bytes,
+        modules: store.modules(key)?,
         extraction,
         storage: started.elapsed().saturating_sub(extraction),
     })

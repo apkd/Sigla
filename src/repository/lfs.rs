@@ -388,6 +388,7 @@ mod tests {
             subdirectory: None,
         };
         let prepared = || Prepared {
+            transfer_bytes: 0,
             unavailable: Default::default(),
             transport: None,
             branch: None,
