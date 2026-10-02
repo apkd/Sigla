@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-pub use payload::{canonical_defines, metadata_id, source_id};
+pub use payload::{ANALYSIS_VERSION, canonical_defines, metadata_id, source_id};
 pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 

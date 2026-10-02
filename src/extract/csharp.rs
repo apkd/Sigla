@@ -184,7 +184,9 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
 }
 
 fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
+    let implicit_value_type = crate::csharp::lower::accessor_value_type(n);
     let kind = match n.kind() {
+        "accessor_declaration" if implicit_value_type.is_some() => "parameter",
         "class_declaration" => "class",
         "struct_declaration" => "struct",
         "record_declaration" => "class",
@@ -222,13 +224,35 @@ fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
         .or_else(|| n.child_by_field_name("operator"))
         .or_else(|| {
             let mut cursor = n.walk();
+            (n.kind() == "conversion_operator_declaration")
+                .then(|| {
+                    n.children(&mut cursor)
+                        .find(|token| matches!(token.kind(), "implicit" | "explicit"))
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            let mut cursor = n.walk();
             (n.kind() == "indexer_declaration")
                 .then(|| n.children(&mut cursor).find(|n| n.kind() == "this"))
                 .flatten()
         });
     let Some(name_node) = name_node else { return };
-    let name = if n.kind() == "indexer_declaration" {
+    let name = if implicit_value_type.is_some() {
+        "value".into()
+    } else if n.kind() == "indexer_declaration" {
         "Item".into()
+    } else if n.kind() == "conversion_operator_declaration" {
+        let checked = n
+            .children(&mut n.walk())
+            .any(|token| token.kind() == "checked");
+        match (text(name_node, s), checked) {
+            ("implicit", false) => "op_Implicit",
+            ("explicit", false) => "op_Explicit",
+            ("implicit", true) => "op_CheckedImplicit",
+            _ => "op_CheckedExplicit",
+        }
+        .into()
     } else {
         normalize_name(text(name_node, s))
     };
@@ -302,7 +326,9 @@ fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
         .child_by_field_name("body")
         .or_else(|| child(n, "accessor_list"));
     let header = outer.start_byte()..body.map_or(outer.end_byte(), |b| b.start_byte());
-    let mut ty = field(n, "type", s);
+    let mut ty = implicit_value_type
+        .map(|node| text(node, s).to_owned())
+        .unwrap_or_else(|| field(n, "type", s));
     if ty.is_empty() {
         ty = field(n, "returns", s);
     }
@@ -336,20 +362,12 @@ fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
                 .collect()
         })
         .unwrap_or_default();
-    let scope = if kind == "parameter" {
-        owner.map(|d| d.span.clone()).unwrap_or(0..s.len())
+    let scope = if implicit_value_type.is_some() {
+        span.clone()
+    } else if kind == "parameter" {
+        crate::csharp::lower::parameter_scope(n)
     } else if kind == "local" || n.kind() == "local_function_statement" {
-        ancestor(
-            n,
-            &[
-                "block",
-                "for_statement",
-                "foreach_statement",
-                "switch_section",
-                "compilation_unit",
-            ],
-        )
-        .map_or(span.clone(), |n| n.byte_range())
+        crate::csharp::lower::local_scope(n).unwrap_or_else(|| span.clone())
     } else {
         span.clone()
     };

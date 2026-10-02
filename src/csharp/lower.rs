@@ -4,6 +4,93 @@ use crate::model::Declaration;
 use std::collections::HashMap;
 use tree_sitter::Node;
 
+/// Type of the implicit value parameter; its source anchor is the accessor keyword.
+pub(crate) fn accessor_value_type(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "accessor_declaration"
+        || !matches!(
+            node.child_by_field_name("name")?.kind(),
+            "set" | "init" | "add" | "remove"
+        )
+    {
+        return None;
+    }
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(
+            parent.kind(),
+            "property_declaration" | "indexer_declaration" | "event_declaration"
+        ) {
+            return parent.child_by_field_name("type");
+        }
+        if matches!(parent.kind(), "declaration_list" | "compilation_unit") {
+            return None;
+        }
+        ancestor = parent.parent();
+    }
+    None
+}
+
+/// Return the syntactic owner of a parameter, not the nearest indexed declaration.
+/// Lambdas and conversion operators may not have an ordinary method-name node.
+pub(crate) fn parameter_scope(node: Node<'_>) -> std::ops::Range<usize> {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "destructor_declaration"
+                | "operator_declaration"
+                | "conversion_operator_declaration"
+                | "delegate_declaration"
+                | "local_function_statement"
+                | "lambda_expression"
+                | "anonymous_method_expression"
+                | "indexer_declaration"
+                | "class_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+        ) {
+            return parent.byte_range();
+        }
+        ancestor = parent.parent();
+    }
+    // Malformed/unsupported syntax must not create a file-wide parameter.
+    node.byte_range()
+}
+
+/// The same local scope must be used by extraction and expression lowering.
+/// None means this is a member initializer, not a lexical local declaration.
+pub(crate) fn local_scope(node: Node<'_>) -> Option<std::ops::Range<usize>> {
+    let mut ancestor = if node.kind() == "foreach_statement" {
+        Some(node)
+    } else {
+        node.parent()
+    };
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "block"
+            | "for_statement"
+            | "foreach_statement"
+            | "switch_section"
+            | "switch_expression_arm"
+            | "arrow_expression_clause"
+            | "lambda_expression"
+            | "anonymous_method_expression"
+            | "accessor_declaration"
+            | "method_declaration"
+            | "local_function_statement"
+            | "constructor_declaration"
+            | "operator_declaration"
+            | "conversion_operator_declaration"
+            | "compilation_unit" => return Some(parent.byte_range()),
+            "declaration_list" => return None,
+            _ => ancestor = parent.parent(),
+        }
+    }
+    None
+}
+
 pub fn query_parameters(parameters: &[String]) -> anyhow::Result<Vec<Parameter>> {
     let source = format!(
         "class Query {{ void Match({}) {{}} }}",
@@ -224,19 +311,7 @@ pub fn bodies(root: Node<'_>, source: &str, syntax: &mut FileSyntax) {
                     children(node).into_iter().rev().find(|n| *n != name_node)
                 }
                 .and_then(|n| ids.get(&n.id()).copied());
-                let mut scope = node;
-                while !matches!(
-                    scope.kind(),
-                    "block"
-                        | "foreach_statement"
-                        | "for_statement"
-                        | "switch_section"
-                        | "declaration_list"
-                ) {
-                    let Some(parent) = scope.parent() else { break };
-                    scope = parent;
-                }
-                if scope.kind() != "declaration_list" {
+                if let Some(scope) = local_scope(node) {
                     let out_argument = if node.kind() == "declaration_expression" {
                         let mut parent = node.parent();
                         while let Some(n) = parent {
@@ -253,7 +328,7 @@ pub fn bodies(root: Node<'_>, source: &str, syntax: &mut FileSyntax) {
                     syntax.locals.push(Local {
                         name: name(name_node, source),
                         span: name_node.byte_range(),
-                        scope: scope.byte_range(),
+                        scope,
                         ty: type_node
                             .map(|n| written(n, source))
                             .unwrap_or(WrittenType::Inferred),
@@ -550,6 +625,7 @@ pub fn header(node: Node<'_>, source: &str, declarations: &[Declaration]) -> Hea
         .map(|(i, _)| i as u32);
     let type_node = node
         .child_by_field_name("type")
+        .or_else(|| accessor_value_type(node))
         .or_else(|| node.child_by_field_name("returns"))
         .or_else(|| {
             (node.kind() == "variable_declarator")

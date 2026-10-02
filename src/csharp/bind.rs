@@ -1159,8 +1159,27 @@ impl Binder {
                                 .unwrap_or(Type::Unsupported);
                         }
                     }
+                    // Keep inferred types and navigation identity together. A type-only
+                    // result loses the use even when the local declaration is indexed.
+                    let declaration = context.facts.declarations.iter().position(|d| {
+                        d.local() && d.name == local.name && d.name_span == local.span
+                    });
+                    let symbols = if let Some(index) = declaration {
+                        let symbol = self.catalog.symbol(
+                            view,
+                            &context.file,
+                            context.project,
+                            index as u32,
+                        )?;
+                        vec![self.remember(symbol)]
+                    } else {
+                        // Some lowered constructs still lack declaration facts. Do not
+                        // substitute a same-named declaration from another scope.
+                        Vec::new()
+                    };
                     return Ok(Bound {
                         ty: Some(ty),
+                        symbols,
                         ..Default::default()
                     });
                 }

@@ -155,12 +155,11 @@ impl Catalog {
         Ok(imports)
     }
     pub fn check(&mut self, view: &View<'_>) -> Result<()> {
-        ensure!(!view.cancel.is_cancelled(), "Query cancelled");
-        self.work += 1;
-        ensure!(
-            self.work <= 100_000,
-            "C# analysis work limit reached; narrow the query"
-        );
+        if view.cancel.is_cancelled() {
+            return Err(crate::diagnostics::Cancelled.into());
+        }
+        self.work = self.work.saturating_add(1);
+        crate::diagnostics::enforce_limit("analysis_work", self.work, 100_000)?;
         Ok(())
     }
     pub fn headers(&mut self, view: &View<'_>, file: &str) -> Result<Arc<DeclarationFile>> {
@@ -180,11 +179,12 @@ impl Catalog {
         if let Some(cached) = self.headers.get(key) {
             return Ok(cached.clone());
         }
-        let bytes = postcard::experimental::serialized_size(data.as_ref())? * 4;
-        ensure!(
-            self.bytes + bytes <= 128 * 1024 * 1024,
-            "C# declaration memory limit reached; narrow the query"
-        );
+        let bytes = postcard::experimental::serialized_size(data.as_ref())?.saturating_mul(4);
+        crate::diagnostics::enforce_limit(
+            "estimated_declaration_bytes",
+            self.bytes.saturating_add(bytes),
+            128 * 1024 * 1024,
+        )?;
         self.headers.insert(key.into(), data.clone());
         self.bytes += bytes;
         Ok(data)
@@ -262,6 +262,12 @@ impl Catalog {
             header.generics.len(),
             &header.explicit_interface,
         ))?;
+        // Preserve other symbol keys while distinguishing conversion destinations.
+        let signature = if decl.kind == "operator" {
+            postcard::to_allocvec(&(&signature, &header.ty))?
+        } else {
+            signature
+        };
         let key = if view.manifest.files[file].metadata {
             format!("metadata:{}", header.declaration)
         } else if header.local {

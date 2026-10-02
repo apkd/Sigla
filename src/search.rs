@@ -1534,6 +1534,7 @@ impl<'a> Search<'a> {
             }
         }
         let mut units = crate::selection::Selection::new(q.limit);
+        let mut unresolved = false;
         for key in keys {
             if only_local && !targets.iter().any(|t| t.file == key) {
                 continue;
@@ -1568,6 +1569,9 @@ impl<'a> Search<'a> {
                         continue;
                     }
                     let bindings = self.bind(&key, m, o, &data)?;
+                    if !outgoing && bindings.is_empty() {
+                        unresolved = true;
+                    }
                     let relevant = bindings
                         .into_iter()
                         .filter(|(b, _)| {
@@ -1672,7 +1676,11 @@ impl<'a> Search<'a> {
                 }
             }
         }
-        Ok(self.finish_relationship(units, &q.selector))
+        let result = self.finish_relationship(units, &q.selector);
+        if unresolved && result == "No matches." {
+            return Ok("No resolved references found.".into());
+        }
+        Ok(result)
     }
     fn hierarchy(
         &mut self,

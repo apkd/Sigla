@@ -20,6 +20,84 @@ fn install(store: &Store, file: &str, data: FileData) {
 }
 
 #[test]
+fn legacy_analysis_is_rebuilt_without_changing_source_stamps() {
+    use sigla::{
+        discovery::Policy,
+        workspace::{Stamp, Workspace},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Test.csproj"),
+        "<Project><ItemGroup><Compile Include=\"Test.cs\" /></ItemGroup></Project>",
+    )
+    .unwrap();
+    let path = root.path().join("Test.cs");
+    let source = "struct Box { public static implicit operator int(Box value) => 0; }";
+    std::fs::write(&path, source).unwrap();
+    let stamp = Stamp::read(&path).unwrap();
+    let policy = Policy::new(vec![root.path().into()]).unwrap();
+    let open = |analysis: &std::path::Path| {
+        Workspace::open(
+            root.path().into(),
+            cache.path(),
+            policy.clone(),
+            analysis,
+            None,
+            Default::default(),
+        )
+        .unwrap()
+    };
+
+    // Obtain a valid discovery manifest, then seed the old namespace with stale facts.
+    let mut seed = open(&cache.path().join("seed"));
+    seed.refresh().unwrap();
+    let manifest = seed.manifest.clone();
+    let (file, _) = manifest
+        .files
+        .iter()
+        .find(|(_, entry)| entry.path == path)
+        .unwrap();
+    let analysis = cache.path().join("analysis");
+    let legacy_key = *blake3::hash(
+        &postcard::to_allocvec(&(root.path(), policy.unity_platform, policy.remote.is_some()))
+            .unwrap(),
+    )
+    .as_bytes();
+    let legacy = Store::open_workspace(&analysis, legacy_key, root.path(), None).unwrap();
+    legacy.begin_refresh().unwrap();
+    let tx = seed.store.read().unwrap();
+    for (key, entry) in &manifest.files {
+        let mut data = seed.store.load(&tx, key).unwrap().unwrap();
+        if key == file {
+            data.facts = Facts::default();
+        }
+        legacy
+            .install(
+                key,
+                &entry.stamp,
+                *blake3::hash(key.as_bytes()).as_bytes(),
+                || Ok(()),
+                || Ok(data),
+            )
+            .unwrap();
+    }
+    drop(tx);
+    legacy.save_manifest(&manifest).unwrap();
+    drop(legacy);
+    drop(seed);
+
+    let mut upgraded = open(&analysis);
+    upgraded.refresh().unwrap();
+    let declarations = upgraded.store.declarations(file).unwrap();
+    assert!(declarations.iter().any(|d| d.kind == "operator"));
+    assert_eq!(Stamp::read(&path).unwrap(), stamp);
+    drop(upgraded);
+    let mut reopened = open(&analysis);
+    assert!(reopened.prepare().unwrap().is_none());
+}
+
+#[test]
 fn compatible_cache_reopens_without_rebuilding_and_detects_offline_edits() {
     use sigla::{discovery::Policy, workspace::Workspace};
     let root = tempfile::tempdir().unwrap();

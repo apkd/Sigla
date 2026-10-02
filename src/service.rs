@@ -883,7 +883,13 @@ impl Mcp {
             Ok(result) => self.session.present(result),
             Err(e) => {
                 tracing::error!(project, error = %format!("{e:#}"), "Tool request failed");
-                CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))])
+                let mut result =
+                    CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))]);
+                result.structured_content = Some(crate::diagnostics::details(
+                    &e,
+                    &format!("{:?}", context.id),
+                ));
+                result
             }
         }
     }

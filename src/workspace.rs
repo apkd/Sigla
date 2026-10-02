@@ -142,6 +142,7 @@ impl Workspace {
         monitor: Arc<crate::watch::Monitor>,
     ) -> Result<Self> {
         let key = *blake3::hash(&postcard::to_allocvec(&(
+            crate::store::ANALYSIS_VERSION,
             &entry,
             policy.unity_platform,
             policy.remote.is_some(),

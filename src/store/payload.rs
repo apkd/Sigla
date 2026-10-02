@@ -23,7 +23,7 @@ pub const MODULES: &[u8] = &[9];
 const BODY: u8 = 10;
 const MEMBER: u8 = 11;
 const DECLARATION_NAME: u8 = 12;
-const VERSION: u32 = 1; // Bump for any extractor, profile, or encoded-record change.
+pub const ANALYSIS_VERSION: u32 = 2; // Bump for extractor, binder, profile, or record changes.
 
 pub fn body_key(index: u32) -> Vec<u8> {
     let mut key = vec![BODY];
@@ -66,7 +66,7 @@ pub fn source_id(
     };
     Ok(*blake3::hash(&postcard::to_allocvec(&(
         "sigla-source-analysis",
-        VERSION,
+        ANALYSIS_VERSION,
         language,
         profile,
         blake3::hash(source.as_bytes()).as_bytes(),
@@ -76,7 +76,7 @@ pub fn source_id(
 pub fn metadata_id(bytes: &[u8], fallback_stem: &str) -> Result<ObjectId> {
     Ok(*blake3::hash(&postcard::to_allocvec(&(
         "sigla-metadata-analysis",
-        VERSION,
+        ANALYSIS_VERSION,
         fallback_stem,
         blake3::hash(bytes).as_bytes(),
     ))?)
