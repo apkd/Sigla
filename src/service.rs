@@ -168,10 +168,7 @@ impl App {
         *startup = Some(receive);
         if let Some(remote) = &self.remote {
             let weak = Arc::downgrade(self);
-            let interval = remote
-                .options
-                .refresh_interval
-                .min(std::time::Duration::from_secs(60));
+            let interval = remote.options.maintenance_interval();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(interval).await;

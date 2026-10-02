@@ -32,6 +32,79 @@ fn remove_branch(root: &Path) -> Result<()> {
     fs::remove_dir_all(root).context("Cannot remove expired repository cache")
 }
 
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    fn options() -> RemoteOptions {
+        RemoteOptions {
+            rules: vec![],
+            refresh_interval: None,
+            repo_ttl: Duration::from_secs(7 * 86400),
+            branch_ttl: Duration::from_secs(86400),
+            unity_versions: vec![],
+            selection: super::super::selection::Selection::new(&[], &[]).unwrap(),
+        }
+    }
+
+    fn branch(target: Target, last_use: u64) -> Branch {
+        Branch {
+            root: PathBuf::new(),
+            repository: Repository::parse("https://github.com/owner/repo")
+                .unwrap()
+                .unwrap(),
+            name: "main".into(),
+            target,
+            state: Arc::new(AsyncMutex::new(None)),
+            last_use: AtomicU64::new(last_use),
+            generation: AtomicU64::new(0),
+            running: Mutex::new(None),
+            retry_after: AtomicU64::new(0),
+            acquiring: AsyncMutex::new(()),
+        }
+    }
+
+    #[test]
+    fn deadlines_are_anchored_and_activity_is_per_selector() {
+        let options = options();
+        let refreshed = 12 * 3600 * 1000;
+        let active = branch(Target::Branch("main".into()), 0);
+        let idle_tag = branch(Target::Tag("release".into()), 0);
+        let delay = options
+            .refresh_delay(Duration::from_millis(refreshed))
+            .as_millis() as u64;
+        assert!(!active.refresh_due(&options, refreshed, refreshed + delay - 1));
+        assert!(active.refresh_due(&options, refreshed, refreshed + delay + 1));
+        // A request makes only its selector active, even before the old deadline.
+        let request = refreshed + options.refresh_delay(Duration::ZERO).as_millis() as u64 + 1;
+        active.last_use.store(request, Ordering::Relaxed);
+        assert!(active.refresh_due(&options, refreshed, request));
+        assert!(!idle_tag.refresh_due(&options, refreshed, request));
+        // Successful publication starts a new interval; clock rollback cannot make it due.
+        assert!(!active.refresh_due(&options, request, request));
+        assert!(!active.refresh_due(&options, request, request - 1));
+        assert!(idle_tag.refresh_due(&options, refreshed, refreshed + delay + 1));
+    }
+
+    #[test]
+    fn commits_stay_pinned_and_fixed_intervals_ignore_activity() {
+        let mut options = options();
+        let pinned = branch(Target::Commit("a".repeat(40)), 0);
+        assert!(!pinned.refresh_due(&options, 0, u64::MAX));
+        let fixed = Duration::from_secs(23);
+        options.refresh_interval = Some(fixed);
+        let moving = branch(Target::Branch("main".into()), 0);
+        let refreshed = 86400 * 1000;
+        let deadline = refreshed + fixed.as_millis() as u64;
+        for last_use in [0, deadline] {
+            moving.last_use.store(last_use, Ordering::Relaxed);
+            assert!(!moving.refresh_due(&options, refreshed, deadline - 1));
+            assert!(moving.refresh_due(&options, refreshed, deadline));
+        }
+        assert!(!pinned.refresh_due(&options, 0, u64::MAX));
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     pub schema: u32,
@@ -65,6 +138,15 @@ pub struct Branch {
 }
 
 impl Branch {
+    fn refresh_due(&self, options: &RemoteOptions, refreshed: u64, now: u64) -> bool {
+        // Anchor the delay to the last successful refresh. A later access
+        // shortens it to the active interval without moving the deadline forward.
+        let idle =
+            Duration::from_millis(refreshed.saturating_sub(self.last_use.load(Ordering::Relaxed)));
+        !matches!(self.target, Target::Commit(_))
+            && Duration::from_millis(now.saturating_sub(refreshed)) >= options.refresh_delay(idle)
+    }
+
     pub fn selector(&self, prepared: &Prepared) -> String {
         if let Some(branch) = &prepared.branch {
             return format!("refs/heads/{branch}");
@@ -185,7 +267,11 @@ impl Manager {
         drop(defaults);
         if let Some(saved) = &cached
             && now().saturating_sub(saved.refreshed)
-                < self.options.refresh_interval.as_millis() as u64
+                < self
+                    .options
+                    .refresh_interval
+                    .unwrap_or(Duration::from_secs(5 * 60))
+                    .as_millis() as u64
         {
             return Ok(saved.branch.clone());
         }
@@ -270,10 +356,7 @@ impl Manager {
                     state.last_use = last_use;
                     branch.persist(state)?;
                 }
-                if !matches!(branch.target, Target::Commit(_))
-                    && now().saturating_sub(state.refreshed)
-                        >= self.options.refresh_interval.as_millis() as u64
-                {
+                if branch.refresh_due(&self.options, state.refreshed, now()) {
                     self.schedule(branch.clone(), false);
                 }
             }
@@ -399,11 +482,9 @@ impl Manager {
                     s.prepared.unavailable.contains(p) || branch.source().join(p).is_file()
                 })
         });
-        let due = state.as_ref().is_none_or(|s| {
-            !matches!(branch.target, Target::Commit(_))
-                && now().saturating_sub(s.refreshed)
-                    >= self.options.refresh_interval.as_millis() as u64
-        });
+        let due = state
+            .as_ref()
+            .is_none_or(|s| branch.refresh_due(&self.options, s.refreshed, now()));
         drop(state);
         if !usable || due {
             self.schedule(branch.clone(), !usable);

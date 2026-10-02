@@ -73,6 +73,14 @@ impl Server {
         Self::launch(root, Duration::from_secs(30), false)
     }
     fn launch(root: &Path, timeout: Duration, live_unity: bool) -> Result<Self> {
+        Self::launch_with_refresh(root, timeout, live_unity, Some("1s"))
+    }
+    fn launch_with_refresh(
+        root: &Path,
+        timeout: Duration,
+        live_unity: bool,
+        refresh: Option<&str>,
+    ) -> Result<Self> {
         // The fixture uses a local SSH executable, never a public GitHub endpoint.
         let repository =
             sigla::repository::Repository::parse("git@github.com:fixture/repo.git")?.unwrap();
@@ -106,8 +114,6 @@ impl Server {
                 "https://github.com/fixture/repo",
                 "--allow-repo-private",
                 "ssh://git@fixture.invalid/repo",
-                "--refresh-interval",
-                "1s",
                 "--repo-ttl",
                 if live_unity { "7d" } else { "60s" },
                 "--branch-ttl",
@@ -115,6 +121,11 @@ impl Server {
                 "--listen",
             ])
             .arg(address.to_string())
+            .args(
+                refresh
+                    .into_iter()
+                    .flat_map(|value| ["--refresh-interval", value]),
+            )
             .arg("--cache-dir")
             .arg(root.join("cache"))
             .env(
@@ -293,7 +304,9 @@ fn lifecycle() -> Result<()> {
     git(&upstream, &["switch", "--quiet", "main"])?;
     fs::create_dir(root.path().join("bin"))?;
     std::os::unix::fs::symlink(std::env::current_exe()?, root.path().join("bin/ssh"))?;
-    let server = Server::start(root.path())?;
+    // Keep background polling outside the cache-only acquisition-count checks.
+    let server =
+        Server::launch_with_refresh(root.path(), Duration::from_secs(30), false, Some("1h"))?;
     fs::write(root.path().join("offline"), "")?;
     ensure!(
         server
@@ -420,6 +433,8 @@ fn lifecycle() -> Result<()> {
         !server.query(main, "type:Main")?.0,
         "Branches did not remain independent"
     );
+    drop(server);
+    let server = Server::start(root.path())?;
     fs::write(upstream.join("src/lib.rs"), "pub struct Changed;\n")?;
     fs::create_dir_all(upstream.join("Dotnet/inputs"))?;
     fs::create_dir_all(upstream.join("Dotnet/Sources"))?;
@@ -465,6 +480,31 @@ fn lifecycle() -> Result<()> {
         !error && cached.contains("Changed"),
         "Restart failed to reuse a valid index while offline"
     );
+    drop(server);
+    fs::remove_file(root.path().join("offline"))?;
+    let server = Server::launch_with_refresh(root.path(), Duration::from_secs(30), false, None)?;
+    server.until(main, "type:Changed", "Changed")?;
+    fs::write(upstream.join("src/lib.rs"), "pub struct Adaptive;\n")?;
+    git(&upstream, &["commit", "--quiet", "-am", "adaptive refresh"])?;
+    // Observe publication without requests, so only maintenance can fetch it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut published = false;
+        for entry in fs::read_dir(root.path().join("cache/repositories"))? {
+            let source = entry?.path().join("source/src/lib.rs");
+            published |= fs::read_to_string(source).is_ok_and(|text| text.contains("Adaptive"));
+        }
+        if published {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Adaptive background refresh did not publish the new commit"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    server.until(main, "type:Adaptive", "Adaptive")?;
+    server.until(&pinned, "type:Main", "Main")?;
     Ok(())
 }
 

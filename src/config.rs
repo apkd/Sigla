@@ -40,6 +40,7 @@ pub struct Options {
     /// Allow authenticated access to matching repositories, including private repositories.
     #[arg(long, global = true)]
     pub allow_repo_private: Vec<String>,
+    /// Fixed remote refresh interval; when omitted, polling slows with idle time.
     #[arg(long, global = true, value_parser = duration)]
     pub refresh_interval: Option<Duration>,
     #[arg(long, global = true, value_parser = duration)]
@@ -56,11 +57,27 @@ pub struct Options {
 
 pub struct RemoteOptions {
     pub rules: Vec<Rule>,
-    pub refresh_interval: Duration,
+    pub refresh_interval: Option<Duration>,
     pub repo_ttl: Duration,
     pub branch_ttl: Duration,
     pub unity_versions: Vec<ReleaseBranch>,
     pub selection: crate::repository::selection::Selection,
+}
+
+impl RemoteOptions {
+    pub fn refresh_delay(&self, idle: Duration) -> Duration {
+        self.refresh_interval.unwrap_or_else(|| {
+            let hours = idle.as_secs_f64() / 3600.0;
+            Duration::from_secs_f64(15.0 + 1785.0 * -(-hours / 28.74).exp_m1())
+        })
+    }
+
+    pub fn maintenance_interval(&self) -> Duration {
+        self.refresh_interval
+            .map_or(Duration::from_secs(1), |fixed| {
+                fixed.min(Duration::from_secs(60))
+            })
+    }
 }
 
 impl Options {
@@ -106,7 +123,7 @@ impl Options {
                         .map(|r| Rule::parse_private(r)),
                 )
                 .collect::<Result<_>>()?,
-            refresh_interval: self.refresh_interval.unwrap_or(Duration::from_secs(5 * 60)),
+            refresh_interval: self.refresh_interval,
             repo_ttl: self
                 .repo_ttl
                 .unwrap_or(Duration::from_secs(7 * 24 * 60 * 60)),
@@ -156,6 +173,61 @@ mod tests {
         #[command(flatten)]
         options: Options,
     }
+    #[test]
+    fn refresh_curve_is_monotone_bounded_and_exponential() {
+        let options = Cli::try_parse_from([
+            "sigla",
+            "--mode",
+            "remote",
+            "--allow-repo",
+            "https://github.com/owner/*",
+        ])
+        .unwrap()
+        .options
+        .validate()
+        .unwrap()
+        .unwrap();
+        assert!(options.refresh_interval.is_none());
+        let active = options.refresh_delay(Duration::ZERO);
+        let maximum = options.refresh_delay(Duration::MAX);
+        assert!(active > Duration::ZERO && active < maximum);
+        assert!(options.maintenance_interval() < active);
+        let mut previous = active;
+        for minutes in [5, 30, 60, 120, 300, 720, 1440, 2880, 4320, 10080] {
+            let next = options.refresh_delay(Duration::from_secs(minutes * 60));
+            assert!(next > previous && next < maximum);
+            previous = next;
+        }
+        // Equal idle-time increments shrink the remaining gap by the same ratio.
+        let gap = |hours: u64| {
+            (maximum - options.refresh_delay(Duration::from_secs(hours * 3600))).as_secs_f64()
+        };
+        assert!((gap(1) / gap(0) - gap(2) / gap(1)).abs() < 1e-8);
+    }
+
+    #[test]
+    fn explicit_refresh_interval_ignores_recency() {
+        let options = Cli::try_parse_from([
+            "sigla",
+            "--mode",
+            "remote",
+            "--allow-repo",
+            "https://github.com/owner/*",
+            "--refresh-interval",
+            "23s",
+        ])
+        .unwrap()
+        .options
+        .validate()
+        .unwrap()
+        .unwrap();
+        let fixed = options.refresh_interval.unwrap();
+        for idle in [Duration::ZERO, Duration::from_secs(86400), Duration::MAX] {
+            assert_eq!(options.refresh_delay(idle), fixed);
+        }
+        assert!(options.maintenance_interval() <= fixed);
+    }
+
     #[test]
     fn mode_controls_roots_and_remote_options() {
         let local = Cli::try_parse_from(["sigla"]).unwrap().options;
