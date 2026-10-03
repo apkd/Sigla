@@ -1,0 +1,32 @@
+name: Set up bundled musl libraries
+description: Build and cache static archive libraries, then configure Cargo for musl.
+runs:
+  using: composite
+  steps:
+    - name: Install musl build tools
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends musl-tools fish pkg-config lld
+    - uses: actions/cache@v5
+      id: libraries
+      with:
+        path: target/musl-native
+        key: musl-libraries-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/build-musl-libraries.fish') }}
+    - name: Build bundled libraries
+      if: steps.libraries.outputs.cache-hit != 'true'
+      shell: bash
+      run: fish scripts/build-musl-libraries.fish "$GITHUB_WORKSPACE/target/musl-native"
+    - name: Configure Cargo for musl
+      shell: bash
+      run: |
+        prefix="$GITHUB_WORKSPACE/target/musl-native"
+        {
+          echo 'CARGO_BUILD_TARGET=x86_64-unknown-linux-musl'
+          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc'
+          echo 'CC_x86_64_unknown_linux_musl=musl-gcc'
+          echo "LIBARCHIVE_LIB_DIR=$prefix/lib"
+          echo "LIBARCHIVE_INCLUDE_DIR=$prefix/include"
+          echo 'LIBARCHIVE_STATIC=1'
+          echo "LIBARCHIVE_LDFLAGS=-L$prefix/lib -lzstd -lbz2 -lz -llzma"
+        } >> "$GITHUB_ENV"

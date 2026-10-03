@@ -77,13 +77,17 @@ jobs:
           EOF
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
       - uses: Swatinem/rust-cache@v2
         with:
+          key: musl-test
           cache-directories: ~/.nuget/packages
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: ./.github/actions/setup-musl
       - name: Restore sandbox executable
         id: bubblewrap
         uses: actions/cache@v5
@@ -92,8 +96,7 @@ jobs:
           key: bubblewrap-0.11.2-ubuntu-24.04-${{ runner.arch }}-v1
       - name: Install test dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libarchive-dev pkg-config lld libcap2
+          sudo apt-get install -y --no-install-recommends libcap2
           echo "$HOME/.cache/sigla-ci/bin" >> "$GITHUB_PATH"
       - name: Build sandbox executable
         if: steps.bubblewrap.outputs.cache-hit != 'true'
@@ -162,17 +165,17 @@ jobs:
             echo "previous_tag=$previous_tag"
           } >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
       # Use the checked-in manifests for cache lookup, before build-only version edits.
       - uses: Swatinem/rust-cache@v2
         with:
+          key: musl-release
           cache-directories: ~/.nuget/packages
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libarchive-dev pkg-config lld
+      - uses: ./.github/actions/setup-musl
       - name: Build release binary
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -181,13 +184,23 @@ jobs:
           sed -i '/^name = "sigla"$/,/^\[\[package\]\]$/s/^version = ".*"$/version = "'"$VERSION"'"/' Cargo.lock
           cargo build --locked --release --bin sigla
           mkdir -p release-assets
-          cp target/release/sigla release-assets/sigla-linux-x64
-          (cd release-assets && sha256sum sigla-linux-x64 > SHA256SUMS)
+          cp target/x86_64-unknown-linux-musl/release/sigla release-assets/sigla-linux-x64
+          cp target/musl-native/THIRD-PARTY-NOTICES.txt release-assets/
+          (cd release-assets && sha256sum sigla-linux-x64 THIRD-PARTY-NOTICES.txt > SHA256SUMS)
       - name: Smoke-test the release binary
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           executable="$PWD/release-assets/sigla-linux-x64"
+          # Reject an interpreter or shared libraries, including accidental host linkage.
+          if readelf -l "$executable" | grep -q 'INTERP'; then
+            echo '::error::Release binary requires a dynamic loader.'
+            exit 1
+          fi
+          if readelf -d "$executable" | grep -q '(NEEDED)'; then
+            echo '::error::Release binary requires shared libraries.'
+            exit 1
+          fi
           [[ "$("$executable" --version)" == "sigla $VERSION" ]]
           work="$RUNNER_TEMP/release-smoke"
           mkdir -p "$work/src"
@@ -307,19 +320,20 @@ jobs:
 
           Installation
           --------------
-          Compatibility: ***Linux x64, Ubuntu 24.04 or newer***
+          Compatibility: ***Linux x64, including NixOS and Alpine***
 
           Download the binary and verify its checksum:
 
           \`\`\`sh
           curl -fLO $repo_url/releases/download/release/sigla-linux-x64
+          curl -fLO $repo_url/releases/download/release/THIRD-PARTY-NOTICES.txt
           curl -fLO $repo_url/releases/download/release/SHA256SUMS
           sha256sum -c SHA256SUMS
           chmod +x sigla-linux-x64
           ./sigla-linux-x64 serve
           \`\`\`
 
-          Requires the libarchive runtime (\`libarchive13t64\` on Ubuntu 24.04).
+          The binary bundles musl, libarchive, and its compression libraries.
           C# project discovery also requires a .NET SDK and bubblewrap 0.11 or newer.
           See the [setup instructions]($repo_url/blob/release/README.md).
 
@@ -391,7 +405,7 @@ jobs:
         if: steps.verify.outputs.changed == 'false'
         run: |
           (cd release-assets && sha256sum -c SHA256SUMS)
-          files=(release-assets/sigla-linux-x64 release-assets/SHA256SUMS)
+          files=(release-assets/sigla-linux-x64 release-assets/SHA256SUMS release-assets/THIRD-PARTY-NOTICES.txt)
           for file in "${files[@]}"; do test -s "$file"; done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -408,7 +422,7 @@ jobs:
           mapfile -t published < <(jq -r '.assets[].name' <<< "$assets")
           for asset in "${published[@]}"; do
             case "$asset" in
-              sigla-linux-x64|SHA256SUMS) ;;
+              sigla-linux-x64|SHA256SUMS|THIRD-PARTY-NOTICES.txt) ;;
               *) gh release delete-asset release "$asset" --yes ;;
             esac
           done

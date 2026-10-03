@@ -52,11 +52,13 @@ sha1 = "0.10"
 md-5 = "0.10"
 
 [dev-dependencies]
+flate2 = "1"
 tar = "0.4"
 windows-metadata = "=0.100.0"
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 strip = true
 

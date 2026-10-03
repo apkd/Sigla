@@ -3403,6 +3403,7 @@ dependencies = [
  "clap",
  "dotscope",
  "encoding_rs",
+ "flate2",
  "gix-features",
  "gix-hash",
  "gix-protocol",

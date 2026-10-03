@@ -43,7 +43,10 @@ Local Unity discovery uses `~/Unity/Hub/Editor` by default. If the editor belong
 
 ## Getting started
 
-With a Rust toolchain, `pkg-config`, and libarchive development files installed (`libarchive-dev` on Debian/Ubuntu):
+Download the [Linux x64 release](https://github.com/apkd/sigla/releases/tag/release).
+C# project discovery also needs a .NET SDK and bubblewrap 0.11 or newer.
+
+To build from source, install a Rust toolchain, a .NET SDK, `pkg-config`, and libarchive development files (`libarchive-dev` on Debian/Ubuntu):
 
 ```sh
 cargo install --git https://github.com/apkd/sigla --locked

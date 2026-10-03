@@ -12,6 +12,7 @@ struct Workload {
     concurrency: usize,
     #[serde(default)]
     idle_ms: u64,
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[serde(default)]
     trim_idle: bool,
 }
@@ -33,17 +34,19 @@ fn memory_sample() -> Result<serde_json::Value> {
             .unwrap_or("")
             .trim()
     };
-    let mut sample = serde_json::json!({
+    let sample = serde_json::json!({
         "rss":memory("VmRSS:"), "anonymous_rss":memory("RssAnon:"),
         "file_rss":memory("RssFile:"), "shared_rss":memory("RssShmem:"),
         "peak_rss":memory("VmHWM:"), "threads":memory("Threads:")
     });
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
+    let sample = {
+        let mut sample = sample;
         let heap = unsafe { libc::mallinfo2() };
         sample["heap"] =
             serde_json::json!({"used":heap.uordblks,"free":heap.fordblks,"mapped":heap.hblkhd});
-    }
+        sample
+    };
     Ok(sample)
 }
 #[tokio::main]

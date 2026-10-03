@@ -251,6 +251,24 @@ mod tests {
     }
 
     #[test]
+    fn compressed_packages_extract() {
+        use flate2::{Compression, write::GzEncoder};
+
+        let bytes = tar(&["package/Code.cs"]);
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&bytes).unwrap();
+        for compressed in [
+            gzip.finish().unwrap(),
+            zstd::encode_all(bytes.as_slice(), 0).unwrap(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let inventory = extract(archive(&compressed), root.path(), analysis_input).unwrap();
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(fs::read(root.path().join("package/Code.cs")).unwrap(), b"x");
+        }
+    }
+
+    #[test]
     fn unity_long_names_remain_distinct_with_nonstandard_tar_magic() {
         let directory = "long-directory/".repeat(8);
         let first = format!("package/{directory}First.cs");
