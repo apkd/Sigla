@@ -3,6 +3,7 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=managed/Program.cs");
     println!("cargo:rerun-if-changed=managed/TrackedFileSystem.cs");
+    println!("cargo:rerun-if-changed=managed/PackageSnapshot.cs");
     println!("cargo:rerun-if-changed=managed/Sigla.Discovery.csproj");
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("managed");
     let status = Command::new("dotnet")

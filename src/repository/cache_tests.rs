@@ -70,6 +70,23 @@ fn idle_orphan_pools_expire_only_after_pending_publication_finishes() {
 }
 
 #[test]
+fn pressure_keeps_inflight_git_objects_and_reclaims_an_idle_pool() {
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Pool::open(cache.path(), &identity()).unwrap();
+    pool.state().unwrap();
+    let pending = pin(&pool);
+    reclaim(cache.path()).unwrap();
+    assert!(pool.root.exists());
+    drop(pending);
+    let operation = pool.operation.lock().unwrap();
+    reclaim(cache.path()).unwrap();
+    assert!(pool.root.exists());
+    drop(operation);
+    reclaim(cache.path()).unwrap();
+    assert!(!pool.root.exists());
+}
+
+#[test]
 fn initial_pool_clock_is_persisted_even_before_successful_acquisition() {
     let cache = tempfile::tempdir().unwrap();
     let pool = Pool::open(cache.path(), &identity()).unwrap();

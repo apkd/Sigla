@@ -145,6 +145,10 @@ pub fn discover_in(
         .context("MSBuild entry is missing")?
         .parent()
         .unwrap();
+    let local_packages = remote
+        .is_none()
+        .then(|| crate::cache::packages::View::local(cache, directory))
+        .transpose()?;
     let sdks = process::run(command(cache).arg("--list-sdks"), Duration::from_secs(30))?;
     let installed: Vec<_> = std::str::from_utf8(&sdks)?
         .lines()
@@ -197,7 +201,13 @@ pub fn discover_in(
             command
         }
         None => {
-            let mut command = crate::sandbox::local_command(&host, directory, cache, job.path())?;
+            let mut command = crate::sandbox::local_command(
+                &host,
+                directory,
+                cache,
+                job.path(),
+                local_packages.as_ref().unwrap(),
+            )?;
             command
                 .current_dir(directory)
                 .arg(bootstrap.join("Sigla.Discovery.dll"))
@@ -268,8 +278,13 @@ pub fn discover_in(
                 command
             }
             None => {
-                let mut command =
-                    crate::sandbox::local_command(&host, directory, cache, job.path())?;
+                let mut command = crate::sandbox::local_command(
+                    &host,
+                    directory,
+                    cache,
+                    job.path(),
+                    local_packages.as_ref().unwrap(),
+                )?;
                 local_artifacts(&mut command, &artifacts);
                 command
                     .arg(root.join("Sigla.Discovery.dll"))
@@ -280,6 +295,10 @@ pub fn discover_in(
             }
         };
         process::run(&mut discovery, Duration::from_secs(120))?;
+        match &sandbox {
+            Some(s) => s.packages.seal(&host, &root)?,
+            None => local_packages.as_ref().unwrap().seal(&host, &root)?,
+        }
         if let Some(sandbox) = &sandbox {
             sandbox.validate_writes()?;
         }
@@ -326,8 +345,13 @@ pub fn discover_in(
             let mut restore = match &sandbox {
                 Some(s) => s.command(&host, &root, job.path(), directory, true)?,
                 None => {
-                    let mut command =
-                        crate::sandbox::local_command(&host, directory, cache, job.path())?;
+                    let mut command = crate::sandbox::local_command(
+                        &host,
+                        directory,
+                        cache,
+                        job.path(),
+                        local_packages.as_ref().unwrap(),
+                    )?;
                     local_artifacts(&mut command, &artifacts);
                     command
                 }

@@ -1,4 +1,5 @@
 mod acquisition;
+pub mod cache;
 mod cache_migration;
 pub mod config;
 pub mod csharp;

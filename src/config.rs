@@ -27,6 +27,12 @@ pub struct Options {
     pub upstream_token_file: Option<PathBuf>,
     #[arg(long, global = true, alias = "cache", default_value = "/tmp/sigla")]
     pub cache_dir: PathBuf,
+    /// Maximum managed cache allocation, in decimal GB. Active and pinned inputs are protected.
+    #[arg(long, global = true, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+    pub max_cache_size_gb: u64,
+    /// Available filesystem space to preserve, as a percentage of filesystem capacity.
+    #[arg(long, global = true, default_value_t = 20, value_parser = clap::value_parser!(u8).range(0..=98))]
+    pub free_disk_space_headroom_percent: u8,
     /// Permitted local roots. Remote mode has no implicit local roots.
     #[arg(long, global = true)]
     pub root: Vec<PathBuf>,
@@ -82,6 +88,12 @@ impl RemoteOptions {
 }
 
 impl Options {
+    pub fn cache_limits(&self) -> crate::cache::policy::Limits {
+        crate::cache::policy::Limits {
+            max_bytes: self.max_cache_size_gb * 1_000_000_000,
+            headroom_percent: self.free_disk_space_headroom_percent,
+        }
+    }
     pub fn validate(&self) -> Result<Option<RemoteOptions>> {
         if self.mode == Mode::Hybrid {
             crate::upstream::validate_endpoint(

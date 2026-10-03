@@ -244,10 +244,16 @@ fn fetch(
     transferred: &mut u64,
 ) -> Result<()> {
     fs::create_dir_all(cache)?;
+    let files =
+        crate::cache::blobs::Store::open(cache.parent().context("LFS cache has no shared root")?)?;
+    // Downloads and cache reads retain their names until publication is complete.
+    // Collection tries this lock without waiting for network work.
+    let _lease = files.lease()?;
     let cached = cache.join(&pointer.oid);
     if let Ok(file) = File::open(&cached)
         && verified_copy(file, &mut std::io::sink(), pointer).is_ok()
     {
+        files.import(&cached)?;
         fs::copy(&cached, target)?;
         return Ok(());
     }
@@ -315,6 +321,7 @@ fn fetch(
     )?;
     temporary.as_file().sync_all()?;
     temporary.persist(&cached)?;
+    files.import(&cached)?;
     fs::copy(cached, target)?;
     Ok(())
 }

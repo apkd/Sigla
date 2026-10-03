@@ -17,6 +17,7 @@ pub fn empty() -> Ticket {
     watch::channel(Some(Ok(Arc::new(Index::default())))).1
 }
 pub struct Request {
+    pub activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     pub workspace: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     pub branch: Option<Arc<Branch>>,
     pub root: PathBuf,
@@ -63,6 +64,7 @@ impl Jobs {
     }
     pub fn start(&self, request: Request) -> Ticket {
         let Request {
+            activity,
             workspace,
             branch,
             root,
@@ -115,6 +117,7 @@ impl Jobs {
                     None => None,
                 };
                 tokio::task::spawn_blocking(move || -> Result<Arc<Index>> {
+                    let _activity = activity;
                     let _permit = permit;
                     let code = state.as_ref().context("Code workspace unavailable")?;
                     ensure!(

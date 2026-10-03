@@ -9,9 +9,15 @@ use std::{
 };
 
 /// Local projects retain host inputs and credentials, with writes confined to cache and private IPC.
-pub fn local_command(host: &Path, directory: &Path, cache: &Path, job: &Path) -> Result<Command> {
+pub fn local_command(
+    host: &Path,
+    directory: &Path,
+    cache: &Path,
+    job: &Path,
+    packages: &crate::cache::packages::View,
+) -> Result<Command> {
     let cache = cache.join("dotnet").canonicalize()?;
-    for child in ["tmp", "home", "packages", "http-cache", "plugins"] {
+    for child in ["tmp", "home", "http-cache", "plugins"] {
         fs::create_dir_all(cache.join(child))?;
     }
     let mut command = Command::new("bwrap");
@@ -52,12 +58,17 @@ pub fn local_command(host: &Path, directory: &Path, cache: &Path, job: &Path) ->
             command.arg("--ro-bind").arg(config).arg(target);
         }
     }
+    packages.mount(&mut command, &packages.path());
+    let legacy = cache.join("packages");
+    if legacy.is_dir() {
+        command.arg("--ro-bind").arg(&legacy).arg(&legacy);
+    }
     command
         .arg("--")
         .arg(host)
         .env("TMPDIR", cache.join("tmp"))
         .env("DOTNET_CLI_HOME", cache.join("home"))
-        .env("NUGET_PACKAGES", cache.join("packages"))
+        .env("NUGET_PACKAGES", packages.path())
         .env("NUGET_HTTP_CACHE_PATH", cache.join("http-cache"))
         .env("NUGET_PLUGINS_CACHE_PATH", cache.join("plugins"))
         .env("MSBUILDDISABLENODEREUSE", "1")
@@ -72,6 +83,7 @@ pub struct Sandbox {
     pub writable: PathBuf,
     pub toolchains: BTreeSet<PathBuf>,
     hidden: Vec<(PathBuf, bool)>,
+    pub packages: crate::cache::packages::View,
 }
 
 /// Remove generated outputs after all sandbox processes have stopped.
@@ -79,14 +91,16 @@ pub fn remove_outputs(writable: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     // Overlayfs leaves its private work directory at mode 000 after unmounting.
     // It is outside the mounted workspace and is never exposed to project code.
-    let work = writable.join("overlay-work/work");
-    match fs::symlink_metadata(&work) {
-        Ok(metadata) => {
-            ensure!(metadata.is_dir(), "Invalid overlay work directory");
-            fs::set_permissions(&work, fs::Permissions::from_mode(0o700))?;
+    for child in ["overlay-work/work", "package-work/work"] {
+        let work = writable.join(child);
+        match fs::symlink_metadata(&work) {
+            Ok(metadata) => {
+                ensure!(metadata.is_dir(), "Invalid overlay work directory");
+                fs::set_permissions(&work, fs::Permissions::from_mode(0o700))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
     }
     match fs::remove_dir_all(writable) {
         Ok(()) => Ok(()),
@@ -152,6 +166,7 @@ impl Sandbox {
         let mut hidden = Vec::new();
         git_paths(&source, &source, &mut hidden)?;
         Ok(Self {
+            packages: crate::cache::packages::View::open(&context.shared, &context.writable)?,
             source,
             writable: context.writable.canonicalize()?,
             toolchains,
@@ -250,6 +265,7 @@ impl Sandbox {
                 command.args(["--ro-bind", "/dev/null"]).arg(path);
             }
         }
+        self.packages.mount(&mut command, Path::new("/packages"));
         command
             .arg("--ro-bind")
             .arg(integration)
@@ -257,9 +273,6 @@ impl Sandbox {
             .arg("--bind")
             .arg(job)
             .arg("/job")
-            .arg("--bind")
-            .arg(self.writable.join("packages"))
-            .arg("/packages")
             .args([
                 "--setenv",
                 "HOME",

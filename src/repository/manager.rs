@@ -208,12 +208,8 @@ impl Branch {
     pub fn persist(&self, state: &State) -> Result<()> {
         write_json(&self.root.join("state.json"), state)
     }
-    pub fn ttl(&self, options: &RemoteOptions) -> Duration {
-        if matches!(self.name.as_str(), "main" | "master") {
-            options.repo_ttl
-        } else {
-            options.branch_ttl
-        }
+    pub fn record_use(&self) {
+        self.last_use.fetch_max(now(), Ordering::Relaxed);
     }
 }
 
@@ -222,6 +218,8 @@ struct DefaultBranch {
     repository: Identity,
     branch: String,
     refreshed: u64,
+    #[serde(default)]
+    previous: Option<String>,
 }
 type DefaultOperation = (
     u64,
@@ -250,36 +248,176 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 impl Manager {
+    fn saved_default(&self, identity: &Identity) -> Result<Option<DefaultBranch>> {
+        match fs::read(self.cache.join("defaults").join(identity.storage_key())) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn default_ready(&self, identity: &Identity, branch: &str) -> Result<bool> {
+        // Named selectors and explicit refs can both resolve to the actual default.
+        Ok(self.cached()?.iter().any(|(_, state)| {
+            &state.repository == identity
+                && state.prepared.branch.as_deref() == Some(branch)
+                && !state.repair
+                && state.indexed_revision.as_ref() == Some(&state.prepared.revision)
+        }))
+    }
+    fn previous_default(&self, identity: &Identity, next: Option<&str>) -> Result<Option<String>> {
+        let Some(saved) = self.saved_default(identity)? else {
+            return Ok(None);
+        };
+        if Some(saved.branch.as_str()) == next {
+            return Ok(saved.previous);
+        }
+        if self.default_ready(identity, &saved.branch)? {
+            return Ok(Some(saved.branch));
+        }
+        Ok(saved.previous.or(Some(saved.branch)))
+    }
+
+    pub fn retention(&self, state: &State) -> Result<(bool, Duration)> {
+        let default = self.saved_default(&state.repository)?;
+        let branch = state.prepared.branch.as_deref().or(match &state.target {
+            Some(Target::Branch(name)) => Some(name.as_str()),
+            None => Some(state.branch.as_str()),
+            _ => None,
+        });
+        let is_default = default
+            .as_ref()
+            .is_some_and(|d| branch == Some(d.branch.as_str()));
+        let mut protected = is_default;
+        if let Some(default) = &default
+            && default.previous.as_deref() == branch
+            && branch.is_some()
+        {
+            let ready = self.default_ready(&state.repository, &default.branch)?;
+            protected |= !ready;
+        }
+        let repository = Repository {
+            identity: state.repository.clone(),
+            transport: state.transport.clone(),
+            selector: None,
+        };
+        // Until the remote's default is known, retain exact allowlist entries
+        // conservatively. A failed metadata refresh must not evict their default.
+        let pinned = (protected || default.is_none())
+            && self
+                .options
+                .rules
+                .iter()
+                .any(|rule| rule.exact_match(&repository));
+        Ok((
+            pinned,
+            if is_default {
+                self.options.repo_ttl
+            } else {
+                self.options.branch_ttl
+            },
+        ))
+    }
+
+    fn state_expired(&self, state: &State) -> Result<bool> {
+        let (pinned, ttl) = self.retention(state)?;
+        Ok(!pinned && now().saturating_sub(state.last_use) >= ttl.as_millis() as u64)
+    }
+    fn branch_expired(&self, branch: &Branch) -> Result<bool> {
+        let bytes = match fs::read(branch.root.join("state.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let mut state: State = serde_json::from_slice(&bytes)?;
+        state.last_use = branch.last_use.load(Ordering::Relaxed);
+        self.state_expired(&state)
+    }
+
+    pub fn cached(&self) -> Result<Vec<(PathBuf, State)>> {
+        let mut result = Vec::new();
+        for entry in fs::read_dir(self.cache.join("repositories"))? {
+            let entry = entry?;
+            ensure!(entry.file_type()?.is_dir(), "Invalid selector directory");
+            match fs::read(entry.path().join("state.json")) {
+                Ok(bytes) => result.push((entry.path(), serde_json::from_slice(&bytes)?)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(result)
+    }
+    pub fn migrate_inputs(&self, root: &Path, store: &crate::cache::blobs::Store) -> Result<bool> {
+        let branches = self.branches.lock().unwrap();
+        let branch = branches.values().find(|branch| branch.root == root);
+        let _gate = if let Some(branch) = branch {
+            if branch
+                .running
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|job| job.borrow().is_none())
+            {
+                return Ok(false);
+            }
+            let Ok(gate) = branch.state.clone().try_lock_owned() else {
+                return Ok(false);
+            };
+            Some(gate)
+        } else {
+            None
+        };
+        if root.join("source").is_dir() {
+            store.import_tree(&root.join("source"))?;
+        }
+        if root.join("generated/packages").is_dir() {
+            crate::cache::packages::View::open(&self.cache, &root.join("generated"))?;
+        }
+        Ok(true)
+    }
+
+    /// Recheck both protection and in-flight acquisitions at the point of removal.
+    pub fn evict(
+        &self,
+        root: &Path,
+        pressure: bool,
+        retire: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        let mut branches = self.branches.lock().unwrap();
+        let branch = branches.values().find(|b| b.root == root).cloned();
+        let _gate = if let Some(branch) = &branch {
+            if Arc::strong_count(branch) > 2
+                || branch
+                    .running
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|job| job.borrow().is_none())
+            {
+                return Ok(false);
+            }
+            let Ok(gate) = branch.state.clone().try_lock_owned() else {
+                return Ok(false);
+            };
+            Some(gate)
+        } else {
+            None
+        };
+        let mut state: State = serde_json::from_slice(&fs::read(root.join("state.json"))?)?;
+        if let Some(branch) = &branch {
+            state.last_use = branch.last_use.load(Ordering::Relaxed);
+        }
+        if self.retention(&state)?.0 || !pressure && !self.state_expired(&state)? {
+            return Ok(false);
+        }
+        retire()?;
+        remove_branch(root)?;
+        branches.retain(|_, branch| branch.root != root);
+        Ok(true)
+    }
+
     pub fn new(cache: PathBuf, options: RemoteOptions) -> Result<Arc<Self>> {
         fs::create_dir_all(cache.join("repositories"))?;
         fs::create_dir_all(cache.join("defaults"))?;
-        for entry in fs::read_dir(cache.join("repositories"))? {
-            let entry = entry?;
-            ensure!(
-                entry.file_type()?.is_dir()
-                    && entry
-                        .file_name()
-                        .to_string_lossy()
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit()),
-                "Invalid managed branch directory"
-            );
-            let path = entry.path().join("state.json");
-            let expired = if path.is_file() {
-                let state: State = serde_json::from_slice(&fs::read(path)?)?;
-                let ttl = if matches!(state.branch.as_str(), "main" | "master") {
-                    options.repo_ttl
-                } else {
-                    options.branch_ttl
-                };
-                now().saturating_sub(state.last_use) >= ttl.as_millis() as u64
-            } else {
-                true
-            };
-            if expired {
-                remove_branch(&entry.path())?;
-            }
-        }
         Ok(Arc::new(Self {
             cache,
             options,
@@ -290,7 +428,11 @@ impl Manager {
         }))
     }
 
-    async fn default_branch(self: &Arc<Self>, repository: &Repository) -> Result<String> {
+    async fn default_branch(
+        self: &Arc<Self>,
+        repository: &Repository,
+        wait: bool,
+    ) -> Result<Option<String>> {
         let key = repository.identity.storage_key();
         let mut defaults = self.defaults.lock().await;
         if !defaults.contains_key(&key) {
@@ -315,7 +457,7 @@ impl Manager {
                     .unwrap_or(Duration::from_secs(5 * 60))
                     .as_millis() as u64
         {
-            return Ok(saved.branch.clone());
+            return Ok(Some(saved.branch.clone()));
         }
         let mut running = {
             let mut operations = self.default_running.lock().unwrap();
@@ -359,6 +501,10 @@ impl Manager {
                             tokio::task::spawn_blocking(move || job::execute(&request, &cache))
                                 .await??;
                         let saved = DefaultBranch {
+                            previous: manager.previous_default(
+                                &repository.identity,
+                                prepared.branch.as_deref(),
+                            )?,
                             repository: repository.identity,
                             branch: prepared.branch.context("Default branch is missing")?,
                             refreshed: now(),
@@ -375,11 +521,14 @@ impl Manager {
             operations[&key].1.clone()
         };
         if let Some(cached) = cached {
-            return Ok(cached.branch);
+            return Ok(Some(cached.branch));
+        }
+        if !wait {
+            return Ok(None);
         }
         loop {
             if let Some(result) = running.borrow().clone() {
-                return result.map(|r| r.branch).map_err(anyhow::Error::msg);
+                return result.map(|r| Some(r.branch)).map_err(anyhow::Error::msg);
             }
             running.changed().await?;
         }
@@ -390,9 +539,7 @@ impl Manager {
         let branches: Vec<_> = self.branches.lock().unwrap().values().cloned().collect();
         let mut expired = Vec::new();
         for branch in branches {
-            if now().saturating_sub(branch.last_use.load(Ordering::Relaxed))
-                >= branch.ttl(&self.options).as_millis() as u64
-            {
+            if self.branch_expired(&branch)? {
                 expired.push(branch);
                 continue;
             }
@@ -418,45 +565,9 @@ impl Manager {
             .lock()
             .unwrap()
             .values()
-            .filter(|branch| {
-                now().saturating_sub(branch.last_use.load(Ordering::Relaxed))
-                    >= branch.ttl(&self.options).as_millis() as u64
-            })
+            .filter(|branch| self.branch_expired(branch).unwrap_or(false))
             .cloned()
             .collect()
-    }
-
-    /// Retire persisted selectors that have not been opened in this process.
-    /// The registry lock excludes resolve() creating a handle during removal.
-    pub fn expire_unloaded(&self, mut retire: impl FnMut(&Path) -> Result<()>) -> Result<()> {
-        let branches = self.branches.lock().unwrap();
-        for entry in fs::read_dir(self.cache.join("repositories"))? {
-            let entry = entry?;
-            if branches.values().any(|branch| branch.root == entry.path()) {
-                continue;
-            }
-            ensure!(
-                entry.file_type()?.is_dir(),
-                "Invalid selector cache directory"
-            );
-            let path = entry.path().join("state.json");
-            let bytes = match fs::read(path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let state: State = serde_json::from_slice(&bytes)?;
-            let ttl = if matches!(state.branch.as_str(), "main" | "master") {
-                self.options.repo_ttl
-            } else {
-                self.options.branch_ttl
-            };
-            if now().saturating_sub(state.last_use) >= ttl.as_millis() as u64 {
-                retire(&entry.path())?;
-                remove_branch(&entry.path())?;
-            }
-        }
-        Ok(())
     }
 
     pub async fn expire(
@@ -466,8 +577,7 @@ impl Manager {
     ) -> Result<()> {
         let mut branches = self.branches.lock().unwrap();
         if Arc::strong_count(branch) > 2
-            || now().saturating_sub(branch.last_use.load(Ordering::Relaxed))
-                < branch.ttl(&self.options).as_millis() as u64
+            || !self.branch_expired(branch)?
             || branch
                 .running
                 .lock()
@@ -489,9 +599,12 @@ impl Manager {
             tokio::task::spawn_blocking(move || super::transport::verify_public(&repository))
                 .await??;
         }
+        let default = self
+            .default_branch(&repository, repository.selector.is_none())
+            .await?;
         let target = match &repository.selector {
             Some(name) => Target::selector(name)?,
-            None => Target::Branch(self.default_branch(&repository).await?),
+            None => Target::Branch(default.context("Default branch is missing")?),
         };
         let name = match &target {
             Target::Branch(name) | Target::Named(name) | Target::Commit(name) => name.clone(),
@@ -508,7 +621,6 @@ impl Manager {
         let branch = {
             let mut branches = self.branches.lock().unwrap();
             if let Some(branch) = branches.get(&key) {
-                branch.last_use.store(now(), Ordering::Relaxed);
                 branch.clone()
             } else {
                 let root = self.cache.join("repositories").join(&key);
@@ -533,15 +645,6 @@ impl Manager {
                     if value.schema < 3 {
                         value.repair = true;
                     }
-                    let ttl = if matches!(name.as_str(), "main" | "master") {
-                        self.options.repo_ttl
-                    } else {
-                        self.options.branch_ttl
-                    };
-                    if now().saturating_sub(value.last_use) >= ttl.as_millis() as u64 {
-                        remove_branch(&root)?;
-                        state = None;
-                    }
                 }
                 fs::create_dir_all(&root)?;
                 let branch = Arc::new(Branch {
@@ -549,7 +652,9 @@ impl Manager {
                     repository: repository.clone(),
                     name,
                     target,
-                    last_use: AtomicU64::new(now()),
+                    last_use: AtomicU64::new(
+                        state.as_ref().map_or_else(now, |state| state.last_use),
+                    ),
                     generation: AtomicU64::new(0),
                     state: Arc::new(AsyncMutex::new(state)),
                     running: Mutex::new(None),
@@ -560,7 +665,6 @@ impl Manager {
                 branch
             }
         };
-        branch.last_use.store(now(), Ordering::Relaxed);
         let state = branch.state.lock().await;
         let usable = state.as_ref().is_some_and(|s| {
             !s.repair

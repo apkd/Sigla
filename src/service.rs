@@ -13,6 +13,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
+#[path = "service_cache.rs"]
+mod disk;
 
 struct WorkspaceSlot {
     state: Arc<tokio::sync::Mutex<Option<Workspace>>>,
@@ -37,6 +39,10 @@ pub struct App {
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
     stateless_summaries: crate::summary::Stateless,
+    activity: Arc<tokio::sync::RwLock<()>>,
+    blobs: Arc<crate::cache::blobs::Store>,
+    cache_limits: crate::cache::policy::Limits,
+    owners: Mutex<crate::cache::owners::Catalog>,
     #[cfg(test)]
     preparation_started: tokio::sync::Notify,
 }
@@ -100,6 +106,7 @@ impl App {
             "Cache root must be a directory owned by the service account"
         );
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))?;
+        let cache = cache.canonicalize()?;
         let ownership = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -110,9 +117,14 @@ impl App {
         ownership
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
+        crate::cache::compaction::recover(&cache)?;
         crate::cache_migration::migrate(&cache)?;
         crate::memory::start_reclaimer()?;
         let app = Self {
+            activity: Arc::new(tokio::sync::RwLock::new(())),
+            blobs: crate::cache::blobs::Store::open(&cache)?,
+            cache_limits: Default::default(),
+            owners: Mutex::new(crate::cache::owners::Catalog::open(&cache)?),
             _ownership: ownership,
             policy,
             cache,
@@ -128,7 +140,12 @@ impl App {
             preparation_started: tokio::sync::Notify::new(),
         };
         app.maintain_analysis(true)?;
+        app.compact_analysis()?;
         Ok(app)
+    }
+    pub fn with_cache_limits(mut self, limits: crate::cache::policy::Limits) -> Self {
+        self.cache_limits = limits;
+        self
     }
 
     pub fn remote(
@@ -138,7 +155,7 @@ impl App {
         options: crate::config::RemoteOptions,
     ) -> Result<Self> {
         let mut app = Self::new(policy, cache.clone(), workers)?;
-        let manager = crate::repository::manager::Manager::new(cache, options)?;
+        let manager = crate::repository::manager::Manager::new(app.cache.clone(), options)?;
         app.remote = Some(manager);
         app.maintain_analysis(true)?;
         Ok(app)
@@ -159,6 +176,9 @@ impl App {
 
     pub async fn shutdown(&self) {
         self.assets.shutdown();
+        if let Err(error) = self.owners.lock().unwrap().flush() {
+            tracing::warn!(%error, "Cannot persist cache usage during shutdown");
+        }
         if let Some(upstream) = &self.upstream {
             upstream.shutdown().await;
         }
@@ -202,13 +222,8 @@ impl App {
                         continue;
                     }
                     last_collection = Instant::now();
-                    let maintenance = app.clone();
-                    if let Err(error) =
-                        tokio::task::spawn_blocking(move || maintenance.maintain_analysis(false))
-                            .await
-                            .unwrap_or_else(|error| Err(error.into()))
-                    {
-                        tracing::error!(%error, "Cannot maintain analysis storage");
+                    if let Err(error) = app.maintain_disk().await {
+                        tracing::error!(%error, "Cannot maintain disk cache");
                     }
                     {
                         let cache = app.cache.clone();
@@ -246,6 +261,7 @@ impl App {
     }
 
     async fn expire_idle(&self) -> Result<()> {
+        let _activity = self.activity.read().await;
         let Some(remote) = &self.remote else {
             return Ok(());
         };
@@ -288,9 +304,6 @@ impl App {
 
     fn maintain_analysis(&self, startup: bool) -> Result<()> {
         use crate::store::shared::Phase;
-        if let Some(remote) = &self.remote {
-            remote.expire_unloaded(|owner| self.retire_owner(owner))?;
-        }
         let analysis = self.cache.join("analysis");
         if !analysis.try_exists()? {
             return Ok(());
@@ -410,6 +423,7 @@ impl App {
     }
 
     async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
+        let activity = Arc::new(self.activity.clone().read_owned().await);
         let query = match &request {
             Request::Search(query) => Some(
                 Query::parse(query)
@@ -418,7 +432,6 @@ impl App {
             _ => None,
         };
         self.ready().await?;
-        self.expire_idle().await?;
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
         let branch = match repository {
             Some(repository) => Some(
@@ -474,6 +487,8 @@ impl App {
             }
             (entry, policy, self.cache.clone())
         };
+        let usage_entry = entry.clone();
+        let usage_branch = branch.clone();
         let (workspace, retired) = {
             let mut registry = self.workspaces.lock().unwrap();
             let mut retired = Vec::new();
@@ -503,7 +518,9 @@ impl App {
         // The service owns preparation. Dropping a caller only drops its wait.
         let preparing_app = self.clone();
         let preparing_branch = branch.clone();
+        let preparing_activity = activity.clone();
         let (mut state, mut branch_state) = tokio::spawn(async move {
+            let _activity = preparing_activity;
             #[cfg(test)]
             preparing_app.preparation_started.notify_one();
             // Request lock order: workspace -> branch state. RequiredInputs
@@ -714,6 +731,7 @@ impl App {
                 expected: asset_generation,
                 revision,
                 refresh: asset_request && branch.is_none(),
+                activity: activity.clone(),
             })
         } else {
             crate::unity::assets::jobs::empty()
@@ -728,7 +746,9 @@ impl App {
             let root = repository_root.unwrap_or_else(|| manifest.root.clone());
             let summary_manifest = manifest.clone();
             let code_gate = asset_workspace.lock_owned().await;
+            let rendering_activity = activity.clone();
             let text = tokio::task::spawn_blocking(move || -> Result<String> {
+                let _activity = rendering_activity;
                 ensure!(
                     code_gate
                         .as_ref()
@@ -770,13 +790,16 @@ impl App {
                 )
                 .attach(&mut result);
             }
+            self.record_usage(&usage_entry, usage_branch.as_deref(), &summary_manifest);
             return Ok(result);
         }
         let permit = self.workers.clone().acquire_owned().await?;
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();
+        let rendering_activity = activity.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let _activity = rendering_activity;
             let _permit = permit;
             app.trim_idle();
             let result = (|| {
@@ -808,6 +831,7 @@ impl App {
                     )
                     .attach(&mut result);
                 }
+                app.record_usage(&usage_entry, usage_branch.as_deref(), &manifest);
                 Ok(result)
             })();
             app.trim_idle();
@@ -816,6 +840,22 @@ impl App {
         .await?;
         guard.disarm();
         result
+    }
+    fn record_usage(
+        &self,
+        entry: &Path,
+        branch: Option<&crate::repository::manager::Branch>,
+        manifest: &crate::workspace::Manifest,
+    ) {
+        if let Some(branch) = branch {
+            branch.record_use();
+        }
+        self.owners.lock().unwrap().observe(
+            entry,
+            branch.map(|branch| branch.root.as_path()),
+            manifest,
+            Some(crate::cache::now()),
+        );
     }
 }
 
@@ -1131,7 +1171,7 @@ mod tests {
                 cache.path().into(),
                 1,
                 crate::config::RemoteOptions {
-                    rules: vec![Rule::parse_private("https://github.com/fixture/repo").unwrap()],
+                    rules: vec![Rule::parse_private("https://github.com/fixture/*").unwrap()],
                     refresh_interval: Some(Duration::from_secs(3600)),
                     repo_ttl: Duration::from_secs(86400),
                     branch_ttl: Duration::from_secs(86400),

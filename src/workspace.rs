@@ -14,33 +14,50 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     size: u64,
-    modified: u128,
-    changed: i64,
-    inode: u64,
+    revision: Revision,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Revision {
+    File {
+        modified: u128,
+        changed: i64,
+        inode: u64,
+    },
+    Immutable(crate::cache::blobs::Id),
 }
 impl Stamp {
     pub fn read(path: &Path) -> Result<Self> {
         let m = std::fs::metadata(path)?;
+        if let Some(id) = crate::cache::blobs::identity(path, &m)? {
+            return Ok(Self {
+                size: m.len(),
+                revision: Revision::Immutable(id),
+            });
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             Ok(Self {
                 size: m.len(),
-                modified: m
-                    .modified()?
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_nanos(),
-                changed: m.ctime_nsec() ^ m.ctime(),
-                inode: m.ino(),
+                revision: Revision::File {
+                    modified: m
+                        .modified()?
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_nanos(),
+                    changed: m.ctime_nsec() ^ m.ctime(),
+                    inode: m.ino(),
+                },
             })
         }
         #[cfg(not(unix))]
         {
             Ok(Self {
                 size: m.len(),
-                modified: 0,
-                changed: 0,
-                inode: 0,
+                revision: Revision::File {
+                    modified: 0,
+                    changed: 0,
+                    inode: 0,
+                },
             })
         }
     }
@@ -110,6 +127,7 @@ impl Manifest {
 }
 
 pub struct Workspace {
+    _files: Arc<crate::cache::blobs::Store>,
     pub entry: PathBuf,
     pub store: Arc<Store>,
     pub manifest: Arc<Manifest>,
@@ -151,6 +169,9 @@ impl Workspace {
         let store = Store::open_workspace(analysis, key, &entry, owner)?;
         let manifest = store.get_manifest()?.unwrap_or_default();
         Ok(Self {
+            _files: crate::cache::blobs::Store::open(
+                analysis.parent().context("Analysis has no cache root")?,
+            )?,
             entry,
             store,
             manifest: Arc::new(manifest),

@@ -8,6 +8,103 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 #[test]
+fn package_views_share_storage_and_isolate_project_writes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let cache = tempfile::tempdir().unwrap();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    for owner in ["a", "b"] {
+        let packages = cache.path().join(owner).join("packages");
+        write(&packages, "fixture/1.0/run", "#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(
+            packages.join("fixture/1.0/run"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        write(&packages, "fixture/1.0/removed.txt", "remove this file");
+        write(
+            &packages,
+            "fixture/1.0/replaced/old.txt",
+            "remove this directory",
+        );
+    }
+    let run = |source: &Path, owner: &str, value: &str| {
+        write(
+            source,
+            "NuGet.Config",
+            "<configuration><packageSources><clear /></packageSources></configuration>",
+        );
+        write(source, "App.cs", "public class App {}");
+        write(
+            source,
+            "App.csproj",
+            &format!(
+                r#"<Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+          <Target Name="PackageFixture" BeforeTargets="PrepareForBuild">
+            <Delete Files="$(NUGET_PACKAGES)/fixture/1.0/removed.txt" Condition="'{value}' == 'modified'" />
+            <RemoveDir Directories="$(NUGET_PACKAGES)/fixture/1.0/replaced" Condition="'{value}' == 'modified'" />
+            <MakeDir Directories="$(NUGET_PACKAGES)/fixture/1.0/replaced" Condition="'{value}' == 'modified'" />
+            <WriteLinesToFile File="$(NUGET_PACKAGES)/fixture/1.0/replaced/new.txt" Lines="new" Condition="'{value}' == 'modified'" />
+            <MakeDir Directories="$(NUGET_PACKAGES)/fixture/1.0" />
+            <WriteLinesToFile File="$(NUGET_PACKAGES)/fixture/1.0/input.txt" Lines="{value}" Overwrite="true" />
+          </Target>
+        </Project>"#
+            ),
+        );
+        let writable = cache.path().join(owner);
+        let mut policy = Policy::new(vec![source.into()]).unwrap();
+        policy.remote = Some(sigla::discovery::RemoteContext {
+            workspace: source.into(),
+            writable: writable.clone(),
+            shared: cache.path().into(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: Default::default(),
+        });
+        let discovery = discover_cached(
+            &source.join("App.csproj"),
+            &policy,
+            &writable.join("analysis"),
+        )
+        .unwrap();
+        assert!(
+            discovery.sources.iter().any(|s| s.path.ends_with("App.cs")),
+            "{:?}",
+            discovery.diagnostics
+        );
+        writable.join("packages/fixture/1.0/input.txt")
+    };
+    let first = run(a.path(), "a", "original");
+    let second = run(b.path(), "b", "original");
+    let before = std::fs::read(&second).unwrap();
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().ino(),
+        std::fs::metadata(&second).unwrap().ino()
+    );
+    run(a.path(), "a", "modified");
+    assert_eq!(std::fs::read(&second).unwrap(), before);
+    assert_ne!(std::fs::read(&first).unwrap(), before);
+    assert_ne!(
+        std::fs::metadata(&first).unwrap().ino(),
+        std::fs::metadata(&second).unwrap().ino()
+    );
+    let changed = first.parent().unwrap();
+    let untouched = second.parent().unwrap();
+    assert!(!changed.join("removed.txt").exists());
+    assert!(!changed.join("replaced/old.txt").exists());
+    assert!(changed.join("replaced/new.txt").is_file());
+    assert!(untouched.join("removed.txt").is_file());
+    assert!(untouched.join("replaced/old.txt").is_file());
+    let executable = std::fs::metadata(changed.join("run")).unwrap();
+    assert!(executable.mode() & 0o111 != 0);
+    assert_eq!(
+        executable.ino(),
+        std::fs::metadata(untouched.join("run")).unwrap().ino()
+    );
+}
+
+#[test]
 fn restore_failure_keeps_project_context_and_readable_sources() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

@@ -54,6 +54,8 @@ struct State {
     replaced: u64,
     used: u64,
     retry_after: u64,
+    #[serde(default)]
+    retained: Option<String>,
 }
 struct Pool {
     root: PathBuf,
@@ -150,6 +152,7 @@ impl Pool {
                     replaced: time,
                     used: time,
                     retry_after: 0,
+                    retained: None,
                 };
                 self.persist(&state)?;
                 Ok(state)
@@ -278,16 +281,22 @@ impl Pool {
         }
         Ok(())
     }
-    fn maybe_rebuild(&self, cache: &Path, state: &mut State) -> Result<()> {
+    fn maybe_rebuild(&self, cache: &Path, state: &mut State, force: bool) -> Result<()> {
         let time = now();
-        if time.saturating_sub(state.replaced) < REBUILD_MS
+        if !force && time.saturating_sub(state.replaced) < REBUILD_MS
             || time < state.retry_after
             || !self.root.join("current").try_exists()?
         {
             return Ok(());
         }
+        let roots = self.roots(cache)?;
+        let retained = blake3::hash(&serde_json::to_vec(&roots)?)
+            .to_hex()
+            .to_string();
+        if force && state.retained.as_ref() == Some(&retained) {
+            return Ok(());
+        }
         let result = (|| -> Result<()> {
-            let roots = self.roots(cache)?;
             let stage = tempfile::Builder::new()
                 .prefix("rebuild-")
                 .tempdir_in(&self.root)?;
@@ -299,6 +308,7 @@ impl Pool {
             Ok(()) => {
                 state.replaced = time;
                 state.retry_after = 0;
+                state.retained = Some(retained);
             }
             Err(error) => {
                 state.retry_after = time.saturating_add(RETRY_MS);
@@ -331,12 +341,14 @@ pub fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
     let mut state = pool.state()?;
-    pool.maybe_rebuild(cache, &mut state)?;
+    pool.maybe_rebuild(cache, &mut state, false)?;
     let mut request = request.clone();
     request.store = pool.root.join("current");
     // execute() is synchronous and does not return until its bounded child is stopped.
     let prepared = super::job::execute(&request, cache)?;
+    crate::cache::blobs::Store::open(cache)?.import_tree(&request.staging)?;
     state.used = now();
+    state.retained = None;
     pool.persist(&state)?;
     let pin = pool.pin(&prepared)?; // Still under operation lock: no unprotected handoff.
     Ok((prepared, pin))
@@ -345,6 +357,15 @@ pub fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
 /// Invoke separately from selector expiration, on a blocking worker, without any
 /// branch/workspace state lock. Retained state files and pending pins protect roots.
 pub fn maintain(cache: &Path, identity: &Identity, idle_lifetime: Duration) -> Result<()> {
+    maintain_pool(cache, identity, idle_lifetime, false)
+}
+
+fn maintain_pool(
+    cache: &Path,
+    identity: &Identity,
+    idle_lifetime: Duration,
+    pressure: bool,
+) -> Result<()> {
     if !cache
         .join("git")
         .join(identity.storage_key())
@@ -353,21 +374,23 @@ pub fn maintain(cache: &Path, identity: &Identity, idle_lifetime: Duration) -> R
         return Ok(());
     }
     let pool = Pool::open(cache, identity)?;
-    let _operation = pool
-        .operation
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Git pool operation interrupted"))?;
+    let _operation = match pool.operation.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        Err(error) => return Err(anyhow::anyhow!("Git pool operation interrupted: {error}")),
+    };
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
     let mut state = pool.state()?;
     if pool.roots(cache)?.is_empty()
-        && now().saturating_sub(state.used)
-            >= idle_lifetime.as_millis().try_into().unwrap_or(u64::MAX)
+        && (pressure
+            || now().saturating_sub(state.used)
+                >= idle_lifetime.as_millis().try_into().unwrap_or(u64::MAX))
     {
         fs::remove_dir_all(&pool.root)?;
         return Ok(());
     }
-    pool.maybe_rebuild(cache, &mut state)
+    pool.maybe_rebuild(cache, &mut state, pressure)
 }
 
 #[cfg(test)]
@@ -376,6 +399,14 @@ mod tests;
 
 /// Include orphaned pools, not only repositories still present in the selector registry.
 pub fn maintain_all(cache: &Path, idle_lifetime: Duration) -> Result<()> {
+    maintain_pools(cache, idle_lifetime, false)
+}
+
+pub fn reclaim(cache: &Path) -> Result<()> {
+    maintain_pools(cache, Duration::ZERO, true)
+}
+
+fn maintain_pools(cache: &Path, idle_lifetime: Duration, pressure: bool) -> Result<()> {
     let entries = match fs::read_dir(cache.join("git")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -421,7 +452,7 @@ pub fn maintain_all(cache: &Path, idle_lifetime: Duration) -> Result<()> {
             entry.file_name().to_str() == Some(state.repository.storage_key().as_str()),
             "Git pool directory identity mismatch"
         );
-        maintain(cache, &state.repository, idle_lifetime)?;
+        maintain_pool(cache, &state.repository, idle_lifetime, pressure)?;
     }
     Ok(())
 }

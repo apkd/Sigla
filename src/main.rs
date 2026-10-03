@@ -69,20 +69,26 @@ async fn main() -> Result<()> {
         .await?;
     }
     let remote = cli.options.validate()?;
+    let cache_limits = cli.options.cache_limits();
     let mut policy = Policy::new(cli.options.local_roots())?;
     policy.unity_platform = cli.options.unity_platform;
     policy.unity_editors = cli.options.unity_editors;
-    let app = Arc::new(match remote {
-        Some(remote) => App::remote(policy, cli.options.cache_dir, cli.workers as usize, remote)?,
-        None if cli.options.mode == sigla::config::Mode::Hybrid => App::hybrid(
-            policy,
-            cli.options.cache_dir,
-            cli.workers as usize,
-            cli.options.upstream.as_deref().unwrap(),
-            cli.options.upstream_token_file.as_deref(),
-        )?,
-        None => App::new(policy, cli.options.cache_dir, cli.workers as usize)?,
-    });
+    let app = Arc::new(
+        match remote {
+            Some(remote) => {
+                App::remote(policy, cli.options.cache_dir, cli.workers as usize, remote)?
+            }
+            None if cli.options.mode == sigla::config::Mode::Hybrid => App::hybrid(
+                policy,
+                cli.options.cache_dir,
+                cli.workers as usize,
+                cli.options.upstream.as_deref().unwrap(),
+                cli.options.upstream_token_file.as_deref(),
+            )?,
+            None => App::new(policy, cli.options.cache_dir, cli.workers as usize)?,
+        }
+        .with_cache_limits(cache_limits),
+    );
     match cli.command {
         Command::GitJob { .. } | Command::GitRebuild { .. } => unreachable!(),
         Command::Query { project, query } => {

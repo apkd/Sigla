@@ -96,6 +96,11 @@ fn unpack(
         stage.path().to_owned()
     };
     check(&package, name, version)?;
+    let shared = cache
+        .parent()
+        .and_then(Path::parent)
+        .context("Package cache has no shared root")?;
+    crate::cache::blobs::Store::open(shared)?.import_tree(&package)?;
     let contents = cache.join("contents");
     if contents.exists() {
         fs::remove_dir_all(&contents)?;

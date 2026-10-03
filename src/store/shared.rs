@@ -344,6 +344,14 @@ impl Database {
     /// Bounded scan; the cursor persists across closing/reopening the environment.
     /// Old readers remain valid through LMDB's own MVCC, including after collection.
     pub fn collect(&self, now: u64, limit: usize) -> Result<Collected> {
+        self.collect_with_retention(now, limit, RETENTION_MS)
+    }
+    pub fn collect_with_retention(
+        &self,
+        now: u64,
+        limit: usize,
+        retention: u64,
+    ) -> Result<Collected> {
         ensure!(limit > 0, "Collection batch must be nonzero");
         let mut tx = self.env.write_txn()?;
         let cursor = self.control.get(&tx, b"gc-cursor")?.map(<[u8]>::to_vec);
@@ -365,7 +373,7 @@ impl Database {
             if live.bindings != 0
                 || !live
                     .unused_since
-                    .is_some_and(|at| now >= at && now - at >= RETENTION_MS)
+                    .is_some_and(|at| now >= at && now - at >= retention)
             {
                 continue;
             }
@@ -394,11 +402,30 @@ impl Database {
     pub fn object_count(&self, tx: &RoTxn<'_>) -> Result<u64> {
         Ok(self.objects.len(tx)?)
     }
+    pub fn collect_unused(&self, now: u64, pressure: bool) -> Result<()> {
+        let mut tx = self.env.write_txn()?;
+        self.control.delete(&mut tx, b"gc-cursor")?;
+        tx.commit()?;
+        let retention = if pressure { 0 } else { RETENTION_MS };
+        while self.collect_with_retention(now, 1024, retention)?.visited == 1024 {}
+        Ok(())
+    }
     pub fn binding_count(&self, tx: &RoTxn<'_>, id: &ObjectId) -> Result<Option<u64>> {
         Ok(self.live(tx, id)?.map(|l| l.bindings))
     }
     pub fn disk_bytes(&self) -> Result<u64> {
         Ok(self.env.real_disk_size()?)
+    }
+    pub fn disk_stats(&self) -> Result<crate::cache::compaction::Stats> {
+        Ok(crate::cache::compaction::Stats {
+            allocated: self.env.real_disk_size()?,
+            live: self.env.non_free_pages_size()?,
+        })
+    }
+    pub fn compact(self: Arc<Self>, cache: &Path) -> Result<u64> {
+        let database =
+            Arc::try_unwrap(self).map_err(|_| anyhow::anyhow!("Analysis is still in use"))?;
+        crate::cache::compaction::run(database.env, cache)
     }
 }
 

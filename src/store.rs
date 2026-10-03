@@ -102,16 +102,19 @@ impl Store {
         self.scope.clean()
     }
     pub fn get_manifest<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
+        const PREFIX: &[u8] = b"sigla-manifest-2\0";
         self.scope
             .manifest()?
-            .map(|b| Ok(postcard::from_bytes(&b)?))
+            .and_then(|bytes| bytes.strip_prefix(PREFIX).map(<[u8]>::to_vec))
+            .map(|bytes| Ok(postcard::from_bytes(&bytes)?))
             .transpose()
     }
     /// Reconcile against persisted bindings, not only the previous in-memory manifest.
     pub fn save_manifest(&self, manifest: &crate::workspace::Manifest) -> Result<()> {
         let keep = manifest.files.keys().cloned().collect();
-        self.scope
-            .finish_refresh(&postcard::to_allocvec(manifest)?, &keep, now())
+        let mut bytes = b"sigla-manifest-2\0".to_vec();
+        bytes.extend(postcard::to_allocvec(manifest)?);
+        self.scope.finish_refresh(&bytes, &keep, now())
     }
     pub fn remove(&self, file: &str) -> Result<()> {
         self.scope.detach(file, now())

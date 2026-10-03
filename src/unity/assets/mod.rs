@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const LOCAL_LIMIT: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

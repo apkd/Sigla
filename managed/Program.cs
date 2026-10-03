@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 
 // Register before the CLR loads any method using Microsoft.Build types.
 if (args[0] == "--resolve-sdk") return Sdk.Resolve(args[1], args[2], args[3], args[4]);
+if (args[0] == "--seal-packages") return PackageSnapshot.Run(args[1], args[2], args[3]);
 // Request structured import events, including conditional and missing imports.
 Environment.SetEnvironmentVariable("MSBUILDLOGIMPORTS", "1");
 MSBuildLocator.RegisterMSBuildPath(args[0]);
