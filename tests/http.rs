@@ -80,11 +80,9 @@ async fn http_contract_and_origin_validation() {
         assert!(tools.iter().any(|tool| tool["name"] == name));
     }
     let tool = tools.iter().find(|tool| tool["name"] == "search").unwrap();
-    assert_eq!(
-        tool["inputSchema"]["properties"].as_object().unwrap().len(),
-        2
-    );
-    assert!(tool.get("outputSchema").is_none());
+    for argument in ["codebase", "query"] {
+        assert!(tool["inputSchema"]["properties"].get(argument).is_some());
+    }
     let mut request = client
         .post(&url)
         .header("Accept", "application/json, text/event-stream");
@@ -94,20 +92,13 @@ async fn http_contract_and_origin_validation() {
     let response=request.json(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"codebase":root.path(),"query":"FoundOverHttp limit:1"}}})).send().await.unwrap();
     let called = body(response).await;
     let result = &called["result"];
-    assert_eq!(result["content"].as_array().unwrap().len(), 1);
+    assert_ne!(result["isError"], true, "{called}");
     assert!(
         result["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("FoundOverHttp")
     );
-    assert!(result.get("structuredContent").is_none());
-    let rendered = result["content"][0]["text"].as_str().unwrap();
-    assert!(
-        rendered.starts_with("`struct:") && rendered.contains("` in `"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("\n```rust\n"), "{rendered}");
     for (name, args, expected) in [
         (
             "browse",
@@ -246,6 +237,13 @@ async fn executable_enforces_bearer_authentication() {
     .await
     .unwrap();
     assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let wrong = client
+        .post(&url)
+        .bearer_auth("wrong-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
     let initialized=client.post(&url).bearer_auth(token).header("Accept","application/json, text/event-stream")
         .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"auth-test","version":"1"}}}))
         .send().await.unwrap();

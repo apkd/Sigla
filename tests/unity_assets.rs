@@ -142,3 +142,123 @@ async fn script_instances_inheritance_views_and_refresh() {
     );
     app.shutdown().await;
 }
+
+#[tokio::test]
+async fn scriptable_objects_stay_in_their_project_and_follow_asset_moves_and_deletions() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for (project, name) in [("One", "Weapon"), ("Two", "Potion")] {
+        let directory = root.path().join(project);
+        write(
+            &directory,
+            "Game.csproj",
+            "<Project><ItemGroup><Compile Include=\"Assets/*.cs\" /></ItemGroup></Project>",
+        );
+        write(
+            &directory,
+            "ProjectSettings/ProjectVersion.txt",
+            "m_EditorVersion: 6000.0.1f1\n",
+        );
+        write(
+            &directory,
+            "Assets/Engine.cs",
+            "namespace UnityEngine { public class Object {} public class ScriptableObject : Object {} }",
+        );
+        write(
+            &directory,
+            &format!("Assets/{name}.cs"),
+            &format!("public class {name} : UnityEngine.ScriptableObject {{}}"),
+        );
+        // Reusing GUIDs is valid across separate Unity projects.
+        write(
+            &directory,
+            &format!("Assets/{name}.cs.meta"),
+            "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        );
+        write(
+            &directory,
+            "Assets/Data.asset",
+            &format!(
+                "--- !u!114 &1\nMonoBehaviour:\n  m_Name: {name}Data\n  m_Script: {{fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}}\n"
+            ),
+        );
+        write(
+            &directory,
+            "Assets/Data.asset.meta",
+            "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        );
+        write(
+            &directory,
+            "Assets/Holder.asset",
+            "--- !u!114 &2\nMonoBehaviour:\n  m_Name: Holder\n  target: {fileID: 1, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 2}\n",
+        );
+    }
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap(),
+    );
+    let codebase = root.path().to_str().unwrap();
+    let all = app
+        .search(codebase, "instance:UnityEngine.ScriptableObject")
+        .await
+        .unwrap();
+    for project in ["One", "Two"] {
+        assert!(
+            all.contains(&format!("{project}/Assets/Data.asset")),
+            "{all}"
+        );
+    }
+    let weapon = app.search(codebase, "instance:Weapon").await.unwrap();
+    assert!(weapon.contains("One/Assets/Data.asset"), "{weapon}");
+    assert!(!weapon.contains("Two/Assets"), "{weapon}");
+    let scoped = app
+        .search(
+            codebase,
+            "instance:UnityEngine.ScriptableObject unity-project:Two",
+        )
+        .await
+        .unwrap();
+    assert!(scoped.contains("Potion"), "{scoped}");
+    assert!(!scoped.contains("One/Assets"), "{scoped}");
+    let references = app
+        .search(codebase, "references:One/Assets/Data.asset")
+        .await
+        .unwrap();
+    assert!(
+        references.contains("One/Assets/Holder.asset"),
+        "{references}"
+    );
+    assert!(!references.contains("Two/Assets"), "{references}");
+
+    for suffix in ["", ".meta"] {
+        std::fs::rename(
+            root.path().join(format!("One/Assets/Data.asset{suffix}")),
+            root.path().join(format!("One/Assets/Moved.asset{suffix}")),
+        )
+        .unwrap();
+    }
+    let moved = app.search(codebase, "instance:Weapon").await.unwrap();
+    assert!(moved.contains("One/Assets/Moved.asset"), "{moved}");
+    assert!(!moved.contains("One/Assets/Data.asset"), "{moved}");
+    assert!(
+        app.search(codebase, "references:One/Assets/Moved.asset")
+            .await
+            .unwrap()
+            .contains("Holder.asset")
+    );
+    std::fs::remove_file(root.path().join("One/Assets/Moved.asset")).unwrap();
+    std::fs::remove_file(root.path().join("One/Assets/Moved.asset.meta")).unwrap();
+    let deleted = app.search(codebase, "instance:Weapon").await.unwrap();
+    assert!(!deleted.contains("unity@"), "{deleted}");
+    assert!(
+        app.search(codebase, "instance:Potion")
+            .await
+            .unwrap()
+            .contains("Two/Assets/Data.asset")
+    );
+    app.shutdown().await;
+}

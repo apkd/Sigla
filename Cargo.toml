@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 description = "Shared C# and Rust source navigation over MCP"
+autotests = false
 
 [dependencies]
 anyhow = "1"
@@ -62,3 +63,7 @@ strip = true
 [[test]]
 name = "remote"
 harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

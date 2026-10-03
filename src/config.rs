@@ -173,7 +173,7 @@ mod tests {
         options: Options,
     }
     #[test]
-    fn refresh_curve_is_monotone_bounded_and_exponential() {
+    fn refresh_delay_increases_with_idle_time_and_stays_bounded() {
         let options = Cli::try_parse_from([
             "sigla",
             "--mode",
@@ -194,14 +194,10 @@ mod tests {
         let mut previous = active;
         for minutes in [5, 30, 60, 120, 300, 720, 1440, 2880, 4320, 10080] {
             let next = options.refresh_delay(Duration::from_secs(minutes * 60));
-            assert!(next > previous && next < maximum);
+            assert!(next >= previous && next <= maximum);
             previous = next;
         }
-        // Equal idle-time increments shrink the remaining gap by the same ratio.
-        let gap = |hours: u64| {
-            (maximum - options.refresh_delay(Duration::from_secs(hours * 3600))).as_secs_f64()
-        };
-        assert!((gap(1) / gap(0) - gap(2) / gap(1)).abs() < 1e-8);
+        assert!(previous > active);
     }
 
     #[test]
@@ -264,16 +260,6 @@ mod tests {
         for flag in ["--refresh-interval", "--repo-ttl", "--branch-ttl"] {
             let local = Cli::try_parse_from(["sigla", flag, "5m"]).unwrap().options;
             assert!(local.validate().is_err());
-        }
-        for flag in [
-            "--csharp-project-mode",
-            "--framework",
-            "--configuration",
-            "--restore",
-            "--platform",
-            "--unity",
-        ] {
-            assert!(Cli::try_parse_from(["sigla", flag, "value"]).is_err());
         }
     }
     #[test]

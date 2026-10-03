@@ -1,0 +1,11 @@
+[profile.ci]
+fail-fast = false
+junit.path = "junit.xml"
+
+[profile.metadata]
+fail-fast = false
+junit.path = "junit.xml"
+
+[profile.oracle]
+fail-fast = false
+junit.path = "junit.xml"

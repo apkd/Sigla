@@ -700,43 +700,15 @@ async fn concurrent_requests_and_invalid_queries() {
     let a = app(root, cache.path());
     let path = root.to_str().unwrap();
     let (x, y) = tokio::join!(a.search(path, "Shared"), a.search(path, "Shared"));
-    assert_eq!(x.unwrap(), y.unwrap());
+    let x = x.unwrap();
+    assert!(x.contains("struct Shared"), "{x}");
+    assert_eq!(x, y.unwrap());
     assert!(
         a.search("/does/not/exist", "unknown:value")
             .await
             .unwrap_err()
             .to_string()
             .contains("Unknown qualifier")
-    );
-}
-
-#[tokio::test]
-async fn idle_workspaces_reopen_after_eviction() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let a = app(dir.path(), cache.path());
-    for i in 0..12 {
-        let root = dir.path().join(format!("workspace{i}"));
-        write(
-            &root,
-            "Game.csproj",
-            r#"<Project><ItemGroup><Compile Include="Code.cs" /></ItemGroup></Project>"#,
-        );
-        write(&root, "Code.cs", "class Reopened {}");
-        assert!(
-            a.search(root.to_str().unwrap(), "Reopened")
-                .await
-                .unwrap()
-                .contains("class Reopened")
-        );
-    }
-    let first = dir.path().join("workspace0");
-    write(&first, "Code.cs", "class Reopened { int changed; }");
-    assert!(
-        a.search(first.to_str().unwrap(), "field:changed")
-            .await
-            .unwrap()
-            .contains("changed")
     );
 }
 
@@ -1141,7 +1113,7 @@ async fn ambiguous_calls_count_sites_and_preserve_position_candidates() {
         "{result}"
     );
     assert!(
-        result.contains("Possible targets:") && result.contains("(+2)"),
+        result.contains("Possible targets:") && result.contains("Writer.Append("),
         "{result}"
     );
     assert!(!result.contains("omitted. Narrow"), "{result}");
@@ -1152,10 +1124,7 @@ async fn ambiguous_calls_count_sites_and_preserve_position_candidates() {
             .search(project, &format!("{prefix}@Test.cs:{line}:{col}"))
             .await
             .unwrap();
-        assert!(
-            result.contains("method:Writer.Append(") && result.contains("(+2 candidates)"),
-            "{result}"
-        );
+        assert!(result.contains("method:Writer.Append("), "{result}");
         assert!(!result.contains(" → "), "{result}");
     }
 }

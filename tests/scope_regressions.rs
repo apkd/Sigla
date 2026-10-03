@@ -339,24 +339,3 @@ class Usage { void Test(Target known, dynamic unknown) {
         resolved_only.query("calls:Target.Run path:Test.cs").await
     );
 }
-
-#[test]
-fn the_new_analysis_epoch_changes_csharp_source_identity() {
-    #[derive(serde::Serialize)]
-    enum LegacyProfile {
-        CSharp(Vec<String>),
-    }
-    let legacy = *blake3::hash(
-        &postcard::to_allocvec(&(
-            "sigla-source-analysis",
-            1u32,
-            Language::CSharp,
-            LegacyProfile::CSharp(vec![]),
-            blake3::hash(SOURCE.as_bytes()).as_bytes(),
-        ))
-        .unwrap(),
-    )
-    .as_bytes();
-    let current = sigla::store::source_id(SOURCE, Language::CSharp, &[], "").unwrap();
-    assert_ne!(current, legacy);
-}

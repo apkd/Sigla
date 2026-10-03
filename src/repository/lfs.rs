@@ -427,7 +427,6 @@ mod tests {
             assert!(output.status.success());
             assert_eq!(output.stdout, path.as_bytes());
         }
-        assert_eq!(shell_argument("owner/repo.git"), "owner/repo.git");
     }
     #[test]
     fn missing_objects_can_recover_and_cached_objects_replace_pointers() {

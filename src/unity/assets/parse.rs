@@ -280,6 +280,19 @@ pub fn parse(source: &str) -> Result<Parsed> {
 mod tests {
     use super::*;
     #[test]
+    fn malformed_and_ambiguous_yaml_fails_without_poisoning_the_next_parse() {
+        for body in [
+            "  values: [1, 2\n",
+            "  m_Name: First\n  m_Name: Second\n",
+            "  value: &loop {child: *loop}\n",
+        ] {
+            let source = format!("--- !u!114 &1\nMonoBehaviour:\n{body}");
+            assert!(parse(&source).is_err(), "{source}");
+        }
+        let valid = parse("--- !u!114 &1\nMonoBehaviour:\n  target: {fileID: 2}\n").unwrap();
+        assert_eq!(valid.objects[0].references["target"].target.id, 2);
+    }
+    #[test]
     fn ordinary_arrays_are_not_retained_and_reference_positions_are_preserved() {
         let source = "--- !u!114 &1\nMonoBehaviour:\n  values: [1, 2, {target: {fileID: 7}}, 4]\n  userData: {fileID: 9, other: text}\n";
         let parsed = parse(source).unwrap();
@@ -301,7 +314,7 @@ mod tests {
     fn nested_references_and_trimmed_unicode_preserve_source() {
         let source = format!(
             "%YAML 1.1\n--- !u!114 &9223372036854775806\nMonoBehaviour:\n  m_Name: Café\n  nested:\n    data: '{}'\n    refs:\n    - item: {{fileID: 12, guid: abcd, type: 2}}\n",
-            "é".repeat(3000)
+            "é".repeat(yaml::VALUE_LIMIT / 2 + 1)
         );
         let parsed = parse(&source).unwrap();
         assert_eq!(parsed.objects.len(), 1);

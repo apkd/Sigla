@@ -69,17 +69,30 @@ fn legacy_analysis_is_rebuilt_without_changing_source_stamps() {
     let tx = seed.store.read().unwrap();
     for (key, entry) in &manifest.files {
         let mut data = seed.store.load(&tx, key).unwrap().unwrap();
-        if key == file {
+        let object = if key == file {
+            // Seed the actual old shared-object identity, not just an old namespace.
+            // A new workspace must not reuse obsolete facts for unchanged source.
+            #[derive(serde::Serialize)]
+            enum LegacyProfile {
+                CSharp(Vec<String>),
+            }
             data.facts = Facts::default();
-        }
-        legacy
-            .install(
-                key,
-                &entry.stamp,
-                *blake3::hash(key.as_bytes()).as_bytes(),
-                || Ok(()),
-                || Ok(data),
+            *blake3::hash(
+                &postcard::to_allocvec(&(
+                    "sigla-source-analysis",
+                    1u32,
+                    sigla::model::Language::CSharp,
+                    LegacyProfile::CSharp(vec![]),
+                    blake3::hash(data.source.as_bytes()).as_bytes(),
+                ))
+                .unwrap(),
             )
+            .as_bytes()
+        } else {
+            *blake3::hash(key.as_bytes()).as_bytes()
+        };
+        legacy
+            .install(key, &entry.stamp, object, || Ok(()), || Ok(data))
             .unwrap();
     }
     drop(tx);

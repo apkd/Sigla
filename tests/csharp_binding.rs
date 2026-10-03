@@ -491,7 +491,7 @@ async fn check_extra(source: &str, extra: &str, cases: &[(&str, &str)]) {
             );
         } else {
             assert!(
-                result.contains(expected),
+                result.contains("```") && result.contains(expected),
                 "{marker}: expected {expected}, got {result}"
             );
         }

@@ -998,6 +998,84 @@ mod tests {
     }
 
     #[test]
+    fn github_size_inventory_prevents_oversized_blob_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        fs::write(upstream_path.join("Large.asset"), "large asset fixture").unwrap();
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&upstream_path)
+            .args(["add", "Large.asset"]))
+        .unwrap();
+        run(Command::new("git").arg("-C").arg(&upstream_path).args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "asset",
+        ]))
+        .unwrap();
+        let revision = String::from_utf8(
+            run(Command::new("git")
+                .arg("-C")
+                .arg(&upstream_path)
+                .args(["rev-parse", "HEAD"]))
+            .unwrap(),
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let mut request = request(root.path());
+        request.repository = "https://github.com/fixture/repo".into();
+        fs::create_dir_all(&request.store).unwrap();
+        // The inventory supplies the size, so the fixture needs no giant payload.
+        fs::write(
+            request.store.join(format!("github-tree-{revision}.json")),
+            serde_json::to_vec(&serde_json::json!({"version":1,"sizes":{
+                "Code.cs": fs::metadata(upstream_path.join("Code.cs")).unwrap().len(),
+                "Large.asset": super::super::selection::ASSET_LIMIT + 1
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let prepared = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert!(request.staging.join("Code.cs").is_file());
+        assert!(!request.staging.join("Large.asset").exists());
+        assert!(prepared.omitted.contains_key("Large.asset"));
+        let blob = &prepared.tracked["Large.asset"];
+        assert!(
+            !crate::process::capture(
+                git(&request.store).args(["cat-file", "-e", blob]),
+                Duration::from_secs(10),
+                None,
+                None
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+    }
+
+    #[test]
+    fn followup_acquisition_keeps_the_existing_transfer_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let mut request = request(root.path());
+        request.transfer_used = TRANSFER_LIMIT;
+        assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
+        assert!(!request.staging.exists());
+        request.unlimited_transfer = true;
+        let prepared = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert!(request.staging.join("Code.cs").is_file());
+        assert!(prepared.transfer_bytes > request.transfer_used);
+    }
+
+    #[test]
     fn partial_acquisition_never_stores_excluded_blobs() {
         let root = tempfile::tempdir().unwrap();
         let upstream_path = root.path().join("upstream");

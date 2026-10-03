@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-/// Local projects retain host inputs and credentials, but may write only to their cache.
+/// Local projects retain host inputs and credentials, with writes confined to cache and private IPC.
 pub fn local_command(host: &Path, directory: &Path, cache: &Path, job: &Path) -> Result<Command> {
     let cache = cache.join("dotnet").canonicalize()?;
     for child in ["tmp", "home", "packages", "http-cache", "plugins"] {
@@ -24,6 +24,15 @@ pub fn local_command(host: &Path, directory: &Path, cache: &Path, job: &Path) ->
             "--ro-bind",
             "/",
             "/",
+            // .NET named mutexes use this fixed path, ignoring TMPDIR.
+            "--tmpfs",
+            "/tmp/.dotnet",
+            // Precreate both roots: .NET otherwise initializes them by renaming
+            // temporary siblings from the read-only /tmp directory.
+            "--dir",
+            "/tmp/.dotnet/shm",
+            "--dir",
+            "/tmp/.dotnet/lockfiles",
         ])
         .arg("--bind")
         .arg(&cache)
