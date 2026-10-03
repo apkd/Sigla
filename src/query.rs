@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 pub const DEFAULT_LIMIT: usize = 20;
 pub const MAX_LIMIT: usize = 100_000;
@@ -10,11 +10,12 @@ pub struct Location {
     pub column: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Target {
     pub name: String,
     pub parameters: Option<Vec<String>>,
     pub location: Option<Location>,
+    pub qualifiers: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,7 @@ pub struct Query {
     pub filters: Vec<Filter>,
     pub loose: bool,
     pub limit: usize,
+    pub wait_complete: bool,
 }
 
 const SELECTORS: &[&str] = &[
@@ -39,6 +41,7 @@ const SELECTORS: &[&str] = &[
     "class",
     "interface",
     "struct",
+    "union",
     "enum",
     "delegate",
     "method",
@@ -75,6 +78,7 @@ const FILTERS: &[&str] = &[
     "in",
     "unity-project",
     "type-match",
+    "lang",
 ];
 
 impl Query {
@@ -86,6 +90,7 @@ impl Query {
         let mut loose = None;
         let mut limit = None;
         let mut offset = false;
+        let mut wait_complete = false;
         for token in tokens {
             let split = token.find(':').filter(|&i| {
                 !token.starts_with('@')
@@ -104,6 +109,7 @@ impl Query {
                 "i" => "interface",
                 "m" => "method",
                 "x" => "text",
+                "language" => "lang",
                 x => x,
             };
             ensure!(!value.is_empty(), "`{key}:` needs a value.");
@@ -112,6 +118,13 @@ impl Query {
                 "Only metadata and containment filters can be negated."
             );
             match key {
+                "wait" => {
+                    ensure!(
+                        value == "complete",
+                        "Use `wait:complete` to wait for all relevant indexes."
+                    );
+                    wait_complete = true;
+                }
                 "offset" => offset = true,
                 "match" => {
                     ensure!(loose.is_none(), "Duplicate `match:` control.");
@@ -182,16 +195,16 @@ impl Query {
             ensure!(
                 filters
                     .iter()
-                    .all(|f| matches!(f.key.as_str(), "path" | "project")),
-                "`file:` supports `project:` and `path:` filters."
+                    .all(|f| matches!(f.key.as_str(), "path" | "project" | "lang")),
+                "`file:` supports `project:`, `path:`, and `lang:` filters."
             );
         }
         if selector == "text" {
             ensure!(
                 filters
                     .iter()
-                    .all(|f| matches!(f.key.as_str(), "path" | "project" | "in")),
-                "`text:` supports `project:`, `path:`, and `in:` filters."
+                    .all(|f| matches!(f.key.as_str(), "path" | "project" | "in" | "lang")),
+                "`text:` supports `project:`, `path:`, `in:`, and `lang:` filters."
             );
         }
         let asset_query = matches!(
@@ -221,12 +234,15 @@ impl Query {
                 "Unity filters require an asset selector"
             );
         }
-        let target = if asset_query || matches!(selector.as_str(), "text" | "operator" | "file") {
+        let target = if asset_query || matches!(selector.as_str(), "text" | "file") {
             Target {
                 name: value,
                 parameters: None,
                 location: None,
+                qualifiers: None,
             }
+        } else if selector == "operator" && value.starts_with("()") {
+            Target::parse(&format!("operator{value}"))?
         } else {
             Target::parse(&value)?
         };
@@ -236,6 +252,7 @@ impl Query {
             filters,
             loose: loose.unwrap_or(false),
             limit: limit.unwrap_or(DEFAULT_LIMIT),
+            wait_complete,
         })
     }
 
@@ -274,23 +291,51 @@ impl Target {
                         line,
                         column,
                     }),
+                    qualifiers: None,
                 });
             }
         }
-        let (name, parameters) = if let Some(i) = value.find('(') {
-            ensure!(value.ends_with(')'), "Unclosed parameter signature.");
+        let opening = value.match_indices('(').find_map(|(i, _)| {
+            (!(value[..i].ends_with("operator") && value[i..].starts_with("()"))).then_some(i)
+        });
+        let (name, parameters, qualifiers) = if let Some(i) = opening {
+            let mut depth = 0;
+            let end = value[i..]
+                .char_indices()
+                .find_map(|(j, c)| {
+                    if c == '(' {
+                        depth += 1;
+                    }
+                    if c == ')' {
+                        depth -= 1;
+                    }
+                    (depth == 0).then_some(i + j)
+                })
+                .context("Unclosed parameter signature.")?;
+            let suffix = value[end + 1..].trim();
+            ensure!(
+                suffix.is_empty()
+                    || [
+                        "const", "volatile", "&", "noexcept", "override", "final", "requires", "->"
+                    ]
+                    .iter()
+                    .any(|p| suffix.starts_with(p)),
+                "Invalid trailing member qualifiers."
+            );
             (
                 &value[..i],
-                Some(split_parameters(&value[i + 1..value.len() - 1])?),
+                Some(split_parameters(&value[i + 1..end])?),
+                (!suffix.is_empty()).then(|| suffix.to_owned()),
             )
         } else {
-            (value, None)
+            (value, None, None)
         };
         ensure!(!name.is_empty(), "A target needs a name.");
         Ok(Self {
             name: normalize_name(name),
             parameters,
             location: None,
+            qualifiers,
         })
     }
 }
@@ -379,7 +424,12 @@ fn lex(input: &str) -> Result<Vec<String>> {
         if !literal {
             match c {
                 '(' | '[' | '{' => stack.push(c),
-                '<' if !stack.contains(&'{') => stack.push(c),
+                '<' if !stack.contains(&'{')
+                    && !token.ends_with("operator")
+                    && !token.ends_with("operator<") =>
+                {
+                    stack.push(c)
+                }
                 ')' | ']' | '}' => {
                     let expected = match c {
                         ')' => '(',

@@ -50,6 +50,10 @@ impl App {
                     let store = crate::store::Store { scope };
                     let manifest: Option<crate::workspace::Manifest> = store.get_manifest()?;
                     if let Some(manifest) = manifest {
+                        // The primary inventory owns dependencies for every source group.
+                        if manifest.source_group.is_some() {
+                            continue;
+                        }
                         self.owners.lock().unwrap().observe(
                             &info.entry,
                             info.owner.as_deref(),
@@ -140,6 +144,7 @@ impl App {
             .lock()
             .unwrap()
             .remove(&candidate.owner.entry);
+        self.sources.forget(&candidate.owner.entry);
         if let Some(root) = &candidate.owner.repository {
             if !self
                 .remote
@@ -187,6 +192,7 @@ impl App {
             return Ok(0);
         }
         self.assets.trim_completed();
+        self.sources.trim_completed();
         self.workspaces.lock().unwrap().clear();
         let start = Instant::now();
         match database.compact(&self.cache) {
@@ -353,6 +359,70 @@ mod tests {
         manager::{State, write_json},
         materialize::{Prepared, Target},
     };
+
+    #[test]
+    fn background_manifests_preserve_all_workspace_dependencies() {
+        use crate::{
+            model::Language,
+            native::Group,
+            store::Store,
+            workspace::{FileEntry, Manifest, Stamp},
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let managed = cache.path().join("local-packages/managed/Library.dll");
+        let native = cache.path().join("unity-packages/native/plugin.h");
+        for path in [&managed, &native] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"retained").unwrap();
+        }
+        let mut primary = Manifest {
+            root: root.path().into(),
+            ..Default::default()
+        };
+        primary
+            .metadata
+            .insert(managed.clone(), Stamp::read(&managed).unwrap());
+        primary.deferred.insert(
+            "plugin.h".into(),
+            FileEntry {
+                path: native.clone(),
+                display: "plugin.h".into(),
+                stamp: Stamp::read(&native).unwrap(),
+                language: Language::Header,
+                memberships: vec![],
+                modules: vec![],
+                metadata: false,
+            },
+        );
+        for (key, manifest) in [
+            ([0; 32], primary),
+            (
+                [1; 32],
+                Manifest {
+                    source_group: Some(Group::Native),
+                    ..Default::default()
+                },
+            ),
+            (
+                [2; 32],
+                Manifest {
+                    source_group: Some(Group::Shaders),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            Store::open_workspace(&cache.path().join("analysis"), key, root.path(), None)
+                .unwrap()
+                .save_manifest(&manifest)
+                .unwrap();
+        }
+        assert!(app.seed_owners().unwrap());
+        app.collect_views(true).unwrap();
+        assert!(managed.is_file());
+        assert!(native.is_file());
+    }
 
     fn app(cache: &Path, rules: Vec<Rule>) -> App {
         App::remote(
@@ -544,6 +614,8 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let rules = || vec![Rule::parse_private("https://github.com/example/keep").unwrap()];
         let first = app(cache.path(), rules());
+        // Model the descriptor inherited by a concurrently spawned child.
+        let _inherited = first._ownership.0.try_clone().unwrap();
         let root = seed(cache.path(), "keep", "trunk", "trunk", 1);
         first.seed_owners().unwrap();
         {

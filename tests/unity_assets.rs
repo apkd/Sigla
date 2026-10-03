@@ -125,14 +125,20 @@ async fn script_instances_inheritance_views_and_refresh() {
             .unwrap()
             .contains("Level.unity")
     );
-    let text = app.search(&project, "text:HitPoints").await.unwrap();
+    let text = app
+        .search(&project, "text:HitPoints wait:complete")
+        .await
+        .unwrap();
     assert!(text.contains("Enemy.prefab"), "{text}");
     write(
         root.path(),
         "Assets/Enemy.prefab",
         &prefab.replace("HitPoints", "ChangedLabel"),
     );
-    let changed = app.search(&project, "text:ChangedLabel").await.unwrap();
+    let changed = app
+        .search(&project, "text:ChangedLabel wait:complete")
+        .await
+        .unwrap();
     assert!(changed.contains("Enemy.prefab"), "{changed}");
     assert!(
         app.browse(&project, "Assets")

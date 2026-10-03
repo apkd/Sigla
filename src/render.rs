@@ -121,7 +121,11 @@ impl SearchResult {
             text.push_str("\n\nPossible match; the target could not be determined uniquely.");
         }
         if self.possible_write {
-            text.push_str("\n\nPossible write through `ref`.");
+            text.push_str(if self.language.native() {
+                "\n\nWrite through a pointer or indexed element."
+            } else {
+                "\n\nPossible write through `ref`."
+            });
         }
         text
     }
@@ -139,12 +143,7 @@ pub fn inline(value: &str) -> String {
 pub fn result(symbol: Option<&str>, location: &str, source: &str, language: Language) -> String {
     let source = dedent(source);
     let fence = "`".repeat(3.max(source.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
-    let language = match language {
-        Language::CSharp => "cs",
-        Language::Rust => "rust",
-        Language::Markdown => "md",
-        Language::Text => "text",
-    };
+    let language = language.tag();
     let heading = symbol.map_or_else(
         || inline(location),
         |symbol| format!("{} in {}", inline(symbol), inline(location)),

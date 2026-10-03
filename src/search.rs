@@ -5,6 +5,7 @@ use crate::{
     workspace::{FileEntry, Manifest, Membership},
 };
 use anyhow::{Result, ensure};
+mod native;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
@@ -22,6 +23,7 @@ struct Hit {
 pub struct Search<'a> {
     assets: Option<&'a crate::unity::assets::Index>,
     store: &'a Store,
+    sources: BTreeMap<crate::native::Group, Arc<Store>>,
     manifest: &'a Manifest,
     cancel: &'a tokio_util::sync::CancellationToken,
     tx: heed::RoTxn<'a, heed::WithTls>,
@@ -43,6 +45,7 @@ impl<'a> Search<'a> {
         Ok(Self {
             assets: None,
             store,
+            sources: BTreeMap::new(),
             manifest,
             cancel,
             tx: store.query_read()?,
@@ -59,6 +62,16 @@ impl<'a> Search<'a> {
     pub fn with_assets(&mut self, assets: &'a crate::unity::assets::Index) {
         self.assets = Some(assets);
     }
+    pub fn with_source(&mut self, group: crate::native::Group, store: Arc<Store>) -> Result<()> {
+        store.check_read(&self.tx)?;
+        self.sources.insert(group, store);
+        Ok(())
+    }
+    fn source_store(&self, key: &str) -> &Store {
+        crate::native::Group::of(self.manifest.files[key].language)
+            .and_then(|group| self.sources.get(&group).map(Arc::as_ref))
+            .unwrap_or(self.store)
+    }
     fn check(&self) -> Result<()> {
         ensure!(!self.cancel.is_cancelled(), "Query cancelled");
         Ok(())
@@ -68,7 +81,7 @@ impl<'a> Search<'a> {
         if let Some(d) = self.cache.get(key) {
             return Ok(d.clone());
         }
-        let store = self.store;
+        let store = self.source_store(key);
         let tx = &self.tx;
         let d = Arc::new(
             store
@@ -97,9 +110,11 @@ impl<'a> Search<'a> {
                 .map(|(key, _)| key.clone())
                 .collect());
         }
-        Ok(self
-            .store
-            .candidates(&self.tx, name, loose, occurrences)?
+        let mut keys = self.store.candidates(&self.tx, name, loose, occurrences)?;
+        for store in self.sources.values() {
+            keys.extend(store.candidates(&self.tx, name, loose, occurrences)?);
+        }
+        Ok(keys
             .into_iter()
             .filter(|key| {
                 self.manifest
@@ -114,7 +129,7 @@ impl<'a> Search<'a> {
         if let Some(declarations) = self.summaries.get(key) {
             return Ok(declarations.clone());
         }
-        let store = self.store;
+        let store = self.source_store(key);
         let tx = &self.tx;
         let declarations = Arc::new(store.declarations_in(tx, key)?);
         let bytes = declarations.len() * 768;
@@ -236,15 +251,49 @@ impl<'a> Search<'a> {
             return Ok(());
         }
         let simple = simple_name(&target.name);
+        let native_pattern = if projection.is_some_and(|q| q.selector == "operator")
+            && target.name != "*"
+            && !target.name.contains("operator")
+        {
+            format!(
+                "operator{}{}",
+                if target
+                    .name
+                    .starts_with(|c: char| c.is_alphabetic() || c == '_')
+                {
+                    " "
+                } else {
+                    ""
+                },
+                target.name
+            )
+        } else {
+            target.name.clone()
+        };
+        let native_simple = crate::native::simple_name(&native_pattern);
         let mut parsed_parameters = None;
         let keys = match restricted_files {
             Some(files) => files.clone(),
-            None => self.candidates(simple, loose, false)?,
+            None => {
+                let mut keys = self.candidates(simple, loose, false)?;
+                if native_simple != simple {
+                    keys.extend(self.candidates(&native_simple, loose, false)?);
+                }
+                keys
+            }
         };
         for key in keys {
             self.check()?;
             let file = self.manifest.files[&key].clone();
             let declarations = self.summary(&key)?;
+            let native_data = if file.language.native()
+                && (target.qualifiers.is_some()
+                    || projection.is_some_and(|q| q.filters.iter().any(|f| f.key == "lang")))
+            {
+                Some(self.data(&key)?)
+            } else {
+                None
+            };
             let mut projected_contexts = BTreeSet::new();
             for membership in &file.memberships {
                 self.check()?;
@@ -275,12 +324,37 @@ impl<'a> Search<'a> {
                         continue;
                     }
                 }
-                for decl in declarations.iter() {
+                for (ordinal, decl) in declarations.iter().enumerate() {
                     if decl.kind == "scope" {
                         continue;
                     }
-                    if !loose && !simple.contains('*') && decl.name != simple {
+                    if !file.language.native()
+                        && !loose
+                        && !simple.contains('*')
+                        && decl.name != simple
+                    {
                         continue;
+                    }
+                    if file.language.native()
+                        && crate::query::name_rank(&native_simple, &decl.name, loose).is_none()
+                    {
+                        continue;
+                    }
+                    if let Some(data) = &native_data {
+                        let facts = data.facts.native.as_ref().unwrap();
+                        let info = &facts.declarations[ordinal];
+                        if target.qualifiers.as_ref().is_some_and(|q| {
+                            crate::native::normalized(q)
+                                != crate::native::normalized(&info.qualifiers)
+                        }) || projection.is_some_and(|q| {
+                            !Self::language_filters(
+                                q,
+                                facts.regions[info.region as usize].language,
+                                file.language,
+                            )
+                        }) {
+                            continue;
+                        }
                     }
                     let qualified;
                     let compared = if target.name.contains('.') || target.name.contains("::") {
@@ -298,14 +372,20 @@ impl<'a> Search<'a> {
                         &decl.name
                     };
                     // Source binding uses complete names; query targets may omit namespaces.
-                    let rank = if from.is_some() {
+                    let rank = if file.language.native() {
+                        crate::native::name_rank(&native_pattern, compared, loose)
+                    } else if from.is_some() {
                         name_rank(&target.name, compared, loose)
                     } else {
                         qualified_name_rank(&target.name, compared, loose)
                     };
                     if let Some(rank) = rank {
                         if let Some(p) = &target.parameters
-                            && !signature_matches(p, &decl.parameters)
+                            && !(if file.language.native() {
+                                crate::native::signature_matches(p, &decl.parameters)
+                            } else {
+                                signature_matches(p, &decl.parameters)
+                            })
                         {
                             if file.language != Language::CSharp {
                                 continue;
@@ -366,6 +446,9 @@ impl<'a> Search<'a> {
         }
     }
     fn same_symbol(&self, a: &Hit, b: &Hit) -> bool {
+        if self.manifest.files[&a.file].language.native() {
+            return a.file == b.file && a.decl.name_span == b.decl.name_span;
+        }
         if let (Some(a), Some(b)) = (&a.semantic_id, &b.semantic_id) {
             return a == b;
         }
@@ -420,6 +503,7 @@ impl<'a> Search<'a> {
                 let mut found = self.declarations_in(
                     &Target {
                         name: base.into(),
+                        qualifiers: None,
                         parameters: None,
                         location: None,
                     },
@@ -449,6 +533,9 @@ impl<'a> Search<'a> {
         o: &Occurrence,
         data: &FileData,
     ) -> Result<Vec<(Hit, bool)>> {
+        if self.manifest.files[key].language.native() {
+            return self.bind_native(key, m, o, data);
+        }
         if self.manifest.files[key].language == Language::CSharp {
             let view = crate::csharp::catalog::View {
                 store: self.store,
@@ -525,6 +612,7 @@ impl<'a> Search<'a> {
         let mut candidates = self.declarations_in(
             &Target {
                 name: name.clone(),
+                qualifiers: None,
                 parameters: None,
                 location: None,
             },
@@ -535,6 +623,7 @@ impl<'a> Search<'a> {
             candidates.extend(self.declarations_in(
                 &Target {
                     name: context_name(&name, m),
+                    qualifiers: None,
                     parameters: None,
                     location: None,
                 },
@@ -598,6 +687,7 @@ impl<'a> Search<'a> {
                     let mut constructors = self.declarations_in(
                         &Target {
                             name: ty.decl.name.clone(),
+                            qualifiers: None,
                             parameters: None,
                             location: None,
                         },
@@ -681,6 +771,7 @@ impl<'a> Search<'a> {
                 .declarations_in(
                     &Target {
                         name: receiver.clone(),
+                        qualifiers: None,
                         parameters: None,
                         location: None,
                     },
@@ -736,6 +827,7 @@ impl<'a> Search<'a> {
                 let types = self.declarations_in(
                     &Target {
                         name: own.clone(),
+                        qualifiers: None,
                         parameters: None,
                         location: None,
                     },
@@ -826,14 +918,18 @@ impl<'a> Search<'a> {
         q: &Query,
         mut files: Option<BTreeSet<String>>,
     ) -> Option<BTreeSet<String>> {
-        if q.filters.iter().any(|f| f.key == "path") {
+        if q.filters
+            .iter()
+            .any(|f| matches!(f.key.as_str(), "path" | "lang"))
+        {
             let allowed = |key: &String| {
                 let file = &self.manifest.files[key];
-                file.memberships.iter().any(|m| {
-                    q.filters.iter().filter(|f| f.key == "path").all(|f| {
-                        self.path_matches(&f.value, &self.manifest.display(file, m)) != f.negate
+                Self::file_language_filters(q, file.language)
+                    && file.memberships.iter().any(|m| {
+                        q.filters.iter().filter(|f| f.key == "path").all(|f| {
+                            self.path_matches(&f.value, &self.manifest.display(file, m)) != f.negate
+                        })
                     })
-                })
             };
             if let Some(files) = files.as_mut() {
                 files.retain(allowed);
@@ -853,7 +949,7 @@ impl<'a> Search<'a> {
     fn project_membership(&self, q: &Query, file: &FileEntry, m: &Membership) -> bool {
         // A document's repository context is not a build project. It must not
         // satisfy project wildcards or bypass its real project memberships.
-        !(file.language.document()
+        !((file.language.document() || file.language.native())
             && self.manifest.projects[m.project].name.is_empty()
             && q.filters
                 .iter()
@@ -876,6 +972,9 @@ impl<'a> Search<'a> {
                 continue;
             }
             let yes = match f.key.as_str() {
+                // Native declarations and occurrences use their embedded region's dialect.
+                "lang" if file.language.native() => continue,
+                "lang" => crate::native::language_matches(&f.value, file.language),
                 "path" => self.path_matches(&f.value, &self.manifest.display(file, m)),
                 "project" => wildcard(&f.value, &self.manifest.projects[m.project].name),
                 "namespace" => decl.is_some_and(|d| component_prefix(&d.namespace, &f.value)),
@@ -898,11 +997,12 @@ impl<'a> Search<'a> {
                 h.membership.project == m.project
                     && ((self.manifest.files[&h.file].path == file.path
                         && h.decl.span.contains(&at))
-                        || decl.is_some_and(|d| {
-                            d.owner == h.decl.qualified
-                                || d.owner.starts_with(&format!("{}::", h.decl.qualified))
-                                || d.owner.starts_with(&format!("{}.", h.decl.qualified))
-                        }))
+                        || (!file.language.native() || h.decl.named_type())
+                            && decl.is_some_and(|d| {
+                                d.owner == h.decl.qualified
+                                    || d.owner.starts_with(&format!("{}::", h.decl.qualified))
+                                    || d.owner.starts_with(&format!("{}.", h.decl.qualified))
+                            }))
             });
             if yes == *negate {
                 return false;
@@ -944,6 +1044,11 @@ impl<'a> Search<'a> {
             let Some(pos) = offset(&data.source, loc.line, loc.column) else {
                 continue;
             };
+            if let Some(native) = &data.facts.native
+                && let Some(hint) = self.native_include_hint(&key, native, pos)
+            {
+                return Ok(Some(hint));
+            }
             if data
                 .facts
                 .declarations
@@ -964,7 +1069,7 @@ impl<'a> Search<'a> {
             for m in &self.manifest.files[&key].memberships {
                 for (hit, uncertain) in self.bind(&key, m, o, &data)? {
                     possible |= uncertain;
-                    let label = Self::target_label(&hit);
+                    let label = self.target_label(&hit)?;
                     let file = &self.manifest.files[&hit.file];
                     let location = if file.metadata {
                         file.path
@@ -988,7 +1093,7 @@ impl<'a> Search<'a> {
                         .map(|id| (id.context.clone(), id.key.clone()));
                     candidates.insert(
                         (identity, hit.file.clone(), hit.decl.name_span.start),
-                        (label, location),
+                        (hit.rank, label, location),
                     );
                 }
             }
@@ -1007,7 +1112,7 @@ impl<'a> Search<'a> {
                 labels
                     .iter()
                     .take(8)
-                    .map(|(label, location)| format!(
+                    .map(|(_, label, location)| format!(
                         "{} in {}",
                         crate::render::inline(label),
                         crate::render::inline(location)
@@ -1022,13 +1127,28 @@ impl<'a> Search<'a> {
         }
         Ok(None)
     }
-    fn target_label(hit: &Hit) -> String {
+    fn target_label(&mut self, hit: &Hit) -> Result<String> {
         let signature = if hit.decl.callable() {
             format!("({})", hit.decl.parameters.join(", "))
         } else {
             String::new()
         };
-        format!("{}:{}{signature}", hit.decl.kind, hit.decl.qualified)
+        let mut label = format!("{}:{}{signature}", hit.decl.kind, hit.decl.qualified);
+        if self.manifest.files[&hit.file].language.native() && hit.decl.callable() {
+            let data = self.data(&hit.file)?;
+            let index = data
+                .facts
+                .declarations
+                .iter()
+                .position(|d| d.name_span == hit.decl.name_span)
+                .unwrap();
+            let qualifiers = &data.facts.native.as_ref().unwrap().declarations[index].qualifiers;
+            if !qualifiers.is_empty() {
+                label.push(' ');
+                label.push_str(qualifiers);
+            }
+        }
+        Ok(label)
     }
 
     fn run_query(&mut self, q: &Query) -> Result<String> {
@@ -1048,10 +1168,9 @@ impl<'a> Search<'a> {
             .collect::<Result<_>>()?;
         let mut inside = Vec::new();
         for f in q.filters.iter().filter(|f| f.key == "in") {
-            inside.push((
-                f.negate,
-                self.declarations(&Target::parse(&f.value)?, false)?,
-            ));
+            let mut hits = self.declarations(&Target::parse(&f.value)?, false)?;
+            hits.retain(|h| Self::file_language_filters(q, self.manifest.files[&h.file].language));
+            inside.push((f.negate, hits));
         }
         if q.selector == "text" {
             return self.text(q, &inside);
@@ -1086,7 +1205,7 @@ impl<'a> Search<'a> {
             targets.retain(|target| {
                 contexts.iter().any(|&(language, project)| {
                     let file = &self.manifest.files[&target.file];
-                    file.language == language
+                    crate::native::compatible(file.language, language)
                         && if file.metadata {
                             self.manifest.metadata_visible(file, project)
                         } else {
@@ -1108,7 +1227,10 @@ impl<'a> Search<'a> {
             None,
             |this, h| {
                 let file = &this.manifest.files[&h.file];
-                if (q.selector == "operator" && h.decl.name != q.target.name)
+                if (q.selector == "operator"
+                    && !file.language.native()
+                    && q.target.name != "*"
+                    && h.decl.name != q.target.name)
                     || !this.filters(
                         q,
                         file,
@@ -1120,7 +1242,13 @@ impl<'a> Search<'a> {
                 {
                     return Ok(());
                 }
-                if !selector_matches(&q.selector, &h.decl) {
+                let native_function = file.language.native()
+                    && match q.selector.as_str() {
+                        "function" => matches!(h.decl.kind.as_str(), "function" | "method"),
+                        "method" => h.decl.kind == "function" && !h.decl.owner.is_empty(),
+                        _ => false,
+                    };
+                if !native_function && !selector_matches(&q.selector, &h.decl) {
                     if !q.loose && !q.target.name.contains('*') && q.target.parameters.is_none() {
                         other_kinds.insert(format!("{}:{}", h.decl.kind, h.decl.qualified));
                         if other_kinds.len() > 4 {
@@ -1199,11 +1327,16 @@ impl<'a> Search<'a> {
             .files
             .iter()
             .filter(|(_, file)| !file.metadata)
-            .filter_map(|(key, file)| {
-                file.path
-                    .strip_prefix(root)
-                    .ok()
-                    .map(|path| (path.to_string_lossy().into_owned(), key.clone()))
+            .flat_map(|(key, file)| {
+                file.memberships.iter().filter_map(move |m| {
+                    if let Ok(path) = file.path.strip_prefix(root) {
+                        Some((path.to_string_lossy().into_owned(), key.clone()))
+                    } else {
+                        let display = self.manifest.display(file, m);
+                        (!std::path::Path::new(display.as_ref()).is_absolute())
+                            .then(|| (display.into_owned(), key.clone()))
+                    }
+                })
             })
             .collect();
         if let Some(assets) = self.assets {
@@ -1251,6 +1384,11 @@ impl<'a> Search<'a> {
                 continue;
             }
             let file = self.manifest.files.get(&key);
+            if q.filters.iter().any(|f| f.key == "lang")
+                && file.is_none_or(|file| !Self::file_language_filters(q, file.language))
+            {
+                continue;
+            }
             if file.is_some_and(|file| {
                 !file.memberships.iter().any(|m| {
                     if !self.project_membership(q, file, m) {
@@ -1367,15 +1505,7 @@ impl<'a> Search<'a> {
         let data = self.data(key)?;
         let (range, first, last) = crate::navigation::lines(&data.source, requested)?;
         let (body, tag) = match mode {
-            crate::navigation::Mode::Exact => (
-                data.source[range].to_owned(),
-                match language {
-                    Language::Rust => "rust",
-                    Language::CSharp => "cs",
-                    Language::Markdown => "md",
-                    Language::Text => "text",
-                },
-            ),
+            crate::navigation::Mode::Exact => (data.source[range].to_owned(), language.tag()),
             crate::navigation::Mode::Minified => {
                 (crate::minify::render(&data.source, language, range), "")
             }
@@ -1395,7 +1525,10 @@ impl<'a> Search<'a> {
     fn text(&mut self, q: &Query, inside: &[(bool, Vec<Hit>)]) -> Result<String> {
         let mut units = crate::selection::Selection::new(q.limit);
         if inside.is_empty()
-            && !q.filters.iter().any(|f| f.key == "project")
+            && !q
+                .filters
+                .iter()
+                .any(|f| matches!(f.key.as_str(), "project" | "lang"))
             && let Some(assets) = self.assets
         {
             assets.visit_text(q, |position, result| {
@@ -1424,6 +1557,16 @@ impl<'a> Search<'a> {
             let mut previous_line = None;
             for matched in literal.find_iter(&data.source) {
                 self.check()?;
+                if let Some(native) = &data.facts.native {
+                    let dialect = native
+                        .regions
+                        .iter()
+                        .find(|r| r.span.contains(&matched.start()))
+                        .map_or(file.language, |r| r.language);
+                    if !Self::language_filters(q, dialect, file.language) {
+                        continue;
+                    }
+                }
                 let containing = data
                     .facts
                     .declarations
@@ -1545,6 +1688,7 @@ impl<'a> Search<'a> {
             keys.retain(|key| targets.iter().any(|t| &t.file == key));
         }
         // alias imports supply additional candidate spellings; binding still decides truth.
+        keys.retain(|key| !self.manifest.files[key].language.native());
         for key in keys.clone() {
             let data = self.data(&key)?;
             for i in &data.facts.imports {
@@ -1565,11 +1709,15 @@ impl<'a> Search<'a> {
         }
         let mut units = crate::selection::Selection::new(q.limit);
         let mut unresolved = false;
+        self.native_relationship(q, &targets, inside, &mut units)?;
         for key in keys {
             if only_local && !targets.iter().any(|t| t.file == key) {
                 continue;
             }
             let file = &self.manifest.files[&key];
+            if file.language.native() {
+                continue;
+            }
             let data = self.data(&key)?;
             for o in &data.facts.occurrences {
                 if only_local
@@ -1635,8 +1783,9 @@ impl<'a> Search<'a> {
                         }
                         let labels: BTreeSet<_> = relevant
                             .iter()
-                            .filter_map(|(t, _)| t.as_ref().map(Self::target_label))
-                            .collect();
+                            .filter_map(|(t, _)| t.as_ref())
+                            .map(|hit| self.target_label(hit))
+                            .collect::<Result<_>>()?;
                         let identities: std::collections::HashSet<_> = relevant
                             .iter()
                             .filter_map(|(hit, _)| hit.as_ref())
@@ -1718,7 +1867,7 @@ impl<'a> Search<'a> {
         targets: &[Hit],
         inside: &[(bool, Vec<Hit>)],
     ) -> Result<String> {
-        if targets.is_empty() {
+        if targets.is_empty() && !self.manifest.files.values().any(|f| f.language.native()) {
             return Ok("No matches.".into());
         }
         if q.selector == "derived"
@@ -1728,12 +1877,16 @@ impl<'a> Search<'a> {
         {
             anyhow::bail!("Rust has no class inheritance; use `impl:` for traits.");
         }
-        if targets.iter().any(|h| h.decl.callable()) {
+        if targets
+            .iter()
+            .any(|h| !self.manifest.files[&h.file].language.native() && h.decl.callable())
+        {
             let mut units = crate::selection::Selection::new(q.limit);
             for target in targets.iter().filter(|h| h.decl.callable()) {
                 let owners = self.declarations(
                     &Target {
                         name: target.decl.owner.clone(),
+                        qualifiers: None,
                         parameters: None,
                         location: None,
                     },
@@ -1745,6 +1898,7 @@ impl<'a> Search<'a> {
                 for candidate in self.declarations(
                     &Target {
                         name: target.decl.name.clone(),
+                        qualifiers: None,
                         parameters: if self.manifest.files[&target.file].language
                             == Language::CSharp
                         {
@@ -1784,6 +1938,7 @@ impl<'a> Search<'a> {
                             .declarations(
                                 &Target {
                                     name: candidate.decl.owner.clone(),
+                                    qualifiers: None,
                                     parameters: None,
                                     location: None,
                                 },
@@ -1816,6 +1971,7 @@ impl<'a> Search<'a> {
         let mut units = crate::selection::Selection::new(q.limit);
         // C# binding follows transitive bases from each eligible result; traversing
         // every descendant first defeats path filters and repeats the same work.
+        self.native_hierarchy(q, targets, inside, &mut units)?;
         let csharp_targets: Vec<_> = targets
             .iter()
             .filter(|t| self.manifest.files[&t.file].language == Language::CSharp)
@@ -2095,7 +2251,16 @@ impl<'a> Search<'a> {
                     .into_owned(),
                 lines: None,
                 source: signature,
-                language: f.language,
+                language: data
+                    .facts
+                    .native
+                    .as_ref()
+                    .and_then(|n| {
+                        n.regions
+                            .iter()
+                            .find(|r| r.span.contains(&h.decl.name_span.start))
+                    })
+                    .map_or(f.language, |r| r.language),
                 uncertain: false,
                 target: None,
                 occurrences: BTreeSet::new(),
@@ -2125,7 +2290,16 @@ impl<'a> Search<'a> {
                 path: self.manifest.display(f, &h.membership).into_owned(),
                 lines: Some(crate::render::lines(&data.source, h.decl.span.clone())),
                 source,
-                language: f.language,
+                language: data
+                    .facts
+                    .native
+                    .as_ref()
+                    .and_then(|n| {
+                        n.regions
+                            .iter()
+                            .find(|r| r.span.contains(&h.decl.name_span.start))
+                    })
+                    .map_or(f.language, |r| r.language),
                 uncertain: false,
                 target: None,
                 occurrences: BTreeSet::new(),

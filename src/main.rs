@@ -10,7 +10,11 @@ use sigla::{
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
-#[command(name = "sigla", version, about = "C# and Rust source navigation")]
+#[command(
+    name = "sigla",
+    version,
+    about = "Source navigation for C#, Rust, C/C++, and shaders"
+)]
 struct Cli {
     #[command(flatten)]
     options: sigla::config::Options,

@@ -7,11 +7,38 @@ pub enum Language {
     Rust,
     Markdown,
     Text,
+    C,
+    Cpp,
+    Header,
+    Hlsl,
+    Glsl,
+    ShaderLab,
 }
 
 impl Language {
     pub fn document(self) -> bool {
         matches!(self, Self::Markdown | Self::Text)
+    }
+
+    pub fn native(self) -> bool {
+        matches!(
+            self,
+            Self::C | Self::Cpp | Self::Header | Self::Hlsl | Self::Glsl | Self::ShaderLab
+        )
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::CSharp => "cs",
+            Self::Rust => "rust",
+            Self::Markdown => "md",
+            Self::Text => "text",
+            Self::C => "c",
+            Self::Cpp | Self::Header => "cpp",
+            Self::Hlsl => "hlsl",
+            Self::Glsl => "glsl",
+            Self::ShaderLab => "shaderlab",
+        }
     }
 }
 
@@ -47,7 +74,7 @@ impl Declaration {
     pub fn named_type(&self) -> bool {
         matches!(
             self.kind.as_str(),
-            "class" | "struct" | "interface" | "enum" | "type" | "trait" | "delegate"
+            "class" | "struct" | "union" | "interface" | "enum" | "type" | "trait" | "delegate"
         )
     }
 }
@@ -92,6 +119,7 @@ pub struct ModuleFile {
 pub struct Facts {
     #[serde(skip)]
     pub csharp: Option<crate::csharp::syntax::FileSyntax>,
+    pub native: Option<crate::native::File>,
     pub declarations: Vec<Declaration>,
     pub occurrences: Vec<Occurrence>,
     pub imports: Vec<Import>,

@@ -23,7 +23,7 @@ pub const MODULES: &[u8] = &[9];
 const BODY: u8 = 10;
 const MEMBER: u8 = 11;
 const DECLARATION_NAME: u8 = 12;
-pub const ANALYSIS_VERSION: u32 = 2; // Bump for extractor, binder, profile, or record changes.
+pub const ANALYSIS_VERSION: u32 = 3; // Bump for extractor, binder, profile, or record changes.
 
 pub fn body_key(index: u32) -> Vec<u8> {
     let mut key = vec![BODY];
@@ -52,6 +52,7 @@ enum Profile<'a> {
     CSharp(Vec<String>),
     Rust(&'a str),
     Document,
+    Native,
 }
 pub fn source_id(
     source: &str,
@@ -63,6 +64,7 @@ pub fn source_id(
         Language::CSharp => Profile::CSharp(canonical_defines(defines)),
         Language::Rust => Profile::Rust(edition),
         Language::Markdown | Language::Text => Profile::Document,
+        _ => Profile::Native,
     };
     Ok(*blake3::hash(&postcard::to_allocvec(&(
         "sigla-source-analysis",
@@ -321,6 +323,58 @@ pub fn validate(data: &FileData) -> Result<()> {
     }
     for o in &data.facts.occurrences {
         ensure!(valid(&o.span), "Invalid occurrence span in analysis object");
+    }
+    if let Some(native) = &data.facts.native {
+        ensure!(
+            native.declarations.len() == data.facts.declarations.len()
+                && native.occurrences.len() == data.facts.occurrences.len(),
+            "Native facts have inconsistent ordinals"
+        );
+        let declaration = |id: u32| (id as usize) < native.declarations.len();
+        for region in &native.regions {
+            ensure!(valid(&region.span), "Invalid native region span");
+        }
+        for info in &native.declarations {
+            ensure!(
+                (info.region as usize) < native.regions.len()
+                    && info.parent.is_none_or(declaration),
+                "Invalid native declaration owner"
+            );
+        }
+        for info in &native.occurrences {
+            ensure!(
+                (info.region as usize) < native.regions.len()
+                    && info.owner.is_none_or(declaration)
+                    && info.local.is_none_or(declaration)
+                    && info.receiver.as_ref().is_none_or(&valid)
+                    && info.assignment.as_ref().is_none_or(&valid),
+                "Invalid native occurrence details"
+            );
+        }
+        for include in &native.includes {
+            ensure!(valid(&include.span), "Invalid native include span");
+        }
+        for (name, indices) in &native.names {
+            ensure!(
+                indices.iter().all(|&i| data
+                    .facts
+                    .occurrences
+                    .get(i as usize)
+                    .is_some_and(|o| &o.name == name)),
+                "Invalid native name lookup"
+            );
+        }
+        for (&owner, indices) in &native.calls {
+            ensure!(
+                declaration(owner)
+                    && indices.iter().all(|&i| native
+                        .occurrences
+                        .get(i as usize)
+                        .is_some_and(|o| o.owner == Some(owner))
+                        && data.facts.occurrences[i as usize].call),
+                "Invalid native call lookup"
+            );
+        }
     }
     Ok(())
 }

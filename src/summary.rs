@@ -111,6 +111,12 @@ impl Summary {
                 Language::Rust => {
                     stack.insert("Rust".to_owned());
                 }
+                Language::C | Language::Cpp | Language::Header => {
+                    stack.insert("C/C++".to_owned());
+                }
+                Language::Hlsl | Language::Glsl | Language::ShaderLab => {
+                    stack.insert("Shaders".to_owned());
+                }
                 _ => (),
             }
         }

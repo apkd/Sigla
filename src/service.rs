@@ -7,6 +7,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
+mod indexes;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -27,13 +28,21 @@ enum Request {
     View(String, crate::navigation::Mode),
 }
 type Startup = tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>;
+struct Ownership(std::fs::File);
+impl Drop for Ownership {
+    fn drop(&mut self) {
+        // A concurrently spawned child can retain a duplicate until it execs.
+        // Release our ownership explicitly instead of waiting for that descriptor.
+        let _ = self.0.unlock();
+    }
+}
 pub struct App {
-    _ownership: std::fs::File,
     policy: Policy,
     cache: PathBuf,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceSlot>>,
     workers: Arc<tokio::sync::Semaphore>,
     assets: crate::unity::assets::jobs::Jobs,
+    sources: crate::native::jobs::Jobs,
     monitor: Arc<crate::watch::Monitor>,
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
@@ -45,6 +54,7 @@ pub struct App {
     owners: Mutex<crate::cache::owners::Catalog>,
     #[cfg(test)]
     preparation_started: tokio::sync::Notify,
+    _ownership: Ownership,
 }
 impl App {
     async fn request_cancellable(
@@ -66,6 +76,7 @@ impl App {
             match crate::memory::resident_bytes() {
                 Ok(bytes) if bytes > crate::memory::IDLE_CACHE_HIGH_WATER => {
                     self.assets.trim_completed();
+                    self.sources.trim_completed();
                 }
                 Ok(_) => return,
                 Err(error) => {
@@ -125,12 +136,13 @@ impl App {
             blobs: crate::cache::blobs::Store::open(&cache)?,
             cache_limits: Default::default(),
             owners: Mutex::new(crate::cache::owners::Catalog::open(&cache)?),
-            _ownership: ownership,
+            _ownership: Ownership(ownership),
             policy,
             cache,
             workspaces: Mutex::new(HashMap::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             assets: Default::default(),
+            sources: Default::default(),
             monitor: Arc::new(crate::watch::Monitor::default()),
             remote: None,
             upstream: None,
@@ -176,6 +188,7 @@ impl App {
 
     pub async fn shutdown(&self) {
         self.assets.shutdown();
+        self.sources.shutdown();
         if let Err(error) = self.owners.lock().unwrap().flush() {
             tracing::warn!(%error, "Cannot persist cache usage during shutdown");
         }
@@ -296,6 +309,7 @@ impl App {
         let database = crate::store::Database::open(&analysis)?;
         for (key, info) in database.workspaces()? {
             if info.owner.as_deref() == Some(owner) {
+                self.sources.forget(&info.entry);
                 database.existing(key)?.unwrap().mark_deleting()?;
             }
         }
@@ -330,6 +344,7 @@ impl App {
                 continue;
             }
             registry.remove(&info.entry);
+            self.sources.forget(&info.entry);
             let Some(scope) = database.existing(key)? else {
                 continue;
             };
@@ -669,7 +684,7 @@ impl App {
                     "instance" | "references" | "dependencies"
                 ) || matches!(q.selector.as_str(), "text" | "file")
                     && !q.filters.iter().any(|f| {
-                        matches!(f.key.as_str(), "in" | "project")
+                        matches!(f.key.as_str(), "in" | "project" | "lang")
                             || f.key == "path"
                                 && !f.negate
                                 && matches!(
@@ -679,6 +694,8 @@ impl App {
                                     Some("cs" | "rs" | "md")
                                 )
                     })
+                    && !(q.selector == "file"
+                        && crate::native::language(Path::new(&q.target.name)).is_some())
             }),
             Request::View(path, _) => {
                 path.starts_with("unity@")
@@ -689,6 +706,7 @@ impl App {
                                     Path::new(p).extension().and_then(|s| s.to_str()),
                                     Some("cs" | "rs")
                                 )
+                                && crate::native::language(Path::new(p)).is_none()
                     })
             }
             Request::Browse(_) => true,
@@ -736,62 +754,54 @@ impl App {
         } else {
             crate::unity::assets::jobs::empty()
         };
-        if asset_request {
-            // Asset workers acquire their own snapshots; do not wait while owning code locks.
-            let store = state.as_ref().unwrap().store.clone();
-            let manifest = state.as_ref().unwrap().manifest.clone();
+        let needed = indexes::groups(&request, query.as_ref(), &state.as_ref().unwrap().manifest);
+        let mut source_tickets = std::collections::BTreeMap::new();
+        for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
+            let code = state.as_ref().unwrap();
+            source_tickets.insert(
+                group,
+                self.sources.start(crate::native::jobs::Request {
+                    activity: activity.clone(),
+                    workspace: asset_workspace.clone(),
+                    branch: branch.clone(),
+                    entry: code.entry.clone(),
+                    analysis: self.cache.join("analysis"),
+                    manifest: code.manifest.clone(),
+                    group,
+                })?,
+            );
+        }
+        let wait_assets = asset_request && indexes::wait_assets(&request, query.as_ref());
+        if wait_assets || needed.values().any(|wait| *wait) {
+            // Waiting requests own neither workspace locks nor query workers.
             drop(state);
             drop(branch_state);
-            let assets = crate::unity::assets::jobs::wait(ticket).await?;
-            let root = repository_root.unwrap_or_else(|| manifest.root.clone());
-            let summary_manifest = manifest.clone();
-            let code_gate = asset_workspace.lock_owned().await;
-            let rendering_activity = activity.clone();
-            let text = tokio::task::spawn_blocking(move || -> Result<String> {
-                let _activity = rendering_activity;
-                ensure!(
-                    code_gate
-                        .as_ref()
-                        .is_some_and(|w| crate::unity::assets::jobs::generation(&w.manifest).ok()
-                            == Some(asset_generation)),
-                    "Workspace changed during asset indexing; retry query"
-                );
-                let cancel = tokio_util::sync::CancellationToken::new();
-                let mut search = Search::new(&store, &manifest, &cancel)?;
-                search.with_assets(&assets);
-                drop(code_gate);
-                match request {
-                    Request::Search(_) => {
-                        let q = query.as_ref().unwrap();
-                        if matches!(q.selector.as_str(), "text" | "file") {
-                            if q.selector == "file" {
-                                search.files(q, &root)
-                            } else {
-                                search.run(q)
-                            }
-                        } else {
-                            assets.search(q)
-                        }
-                    }
-                    Request::View(path, mode) => search.view(&root, &path, mode, allow_absolute),
-                    Request::Browse(path) => search.browse(&root, &path, allow_absolute),
+            for (group, wait) in &needed {
+                if *wait {
+                    source_tickets[group].clone().wait().await?;
                 }
-            })
-            .await??;
-            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-            if let Some((identity, branch, revision, tracked)) = context {
-                crate::summary::Summary::build(
-                    &identity,
-                    &branch,
-                    &revision,
-                    tracked,
-                    &summary_manifest.root,
-                    &summary_manifest,
-                )
-                .attach(&mut result);
             }
-            self.record_usage(&usage_entry, usage_branch.as_deref(), &summary_manifest);
-            return Ok(result);
+            if wait_assets {
+                crate::unity::assets::jobs::wait(ticket.clone()).await?;
+            }
+            state = asset_workspace.clone().lock_owned().await;
+            branch_state = match &branch {
+                Some(branch) => Some(branch.state.clone().lock_owned().await),
+                None => None,
+            };
+            ensure!(
+                crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?
+                    == asset_generation,
+                "Workspace changed during indexing; retry query"
+            );
+            ensure!(
+                branch_state
+                    .as_ref()
+                    .and_then(|s| s.as_ref())
+                    .map(|s| &s.prepared.revision)
+                    == context.as_ref().map(|(_, _, revision, _)| revision),
+                "Repository changed during indexing; retry query"
+            );
         }
         let permit = self.workers.clone().acquire_owned().await?;
         let app = self.clone();
@@ -806,16 +816,65 @@ impl App {
                 let _branch_state = branch_state;
                 let workspace = state.as_mut().unwrap();
                 let store = workspace.store.clone();
-                let manifest = workspace.manifest.clone();
+                let mut manifest = workspace.manifest.as_ref().clone();
+                let mut ready = Vec::new();
+                let mut pending = std::collections::BTreeSet::new();
+                let mut remaining = None;
+                for (group, ticket) in &source_tickets {
+                    match ticket.ready() {
+                        Some(Ok(snapshot)) => {
+                            manifest.files.extend(snapshot.manifest.files.clone());
+                            ready.push((*group, snapshot));
+                        }
+                        _ if needed.contains_key(group) => {
+                            pending.extend(
+                                manifest
+                                    .deferred
+                                    .values()
+                                    .filter(|f| {
+                                        crate::native::Group::of(f.language) == Some(*group)
+                                    })
+                                    .map(|f| f.language.tag()),
+                            );
+                            if let Some(seconds) = ticket.remaining_seconds() {
+                                remaining = Some(remaining.unwrap_or(0).max(seconds));
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+                let assets = if asset_request {
+                    ticket
+                        .borrow()
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .cloned()
+                } else {
+                    None
+                };
+                if asset_request && assets.is_none() {
+                    pending.insert("Unity assets");
+                }
                 // Pin the shared LMDB snapshot under the publication gate. It
                 // stays on this blocking thread through rendering and destruction.
                 let mut search = Search::new(&store, &manifest, &cancel)?;
+                for (group, snapshot) in ready {
+                    search.with_source(group, snapshot.store.clone())?;
+                }
+                if let Some(assets) = &assets {
+                    search.with_assets(assets);
+                }
                 drop(state);
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
-                let text = match request {
+                let mut text = match request {
                     Request::Search(_) => {
                         let query = query.as_ref().unwrap();
-                        if query.selector == "file" {
+                        if matches!(
+                            query.selector.as_str(),
+                            "instance" | "references" | "dependencies"
+                        ) {
+                            assets.as_ref().unwrap().search(query)
+                        } else if query.selector == "file" {
                             search.files(query, root)
                         } else {
                             search.run(query)
@@ -824,6 +883,14 @@ impl App {
                     Request::Browse(path) => search.browse(root, &path, allow_absolute),
                     Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
                 }?;
+                if !pending.is_empty() {
+                    let eta = remaining
+                        .map_or(String::new(), |seconds| format!(" (~{seconds}s remaining)"));
+                    text.push_str(&format!(
+                        "\n\n> Index incomplete: {}{eta}",
+                        pending.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                 if let Some((identity, branch, revision, tracked)) = context {
                     crate::summary::Summary::build(
@@ -918,7 +985,20 @@ impl Mcp {
 impl Mcp {
     #[tool(
         name = "search",
-        description = r#"Find symbols, follow references, and explore C# and Rust codebases.
+        description = r#"Find symbols, follow references, and explore C#, Rust, C/C++, HLSL, GLSL, and ShaderLab code.
+
+Native source and shaders
+Bodies are indexed eagerly from source, without preprocessing or build configurations.
+Native references are candidates; local variables and parameters can resolve by lexical scope.
+Overloads and declaration sites remain distinct. Member signatures support const, &, and other written qualifiers.
+derived: matches direct written bases; native impl: is unsupported.
+Macro bodies contribute identifier references, not inferred calls or writes.
+ShaderLab indexes embedded code and entry-point pragmas, not properties or material links.
+
+Background indexing
+Native code, shaders, and Unity assets use independent background jobs.
+Broad queries return ready results and one incomplete-index notice. Stale groups are hidden during refresh.
+Queries narrowed to a background group wait for it; wait:complete waits for all relevant groups.
 
 Unity assets
 instance:TYPE finds saved and inherited Component/ScriptableObject instances, including derived types.
@@ -932,12 +1012,13 @@ Bare names find declarations. Qualified names and signatures narrow targets.
 writes: includes out arguments and possible writes through ref.
 
 Kinds
-t: type: c: class: i: interface: struct: enum: delegate: m: method: function: property: field: trait: module:
+t: type: c: class: i: interface: struct: union: enum: delegate: m: method: function: operator: property: field: trait: module: macro:
 
 Filters
-project: path: namespace: access: attr: in:
+project: path: namespace: access: attr: in: lang:
+lang: accepts cs, rust, c, cpp, hlsl, glsl, shaderlab, native, or shaders.
 Prefix filters with - to exclude matches.
-File queries support only project: and path: filters.
+File queries support project:, path:, and lang: filters.
 project: matches build-project names.
 
 Matching
@@ -1081,6 +1162,91 @@ impl ServerHandler for Mcp {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn source_groups_are_independent_and_waits_leave_code_available() {
+        use crate::native::Group;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("code.rs"), "pub struct Available;").unwrap();
+        std::fs::write(root.path().join("native.cpp"), "void native_ready() {}").unwrap();
+        std::fs::write(
+            root.path().join("shader.hlsl"),
+            "float shader_ready() { return 0; }",
+        )
+        .unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let native = app.sources.pause(Group::Native).await;
+        let shader = app.sources.pause(Group::Shaders).await;
+        let path = root.path().to_str().unwrap();
+        let broad = app.search(path, "symbol:*").await.unwrap();
+        assert!(
+            broad.contains("Available")
+                && !broad.contains("native_ready")
+                && !broad.contains("shader_ready"),
+            "{broad}"
+        );
+        assert_eq!(broad.matches("Index incomplete:").count(), 1);
+        let waiting = {
+            let app = app.clone();
+            let path = path.to_owned();
+            tokio::spawn(async move { app.search(&path, "symbol:* wait:complete").await })
+        };
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.search(path, "type:Available lang:rust"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(code.contains("Available") && !code.contains("Index incomplete:"));
+        drop(shader);
+        let shader = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.search(path, "function:shader_ready lang:hlsl"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(shader.contains("shader_ready"));
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        drop(native);
+        assert!(
+            app.search(path, "function:native_ready lang:cpp")
+                .await
+                .unwrap()
+                .contains("native_ready")
+        );
+
+        let pause = app.sources.pause(Group::Native).await;
+        std::fs::write(root.path().join("native.cpp"), "void intermediate() {}").unwrap();
+        let broad = app.search(path, "symbol:*").await.unwrap();
+        assert!(
+            !broad.contains("native_ready") && broad.contains("Available"),
+            "{broad}"
+        );
+        std::fs::write(root.path().join("native.cpp"), "void newest() {}").unwrap();
+        let broad = app.search(path, "symbol:*").await.unwrap();
+        assert!(!broad.contains("intermediate"), "{broad}");
+        drop(pause);
+        let current = app.search(path, "function:* lang:cpp").await.unwrap();
+        assert!(
+            current.contains("newest")
+                && !current.contains("intermediate")
+                && !current.contains("native_ready"),
+            "{current}"
+        );
+        app.shutdown().await;
+    }
+
     #[tokio::test]
     async fn asset_wait_does_not_hold_code_workspace_or_query_worker() {
         let root = tempfile::tempdir().unwrap();

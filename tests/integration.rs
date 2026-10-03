@@ -5,6 +5,7 @@ mod http;
 mod hybrid;
 mod metadata;
 mod msbuild;
+mod native;
 mod navigation;
 mod scope_regressions;
 mod sharing_analysis;

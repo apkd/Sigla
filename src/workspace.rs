@@ -13,7 +13,7 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
-    size: u64,
+    pub(crate) size: u64,
     revision: Revision,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,11 +80,14 @@ pub struct FileEntry {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
+    pub source_group: Option<crate::native::Group>,
     pub discovery_policy: [u8; 32],
     pub environment: [u8; 32],
     pub root: PathBuf,
     pub projects: Vec<Project>,
     pub files: BTreeMap<String, FileEntry>,
+    /// Selected sources whose facts are published by the native/shader workers.
+    pub deferred: BTreeMap<String, FileEntry>,
     pub metadata: BTreeMap<PathBuf, Stamp>,
     pub inputs: Vec<SourceInput>,
     pub dependencies: BTreeSet<PathBuf>,
@@ -208,6 +211,7 @@ impl Workspace {
                 .manifest
                 .files
                 .values()
+                .chain(self.manifest.deferred.values())
                 .map(|f| &f.path)
                 .chain(self.manifest.metadata.keys())
             {
@@ -237,6 +241,7 @@ impl Workspace {
             .manifest
             .files
             .values()
+            .chain(self.manifest.deferred.values())
             .find(|f| Stamp::read(&f.path).as_ref().ok() != Some(&f.stamp))
             .map(|file| &file.path);
         let metadata_changed = !cache_current
@@ -290,11 +295,13 @@ impl Workspace {
         } = prepared;
         let mut directories = BTreeSet::new();
         let mut manifest = Manifest {
+            source_group: None,
             discovery_policy: self.policy.identity()?,
             environment: [0; 32],
             root: discovery.root,
             projects: discovery.projects,
             files: BTreeMap::new(),
+            deferred: BTreeMap::new(),
             metadata: BTreeMap::new(),
             inputs: discovery.sources.clone(),
             dependencies: discovery.dependencies,
@@ -388,7 +395,12 @@ impl Workspace {
                 }
             };
             let key = input_key(&input, project, &stamp);
-            if let Some(f) = manifest.files.get_mut(&key) {
+            let files = if input.language.native() {
+                &mut manifest.deferred
+            } else {
+                &mut manifest.files
+            };
+            if let Some(f) = files.get_mut(&key) {
                 f.memberships.push(Membership {
                     project: input.project,
                     module: input.module,
@@ -402,6 +414,29 @@ impl Workspace {
                     MAX_SOURCE_BYTES / 1024 / 1024,
                     input.path.display()
                 ));
+                continue;
+            }
+            if input.language.native() {
+                manifest.deferred.insert(
+                    key,
+                    FileEntry {
+                        display: input
+                            .path
+                            .strip_prefix(&manifest.root)
+                            .unwrap_or(&input.path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        path: input.path,
+                        stamp,
+                        language: input.language,
+                        memberships: vec![Membership {
+                            project: input.project,
+                            module: input.module,
+                        }],
+                        modules: Vec::new(),
+                        metadata: false,
+                    },
+                );
                 continue;
             }
             let store = &self.store;
@@ -610,6 +645,8 @@ fn input_key(input: &SourceInput, project: &Project, stamp: &Stamp) -> String {
         "document".into()
     } else if input.language == Language::CSharp {
         crate::store::canonical_defines(&project.defines).join(";")
+    } else if input.language.native() {
+        format!("native:{:?}", input.language)
     } else {
         format!("rust-2:{}", project.edition)
     };
@@ -716,6 +753,33 @@ fn index_input(
 }
 
 type IndexedSources = BTreeMap<String, (Stamp, Result<Indexed>)>;
+
+pub(crate) fn index_native(
+    store: &Store,
+    key: &str,
+    file: &FileEntry,
+    projects: &[Project],
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    tracing::debug!(path = %file.path.display(), "indexing native source");
+    let membership = &file.memberships[0];
+    let input = SourceInput {
+        path: file.path.clone(),
+        project: membership.project,
+        module: String::new(),
+        language: file.language,
+        metadata: false,
+    };
+    index_input(
+        store,
+        key,
+        &input,
+        &projects[membership.project],
+        &file.stamp,
+    )?;
+    tracing::debug!(path = %file.path.display(), elapsed_ms = started.elapsed().as_millis(), "native source indexed");
+    Ok(())
+}
 
 /// C# discovery already supplies all sources. Extract independent compilation
 /// contexts concurrently, then assemble the manifest in discovery order.

@@ -463,11 +463,15 @@ impl Scope {
     }
     pub fn query_read(&self) -> Result<RoTxn<'_, heed::WithTls>> {
         let tx = self.read()?;
+        self.check_read(&tx)?;
+        Ok(tx)
+    }
+    pub fn check_read(&self, tx: &RoTxn<'_>) -> Result<()> {
         ensure!(
-            self.info(&tx)?.phase == Phase::Clean,
+            self.info(tx)?.phase == Phase::Clean,
             "Workspace needs a completed refresh"
         );
-        Ok(tx)
+        Ok(())
     }
     pub fn begin_refresh(&self) -> Result<()> {
         let mut tx = self.database.env.write_txn()?;

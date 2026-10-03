@@ -12,6 +12,7 @@ pub mod metadata;
 mod minify;
 pub mod model;
 mod msbuild;
+pub mod native;
 mod navigation;
 mod process;
 mod sandbox;

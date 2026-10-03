@@ -240,7 +240,8 @@ fn exchange(a: &Path, b: &Path) -> Result<()> {
     let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
     ensure!(
         unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 a.as_ptr(),
                 libc::AT_FDCWD,

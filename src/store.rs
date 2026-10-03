@@ -18,6 +18,7 @@ use std::{
 pub use payload::{ANALYSIS_VERSION, canonical_defines, metadata_id, source_id};
 pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const MANIFEST_PREFIX: &[u8] = b"sigla-manifest-3\0";
 
 #[derive(Serialize, Deserialize)]
 pub struct FileData {
@@ -95,6 +96,9 @@ impl Store {
     pub fn query_read(&self) -> Result<RoTxn<'_, heed::WithTls>> {
         self.scope.query_read()
     }
+    pub fn check_read(&self, tx: &RoTxn<'_>) -> Result<()> {
+        self.scope.check_read(tx)
+    }
     pub fn begin_refresh(&self) -> Result<()> {
         self.scope.begin_refresh()
     }
@@ -102,17 +106,16 @@ impl Store {
         self.scope.clean()
     }
     pub fn get_manifest<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
-        const PREFIX: &[u8] = b"sigla-manifest-2\0";
         self.scope
             .manifest()?
-            .and_then(|bytes| bytes.strip_prefix(PREFIX).map(<[u8]>::to_vec))
+            .and_then(|bytes| bytes.strip_prefix(MANIFEST_PREFIX).map(<[u8]>::to_vec))
             .map(|bytes| Ok(postcard::from_bytes(&bytes)?))
             .transpose()
     }
     /// Reconcile against persisted bindings, not only the previous in-memory manifest.
     pub fn save_manifest(&self, manifest: &crate::workspace::Manifest) -> Result<()> {
         let keep = manifest.files.keys().cloned().collect();
-        let mut bytes = b"sigla-manifest-2\0".to_vec();
+        let mut bytes = MANIFEST_PREFIX.to_vec();
         bytes.extend(postcard::to_allocvec(manifest)?);
         self.scope.finish_refresh(&bytes, &keep, now())
     }

@@ -14,5 +14,6 @@ pub fn extract(
         Language::CSharp => csharp::extract(source, defines),
         Language::Rust => rust::extract(source, edition),
         Language::Markdown | Language::Text => Ok(Facts::default()),
+        language => crate::native::extract(source, language),
     }
 }

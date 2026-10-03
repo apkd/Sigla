@@ -220,7 +220,8 @@ pub fn analysis_input(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|s| s.to_str()),
         Some("cs" | "asmdef" | "asmref" | "rsp" | "dll")
-    ) || name == "package.json"
+    ) || crate::native::language(path).is_some()
+        || name == "package.json"
         || [".asmdef.meta", ".asmref.meta", ".dll.meta", ".rsp.meta"]
             .iter()
             .any(|s| name.ends_with(s))

@@ -66,6 +66,7 @@ impl Catalog {
         owner.dependencies = manifest
             .files
             .values()
+            .chain(manifest.deferred.values())
             .map(|file| &file.path)
             .chain(manifest.metadata.keys())
             .chain(manifest.dependencies.iter())

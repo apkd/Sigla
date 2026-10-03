@@ -1,7 +1,7 @@
 use crate::model::{Language, MetadataReference, Project, ProjectReference, SourceInput};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -77,7 +77,7 @@ impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         hash.update(&serde_json::to_vec(&(
-            8u32,
+            9u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -325,9 +325,21 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
 /// Documents have a repository context plus memberships in enclosing build
 /// projects. The repository context is not a build project or a declaration.
 fn discover_documents(policy: &Policy, result: &mut Discovery) {
+    // Unity has already selected and approved these package roots (including its cache).
+    let packages: BTreeSet<_> = result
+        .projects
+        .iter()
+        .filter(|p| p.compiler_options.contains_key("UnityVersion"))
+        .flat_map(|p| p.source_roots.iter().map(|r| r.physical.clone()))
+        .collect();
     let mut pending = vec![result.root.clone()];
+    pending.extend(packages.iter().cloned());
+    let mut visited = BTreeSet::new();
     let mut documents = Vec::new();
     while let Some(directory) = pending.pop() {
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
         result.metadata.insert(directory.clone());
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -371,6 +383,10 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                     || entry
                         .file_name()
                         .to_str()
+                        .is_some_and(|n| !n.starts_with('.') && n.ends_with('~'))
+                    || entry
+                        .file_name()
+                        .to_str()
                         .is_some_and(|n| matches!(n, ".github" | ".gitlab" | ".cargo" | ".config")))
                     && !matches!(
                         entry.file_name().to_str(),
@@ -388,10 +404,18 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                     pending.push(path);
                 }
             } else if kind.is_file() {
-                let Some(language) = crate::documents::language(&path) else {
+                let Some(language) = crate::native::language(&path).or_else(|| {
+                    (path.starts_with(&result.root)
+                        && !path
+                            .components()
+                            .any(|c| c.as_os_str().to_string_lossy().ends_with('~')))
+                    .then(|| crate::documents::language(&path))
+                    .flatten()
+                }) else {
                     continue;
                 };
                 if let Some(remote) = &policy.remote
+                    && path.starts_with(&remote.workspace)
                     && !path
                         .strip_prefix(&remote.workspace)
                         .ok()
@@ -400,7 +424,13 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                 {
                     continue;
                 }
-                match policy.canonical(&path) {
+                let canonical = if language.native() && packages.iter().any(|p| path.starts_with(p))
+                {
+                    path.canonicalize().map_err(anyhow::Error::from)
+                } else {
+                    policy.canonical(&path)
+                };
+                match canonical {
                     Ok(path) => documents.push((path, language)),
                     Err(error) => result
                         .diagnostics
@@ -422,7 +452,19 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
         assemblies: Vec::new(),
         edition: String::new(),
         compiler_options: Default::default(),
-        source_roots: Vec::new(),
+        source_roots: result
+            .projects
+            .iter()
+            .filter(|p| p.compiler_options.contains_key("UnityVersion"))
+            .flat_map(|p| &p.source_roots)
+            .fold(BTreeMap::new(), |mut roots, root| {
+                roots
+                    .entry((root.physical.clone(), root.logical.clone()))
+                    .or_insert_with(|| root.clone());
+                roots
+            })
+            .into_values()
+            .collect(),
     });
     for (path, language) in documents {
         let projects = std::iter::once(context).chain(
@@ -430,12 +472,18 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                 .iter()
                 .enumerate()
                 .filter(|(_, project)| {
-                    path.parent() != Some(result.root.as_path())
-                        && project
+                    (language.native() || path.parent() != Some(result.root.as_path()))
+                        && (project.source_roots.iter().any(|r| {
+                            path.starts_with(&r.physical)
+                                && project
+                                    .origin
+                                    .as_ref()
+                                    .is_some_and(|origin| origin.starts_with(&r.physical))
+                        }) || project
                             .origin
                             .as_ref()
                             .and_then(|p| p.parent())
-                            .is_some_and(|dir| path.starts_with(dir))
+                            .is_some_and(|dir| path.starts_with(dir)))
                 })
                 .map(|(i, _)| i),
         );

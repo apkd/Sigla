@@ -82,7 +82,10 @@ impl Jobs {
         if let Some(job) = jobs.get(&root) {
             let outcome = job.ticket.borrow();
             if job.generation == generation
-                && (outcome.is_none() || !refresh && outcome.as_ref().is_some_and(|r| r.is_ok()))
+                && (outcome.is_none()
+                    || outcome
+                        .as_ref()
+                        .is_some_and(|r| r.as_ref().is_ok_and(|index| !refresh || index.current())))
             {
                 return job.ticket.clone();
             }

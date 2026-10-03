@@ -34,7 +34,7 @@ impl Selection {
         Ok(Self {
             includes: compile(includes)?,
             excludes: compile(excludes)?,
-            identity: blake3::hash(&serde_json::to_vec(&(5u32, includes, excludes))?)
+            identity: blake3::hash(&serde_json::to_vec(&(6u32, includes, excludes))?)
                 .to_hex()
                 .to_string(),
             patterns: (includes.to_vec(), excludes.to_vec()),
@@ -115,7 +115,7 @@ fn baseline(path: &str) -> bool {
     {
         return true;
     }
-    if crate::documents::language(path).is_some() {
+    if crate::native::language(path).is_some() || crate::documents::language(path).is_some() {
         return true;
     }
     if path

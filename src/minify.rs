@@ -16,7 +16,7 @@ pub fn render(source: &str, language: Language, range: Range<usize>) -> String {
     let (tokens, mut edits) = match language {
         Language::Rust => rust(source),
         Language::CSharp => csharp(source, &range),
-        Language::Markdown | Language::Text => return source[range].into(),
+        _ => return source[range].into(),
     };
     edits.extend(spacing(source, &tokens));
     if let Some(first) = tokens.iter().find(|t| t.range.end > range.start)
