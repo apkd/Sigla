@@ -91,7 +91,7 @@ async fn http_contract_and_origin_validation() {
     if let Some(session) = &session {
         request = request.header("mcp-session-id", session);
     }
-    let response=request.json(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"project":root.path(),"query":"FoundOverHttp limit:1"}}})).send().await.unwrap();
+    let response=request.json(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"codebase":root.path(),"query":"FoundOverHttp limit:1"}}})).send().await.unwrap();
     let called = body(response).await;
     let result = &called["result"];
     assert_eq!(result["content"].as_array().unwrap().len(), 1);
@@ -111,17 +111,17 @@ async fn http_contract_and_origin_validation() {
     for (name, args, expected) in [
         (
             "browse",
-            serde_json::json!({"project":root.path()}),
+            serde_json::json!({"codebase":root.path()}),
             "lib.rs",
         ),
         (
             "view",
-            serde_json::json!({"project":root.path(),"path":"lib.rs"}),
+            serde_json::json!({"codebase":root.path(),"path":"lib.rs"}),
             "FoundOverHttp",
         ),
         (
             "view",
-            serde_json::json!({"project":root.path(),"path":"src/lib.rs:1","mode":"exact"}),
+            serde_json::json!({"codebase":root.path(),"path":"src/lib.rs:1","mode":"exact"}),
             "```rust",
         ),
     ] {

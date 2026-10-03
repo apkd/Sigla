@@ -3435,6 +3435,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-c-sharp",
+ "unsafe-libyaml",
  "url",
  "windows-metadata",
  "zstd",

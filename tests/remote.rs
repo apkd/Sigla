@@ -19,6 +19,44 @@ fn git(root: &Path, args: &[&str]) -> Result<()> {
             .success(),
         "Fixture Git operation failed"
     );
+    if args.first() == Some(&"commit") {
+        // Git transport is local in this fixture. Seed the matching host inventory
+        // as well, so exercising GitHub aliases never contacts the public API.
+        let repository =
+            sigla::repository::Repository::parse("https://github.com/fixture/repo")?.unwrap();
+        let store = root
+            .parent()
+            .unwrap()
+            .join("cache/git")
+            .join(repository.identity.storage_key())
+            .join("current");
+        fs::create_dir_all(&store)?;
+        let revision = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        ensure!(revision.status.success(), "Cannot resolve fixture revision");
+        let revision = String::from_utf8(revision.stdout)?.trim().to_owned();
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-tree", "-rl", "HEAD"])
+            .output()?;
+        ensure!(tree.status.success(), "Cannot enumerate fixture tree");
+        let mut sizes = std::collections::BTreeMap::new();
+        for line in std::str::from_utf8(&tree.stdout)?.lines() {
+            let (header, path) = line.split_once('\t').context("Invalid fixture tree")?;
+            let fields: Vec<_> = header.split_whitespace().collect();
+            if fields[1] == "blob" {
+                sizes.insert(path, fields[3].parse::<u64>()?);
+            }
+        }
+        fs::write(
+            store.join(format!("github-tree-{revision}.json")),
+            serde_json::to_vec(&json!({"version":1,"sizes":sizes}))?,
+        )?;
+    }
     Ok(())
 }
 
@@ -181,7 +219,7 @@ impl Server {
             .error_for_status()?)
     }
     fn query(&self, project: &str, query: &str) -> Result<(bool, String)> {
-        self.call("search", json!({"project":project,"query":query}))
+        self.call("search", json!({"codebase":project,"query":query}))
     }
     fn call(&self, name: &str, arguments: Value) -> Result<(bool, String)> {
         let id = self
@@ -344,7 +382,7 @@ fn lifecycle() -> Result<()> {
     let count = fs::read(root.path().join("requests.log"))?.len();
     let (error, document) = server.call(
         "view",
-        json!({"project":main,"path":"README.md","mode":"minified"}),
+        json!({"codebase":main,"path":"README.md","mode":"minified"}),
     )?;
     ensure!(
         !error && document.contains("Keep  document spacing."),
@@ -355,14 +393,14 @@ fn lifecycle() -> Result<()> {
         !error && document_match.contains("README.md"),
         "Remote text search missed document: {document_match}"
     );
-    let (error, tree) = server.call("browse", json!({"project":main}))?;
+    let (error, tree) = server.call("browse", json!({"codebase":main}))?;
     ensure!(
         !error && tree.contains("lib.rs") && !tree.contains("asset.bin"),
         "Remote browse failed: {tree}"
     );
     let (error, viewed) = server.call(
         "view",
-        json!({"project":main,"path":"lib.rs:1","mode":"exact"}),
+        json!({"codebase":main,"path":"lib.rs:1","mode":"exact"}),
     )?;
     ensure!(
         !error && viewed.contains("pub struct Main;\n") && viewed.contains("`src/lib.rs:1`"),
@@ -381,7 +419,7 @@ fn lifecycle() -> Result<()> {
     );
     ensure!(
         server
-            .call("view", json!({"project":main,"path":"/etc/passwd"}))?
+            .call("view", json!({"codebase":main,"path":"/etc/passwd"}))?
             .0,
         "Remote view accepted an absolute path"
     );

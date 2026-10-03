@@ -20,6 +20,7 @@ struct Hit {
 }
 
 pub struct Search<'a> {
+    assets: Option<&'a crate::unity::assets::Index>,
     store: &'a Store,
     manifest: &'a Manifest,
     cancel: &'a tokio_util::sync::CancellationToken,
@@ -40,6 +41,7 @@ impl<'a> Search<'a> {
         cancel: &'a tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
         Ok(Self {
+            assets: None,
             store,
             manifest,
             cancel,
@@ -53,6 +55,9 @@ impl<'a> Search<'a> {
             summary_bytes: 0,
             csharp: Default::default(),
         })
+    }
+    pub fn with_assets(&mut self, assets: &'a crate::unity::assets::Index) {
+        self.assets = Some(assets);
     }
     fn check(&self) -> Result<()> {
         ensure!(!self.cancel.is_cancelled(), "Query cancelled");
@@ -1189,7 +1194,8 @@ impl<'a> Search<'a> {
         None
     }
     fn source_paths(&self, root: &std::path::Path) -> BTreeMap<String, String> {
-        self.manifest
+        let mut paths: BTreeMap<String, String> = self
+            .manifest
             .files
             .iter()
             .filter(|(_, file)| !file.metadata)
@@ -1199,7 +1205,13 @@ impl<'a> Search<'a> {
                     .ok()
                     .map(|path| (path.to_string_lossy().into_owned(), key.clone()))
             })
-            .collect()
+            .collect();
+        if let Some(assets) = self.assets {
+            for asset in assets.assets.values() {
+                paths.entry(asset.path.clone()).or_default();
+            }
+        }
+        paths
     }
     pub fn files(&self, q: &Query, root: &std::path::Path) -> Result<String> {
         let pattern = globset::GlobBuilder::new(&q.target.name)
@@ -1238,15 +1250,18 @@ impl<'a> Search<'a> {
             {
                 continue;
             }
-            let file = &self.manifest.files[&key];
-            if !file.memberships.iter().any(|m| {
-                if !self.project_membership(q, file, m) {
-                    return false;
-                }
-                q.filters.iter().filter(|f| f.key == "project").all(|f| {
-                    wildcard(&f.value, &self.manifest.projects[m.project].name) != f.negate
+            let file = self.manifest.files.get(&key);
+            if file.is_some_and(|file| {
+                !file.memberships.iter().any(|m| {
+                    if !self.project_membership(q, file, m) {
+                        return false;
+                    }
+                    q.filters.iter().filter(|f| f.key == "project").all(|f| {
+                        wildcard(&f.value, &self.manifest.projects[m.project].name) != f.negate
+                    })
                 })
-            }) {
+            }) || file.is_none() && q.filters.iter().any(|f| f.key == "project")
+            {
                 continue;
             }
             total += 1;
@@ -1296,6 +1311,11 @@ impl<'a> Search<'a> {
         absolute: bool,
     ) -> Result<String> {
         self.check()?;
+        if let Some(assets) = self.assets
+            && let Some(text) = assets.view(path)?
+        {
+            return Ok(text);
+        }
         let files = self.source_paths(root);
         let indexed = |p: &str| {
             files.contains_key(p)
@@ -1374,6 +1394,16 @@ impl<'a> Search<'a> {
     }
     fn text(&mut self, q: &Query, inside: &[(bool, Vec<Hit>)]) -> Result<String> {
         let mut units = crate::selection::Selection::new(q.limit);
+        if inside.is_empty()
+            && !q.filters.iter().any(|f| f.key == "project")
+            && let Some(assets) = self.assets
+        {
+            assets.visit_text(q, |position, result| {
+                self.check()?;
+                units.insert((result.path.clone(), position), result);
+                Ok(())
+            })?;
+        }
         let files = self.containment_files(inside)?;
         let files = self.filtered_files(q, files);
         let literal = regex::RegexBuilder::new(&regex::escape(&q.target.name))

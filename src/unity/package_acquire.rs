@@ -276,6 +276,12 @@ impl GitSource {
                 .tempdir_in(&root)?;
             let sources = stage.path().join("sources");
             let request = crate::repository::materialize::Request {
+                transfer_used: 0,
+                unlimited_transfer: remote
+                    .unwrap()
+                    .repositories
+                    .iter()
+                    .any(|r| r.exact_match(&self.repository)),
                 allow_private: crate::repository::authorize(
                     &remote.unwrap().repositories,
                     &self.repository,

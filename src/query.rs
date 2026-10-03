@@ -62,8 +62,20 @@ const SELECTORS: &[&str] = &[
     "impl",
     "text",
     "file",
+    "instance",
+    "references",
+    "dependencies",
 ];
-const FILTERS: &[&str] = &["project", "namespace", "access", "path", "attr", "in"];
+const FILTERS: &[&str] = &[
+    "project",
+    "namespace",
+    "access",
+    "path",
+    "attr",
+    "in",
+    "unity-project",
+    "type-match",
+];
 
 impl Query {
     pub fn parse(input: &str) -> Result<Self> {
@@ -182,7 +194,34 @@ impl Query {
                 "`text:` supports `project:`, `path:`, and `in:` filters."
             );
         }
-        let target = if matches!(selector.as_str(), "text" | "operator" | "file") {
+        let asset_query = matches!(
+            selector.as_str(),
+            "instance" | "references" | "dependencies"
+        );
+        if asset_query {
+            ensure!(
+                filters
+                    .iter()
+                    .all(|f| matches!(f.key.as_str(), "path" | "unity-project" | "type-match")),
+                "Asset queries support path:, unity-project:, and type-match: filters"
+            );
+            for filter in &filters {
+                if filter.key == "type-match" {
+                    ensure!(
+                        !filter.negate && matches!(filter.value.as_str(), "exact" | "derived"),
+                        "Use type-match:exact or type-match:derived"
+                    );
+                }
+            }
+        } else {
+            ensure!(
+                !filters
+                    .iter()
+                    .any(|f| matches!(f.key.as_str(), "unity-project" | "type-match")),
+                "Unity filters require an asset selector"
+            );
+        }
+        let target = if asset_query || matches!(selector.as_str(), "text" | "operator" | "file") {
             Target {
                 name: value,
                 parameters: None,

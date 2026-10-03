@@ -31,6 +31,7 @@ pub struct App {
     cache: PathBuf,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceSlot>>,
     workers: Arc<tokio::sync::Semaphore>,
+    assets: crate::unity::assets::jobs::Jobs,
     monitor: Arc<crate::watch::Monitor>,
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
@@ -57,7 +58,9 @@ impl App {
         crate::memory::reclaim();
         loop {
             match crate::memory::resident_bytes() {
-                Ok(bytes) if bytes > crate::memory::IDLE_CACHE_HIGH_WATER => {}
+                Ok(bytes) if bytes > crate::memory::IDLE_CACHE_HIGH_WATER => {
+                    self.assets.trim_completed();
+                }
                 Ok(_) => return,
                 Err(error) => {
                     tracing::warn!(%error, "Cannot measure resident cache memory");
@@ -115,6 +118,7 @@ impl App {
             cache,
             workspaces: Mutex::new(HashMap::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            assets: Default::default(),
             monitor: Arc::new(crate::watch::Monitor::default()),
             remote: None,
             upstream: None,
@@ -154,6 +158,7 @@ impl App {
     }
 
     pub async fn shutdown(&self) {
+        self.assets.shutdown();
         if let Some(upstream) = &self.upstream {
             upstream.shutdown().await;
         }
@@ -364,7 +369,7 @@ impl App {
         request: Request,
         upstream: Option<&crate::upstream::Upstream>,
     ) -> Result<CallToolResult> {
-        ensure!(path.len() <= 4096, "Project exceeds request size limit");
+        ensure!(path.len() <= 4096, "Codebase exceeds request size limit");
         match &request {
             Request::Browse(path) | Request::View(path, _) => {
                 ensure!(path.len() <= 4096, "Path exceeds request size limit")
@@ -385,14 +390,15 @@ impl App {
             let (name, args) = match request {
                 Request::Search(query) => (
                     "search",
-                    serde_json::json!({"project":project,"query":query}),
+                    serde_json::json!({"codebase":project,"query":query}),
                 ),
-                Request::Browse(path) => {
-                    ("browse", serde_json::json!({"project":project,"path":path}))
-                }
+                Request::Browse(path) => (
+                    "browse",
+                    serde_json::json!({"codebase":project,"path":path}),
+                ),
                 Request::View(path, mode) => (
                     "view",
-                    serde_json::json!({"project":project,"path":path,"mode":match mode {
+                    serde_json::json!({"codebase":project,"path":path,"mode":match mode {
                         crate::navigation::Mode::Exact => "exact",
                         crate::navigation::Mode::Minified => "minified",
                     }}),
@@ -493,6 +499,7 @@ impl App {
             (state, retired)
         };
         drop(retired);
+        let asset_workspace = workspace.clone();
         // The service owns preparation. Dropping a caller only drops its wait.
         let preparing_app = self.clone();
         let preparing_branch = branch.clone();
@@ -638,6 +645,133 @@ impl App {
             .map(|branch| branch.source().canonicalize())
             .transpose()?;
         let allow_absolute = self.remote.is_none();
+        let asset_request = match &request {
+            Request::Search(_) => query.as_ref().is_some_and(|q| {
+                matches!(
+                    q.selector.as_str(),
+                    "instance" | "references" | "dependencies"
+                ) || matches!(q.selector.as_str(), "text" | "file")
+                    && !q.filters.iter().any(|f| {
+                        matches!(f.key.as_str(), "in" | "project")
+                            || f.key == "path"
+                                && !f.negate
+                                && matches!(
+                                    std::path::Path::new(&f.value)
+                                        .extension()
+                                        .and_then(|e| e.to_str()),
+                                    Some("cs" | "rs" | "md")
+                                )
+                    })
+            }),
+            Request::View(path, _) => {
+                path.starts_with("unity@")
+                    || crate::navigation::location(path).is_ok_and(|(p, _)| {
+                        crate::unity::assets::is_asset(Path::new(p))
+                            || crate::documents::language(Path::new(p)).is_none()
+                                && !matches!(
+                                    Path::new(p).extension().and_then(|s| s.to_str()),
+                                    Some("cs" | "rs")
+                                )
+                    })
+            }
+            Request::Browse(_) => true,
+        };
+        let asset_root = state.as_ref().unwrap().manifest.root.clone();
+        let asset_generation =
+            crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?;
+        let asset_cache = branch
+            .as_ref()
+            .map(|b| b.root.join("unity-assets"))
+            .unwrap_or_else(|| {
+                self.cache.join("unity-assets").join(
+                    blake3::hash(asset_root.as_os_str().as_encoded_bytes())
+                        .to_hex()
+                        .as_str(),
+                )
+            });
+        let revision = context.as_ref().map(|(_, _, revision, _)| revision.clone());
+        let has_unity = crate::unity::assets::is_root(&asset_root)
+            || state
+                .as_ref()
+                .unwrap()
+                .manifest
+                .projects
+                .iter()
+                .any(|p| p.compiler_options.contains_key("UnityVersion"))
+            || state.as_ref().unwrap().manifest.files.values().any(|f| {
+                f.path.ancestors().any(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n == "Assets" || n == "ProjectSettings")
+                        && p.parent().is_some_and(crate::unity::assets::is_root)
+                })
+            });
+        let ticket = if has_unity {
+            self.assets.start(crate::unity::assets::jobs::Request {
+                workspace: asset_workspace.clone(),
+                branch: branch.clone(),
+                root: asset_root,
+                cache: asset_cache,
+                expected: asset_generation,
+                revision,
+                refresh: asset_request && branch.is_none(),
+            })
+        } else {
+            crate::unity::assets::jobs::empty()
+        };
+        if asset_request {
+            // Asset workers acquire their own snapshots; do not wait while owning code locks.
+            let store = state.as_ref().unwrap().store.clone();
+            let manifest = state.as_ref().unwrap().manifest.clone();
+            drop(state);
+            drop(branch_state);
+            let assets = crate::unity::assets::jobs::wait(ticket).await?;
+            let root = repository_root.unwrap_or_else(|| manifest.root.clone());
+            let summary_manifest = manifest.clone();
+            let code_gate = asset_workspace.lock_owned().await;
+            let text = tokio::task::spawn_blocking(move || -> Result<String> {
+                ensure!(
+                    code_gate
+                        .as_ref()
+                        .is_some_and(|w| crate::unity::assets::jobs::generation(&w.manifest).ok()
+                            == Some(asset_generation)),
+                    "Workspace changed during asset indexing; retry query"
+                );
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let mut search = Search::new(&store, &manifest, &cancel)?;
+                search.with_assets(&assets);
+                drop(code_gate);
+                match request {
+                    Request::Search(_) => {
+                        let q = query.as_ref().unwrap();
+                        if matches!(q.selector.as_str(), "text" | "file") {
+                            if q.selector == "file" {
+                                search.files(q, &root)
+                            } else {
+                                search.run(q)
+                            }
+                        } else {
+                            assets.search(q)
+                        }
+                    }
+                    Request::View(path, mode) => search.view(&root, &path, mode, allow_absolute),
+                    Request::Browse(path) => search.browse(&root, &path, allow_absolute),
+                }
+            })
+            .await??;
+            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            if let Some((identity, branch, revision, tracked)) = context {
+                crate::summary::Summary::build(
+                    &identity,
+                    &branch,
+                    &revision,
+                    tracked,
+                    &summary_manifest.root,
+                    &summary_manifest,
+                )
+                .attach(&mut result);
+            }
+            return Ok(result);
+        }
         let permit = self.workers.clone().acquire_owned().await?;
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -700,14 +834,14 @@ fn result_text(result: CallToolResult) -> Result<String> {
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
     /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique cached commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
-    pub project: String,
+    pub codebase: String,
     pub query: String,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseArguments {
     /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique cached commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
-    pub project: String,
+    pub codebase: String,
     #[serde(default)]
     pub path: String,
 }
@@ -715,7 +849,7 @@ pub struct BrowseArguments {
 #[serde(deny_unknown_fields)]
 pub struct ViewArguments {
     /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique cached commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
-    pub project: String,
+    pub codebase: String,
     pub path: String,
     #[serde(default)]
     pub mode: crate::navigation::Mode,
@@ -745,6 +879,13 @@ impl Mcp {
     #[tool(
         name = "search",
         description = r#"Find symbols, follow references, and explore C# and Rust codebases.
+
+Unity assets
+instance:TYPE finds saved and inherited Component/ScriptableObject instances, including derived types.
+type-match:exact restricts instance searches to the requested type. unity-project: selects a Unity root.
+references:ASSET finds incoming references; dependencies:ASSET finds outgoing references after prefab overrides.
+ASSET can be a file path or a returned unity@ object identifier. Pass that identifier to view to inspect it.
+Asset queries wait for background indexing; code queries remain available.
 
 Declarations
 Bare names find declarations. Qualified names and signatures narrow targets.
@@ -790,7 +931,7 @@ file:src/**/*.cs"#,
         Parameters(args): Parameters<Arguments>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.execute(&args.project, Ok(Request::Search(args.query)), context)
+        self.execute(&args.codebase, Ok(Request::Search(args.query)), context)
             .await
     }
 
@@ -803,7 +944,7 @@ file:src/**/*.cs"#,
         Parameters(args): Parameters<BrowseArguments>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.execute(&args.project, Ok(Request::Browse(args.path)), context)
+        self.execute(&args.codebase, Ok(Request::Browse(args.path)), context)
             .await
     }
 
@@ -817,7 +958,7 @@ file:src/**/*.cs"#,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
         self.execute(
-            &args.project,
+            &args.codebase,
             Ok(Request::View(args.path, args.mode)),
             context,
         )
@@ -828,13 +969,13 @@ impl Mcp {
     #[tracing::instrument(skip(self, context), fields(request_id = ?context.id))]
     async fn execute(
         &self,
-        project: &str,
+        codebase: &str,
         request: Result<Request>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
         let search = async {
             self.app
-                .request_cancellable(project, request?, &context.ct, self.upstream.as_deref())
+                .request_cancellable(codebase, request?, &context.ct, self.upstream.as_deref())
                 .await
         };
         let heartbeat = async {
@@ -882,7 +1023,7 @@ impl Mcp {
             }
             Ok(result) => self.session.present(result),
             Err(e) => {
-                tracing::error!(project, error = %format!("{e:#}"), "Tool request failed");
+                tracing::error!(codebase, error = %format!("{e:#}"), "Tool request failed");
                 let mut result =
                     CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))]);
                 result.structured_content = Some(crate::diagnostics::details(
@@ -900,6 +1041,53 @@ impl ServerHandler for Mcp {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn asset_wait_does_not_hold_code_workspace_or_query_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("code.rs"), "pub struct Available;").unwrap();
+        std::fs::create_dir(root.path().join("Assets")).unwrap();
+        std::fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+        std::fs::write(
+            root.path().join("ProjectSettings/ProjectVersion.txt"),
+            "version",
+        )
+        .unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let pause = app.assets.pause().await;
+        let waiting = {
+            let app = app.clone();
+            let project = root.path().join("code.rs").to_string_lossy().into_owned();
+            tokio::spawn(async move { app.search(&project, "instance:*").await })
+        };
+        app.preparation_started.notified().await;
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.search(
+                root.path().join("code.rs").to_str().unwrap(),
+                "type:Available",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(code.contains("Available"));
+        assert!(!waiting.is_finished());
+        drop(pause);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        app.shutdown().await;
+    }
     #[tokio::test]
     async fn queued_preparation_does_not_block_branch_reacquisition() {
         use crate::repository::{Repository, Rule, materialize::Target};
@@ -1133,7 +1321,7 @@ mod tests {
             .await
             .unwrap();
         let (pings, mut received) = tokio::sync::mpsc::channel(16);
-        let request = post().json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"project":root.path(),"query":"type:Prepared"}}}));
+        let request = post().json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"codebase":root.path(),"query":"type:Prepared"}}}));
         let search = {
             let client = client.clone();
             let url = url.clone();

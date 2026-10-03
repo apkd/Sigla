@@ -68,6 +68,10 @@ impl Target {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default)]
+    pub transfer_used: u64,
+    #[serde(default)]
+    pub unlimited_transfer: bool,
     pub repository: String,
     #[serde(default)]
     pub allow_private: bool,
@@ -86,6 +90,8 @@ pub struct Request {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Prepared {
+    #[serde(default)]
+    pub omitted: BTreeMap<String, String>,
     #[serde(default)]
     pub transfer_bytes: u64,
     #[serde(default)]
@@ -195,10 +201,21 @@ fn receive(
     store: &Path,
     objects: Vec<gix_hash::ObjectId>,
     depth_one: bool,
+    remaining: Option<u64>,
 ) -> Result<u64> {
     let scratch = tempfile::tempdir_in(store.join("objects/pack"))?;
     let pack = scratch.path().join("incoming.pack");
-    session.pack(objects, store, depth_one, &mut File::create(&pack)?)?;
+    let mut output = LimitedWriter {
+        output: File::create(&pack)?,
+        remaining,
+        exceeded: false,
+    };
+    let received = session.pack(objects, store, depth_one, &mut output);
+    ensure!(
+        !output.exceeded,
+        "Repository transfer limit exceeded; use an exact repository allow entry to remove the cap"
+    );
+    received?;
     let bytes = fs::metadata(&pack)?.len();
     let index = scratch.path().join("incoming.idx");
     let result = run(git(store)
@@ -213,6 +230,74 @@ fn receive(
     fs::rename(index, destination.with_extension("idx"))?;
     fs::rename(pack, destination.with_extension("pack"))?;
     Ok(bytes)
+}
+
+pub const TRANSFER_LIMIT: u64 = 128 * 1024 * 1024;
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn streaming_budget_stops_before_publishing_excess_bytes() {
+        let mut output = LimitedWriter {
+            output: Vec::new(),
+            remaining: Some(5),
+            exceeded: false,
+        };
+        output.write_all(b"abc").unwrap();
+        assert!(output.write_all(b"def").is_err());
+        assert!(output.exceeded);
+        assert_eq!(output.output, b"abc");
+    }
+    #[test]
+    fn exact_permissions_are_distinct_from_wildcard_permissions() {
+        let repo = super::super::Repository::parse("https://github.com/owner/repo")
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::super::Rule::parse("git@github.com:owner/repo.git")
+                .unwrap()
+                .exact_match(&repo)
+        );
+        assert!(
+            !super::super::Rule::parse("https://github.com/owner/*")
+                .unwrap()
+                .exact_match(&repo)
+        );
+        assert!(
+            !super::super::Rule::parse("https://github.com/other/repo")
+                .unwrap()
+                .exact_match(&repo)
+        );
+    }
+}
+
+struct LimitedWriter<W> {
+    output: W,
+    remaining: Option<u64>,
+    exceeded: bool,
+}
+impl<W: std::io::Write> std::io::Write for LimitedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.remaining.is_some_and(|n| n < bytes.len() as u64) {
+            self.exceeded = true;
+            return Err(std::io::Error::other("Repository transfer limit exceeded"));
+        }
+        let n = self.output.write(bytes)?;
+        if let Some(left) = &mut self.remaining {
+            *left -= n as u64;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+impl Request {
+    pub fn remaining(&self, used: u64) -> Option<u64> {
+        (!self.unlimited_transfer).then(|| TRANSFER_LIMIT.saturating_sub(used))
+    }
 }
 
 /// Return false for absent commit/tree data; never confuse that with missing blobs.
@@ -332,6 +417,7 @@ fn prepare_with(
                 .to_owned();
             super::validate_branch(&name)?;
             return Ok(Prepared {
+                omitted: BTreeMap::new(),
                 transfer_bytes: 0,
                 unavailable: BTreeSet::new(),
                 transport: session.endpoint.clone(),
@@ -356,9 +442,16 @@ fn prepare_with(
             .arg(&request.store))?;
     }
     let listing = tempfile::tempfile()?;
-    let mut transfer_bytes = 0;
+    let mut transfer_bytes = request.transfer_used;
     if !cached_tree_inventory(&request.store, &revision.to_string(), &listing)? {
-        transfer_bytes += receive(&mut session, &request.store, vec![revision], true).context(
+        transfer_bytes += receive(
+            &mut session,
+            &request.store,
+            vec![revision],
+            true,
+            request.remaining(transfer_bytes),
+        )
+        .context(
             "Cannot fetch selected revision; the server may disallow fetching unadvertised commits",
         )?;
         ensure!(
@@ -445,7 +538,40 @@ fn prepare_with(
             }
         }
     }
-    let changed: BTreeMap<_, _> = selected
+    let sizes = super::github::sizes(
+        &repository,
+        &revision.to_string(),
+        &request.store,
+        request.allow_private,
+    )?;
+    if let Some(sizes) = &sizes {
+        ensure!(
+            selected.keys().all(|p| sizes.contains_key(p)),
+            "GitHub inventory does not cover selected Git files"
+        );
+    }
+    let mut omitted = BTreeMap::new();
+    selected.retain(|path, _| {
+        if (super::selection::asset(Path::new(path))
+            || super::selection::visual_graph(Path::new(path)))
+            && sizes
+                .as_ref()
+                .and_then(|s| s.get(path))
+                .is_some_and(|s| *s > super::selection::ASSET_LIMIT)
+        {
+            omitted.insert(
+                path.clone(),
+                format!(
+                    "Exceeds remote asset size limit ({} bytes)",
+                    sizes.as_ref().unwrap()[path]
+                ),
+            );
+            false
+        } else {
+            true
+        }
+    });
+    let mut changed: BTreeMap<_, _> = selected
         .iter()
         .filter(|(path, id)| request.previous.get(*path) != Some(*id))
         .map(|(p, i)| (p.clone(), i.clone()))
@@ -476,9 +602,58 @@ fn prepare_with(
             .collect::<Result<Vec<_>>>()?;
         if !missing.is_empty() {
             let mut session = connect(&repository)?;
-            transfer_bytes += receive(&mut session, &request.store, missing, false)?;
+            transfer_bytes += receive(
+                &mut session,
+                &request.store,
+                missing,
+                false,
+                request.remaining(transfer_bytes),
+            )?;
         }
     }
+    // Inspect decompressed lengths before extracting payloads into staging files.
+    let mut blob_sizes = BTreeMap::new();
+    for chunk in ids.iter().collect::<Vec<_>>().chunks(2048) {
+        let input = chunk
+            .iter()
+            .map(|id| format!("{id}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let output = crate::process::capture(
+            git(&request.store)
+                .arg("cat-file")
+                .arg("--batch-check=%(objectname) %(objecttype) %(objectsize)"),
+            Duration::from_secs(120),
+            Some(input),
+            None,
+        )?;
+        ensure!(
+            output.status.success(),
+            "Cannot inspect selected blob sizes"
+        );
+        for line in std::str::from_utf8(&output.stdout)?.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            ensure!(
+                fields.len() == 3 && fields[1] == "blob",
+                "Selected Git blob unavailable"
+            );
+            blob_sizes.insert(fields[0].to_owned(), fields[2].parse::<u64>()?);
+        }
+    }
+    changed.retain(|path, id| {
+        if (super::selection::asset(Path::new(path))
+            || super::selection::visual_graph(Path::new(path)))
+            && blob_sizes[id] > super::selection::ASSET_LIMIT
+        {
+            omitted.insert(
+                path.clone(),
+                format!("Exceeds remote asset size limit ({} bytes)", blob_sizes[id]),
+            );
+            false
+        } else {
+            true
+        }
+    });
     fs::create_dir_all(&request.staging)?;
     for chunk in changed.iter().collect::<Vec<_>>().chunks(2048) {
         let contents = tempfile::tempfile()?;
@@ -506,6 +681,14 @@ fn prepare_with(
                 "Selected Git object is unavailable"
             );
             let size: u64 = fields[2].parse()?;
+            if super::selection::asset(Path::new(path)) && size > super::selection::ASSET_LIMIT {
+                std::io::copy(&mut contents.by_ref().take(size + 1), &mut std::io::sink())?;
+                omitted.insert(
+                    path.to_string(),
+                    format!("Exceeds remote asset size limit ({size} bytes)"),
+                );
+                continue;
+            }
             let target = request.staging.join(path);
             fs::create_dir_all(target.parent().unwrap())?;
             let mut file = fs::OpenOptions::new()
@@ -521,7 +704,9 @@ fn prepare_with(
             ensure!(delimiter == [b'\n'], "Invalid Git blob delimiter");
         }
     }
+    selected.retain(|p, _| !omitted.contains_key(p));
     Ok(Prepared {
+        omitted,
         transfer_bytes,
         unavailable: BTreeSet::new(),
         transport,
@@ -613,6 +798,8 @@ mod tests {
 
     fn request(root: &Path) -> Request {
         Request {
+            transfer_used: 0,
+            unlimited_transfer: false,
             allow_private: false,
             repository: "https://example.invalid/team/repo".into(),
             preferred_transport: None,

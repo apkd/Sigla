@@ -42,6 +42,30 @@ pub(crate) struct Binder {
 }
 
 impl Binder {
+    /// Resolved ancestry for serialized script types, using the normal C# binder.
+    pub fn ancestry(&mut self, view: &View<'_>, site: &Site<'_>) -> Result<Vec<String>> {
+        let Some(symbol) = self.site(view, site)? else {
+            return Ok(Vec::new());
+        };
+        let ty = self.open_type(view, &symbol)?;
+        let mut pending = vec![(symbol, ty, 0)];
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        while let Some((symbol, ty, depth)) = pending.pop() {
+            if depth > 64 || !seen.insert(symbol.id.clone()) {
+                continue;
+            }
+            names.push(symbol.declaration().qualified.clone());
+            for base in self.base_types(view, &symbol, &ty, depth + 1)? {
+                if let Type::Named { definition, .. } = &base
+                    && let Some(symbol) = self.definitions.get(definition).cloned()
+                {
+                    pending.push((symbol, base, depth + 1));
+                }
+            }
+        }
+        Ok(names)
+    }
     pub fn local_scope(
         &mut self,
         view: &View<'_>,

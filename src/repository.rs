@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use url::Url;
 pub mod cache;
+mod github;
 pub mod job;
 mod lfs;
 pub mod manager;
@@ -152,6 +153,10 @@ impl Repository {
 pub struct Rule(Identity, bool);
 
 impl Rule {
+    pub fn exact_match(&self, repository: &Repository) -> bool {
+        !self.0.components.iter().any(|p| p == "*" || p == "**")
+            && self.matches(&repository.identity)
+    }
     pub fn parse(input: &str) -> Result<Self> {
         ensure!(
             !input.contains('#'),

@@ -698,6 +698,11 @@ fn scan(
             continue;
         }
         if kind.is_dir() {
+            if path.join("Assets").is_dir()
+                && path.join("ProjectSettings/ProjectVersion.txt").is_file()
+            {
+                continue;
+            }
             scan(&path, scope, files, watched, diagnostics);
         } else if kind.is_file()
             && path.extension().is_some_and(|e| {

@@ -34,7 +34,7 @@ impl Selection {
         Ok(Self {
             includes: compile(includes)?,
             excludes: compile(excludes)?,
-            identity: blake3::hash(&serde_json::to_vec(&(4u32, includes, excludes))?)
+            identity: blake3::hash(&serde_json::to_vec(&(5u32, includes, excludes))?)
                 .to_hex()
                 .to_string(),
             patterns: (includes.to_vec(), excludes.to_vec()),
@@ -46,6 +46,14 @@ impl Selection {
     }
 
     pub fn selected_in(&self, path: &str, unity_roots: &[std::path::PathBuf]) -> bool {
+        if unity_roots.iter().any(|inner| {
+            Path::new(path).starts_with(inner)
+                && unity_roots
+                    .iter()
+                    .any(|outer| inner != outer && inner.starts_with(outer))
+        }) {
+            return false;
+        }
         let generated = unity_roots.iter().any(|root| {
             Path::new(path)
                 .strip_prefix(root)
@@ -99,6 +107,14 @@ fn baseline(path: &str) -> bool {
         return false;
     }
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if asset(path)
+        || path.extension().is_some_and(|e| e == "meta")
+        || path
+            .components()
+            .any(|c| c.as_os_str() == "ProjectSettings")
+    {
+        return true;
+    }
     if crate::documents::language(path).is_some() {
         return true;
     }
@@ -163,11 +179,40 @@ fn baseline(path: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+pub const ASSET_LIMIT: u64 = 32 * 1024 * 1024;
+
+pub fn asset(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e,
+            "unity"
+                | "prefab"
+                | "asset"
+                | "mat"
+                | "controller"
+                | "overrideController"
+                | "anim"
+                | "mask"
+                | "playable"
+                | "inputactions"
+        )
+    })
+}
+
+pub fn visual_graph(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e,
+            "shadergraph" | "shadersubgraph" | "vfx" | "vfxoperator" | "vfxblock"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn nested_discovery_inputs_are_selected_without_assets() {
+    fn unity_inputs_and_metadata_are_selected_without_binary_payloads() {
         let selection = Selection::new(&[], &[]).unwrap();
         for path in [
             "game/Assets/Code.cs",
@@ -176,6 +221,8 @@ mod tests {
             "game/ProjectSettings/ProjectVersion.txt",
             "game/ProjectSettings/ProjectSettings.asset",
             "game/Assets/Runtime.asmdef.meta",
+            "game/Assets/Texture.png.meta",
+            "game/Assets/Scene.unity",
             "dotnet/NuGet.Config",
             "dotnet/Directory.Packages.props",
             "rust/.cargo/config.toml",
@@ -188,8 +235,6 @@ mod tests {
         }
         for path in [
             "game/Assets/Texture.png",
-            "game/Assets/Texture.png.meta",
-            "game/Assets/Scene.unity",
             "game/Assets/Plugin.dll",
             "rust/target/Generated.rs",
             "data/arbitrary.json",

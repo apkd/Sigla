@@ -72,3 +72,4 @@ impl Platform {
         }
     }
 }
+pub mod assets;

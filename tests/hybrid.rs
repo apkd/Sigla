@@ -146,7 +146,7 @@ async fn repository_summaries_follow_downstream_sessions_and_survive_upstream_re
             .unwrap();
     let request = || {
         CallToolRequestParams::new("search").with_arguments(
-            serde_json::json!({"project":"owner/repo", "query":"type:X"})
+            serde_json::json!({"codebase":"owner/repo", "query":"type:X"})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -180,7 +180,7 @@ async fn repository_summaries_follow_downstream_sessions_and_survive_upstream_re
             .header("mcp-name", "search")
             .json(&serde_json::json!({
                 "jsonrpc":"2.0", "id":1, "method":"tools/call",
-                "params":{"name":"search", "arguments":{"project":"owner/repo", "query":"type:X"},
+                "params":{"name":"search", "arguments":{"codebase":"owner/repo", "query":"type:X"},
                     "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                         "io.modelcontextprotocol/clientCapabilities":{}}}
             }))
@@ -289,23 +289,23 @@ async fn forwards_all_tools_and_preserves_results_and_cancellation() {
     for (name, arguments) in [
         (
             "search",
-            serde_json::json!({"project":"owner/repo#feature/test","query":"future:syntax"}),
+            serde_json::json!({"codebase":"owner/repo#feature/test","query":"future:syntax"}),
         ),
         (
             "search",
-            serde_json::json!({"project":"https://github.com/owner/repo","query":"fail"}),
+            serde_json::json!({"codebase":"https://github.com/owner/repo","query":"fail"}),
         ),
         (
             "search",
-            serde_json::json!({"project":"https://github.com/owner/repo#refs%2Ftags%2Frelease%2520literal","query":"type:Example"}),
+            serde_json::json!({"codebase":"https://github.com/owner/repo#refs%2Ftags%2Frelease%2520literal","query":"type:Example"}),
         ),
         (
             "browse",
-            serde_json::json!({"project":"git@github.com:owner/repo.git","path":"src"}),
+            serde_json::json!({"codebase":"git@github.com:owner/repo.git","path":"src"}),
         ),
         (
             "view",
-            serde_json::json!({"project":"ssh://git@github.com/owner/repo.git","path":"src/File.cs:20-50","mode":"exact"}),
+            serde_json::json!({"codebase":"ssh://git@github.com/owner/repo.git","path":"src/File.cs:20-50","mode":"exact"}),
         ),
     ] {
         let result = client
@@ -316,8 +316,8 @@ async fn forwards_all_tools_and_preserves_results_and_cancellation() {
             .await
             .unwrap();
         let mut expected = arguments.clone();
-        if expected["project"] == "owner/repo#feature/test" {
-            expected["project"] = "https://github.com/owner/repo#feature/test".into();
+        if expected["codebase"] == "owner/repo#feature/test" {
+            expected["codebase"] = "https://github.com/owner/repo#feature/test".into();
         }
         let value = serde_json::to_value(result).unwrap();
         assert_eq!(
@@ -357,7 +357,7 @@ async fn forwards_all_tools_and_preserves_results_and_cancellation() {
         .send_cancellable_request(
             rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
                 CallToolRequestParams::new("search").with_arguments(
-                    serde_json::json!({"project":"owner/repo","query":"wait"})
+                    serde_json::json!({"codebase":"owner/repo","query":"wait"})
                         .as_object()
                         .unwrap()
                         .clone(),

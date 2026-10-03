@@ -41,6 +41,7 @@ pub fn language(path: &Path) -> Option<Language> {
             | "hlsli"
             | "glsl"
             | "shader"
+            | "surfshader"
             | "compute"
             | "cginc"
             | "uss"

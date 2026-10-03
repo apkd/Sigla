@@ -503,6 +503,9 @@ fn fallback_sources(entry: &Path, policy: &Policy, result: &mut Discovery) -> Re
             };
             if kind.is_dir() {
                 let name = entry.file_name();
+                if crate::unity::assets::is_root(base) && crate::unity::assets::is_root(&path) {
+                    continue;
+                }
                 if name == "Library" && base.join("Assets").is_dir() {
                     if path.join("PackageCache").is_dir() {
                         pending.push(path.join("PackageCache"));

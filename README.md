@@ -36,6 +36,10 @@ Local Unity discovery uses `~/Unity/Hub/Editor` by default. If the editor belong
 | Text in part of the project | `text:"[Singleton]" path:Assets/Scripts` |
 | Source files by name | `file:*Parser*.cs` |
 | Source paths under a directory | `file:src/**/*.rs` |
+| Saved and inherited Unity components | `instance:MyGame.Health` |
+| Only the requested Unity type | `instance:MyGame.Health type-match:exact` |
+| References to a Unity asset | `references:Assets/Weapons/Sword.asset` |
+| References used by an asset | `dependencies:Assets/Enemies/Enemy.prefab` |
 
 ## Getting started
 

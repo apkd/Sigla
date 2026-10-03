@@ -240,6 +240,8 @@ fn fetch(
     pointer: &Pointer,
     cache: &Path,
     target: &Path,
+    request: &Request,
+    transferred: &mut u64,
 ) -> Result<()> {
     fs::create_dir_all(cache)?;
     let cached = cache.join(&pointer.oid);
@@ -249,6 +251,12 @@ fn fetch(
         fs::copy(&cached, target)?;
         return Ok(());
     }
+    ensure!(
+        request
+            .remaining(*transferred)
+            .is_none_or(|n| pointer.size <= n),
+        "Repository transfer limit exceeded by LFS object"
+    );
     let mut url = endpoint.url()?;
     url.set_path(&format!(
         "{}/objects/batch",
@@ -286,7 +294,25 @@ fn fetch(
         response.status()
     );
     let mut temporary = tempfile::NamedTempFile::new_in(cache)?;
-    verified_copy(response, &mut temporary, pointer)?;
+    struct Counted<'a, R> {
+        input: R,
+        count: &'a mut u64,
+    }
+    impl<R: Read> Read for Counted<'_, R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.input.read(bytes)?;
+            *self.count += n as u64;
+            Ok(n)
+        }
+    }
+    verified_copy(
+        Counted {
+            input: response.take(pointer.size),
+            count: transferred,
+        },
+        &mut temporary,
+        pointer,
+    )?;
     temporary.as_file().sync_all()?;
     temporary.persist(&cached)?;
     fs::copy(cached, target)?;
@@ -319,6 +345,28 @@ pub fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Resu
             let Some(pointer) = Pointer::parse(&bytes)? else {
                 return Ok(());
             };
+            let asset = super::selection::asset(Path::new(path))
+                || super::selection::visual_graph(Path::new(path));
+            let code = matches!(
+                Path::new(path).extension().and_then(|e| e.to_str()),
+                Some("cs" | "rs" | "dll" | "meta")
+            );
+            if !asset && !code && crate::documents::language(Path::new(path)).is_none() {
+                prepared.omitted.insert(
+                    path.clone(),
+                    "LFS payload format was not selected for analysis".into(),
+                );
+                fs::remove_file(&target)?;
+                return Ok(());
+            }
+            if asset && pointer.size > super::selection::ASSET_LIMIT {
+                prepared.omitted.insert(
+                    path.clone(),
+                    format!("LFS asset exceeds size limit ({} bytes)", pointer.size),
+                );
+                fs::remove_file(&target)?;
+                return Ok(());
+            }
             ensure!(
                 started.elapsed() < Duration::from_secs(90),
                 "LFS preparation time budget exhausted; retrying on the next preparation"
@@ -334,15 +382,29 @@ pub fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Resu
                 })
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-            fetch(&client, authentication, &pointer, &objects, &target)
+            fetch(
+                &client,
+                authentication,
+                &pointer,
+                &objects,
+                &target,
+                request,
+                &mut prepared.transfer_bytes,
+            )
         })();
         if let Err(error) = result {
+            if error.to_string().contains("transfer limit exceeded") {
+                return Err(error);
+            }
             // Log only our context, never remote response bodies, URLs or credentials.
             tracing::warn!(path, reason = %error, "Skipping unavailable LFS input");
             fs::remove_file(&target)?;
             prepared.unavailable.insert(path.clone());
         }
     }
+    prepared
+        .selected
+        .retain(|path, _| !prepared.omitted.contains_key(path));
     Ok(())
 }
 
@@ -374,6 +436,8 @@ mod tests {
         fs::create_dir(&sources).unwrap();
         let path = "Code.cs";
         let request = Request {
+            transfer_used: 0,
+            unlimited_transfer: false,
             repository: "https://example.invalid/owner/repo".into(),
             allow_private: false,
             preferred_transport: None,
@@ -388,6 +452,7 @@ mod tests {
             subdirectory: None,
         };
         let prepared = || Prepared {
+            omitted: Default::default(),
             transfer_bytes: 0,
             unavailable: Default::default(),
             transport: None,

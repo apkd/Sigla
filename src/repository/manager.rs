@@ -110,6 +110,7 @@ mod refresh_tests {
         let mut short = branch(Target::Named("abcdef1".into()), 0);
         short.name = "abcdef1".into();
         let prepared = Prepared {
+            omitted: Default::default(),
             transfer_bytes: 0,
             unavailable: Default::default(),
             transport: None,
@@ -333,6 +334,12 @@ impl Manager {
                 tokio::spawn(async move {
                     let result = async {
                         let request = Request {
+                            transfer_used: 0,
+                            unlimited_transfer: manager
+                                .options
+                                .rules
+                                .iter()
+                                .any(|r| r.exact_match(&repository)),
                             allow_private: authorize(&manager.options.rules, &repository)?,
                             repository: repository.transport.clone(),
                             preferred_transport: None,
@@ -637,6 +644,12 @@ impl Manager {
             .prefix("required-")
             .tempdir_in(&branch.root)?;
         let request = Request {
+            transfer_used: before.prepared.transfer_bytes,
+            unlimited_transfer: self
+                .options
+                .rules
+                .iter()
+                .any(|r| r.exact_match(&branch.repository)),
             allow_private: authorize(&self.options.rules, &branch.repository)?,
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
@@ -716,6 +729,12 @@ impl Manager {
         let target =
             Target::clone(branch.acquisition_target(before.as_ref().map(|state| &state.prepared)));
         let request = Request {
+            transfer_used: 0,
+            unlimited_transfer: self
+                .options
+                .rules
+                .iter()
+                .any(|r| r.exact_match(&branch.repository)),
             allow_private: authorize(&self.options.rules, &branch.repository)?,
             repository: branch.repository.transport.clone(),
             preferred_transport: None,
