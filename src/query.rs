@@ -35,6 +35,33 @@ pub struct Query {
     pub wait_complete: bool,
 }
 
+impl Query {
+    pub(crate) fn file_language_filters(&self, language: crate::model::Language) -> bool {
+        use crate::model::Language;
+        let dialects: &[Language] = match language {
+            Language::Header => &[Language::C, Language::Cpp],
+            Language::ShaderLab => &[Language::Hlsl, Language::Glsl, Language::ShaderLab],
+            _ => std::slice::from_ref(&language),
+        };
+        dialects
+            .iter()
+            .any(|&dialect| self.language_filters(dialect, language))
+    }
+    pub(crate) fn language_filters(
+        &self,
+        dialect: crate::model::Language,
+        container: crate::model::Language,
+    ) -> bool {
+        use crate::{model::Language, native::language_matches};
+        self.filters.iter().filter(|f| f.key == "lang").all(|f| {
+            (language_matches(&f.value, dialect)
+                || matches!(container, Language::Header | Language::ShaderLab)
+                    && language_matches(&f.value, container))
+                != f.negate
+        })
+    }
+}
+
 const SELECTORS: &[&str] = &[
     "symbol",
     "type",

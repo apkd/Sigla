@@ -78,6 +78,21 @@ pub struct FileEntry {
     pub modules: Vec<ModuleFile>,
     pub metadata: bool,
 }
+impl FileEntry {
+    pub(crate) fn read_source(&self) -> Result<String> {
+        let _admission = crate::memory::admit_file(self.stamp.size, false);
+        ensure!(
+            Stamp::read(&self.path)? == self.stamp,
+            "Source changed; retry query"
+        );
+        let source = read_stable(&self.path, self.language)?;
+        ensure!(
+            Stamp::read(&self.path)? == self.stamp,
+            "Source changed; retry query"
+        );
+        Ok(source)
+    }
+}
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub source_group: Option<crate::native::Group>,
@@ -95,6 +110,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub(crate) fn sources_current(&self) -> bool {
+        self.metadata
+            .iter()
+            .chain(
+                self.files
+                    .values()
+                    .chain(self.deferred.values())
+                    .map(|file| (&file.path, &file.stamp)),
+            )
+            .all(|(path, stamp)| Stamp::read(path).as_ref().ok() == Some(stamp))
+    }
     pub fn metadata_visible(&self, file: &FileEntry, project: usize) -> bool {
         self.projects[project].assemblies.iter().any(|reference| {
             reference.path == file.path
@@ -143,6 +169,15 @@ pub struct Workspace {
     initialized: bool,
     materialization: Option<u64>,
 }
+pub(crate) struct IndexPlan {
+    pub manifest: Arc<Manifest>,
+    pub watch: crate::watch::Snapshot,
+    directories: BTreeSet<PathBuf>,
+    fence: u64,
+    started: std::time::Instant,
+    validation: std::time::Duration,
+    discovery_time: std::time::Duration,
+}
 pub struct Preparation {
     discovery: discovery::Discovery,
     fence: u64,
@@ -151,6 +186,9 @@ pub struct Preparation {
     discovery_time: std::time::Duration,
 }
 impl Workspace {
+    pub(crate) fn watch_snapshot(&self) -> crate::watch::Snapshot {
+        self.monitor.snapshot(&self.directories, self.fence)
+    }
     pub fn update_policy(&mut self, policy: Policy) {
         self.policy = policy;
     }
@@ -280,12 +318,12 @@ impl Workspace {
     }
 
     pub fn apply(&mut self, prepared: Preparation) -> Result<()> {
-        self.initialized = false;
-        self.store.begin_refresh()?;
-        self.apply_inner(prepared)
+        let plan = self.plan(prepared)?;
+        self.apply_plan(plan)
     }
 
-    fn apply_inner(&mut self, prepared: Preparation) -> Result<()> {
+    /// Resolve the selected paths before extracting semantic facts.
+    pub(crate) fn plan(&mut self, prepared: Preparation) -> Result<IndexPlan> {
         let Preparation {
             discovery,
             fence,
@@ -360,14 +398,6 @@ impl Workspace {
             }
         }
         let mut visited = BTreeSet::new();
-        let mut parsed = 0;
-        let mut objects_reused = 0;
-        let mut new_object_bytes = 0u64;
-        let mut reused_object_bytes = 0u64;
-        let mut extraction_time = std::time::Duration::ZERO;
-        let mut storage_time = std::time::Duration::ZERO;
-        let indexing_started = std::time::Instant::now();
-        let mut indexed = index_sources(&self.store, &queue, &manifest.projects)?;
         while let Some(input) = queue.pop_front() {
             if let Some(dir) = input.path.parent() {
                 directories.insert(dir.to_owned());
@@ -400,8 +430,8 @@ impl Workspace {
             } else {
                 &mut manifest.files
             };
-            if let Some(f) = files.get_mut(&key) {
-                f.memberships.push(Membership {
+            if let Some(file) = files.get_mut(&key) {
+                file.memberships.push(Membership {
                     project: input.project,
                     module: input.module,
                 });
@@ -416,66 +446,31 @@ impl Workspace {
                 ));
                 continue;
             }
-            if input.language.native() {
-                manifest.deferred.insert(
-                    key,
-                    FileEntry {
-                        display: input
-                            .path
-                            .strip_prefix(&manifest.root)
-                            .unwrap_or(&input.path)
-                            .to_string_lossy()
-                            .into_owned(),
-                        path: input.path,
-                        stamp,
-                        language: input.language,
-                        memberships: vec![Membership {
-                            project: input.project,
-                            module: input.module,
-                        }],
-                        modules: Vec::new(),
-                        metadata: false,
-                    },
-                );
-                continue;
-            }
-            let store = &self.store;
-            let extracted = indexed
-                .remove(&key)
-                .filter(|(before, _)| before == &stamp)
-                .map_or_else(
-                    || index_input(store, &key, &input, project, &stamp),
-                    |(_, result)| result,
-                );
-            let Indexed {
-                changed,
-                reused,
-                encoded_bytes,
-                modules,
-                extraction,
-                storage,
-            } = match extracted {
-                Ok(value) => value,
-                Err(error) => {
-                    // A repaired input must trigger another refresh even though it
-                    // has no searchable record in the current manifest.
-                    manifest.metadata.insert(input.path.clone(), stamp);
-                    manifest
-                        .diagnostics
-                        .push(format!("Skipped {}: {error:#}", input.path.display()));
-                    continue;
+            let modules = if input.language == Language::Rust {
+                let modules = self.store.current(&key, &stamp).and_then(|cached| {
+                    cached.map_or_else(
+                        || {
+                            Ok(crate::extract::rust_modules(
+                                &read_stable(&input.path, input.language)?,
+                                &project.edition,
+                            ))
+                        },
+                        Ok,
+                    )
+                });
+                match modules {
+                    Ok(modules) => modules,
+                    Err(error) => {
+                        manifest.metadata.insert(input.path.clone(), stamp);
+                        manifest
+                            .diagnostics
+                            .push(format!("Skipped {}: {error:#}", input.path.display()));
+                        continue;
+                    }
                 }
+            } else {
+                Vec::new()
             };
-            extraction_time += extraction;
-            storage_time += storage;
-            parsed += usize::from(changed);
-            objects_reused += usize::from(reused);
-            if changed {
-                new_object_bytes += encoded_bytes;
-            }
-            if reused {
-                reused_object_bytes += encoded_bytes;
-            }
             if input.language == Language::Rust {
                 let base = input.path.parent().unwrap();
                 let stem = input.path.file_stem().unwrap().to_string_lossy();
@@ -547,27 +542,120 @@ impl Workspace {
                     });
                 }
             }
-            let display = input
-                .path
-                .strip_prefix(&manifest.root)
-                .unwrap_or(&input.path)
-                .to_string_lossy()
-                .into_owned();
-            manifest.files.insert(
-                key,
-                FileEntry {
-                    path: input.path,
-                    display,
-                    stamp,
-                    language: input.language,
-                    memberships: vec![Membership {
-                        project: input.project,
-                        module: input.module,
-                    }],
-                    modules,
-                    metadata: input.metadata,
-                },
+            let file = FileEntry {
+                display: input
+                    .path
+                    .strip_prefix(&manifest.root)
+                    .unwrap_or(&input.path)
+                    .to_string_lossy()
+                    .into_owned(),
+                path: input.path,
+                stamp,
+                language: input.language,
+                memberships: vec![Membership {
+                    project: input.project,
+                    module: input.module,
+                }],
+                modules,
+                metadata: input.metadata,
+            };
+            if input.language.native() {
+                manifest.deferred.insert(key, file);
+            } else {
+                manifest.files.insert(key, file);
+            }
+        }
+        for directory in &directories {
+            if let Ok(stamp) = Stamp::read(directory) {
+                manifest.metadata.insert(directory.clone(), stamp);
+            }
+        }
+        Ok(IndexPlan {
+            manifest: Arc::new(manifest),
+            watch: self.monitor.snapshot(&directories, fence),
+            directories,
+            fence,
+            started: start,
+            validation,
+            discovery_time,
+        })
+    }
+
+    pub(crate) fn apply_plan(&mut self, plan: IndexPlan) -> Result<()> {
+        self.initialized = false;
+        self.store.begin_refresh()?;
+        let IndexPlan {
+            manifest,
+            directories,
+            fence,
+            started: start,
+            validation,
+            discovery_time,
+            ..
+        } = plan;
+        let mut manifest = Arc::unwrap_or_clone(manifest);
+        let mut parsed = 0;
+        let mut objects_reused = 0;
+        let mut new_object_bytes = 0u64;
+        let mut reused_object_bytes = 0u64;
+        let mut extraction_time = std::time::Duration::ZERO;
+        let mut storage_time = std::time::Duration::ZERO;
+        let indexing_started = std::time::Instant::now();
+        let inputs: VecDeque<_> = manifest
+            .files
+            .values()
+            .map(|file| SourceInput {
+                path: file.path.clone(),
+                project: file.memberships[0].project,
+                module: file.memberships[0].module.clone(),
+                language: file.language,
+                metadata: file.metadata,
+            })
+            .collect();
+        let mut indexed = index_sources(&self.store, &inputs, &manifest.projects)?;
+        for input in inputs {
+            let project = &manifest.projects[input.project];
+            let stamp = Stamp::read(&input.path)?;
+            let key = input_key(&input, project, &stamp);
+            ensure!(
+                manifest.files.get(&key).is_some_and(|f| f.stamp == stamp),
+                "File changed during indexing; retry query"
             );
+            let extracted = indexed
+                .remove(&key)
+                .filter(|(before, _)| before == &stamp)
+                .map_or_else(
+                    || index_input(&self.store, &key, &input, project, &stamp),
+                    |(_, result)| result,
+                );
+            let Indexed {
+                changed,
+                reused,
+                encoded_bytes,
+                extraction,
+                storage,
+                ..
+            } = match extracted {
+                Ok(value) => value,
+                Err(error) => {
+                    manifest.files.remove(&key);
+                    manifest.metadata.insert(input.path.clone(), stamp);
+                    manifest
+                        .diagnostics
+                        .push(format!("Skipped {}: {error:#}", input.path.display()));
+                    continue;
+                }
+            };
+            extraction_time += extraction;
+            storage_time += storage;
+            parsed += usize::from(changed);
+            objects_reused += usize::from(reused);
+            if changed {
+                new_object_bytes += encoded_bytes;
+            }
+            if reused {
+                reused_object_bytes += encoded_bytes;
+            }
         }
         for key in self
             .manifest
@@ -576,11 +664,6 @@ impl Workspace {
             .filter(|k| !manifest.files.contains_key(*k))
         {
             self.store.remove(key)?;
-        }
-        for directory in &directories {
-            if let Ok(stamp) = Stamp::read(directory) {
-                manifest.metadata.insert(directory.clone(), stamp);
-            }
         }
         let mut environment = blake3::Hasher::new();
         environment.update(&postcard::to_allocvec(&manifest.projects)?);
@@ -665,7 +748,6 @@ struct Indexed {
     changed: bool,
     reused: bool,
     encoded_bytes: u64,
-    modules: Vec<ModuleFile>,
     extraction: std::time::Duration,
     storage: std::time::Duration,
 }
@@ -686,13 +768,12 @@ fn index_input(
         );
         Ok(())
     };
-    if let Some(modules) = store.current(key, stamp)? {
+    if store.current(key, stamp)?.is_some() {
         verify()?;
         return Ok(Indexed {
             changed: false,
             reused: false,
             encoded_bytes: 0,
-            modules,
             extraction: std::time::Duration::ZERO,
             storage: started.elapsed(),
         });
@@ -746,7 +827,6 @@ fn index_input(
         changed: installed.built,
         reused: installed.reused,
         encoded_bytes: installed.encoded_bytes,
-        modules: store.modules(key)?,
         extraction,
         storage: started.elapsed().saturating_sub(extraction),
     })

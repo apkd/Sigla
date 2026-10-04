@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -26,6 +26,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// inspect managed disk usage and preview eviction without changing the cache.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     #[command(name = "__git-job", hide = true)]
     GitJob { input: PathBuf, output: PathBuf },
     #[command(name = "__git-rebuild", hide = true)]
@@ -47,6 +52,15 @@ enum Command {
     /// execute the same search locally, for development and diagnostics.
     Query { project: String, query: String },
 }
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// show the running service's policy, or its last saved policy when stopped.
+    Inspect {
+        /// emit the full report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,7 +71,34 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    if let Command::Cache {
+        command: CacheCommand::Inspect { json },
+    } = &cli.command
+    {
+        let explicit =
+            |name| matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine);
+        let report = sigla::cache::inspect::inspect(
+            &cli.options.cache_dir,
+            sigla::cache::inspect::Overrides {
+                max_bytes: explicit("max_cache_size_gb")
+                    .then_some(cli.options.max_cache_size_gb * 1_000_000_000),
+                headroom_percent: explicit("free_disk_space_headroom_percent")
+                    .then_some(cli.options.free_disk_space_headroom_percent),
+            },
+        )
+        .await?;
+        println!(
+            "{}",
+            if *json {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                report.render()
+            }
+        );
+        return Ok(());
+    }
     if let Command::GitJob { input, output } = &cli.command {
         let (input, output) = (input.clone(), output.clone());
         return tokio::task::spawn_blocking(move || {
@@ -94,12 +135,17 @@ async fn main() -> Result<()> {
         .with_cache_limits(cache_limits),
     );
     match cli.command {
-        Command::GitJob { .. } | Command::GitRebuild { .. } => unreachable!(),
+        Command::GitJob { .. } | Command::GitRebuild { .. } | Command::Cache { .. } => {
+            unreachable!()
+        }
         Command::Query { project, query } => {
             let result = app.search(&project, &query).await;
+            if let Ok(text) = &result {
+                println!("{text}");
+            }
             app.shutdown().await;
             sigla::shutdown();
-            println!("{}", result?);
+            result?;
         }
         Command::Serve {
             listen,
@@ -165,6 +211,7 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(listen).await?;
             let listen = listener.local_addr()?;
             tracing::info!(%listen,"Sigla listening at /mcp");
+            let inspection = app.start_inspection()?;
             app.start_setup();
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
@@ -174,6 +221,7 @@ async fn main() -> Result<()> {
                     sigla::shutdown();
                 })
                 .await?;
+            let _ = inspection.await;
         }
     }
     Ok(())

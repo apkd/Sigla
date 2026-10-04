@@ -11,23 +11,10 @@ type HierarchyResults = Selection<(bool, String, usize), SearchResult>;
 
 impl Search<'_> {
     pub(crate) fn file_language_filters(q: &Query, language: Language) -> bool {
-        let dialects: &[Language] = match language {
-            Language::Header => &[Language::C, Language::Cpp],
-            Language::ShaderLab => &[Language::Hlsl, Language::Glsl, Language::ShaderLab],
-            _ => std::slice::from_ref(&language),
-        };
-        dialects
-            .iter()
-            .any(|&dialect| Self::language_filters(q, dialect, language))
+        q.file_language_filters(language)
     }
     pub(super) fn language_filters(q: &Query, dialect: Language, container: Language) -> bool {
-        q.filters.iter().filter(|f| f.key == "lang").all(|f| {
-            (native::language_matches(&f.value, dialect)
-                || container == Language::Header && native::language_matches(&f.value, container)
-                || container == Language::ShaderLab
-                    && native::language_matches(&f.value, container))
-                != f.negate
-        })
+        q.language_filters(dialect, container)
     }
 
     pub(super) fn bind_native(

@@ -1,14 +1,10 @@
 //! Cache ownership is coordinated at the service boundary, above storage drivers.
 use super::*;
-use crate::cache::{blobs, owners::Owner, policy::Disk};
-use std::{collections::BTreeMap, fs};
-
-struct Candidate {
-    owner: Owner,
-    pinned: bool,
-    expired: bool,
-    bytes: u64,
-}
+use crate::cache::{
+    blobs,
+    policy::{Candidate, Disk},
+};
+use std::fs;
 
 impl App {
     pub(super) async fn maintain_disk(self: &Arc<Self>) -> Result<()> {
@@ -81,59 +77,15 @@ impl App {
     }
 
     fn candidates(&self) -> Result<Vec<Candidate>> {
-        let owners = self.owners.lock().unwrap();
-        let mut result = Vec::new();
-        let now = crate::cache::now();
-        let states: BTreeMap<_, _> = self
-            .remote
-            .as_ref()
-            .map(|remote| remote.cached())
-            .transpose()?
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let mut roots = Vec::new();
-        for owner in owners.entries.values() {
-            let mut views = owners.view_roots(owner);
-            let (pinned, ttl) = match (&owner.repository, &self.remote) {
-                (Some(root), Some(remote)) => {
-                    let Some(state) = states.get(root) else {
-                        continue;
-                    };
-                    views.push(root.clone());
-                    remote.retention(state)?
-                }
-                (Some(_), None) => continue,
-                (None, _) => (
-                    false,
-                    self.remote
-                        .as_ref()
-                        .map_or(crate::config::DEFAULT_REPO_TTL, |remote| {
-                            remote.options.repo_ttl
-                        }),
-                ),
-            };
-            roots.push((owner.entry.clone(), views));
-            result.push(Candidate {
-                owner: owner.clone(),
-                pinned,
-                expired: !pinned
-                    && now.saturating_sub(owner.usage.last_use) >= ttl.as_millis() as u64,
-                bytes: 0,
-            });
-        }
-        let costs = crate::cache::policy::attributed(&roots)?;
-        for candidate in &mut result {
-            candidate.bytes = costs[&candidate.owner.entry];
-        }
-        result.sort_by(|a, b| {
-            a.owner
-                .usage
-                .priority(now, a.bytes)
-                .total_cmp(&b.owner.usage.priority(now, b.bytes))
-                .then_with(|| a.owner.usage.last_use.cmp(&b.owner.usage.last_use))
-        });
-        Ok(result)
+        crate::cache::policy::candidates(
+            &self.cache,
+            &self.owners.lock().unwrap(),
+            self.remote
+                .as_ref()
+                .map(|remote| crate::repository::retention::Policy::from(&remote.options))
+                .as_ref(),
+            crate::cache::now(),
+        )
     }
 
     fn evict_candidate(&self, candidate: &Candidate, pressure: bool) -> Result<bool> {
@@ -533,6 +485,86 @@ mod tests {
         app.maintain_disk_exclusive().unwrap();
         assert!(hot.exists());
         assert!(!cold.exists());
+    }
+
+    #[tokio::test]
+    async fn inspection_reports_pins_and_eviction_without_changing_live_or_idle_data() {
+        use crate::cache::inspect::{Overrides, inspect};
+        let cache = tempfile::tempdir().unwrap();
+        let mut app = app(
+            cache.path(),
+            vec![
+                Rule::parse("https://github.com/example/*").unwrap(),
+                Rule::parse_private("https://github.com/example/keep").unwrap(),
+            ],
+        );
+        let now = crate::cache::now();
+        let pinned = seed(cache.path(), "keep", "trunk", "trunk", now);
+        let cold = seed(cache.path(), "cold", "trunk", "trunk", now - 60_000);
+        let hot = seed(cache.path(), "hot", "trunk", "trunk", now - 60_000);
+        app.seed_owners().unwrap();
+        app.owners.lock().unwrap().observe(
+            &hot.join("source"),
+            Some(&hot),
+            &crate::workspace::Manifest {
+                root: hot.join("source"),
+                ..Default::default()
+            },
+            Some(now),
+        );
+        app.owners.lock().unwrap().flush().unwrap();
+        app.cache_limits.max_bytes = 1;
+        app.cache_limits.headroom_percent = 0;
+        let app = Arc::new(app);
+        let server = app.start_inspection().unwrap();
+        let state_before = fs::read(cold.join("state.json")).unwrap();
+        let owners_before = fs::read(cache.path().join("owners.json")).unwrap();
+        let report = inspect(cache.path(), Overrides::default()).await.unwrap();
+        assert!(report.live_service);
+        assert_eq!(
+            report.preview.eviction_order,
+            vec![cold.join("source"), hot.join("source")]
+        );
+        assert!(
+            report
+                .workspaces
+                .iter()
+                .find(|w| w.entry == pinned.join("source"))
+                .unwrap()
+                .protection
+                .is_some()
+        );
+        assert_eq!(fs::read(cold.join("state.json")).unwrap(), state_before);
+        assert_eq!(
+            fs::read(cache.path().join("owners.json")).unwrap(),
+            owners_before
+        );
+        let roomy = inspect(
+            cache.path(),
+            Overrides {
+                max_bytes: Some(u64::MAX),
+                headroom_percent: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(roomy.preview.eviction_order.is_empty());
+        // Proposed limits must not alter the service's real settings.
+        assert_eq!(app.cache_limits.max_bytes, report.limits.max_bytes);
+        app.shutdown().await;
+        server.await.unwrap();
+        drop(app);
+        let offline = inspect(cache.path(), Overrides::default()).await.unwrap();
+        assert!(!offline.live_service);
+        assert_eq!(
+            offline.preview.eviction_order,
+            report.preview.eviction_order
+        );
+        assert_eq!(fs::read(cold.join("state.json")).unwrap(), state_before);
+        assert_eq!(
+            fs::read(cache.path().join("owners.json")).unwrap(),
+            owners_before
+        );
     }
 
     #[test]

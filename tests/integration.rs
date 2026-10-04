@@ -1,4 +1,5 @@
 // Keep suites separate in source while sharing one integration-test executable.
+mod cache_inspection;
 mod csharp_binding;
 mod csharp_facts;
 mod http;

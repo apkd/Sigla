@@ -10,6 +10,77 @@ use std::{
 };
 
 const HALF_LIFE_MS: f64 = 86_400_000.0;
+
+pub(crate) struct Candidate {
+    pub owner: super::owners::Owner,
+    pub pinned: bool,
+    pub protection: Option<String>,
+    pub expired: bool,
+    pub bytes: u64,
+}
+
+pub(crate) fn candidates(
+    cache: &Path,
+    owners: &super::owners::Catalog,
+    policy: Option<&crate::repository::retention::Policy>,
+    now: u64,
+) -> Result<Vec<Candidate>> {
+    let states = crate::repository::retention::cached(cache)?;
+    let mut result = Vec::new();
+    let mut roots = Vec::new();
+    for owner in owners.entries.values() {
+        let mut views = owners.view_roots(owner);
+        let (protection, ttl) = match (&owner.repository, policy) {
+            (Some(root), Some(policy)) => {
+                let Some(state) = states.get(root) else {
+                    continue;
+                };
+                views.push(root.clone());
+                policy.decision(cache, state, |identity, branch| {
+                    Ok(states.values().any(|s| {
+                        &s.repository == identity
+                            && s.prepared.branch.as_deref() == Some(branch)
+                            && !s.repair
+                            && s.indexed_revision.as_ref() == Some(&s.prepared.revision)
+                    }))
+                })?
+            }
+            (Some(root), None) => {
+                views.push(root.clone());
+                (
+                    Some("repository is outside the current maintenance configuration".into()),
+                    crate::config::DEFAULT_REPO_TTL,
+                )
+            }
+            (None, _) => (
+                None,
+                policy.map_or(crate::config::DEFAULT_REPO_TTL, |p| p.repo_ttl),
+            ),
+        };
+        roots.push((owner.entry.clone(), views));
+        result.push(Candidate {
+            owner: owner.clone(),
+            pinned: protection.is_some(),
+            expired: protection.is_none()
+                && now.saturating_sub(owner.usage.last_use) >= ttl.as_millis() as u64,
+            protection,
+            bytes: 0,
+        });
+    }
+    let costs = attributed(&roots)?;
+    for candidate in &mut result {
+        candidate.bytes = costs[&candidate.owner.entry];
+    }
+    result.sort_by(|a, b| {
+        a.owner
+            .usage
+            .priority(now, a.bytes)
+            .total_cmp(&b.owner.usage.priority(now, b.bytes))
+            .then_with(|| a.owner.usage.last_use.cmp(&b.owner.usage.last_use))
+    });
+    Ok(result)
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Usage {
     pub last_use: u64,
@@ -39,7 +110,7 @@ impl Usage {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Limits {
     pub max_bytes: u64,
     pub headroom_percent: u8,
@@ -52,7 +123,7 @@ impl Default for Limits {
         }
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Disk {
     pub capacity: u64,
     pub available: u64,

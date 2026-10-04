@@ -12,6 +12,11 @@ pub(super) fn groups(
     query: Option<&Query>,
     manifest: &Manifest,
 ) -> BTreeMap<Group, bool> {
+    if matches!(request, Request::Browse(_))
+        || query.is_some_and(|q| q.selector == "file" && !q.wait_complete)
+    {
+        return BTreeMap::new();
+    }
     if query.is_some_and(|q| {
         matches!(
             q.selector.as_str(),
@@ -45,6 +50,29 @@ pub(super) fn groups(
         query.is_some_and(|q| q.wait_complete) || narrowed && !manifest.files.values().any(matches);
     groups.values_mut().for_each(|value| *value = wait);
     groups
+}
+
+pub(super) fn source_only(request: &Request, query: Option<&Query>) -> bool {
+    let source_path = |path: &str| {
+        let path = std::path::Path::new(path);
+        matches!(path.extension().and_then(|s| s.to_str()), Some("cs" | "rs"))
+            || crate::native::language(path).is_some()
+            || crate::documents::language(path).is_some()
+    };
+    match request {
+        Request::View(path, _) => {
+            crate::navigation::location(path).is_ok_and(|(path, _)| source_path(path))
+        }
+        Request::Search(_) => query.is_some_and(|q| {
+            q.selector == "file"
+                && !q.wait_complete
+                && (source_path(&q.target.name)
+                    || q.filters
+                        .iter()
+                        .any(|f| matches!(f.key.as_str(), "lang" | "project")))
+        }),
+        Request::Browse(_) => false,
+    }
 }
 
 fn selected(
@@ -138,5 +166,70 @@ pub(super) fn wait_assets(request: &Request, query: Option<&Query>) -> bool {
                         && crate::unity::assets::is_asset(std::path::Path::new(&f.value))
                 })
         }),
+    }
+}
+/// Source navigation only needs selected paths and stable source bytes.
+pub(super) fn navigation(request: &Request, query: Option<&Query>) -> bool {
+    match request {
+        Request::Browse(_) => true,
+        Request::Search(_) => query.is_some_and(|q| {
+            q.selector == "file" && !q.wait_complete && !wait_assets(request, Some(q))
+        }),
+        Request::View(path, _) => crate::navigation::location(path).is_ok_and(|(path, _)| {
+            let path = std::path::Path::new(path);
+            matches!(path.extension().and_then(|s| s.to_str()), Some("cs" | "rs"))
+                || crate::native::language(path).is_some()
+                || crate::documents::language(path).is_some()
+        }),
+    }
+}
+pub(super) fn has_unity(manifest: &Manifest) -> bool {
+    crate::unity::assets::is_root(&manifest.root)
+        || manifest
+            .projects
+            .iter()
+            .any(|p| p.compiler_options.contains_key("UnityVersion"))
+        || manifest.files.values().any(|file| {
+            file.path.ancestors().any(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "Assets" || name == "ProjectSettings")
+                    && path.parent().is_some_and(crate::unity::assets::is_root)
+            })
+        })
+}
+
+impl super::App {
+    pub(super) fn start_assets(
+        &self,
+        workspace: std::sync::Arc<tokio::sync::Mutex<Option<crate::workspace::Workspace>>>,
+        branch: Option<std::sync::Arc<crate::repository::manager::Branch>>,
+        manifest: &Manifest,
+        revision: Option<String>,
+        refresh: bool,
+        activity: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> anyhow::Result<crate::unity::assets::jobs::Ticket> {
+        if !has_unity(manifest) {
+            return Ok(crate::unity::assets::jobs::empty());
+        }
+        let cache = branch
+            .as_ref()
+            .map(|b| b.root.join("unity-assets"))
+            .unwrap_or_else(|| {
+                self.cache.join("unity-assets").join(
+                    blake3::hash(manifest.root.as_os_str().as_encoded_bytes())
+                        .to_hex()
+                        .as_str(),
+                )
+            });
+        Ok(self.assets.start(crate::unity::assets::jobs::Request {
+            workspace,
+            branch,
+            root: manifest.root.clone(),
+            cache,
+            expected: crate::unity::assets::jobs::generation(manifest)?,
+            revision,
+            refresh,
+            activity,
+        }))
     }
 }

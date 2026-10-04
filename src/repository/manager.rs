@@ -278,44 +278,12 @@ impl Manager {
     }
 
     pub fn retention(&self, state: &State) -> Result<(bool, Duration)> {
-        let default = self.saved_default(&state.repository)?;
-        let branch = state.prepared.branch.as_deref().or(match &state.target {
-            Some(Target::Branch(name)) => Some(name.as_str()),
-            None => Some(state.branch.as_str()),
-            _ => None,
-        });
-        let is_default = default
-            .as_ref()
-            .is_some_and(|d| branch == Some(d.branch.as_str()));
-        let mut protected = is_default;
-        if let Some(default) = &default
-            && default.previous.as_deref() == branch
-            && branch.is_some()
-        {
-            let ready = self.default_ready(&state.repository, &default.branch)?;
-            protected |= !ready;
-        }
-        let repository = Repository {
-            identity: state.repository.clone(),
-            transport: state.transport.clone(),
-            selector: None,
-        };
-        // Until the remote's default is known, retain exact allowlist entries
-        // conservatively. A failed metadata refresh must not evict their default.
-        let pinned = (protected || default.is_none())
-            && self
-                .options
-                .rules
-                .iter()
-                .any(|rule| rule.exact_match(&repository));
-        Ok((
-            pinned,
-            if is_default {
-                self.options.repo_ttl
-            } else {
-                self.options.branch_ttl
-            },
-        ))
+        let (protection, ttl) = super::retention::Policy::from(&self.options).decision(
+            &self.cache,
+            state,
+            |identity, branch| self.default_ready(identity, branch),
+        )?;
+        Ok((protection.is_some(), ttl))
     }
 
     fn state_expired(&self, state: &State) -> Result<bool> {
@@ -334,17 +302,25 @@ impl Manager {
     }
 
     pub fn cached(&self) -> Result<Vec<(PathBuf, State)>> {
-        let mut result = Vec::new();
-        for entry in fs::read_dir(self.cache.join("repositories"))? {
-            let entry = entry?;
-            ensure!(entry.file_type()?.is_dir(), "Invalid selector directory");
-            match fs::read(entry.path().join("state.json")) {
-                Ok(bytes) => result.push((entry.path(), serde_json::from_slice(&bytes)?)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(result)
+        Ok(super::retention::cached(&self.cache)?.into_iter().collect())
+    }
+    pub(crate) fn active_entries(&self) -> std::collections::BTreeSet<PathBuf> {
+        self.branches
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|branch| {
+                Arc::strong_count(branch) > 1
+                    || branch
+                        .running
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|job| job.borrow().is_none())
+                    || branch.state.try_lock().is_err()
+            })
+            .map(|branch| branch.source())
+            .collect()
     }
     pub fn migrate_inputs(&self, root: &Path, store: &crate::cache::blobs::Store) -> Result<bool> {
         let branches = self.branches.lock().unwrap();

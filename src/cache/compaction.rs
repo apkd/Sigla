@@ -11,7 +11,7 @@ use std::{
 
 const PENDING: &str = "data.mdb.compacting";
 const PREVIOUS: &str = "data.mdb.previous";
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub allocated: u64,
     pub live: u64,

@@ -20,6 +20,13 @@ pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const MANIFEST_PREFIX: &[u8] = b"sigla-manifest-3\0";
 
+pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<Option<crate::workspace::Manifest>> {
+    bytes
+        .strip_prefix(MANIFEST_PREFIX)
+        .map(|bytes| Ok(postcard::from_bytes(bytes)?))
+        .transpose()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct FileData {
     pub source: String,

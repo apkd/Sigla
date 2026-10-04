@@ -1,6 +1,7 @@
 mod csharp;
 mod preprocess;
 mod rust;
+pub(crate) use rust::modules as rust_modules;
 
 use crate::model::{Facts, Language};
 

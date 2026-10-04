@@ -10,6 +10,7 @@ mod lfs;
 pub mod manager;
 pub mod materialize;
 pub mod rebuild;
+pub(crate) mod retention;
 pub mod selection;
 pub mod transport;
 
@@ -149,7 +150,7 @@ impl Repository {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rule(Identity, bool);
 
 impl Rule {

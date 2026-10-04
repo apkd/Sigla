@@ -23,6 +23,7 @@ pub struct Owner {
     pub usage: Usage,
     pub dependencies: BTreeSet<PathBuf>,
 }
+#[derive(Clone)]
 pub struct Catalog {
     path: PathBuf,
     pub entries: BTreeMap<PathBuf, Owner>,

@@ -1,4 +1,5 @@
 //! Repository path lookup and compact directory rendering. Never reads the filesystem.
+pub(crate) mod sources;
 use anyhow::{Result, ensure};
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::LazyLock};
 

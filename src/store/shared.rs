@@ -71,6 +71,53 @@ pub struct Collected {
     pub encoded_bytes: u64,
 }
 
+pub(crate) type InspectionVisitor<'a> = dyn FnMut(&WorkspaceInfo, Option<&[u8]>) -> Result<()> + 'a;
+fn inspect_env(
+    env: &Env,
+    visit: &mut InspectionVisitor<'_>,
+) -> Result<crate::cache::compaction::Stats> {
+    let stats = crate::cache::compaction::Stats {
+        allocated: env.real_disk_size()?,
+        live: env.non_free_pages_size()?,
+    };
+    let tx = env.read_txn()?;
+    let control = env
+        .open_database::<Bytes, Bytes>(&tx, Some("control"))?
+        .context("Missing analysis control table")?;
+    ensure!(
+        control.get(&tx, b"format")? == Some(FORMAT),
+        "Unknown analysis format"
+    );
+    let spaces = env
+        .open_database::<Bytes, Bytes>(&tx, Some("workspaces"))?
+        .context("Missing workspace table")?;
+    for row in spaces.iter(&tx)? {
+        let (_, value) = row?;
+        let info: WorkspaceInfo = decode(value)?;
+        visit(&info, control.get(&tx, &manifest_key(info.id))?)?;
+    }
+    Ok(stats)
+}
+
+/// The caller must hold exclusive service-cache ownership for the entire read.
+pub(crate) fn inspect_idle(
+    path: &Path,
+    visit: &mut InspectionVisitor<'_>,
+) -> Result<crate::cache::compaction::Stats> {
+    let metadata = std::fs::symlink_metadata(path.join("data.mdb"))?;
+    ensure!(metadata.is_file(), "Invalid analysis file");
+    // No reader-table writes are needed while exclusive cache ownership excludes writers.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(8)
+            .flags(heed::EnvFlags::READ_ONLY | heed::EnvFlags::NO_LOCK)
+            .open(path)
+    }?;
+    let result = inspect_env(&env, visit);
+    env.prepare_for_closing().wait();
+    result
+}
+
 pub struct Database {
     env: Env,
     control: Table<Bytes, Bytes>,
@@ -115,6 +162,15 @@ fn manifest_key(scope: u64) -> Vec<u8> {
 }
 
 impl Database {
+    pub(crate) fn opened(path: &Path) -> Option<Arc<Self>> {
+        OPEN.lock().unwrap().get(path).and_then(Weak::upgrade)
+    }
+    pub(crate) fn inspection(
+        &self,
+        visit: &mut InspectionVisitor<'_>,
+    ) -> Result<crate::cache::compaction::Stats> {
+        inspect_env(&self.env, visit)
+    }
     /// The service's existing ownership lock must protect the cache root.
     /// No strong reference is stored in the process-wide open registry.
     pub fn open(path: &Path) -> Result<Arc<Self>> {

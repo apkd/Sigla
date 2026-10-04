@@ -1,3 +1,4 @@
+use crate::cache::Ownership;
 use crate::{discovery::Policy, query::Query, search::Search, workspace::Workspace};
 use anyhow::{Result, ensure};
 use rmcp::{
@@ -8,6 +9,8 @@ use rmcp::{
 };
 use serde::Deserialize;
 mod indexes;
+mod inspection;
+mod preparation;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -19,6 +22,7 @@ mod disk;
 
 struct WorkspaceSlot {
     state: Arc<tokio::sync::Mutex<Option<Workspace>>>,
+    preparing: Option<preparation::Ticket>,
     used: Instant,
 }
 #[derive(Debug)]
@@ -28,19 +32,13 @@ enum Request {
     View(String, crate::navigation::Mode),
 }
 type Startup = tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>;
-struct Ownership(std::fs::File);
-impl Drop for Ownership {
-    fn drop(&mut self) {
-        // A concurrently spawned child can retain a duplicate until it execs.
-        // Release our ownership explicitly instead of waiting for that descriptor.
-        let _ = self.0.unlock();
-    }
-}
 pub struct App {
     policy: Policy,
     cache: PathBuf,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceSlot>>,
     workers: Arc<tokio::sync::Semaphore>,
+    navigation_workers: Arc<tokio::sync::Semaphore>,
+    inspection_shutdown: tokio_util::sync::CancellationToken,
     assets: crate::unity::assets::jobs::Jobs,
     sources: crate::native::jobs::Jobs,
     monitor: Arc<crate::watch::Monitor>,
@@ -54,6 +52,8 @@ pub struct App {
     owners: Mutex<crate::cache::owners::Catalog>,
     #[cfg(test)]
     preparation_started: tokio::sync::Notify,
+    #[cfg(test)]
+    indexing_pause: Arc<tokio::sync::Semaphore>,
     _ownership: Ownership,
 }
 impl App {
@@ -141,6 +141,8 @@ impl App {
             cache,
             workspaces: Mutex::new(HashMap::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            navigation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            inspection_shutdown: tokio_util::sync::CancellationToken::new(),
             assets: Default::default(),
             sources: Default::default(),
             monitor: Arc::new(crate::watch::Monitor::default()),
@@ -150,6 +152,8 @@ impl App {
             stateless_summaries: Default::default(),
             #[cfg(test)]
             preparation_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            indexing_pause: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         app.maintain_analysis(true)?;
         app.compact_analysis()?;
@@ -187,8 +191,20 @@ impl App {
     }
 
     pub async fn shutdown(&self) {
+        self.inspection_shutdown.cancel();
+        let tickets: Vec<_> = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|slot| slot.preparing.clone())
+            .collect();
+        for mut ticket in tickets {
+            let _ = ticket.complete().await;
+        }
         self.assets.shutdown();
         self.sources.shutdown();
+        let _idle = self.activity.write().await;
         if let Err(error) = self.owners.lock().unwrap().flush() {
             tracing::warn!(%error, "Cannot persist cache usage during shutdown");
         }
@@ -201,6 +217,9 @@ impl App {
         let mut startup = self.startup.lock().unwrap();
         if startup.is_some() {
             return;
+        }
+        if let Err(error) = self.save_cache_configuration() {
+            tracing::warn!(%error, "Cannot save cache inspection configuration");
         }
         let versions = self
             .remote
@@ -504,165 +523,80 @@ impl App {
         };
         let usage_entry = entry.clone();
         let usage_branch = branch.clone();
-        let (workspace, retired) = {
-            let mut registry = self.workspaces.lock().unwrap();
-            let mut retired = Vec::new();
-            let slot = registry
-                .entry(entry.clone())
-                .or_insert_with(|| WorkspaceSlot {
-                    state: Arc::new(tokio::sync::Mutex::new(None)),
-                    used: Instant::now(),
-                });
-            slot.used = Instant::now();
-            let state = slot.state.clone();
-            while registry.len() > 8 {
-                let oldest = registry
-                    .iter()
-                    .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
-                    .min_by_key(|(_, slot)| slot.used)
-                    .map(|(path, _)| path.clone());
-                let Some(oldest) = oldest else {
-                    break;
-                };
-                retired.push(registry.remove(&oldest));
-            }
-            (state, retired)
-        };
-        drop(retired);
-        let asset_workspace = workspace.clone();
-        // The service owns preparation. Dropping a caller only drops its wait.
-        let preparing_app = self.clone();
-        let preparing_branch = branch.clone();
-        let preparing_activity = activity.clone();
-        let (mut state, mut branch_state) = tokio::spawn(async move {
-            let _activity = preparing_activity;
-            #[cfg(test)]
-            preparing_app.preparation_started.notify_one();
-            // Request lock order: workspace -> branch state. RequiredInputs
-            // releases and reacquires branch state while retaining the workspace.
-            let mut state = workspace.lock_owned().await;
-            let mut branch_state = match &preparing_branch {
-                Some(branch) => Some(branch.state.clone().lock_owned().await),
-                None => None,
-            };
-            let mut policy = policy;
-            if let Some(gate) = &branch_state {
-                let applied = gate
+        let (workspace, mut preparation, inventory) = loop {
+            let (workspace, mut preparation, retired) = {
+                let mut registry = self.workspaces.lock().unwrap();
+                let mut retired = Vec::new();
+                let slot = registry
+                    .entry(entry.clone())
+                    .or_insert_with(|| WorkspaceSlot {
+                        state: Arc::new(tokio::sync::Mutex::new(None)),
+                        preparing: None,
+                        used: Instant::now(),
+                    });
+                slot.used = Instant::now();
+                if slot
+                    .preparing
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
-                ensure!(
-                    !applied.repair,
-                    "Repository materialization requires repair"
-                );
-                policy.remote.as_mut().unwrap().tracked = Arc::new(
-                    applied
-                        .prepared
-                        .tracked
-                        .keys()
-                        .filter(|p| !applied.prepared.unavailable.contains(*p))
-                        .cloned()
-                        .collect(),
-                );
-            }
-            let prepared = loop {
-                let app = preparing_app.clone();
-                let entry = entry.clone();
-                let cache = cache.clone();
-                let current_policy = policy.clone();
-                let owner = preparing_branch.as_ref().map(|branch| branch.root.clone());
-                let generation = preparing_branch
-                    .as_ref()
-                    .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
-                let (next, result) = tokio::task::spawn_blocking(move || -> Result<_> {
-                    if state.is_none() {
-                        *state = Some(Workspace::open(
-                            entry,
-                            &cache,
-                            current_policy.clone(),
-                            &app.cache.join("analysis"),
-                            owner.as_deref(),
-                            app.monitor.clone(),
-                        )?);
-                    }
-                    state.as_mut().unwrap().update_policy(current_policy);
-                    if let Some(generation) = generation {
-                        state.as_mut().unwrap().materialized(generation);
-                    }
-                    let result = state.as_mut().unwrap().prepare();
-                    crate::memory::reclaim();
-                    Ok((state, result))
-                })
-                .await??;
-                state = next;
-                match result {
-                    Ok(prepared) => break prepared,
-                    Err(error) => {
-                        let Some(required) =
-                            error.downcast_ref::<crate::discovery::RequiredInputs>()
-                        else {
-                            return Err(error);
-                        };
-                        let paths = required.0.clone();
-                        let branch = preparing_branch
-                            .as_ref()
-                            .ok_or(error.context("No repository materializer is available"))?;
-                        let revision = branch_state
-                            .as_ref()
-                            .unwrap()
-                            .as_ref()
-                            .unwrap()
-                            .prepared
-                            .revision
-                            .clone();
-                        drop(branch_state.take());
-                        preparing_app
-                            .remote
-                            .as_ref()
-                            .unwrap()
-                            .require_inputs(branch, &revision, paths)
-                            .await?;
-                        let gate = branch.state.clone().lock_owned().await;
-                        let applied = gate
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
-                        ensure!(
-                            !applied.repair,
-                            "Repository materialization requires repair"
-                        );
-                        policy.remote.as_mut().unwrap().tracked = Arc::new(
-                            applied
-                                .prepared
-                                .tracked
-                                .keys()
-                                .filter(|p| !applied.prepared.unavailable.contains(*p))
-                                .cloned()
-                                .collect(),
-                        );
-                        branch_state = Some(gate);
-                    }
+                    .is_none_or(|ticket| !ticket.running())
+                {
+                    slot.preparing = Some(preparation::start(
+                        self.clone(),
+                        preparation::Request {
+                            workspace: slot.state.clone(),
+                            entry: entry.clone(),
+                            policy: policy.clone(),
+                            cache: cache.clone(),
+                            branch: branch.clone(),
+                            activity: activity.clone(),
+                        },
+                    ));
                 }
+                let state = slot.state.clone();
+                let ticket = slot.preparing.as_ref().unwrap().clone();
+                while registry.len() > 8 {
+                    let oldest = registry
+                        .iter()
+                        .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
+                        .min_by_key(|(_, slot)| slot.used)
+                        .map(|(path, _)| path.clone());
+                    let Some(oldest) = oldest else {
+                        break;
+                    };
+                    retired.push(registry.remove(&oldest));
+                }
+                (state, ticket, retired)
             };
-            if let Some(prepared) = prepared {
-                let permit = preparing_app.workers.clone().acquire_owned().await?;
-                state = tokio::task::spawn_blocking(move || -> Result<_> {
-                    let _permit = permit;
-                    state.as_mut().unwrap().apply(prepared)?;
-                    crate::memory::reclaim();
-                    Ok(state)
-                })
-                .await??;
+            drop(retired);
+            let inventory = preparation.inventory().await?;
+            if inventory.current().await? {
+                break (workspace, preparation, inventory);
             }
-            Ok::<_, anyhow::Error>((state, branch_state))
-        })
-        .await??;
-        if let (Some(branch), Some(gate)) = (&branch, branch_state.as_mut()) {
-            let metadata = gate.as_mut().unwrap();
-            if metadata.indexed_revision.as_ref() != Some(&metadata.prepared.revision) {
-                metadata.indexed_revision = Some(metadata.prepared.revision.clone());
-                metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
-                branch.persist(metadata)?;
-            }
+            // A shared job may predate this request's filesystem changes.
+            // Drain it before preparing a fresh inventory, including when the
+            // changes caused its semantic extraction to fail.
+            let _ = preparation.complete().await;
+        };
+        if indexes::navigation(&request, query.as_ref())
+            && (preparation.running() || indexes::source_only(&request, query.as_ref()))
+        {
+            return self
+                .navigate_early(
+                    inventory,
+                    request,
+                    query,
+                    (usage_entry, usage_branch),
+                    activity,
+                )
+                .await;
         }
+        preparation.complete().await?;
+        let asset_workspace = workspace.clone();
+        let mut state = workspace.lock_owned().await;
+        let mut branch_state = match &branch {
+            Some(branch) => Some(branch.state.clone().lock_owned().await),
+            None => None,
+        };
         let context = branch.as_ref().map(|branch| {
             let prepared = &branch_state.as_ref().unwrap().as_ref().unwrap().prepared;
             (
@@ -711,49 +645,16 @@ impl App {
             }
             Request::Browse(_) => true,
         };
-        let asset_root = state.as_ref().unwrap().manifest.root.clone();
         let asset_generation =
             crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?;
-        let asset_cache = branch
-            .as_ref()
-            .map(|b| b.root.join("unity-assets"))
-            .unwrap_or_else(|| {
-                self.cache.join("unity-assets").join(
-                    blake3::hash(asset_root.as_os_str().as_encoded_bytes())
-                        .to_hex()
-                        .as_str(),
-                )
-            });
-        let revision = context.as_ref().map(|(_, _, revision, _)| revision.clone());
-        let has_unity = crate::unity::assets::is_root(&asset_root)
-            || state
-                .as_ref()
-                .unwrap()
-                .manifest
-                .projects
-                .iter()
-                .any(|p| p.compiler_options.contains_key("UnityVersion"))
-            || state.as_ref().unwrap().manifest.files.values().any(|f| {
-                f.path.ancestors().any(|p| {
-                    p.file_name()
-                        .is_some_and(|n| n == "Assets" || n == "ProjectSettings")
-                        && p.parent().is_some_and(crate::unity::assets::is_root)
-                })
-            });
-        let ticket = if has_unity {
-            self.assets.start(crate::unity::assets::jobs::Request {
-                workspace: asset_workspace.clone(),
-                branch: branch.clone(),
-                root: asset_root,
-                cache: asset_cache,
-                expected: asset_generation,
-                revision,
-                refresh: asset_request && branch.is_none(),
-                activity: activity.clone(),
-            })
-        } else {
-            crate::unity::assets::jobs::empty()
-        };
+        let ticket = self.start_assets(
+            asset_workspace.clone(),
+            branch.clone(),
+            &state.as_ref().unwrap().manifest,
+            context.as_ref().map(|(_, _, revision, _)| revision.clone()),
+            asset_request && branch.is_none(),
+            activity.clone(),
+        )?;
         let needed = indexes::groups(&request, query.as_ref(), &state.as_ref().unwrap().manifest);
         let mut source_tickets = std::collections::BTreeMap::new();
         for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
@@ -1163,6 +1064,104 @@ impl ServerHandler for Mcp {}
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn navigation_precedes_indexing_and_cancelled_waiters_do_not_stop_it() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "mod child; pub struct Available;",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("child.rs"), "pub fn child_function() {}").unwrap();
+        std::fs::write(root.path().join("invalid.rs"), [0xff]).unwrap();
+        std::fs::write(root.path().join("Managed.cs"), "public class Managed {}").unwrap();
+        std::fs::write(root.path().join("native.cpp"), "void native_function() {}").unwrap();
+        std::fs::write(root.path().join("temporary.md"), "Temporary document").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
+        let path = root.path().to_str().unwrap();
+        let waiting = {
+            let app = app.clone();
+            let path = path.to_owned();
+            tokio::spawn(async move { app.search(&path, "type:Available").await })
+        };
+        app.preparation_started.notified().await;
+        for (query, expected) in [
+            ("file:*.rs", "child.rs"),
+            ("file:*.cpp", "native.cpp"),
+            ("file:*.cs", "Managed.cs"),
+        ] {
+            let result = tokio::time::timeout(Duration::from_secs(5), app.search(path, query))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.contains(expected), "{result}");
+            assert!(!result.contains("invalid.rs"), "{result}");
+        }
+        let tree = tokio::time::timeout(Duration::from_secs(5), app.browse(path, ""))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tree.contains("lib.rs") && tree.contains("child.rs"));
+        let source =
+            tokio::time::timeout(Duration::from_secs(5), app.view(path, "child.rs", "exact"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(source.contains("pub fn child_function() {}"));
+        assert!(app.view(path, "../outside.rs", "exact").await.is_err());
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        drop(pause);
+        assert!(
+            app.search(path, "type:Available")
+                .await
+                .unwrap()
+                .contains("Available")
+        );
+        // The next inventory must reflect edits while the new index is pending.
+        let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
+        std::fs::write(root.path().join("child.rs"), "pub fn replacement() {}").unwrap();
+        let source =
+            tokio::time::timeout(Duration::from_secs(5), app.view(path, "child.rs", "exact"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(source.contains("replacement") && !source.contains("child_function"));
+        std::fs::remove_file(root.path().join("temporary.md")).unwrap();
+        std::fs::write(root.path().join("added.md"), "Added during indexing").unwrap();
+        let files = app.search(path, "file:*.md");
+        tokio::pin!(files);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut files)
+                .await
+                .is_err(),
+            "A changed inventory must wait for a fresh preparation"
+        );
+        drop(pause);
+        let files = tokio::time::timeout(Duration::from_secs(5), files)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(files.contains("added.md") && !files.contains("temporary.md"));
+        assert!(
+            app.search(path, "function:replacement")
+                .await
+                .unwrap()
+                .contains("replacement")
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn source_groups_are_independent_and_waits_leave_code_available() {
         use crate::native::Group;
         use std::time::Duration;
@@ -1359,6 +1358,7 @@ mod tests {
             source,
             WorkspaceSlot {
                 state: workspace.clone(),
+                preparing: None,
                 used: Instant::now(),
             },
         );
@@ -1416,6 +1416,9 @@ mod tests {
         app.view(project.to_str().unwrap(), "README.md", "exact")
             .await
             .unwrap();
+        // Navigation may finish while indexing still owns the workspace.
+        // Production maintenance drains those jobs before retiring namespaces.
+        let gate = app.activity.write().await;
         let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
         let before = database.workspaces().unwrap()[0].1.id;
         app.maintain_analysis(false).unwrap();
@@ -1424,6 +1427,7 @@ mod tests {
         std::fs::remove_dir(&project).unwrap();
         app.maintain_analysis(false).unwrap();
         assert!(database.workspaces().unwrap().is_empty());
+        drop(gate);
         std::fs::create_dir(&project).unwrap();
         std::fs::write(project.join("README.md"), "After").unwrap();
         assert!(
@@ -1433,6 +1437,7 @@ mod tests {
                 .contains("After")
         );
         assert!(database.workspaces().unwrap()[0].1.id > before);
+        app.shutdown().await;
     }
 
     #[test]

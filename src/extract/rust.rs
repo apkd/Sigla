@@ -34,7 +34,7 @@ fn scope(n: &SyntaxNode) -> Range<usize> {
         .unwrap_or_else(|| range(n))
 }
 
-pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
+pub(crate) fn modules(source: &str, edition: &str) -> Vec<ModuleFile> {
     let edition = match edition {
         "2015" => Edition::Edition2015,
         "2018" => Edition::Edition2018,
@@ -42,18 +42,12 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
         _ => Edition::Edition2024,
     };
     let parsed = SourceFile::parse(source, edition);
-    let root = parsed.tree().syntax().clone();
-    let mut facts = Facts {
-        errors: !parsed.errors().is_empty(),
-        ..Facts::default()
-    };
+    module_files(parsed.tree().syntax())
+}
+
+fn module_files(root: &SyntaxNode) -> Vec<ModuleFile> {
+    let mut modules = Vec::new();
     for n in root.descendants() {
-        let k = kind(&n);
-        if k == "USE"
-            && let Some(tree) = ast::Use::cast(n.clone()).and_then(|u| u.use_tree())
-        {
-            imports(tree, "", 0..source.len(), &mut facts);
-        }
         if let Some(m) = ast::Module::cast(n.clone())
             && m.semicolon_token().is_some()
             && let Some(name) = m.name()
@@ -73,11 +67,36 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
                     None
                 }
             });
-            facts.modules.push(ModuleFile {
+            modules.push(ModuleFile {
                 name: normalize_name(name.text().as_ref()),
                 path,
                 inline: inline.into_iter().rev().collect(),
             });
+        }
+    }
+    modules
+}
+
+pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
+    let edition = match edition {
+        "2015" => Edition::Edition2015,
+        "2018" => Edition::Edition2018,
+        "2021" => Edition::Edition2021,
+        _ => Edition::Edition2024,
+    };
+    let parsed = SourceFile::parse(source, edition);
+    let root = parsed.tree().syntax().clone();
+    let mut facts = Facts {
+        modules: module_files(&root),
+        errors: !parsed.errors().is_empty(),
+        ..Facts::default()
+    };
+    for n in root.descendants() {
+        let k = kind(&n);
+        if k == "USE"
+            && let Some(tree) = ast::Use::cast(n.clone()).and_then(|u| u.use_tree())
+        {
+            imports(tree, "", 0..source.len(), &mut facts);
         }
         let dk = match k.as_str() {
             "STRUCT" => "struct",

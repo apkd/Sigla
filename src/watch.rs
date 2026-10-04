@@ -3,11 +3,22 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 pub struct Monitor {
     state: Mutex<State>,
+}
+#[derive(Clone)]
+pub(crate) struct Snapshot {
+    monitor: Arc<Monitor>,
+    paths: BTreeSet<PathBuf>,
+    generation: u64,
+}
+impl Snapshot {
+    pub fn changed(&self) -> bool {
+        self.monitor.fence(&self.paths, self.generation).0
+    }
 }
 struct State {
     inotify: Option<Inotify>,
@@ -33,6 +44,17 @@ impl Default for Monitor {
     }
 }
 impl Monitor {
+    pub(crate) fn snapshot(
+        self: &Arc<Self>,
+        paths: &BTreeSet<PathBuf>,
+        generation: u64,
+    ) -> Snapshot {
+        Snapshot {
+            monitor: self.clone(),
+            paths: paths.clone(),
+            generation,
+        }
+    }
     pub fn register(&self, path: &Path) {
         let mut state = self.state.lock().unwrap();
         if let Some((_, users)) = state.directories.get_mut(path) {
