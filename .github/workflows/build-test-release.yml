@@ -53,6 +53,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libarchive-dev pkg-config lld
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
       - name: Check formatting and lint all targets
         run: bash scripts/check-ci.sh lint
 
@@ -110,7 +113,7 @@ jobs:
           install -Dm755 "$RUNNER_TEMP/bubblewrap-build/bwrap" "$HOME/.cache/sigla-ci/bin/bwrap"
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.146,cargo-about@0.9.2
       - name: Run tests and metadata oracles
         env:
           SIGLA_TEST_WITH_SUDO: '1'
@@ -176,6 +179,9 @@ jobs:
           key: musl-release
           cache-directories: ~/.nuget/packages
       - uses: ./.github/actions/setup-musl
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
       - name: Build release binary
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -185,8 +191,6 @@ jobs:
           cargo build --locked --release --bin sigla
           mkdir -p release-assets
           cp target/x86_64-unknown-linux-musl/release/sigla release-assets/sigla-linux-x64
-          cp target/musl-native/THIRD-PARTY-NOTICES.txt release-assets/
-          (cd release-assets && sha256sum sigla-linux-x64 THIRD-PARTY-NOTICES.txt > SHA256SUMS)
       - name: Smoke-test the release binary
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -204,6 +208,11 @@ jobs:
           [[ "$("$executable" --version)" == "sigla $VERSION" ]]
           work="$RUNNER_TEMP/release-smoke"
           mkdir -p "$work/src"
+          cp "$executable" "$work/sigla"
+          (cd "$work" && env -i ./sigla --mode remote --cache-dir "$work/unused-cache" licenses) > "$work/licenses.txt"
+          test -s "$work/licenses.txt"
+          "$executable" licenses | cmp - "$work/licenses.txt"
+          test ! -e "$work/unused-cache"
           printf '[package]\nname = "release-smoke"\nversion = "0.0.0"\nedition = "2024"\n' > "$work/Cargo.toml"
           printf 'pub struct ReleaseSmoke;\n' > "$work/src/lib.rs"
           "$executable" --cache-dir "$work/cache" query "$work" type:ReleaseSmoke | tee "$work/query.txt"
@@ -234,7 +243,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: sigla-linux-x64
-          path: release-assets/*
+          path: release-assets/sigla-linux-x64
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -322,18 +331,16 @@ jobs:
           --------------
           Compatibility: ***Linux x64, including NixOS and Alpine***
 
-          Download the binary and verify its checksum:
+          Download and run the binary:
 
           \`\`\`sh
           curl -fLO $repo_url/releases/download/release/sigla-linux-x64
-          curl -fLO $repo_url/releases/download/release/THIRD-PARTY-NOTICES.txt
-          curl -fLO $repo_url/releases/download/release/SHA256SUMS
-          sha256sum -c SHA256SUMS
           chmod +x sigla-linux-x64
           ./sigla-linux-x64 serve
           \`\`\`
 
           The binary bundles musl, libarchive, and its compression libraries.
+          Run \`./sigla-linux-x64 licenses\` to read the bundled license notices.
           C# project discovery also requires a .NET SDK and bubblewrap 0.11 or newer.
           See the [setup instructions]($repo_url/blob/release/README.md).
 
@@ -404,8 +411,7 @@ jobs:
       - name: Create or update rolling release
         if: steps.verify.outputs.changed == 'false'
         run: |
-          (cd release-assets && sha256sum -c SHA256SUMS)
-          files=(release-assets/sigla-linux-x64 release-assets/SHA256SUMS release-assets/THIRD-PARTY-NOTICES.txt)
+          files=(release-assets/sigla-linux-x64)
           for file in "${files[@]}"; do test -s "$file"; done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -422,7 +428,7 @@ jobs:
           mapfile -t published < <(jq -r '.assets[].name' <<< "$assets")
           for asset in "${published[@]}"; do
             case "$asset" in
-              sigla-linux-x64|SHA256SUMS|THIRD-PARTY-NOTICES.txt) ;;
+              sigla-linux-x64) ;;
               *) gh release delete-asset release "$asset" --yes ;;
             esac
           done

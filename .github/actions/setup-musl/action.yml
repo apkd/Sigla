@@ -7,12 +7,12 @@ runs:
       shell: bash
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends musl-tools fish pkg-config lld
+        sudo apt-get install -y --no-install-recommends musl-tools fish jq pkg-config lld
     - uses: actions/cache@v5
       id: libraries
       with:
         path: target/musl-native
-        key: musl-libraries-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/build-musl-libraries.fish') }}
+        key: musl-libraries-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/build-musl-libraries.fish', 'scripts/native-libraries.json') }}
     - name: Build bundled libraries
       if: steps.libraries.outputs.cache-hit != 'true'
       shell: bash

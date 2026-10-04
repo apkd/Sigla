@@ -7,7 +7,7 @@ use sigla::{
     discovery::Policy,
     service::{App, Mcp},
 };
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{io::Write, net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
 #[command(
@@ -26,6 +26,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// show licenses and copyright notices for bundled components.
+    Licenses,
     /// inspect managed disk usage and preview eviction without changing the cache.
     Cache {
         #[command(subcommand)]
@@ -73,6 +75,12 @@ async fn main() -> Result<()> {
         .init();
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
+    if let Command::Licenses = cli.command {
+        std::io::stdout()
+            .lock()
+            .write_all(include_bytes!(concat!(env!("OUT_DIR"), "/licenses.txt")))?;
+        return Ok(());
+    }
     if let Command::Cache {
         command: CacheCommand::Inspect { json },
     } = &cli.command
@@ -135,7 +143,10 @@ async fn main() -> Result<()> {
         .with_cache_limits(cache_limits),
     );
     match cli.command {
-        Command::GitJob { .. } | Command::GitRebuild { .. } | Command::Cache { .. } => {
+        Command::Licenses
+        | Command::GitJob { .. }
+        | Command::GitRebuild { .. }
+        | Command::Cache { .. } => {
             unreachable!()
         }
         Command::Query { project, query } => {

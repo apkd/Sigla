@@ -40,7 +40,7 @@ fi
 if [[ ${SIGLA_TEST_REPORTS:-0} == 1 ]]; then
     # Separate reports prevent the SDK-only runs from overwriting the main suite.
     status=0
-    "${test_command[@]}" nextest run --locked --profile ci --lib --bins --test integration || status=1
+    "${test_command[@]}" nextest run --locked --profile ci --lib --bins --test integration --test licenses || status=1
     "${test_command[@]}" nextest run --locked --profile metadata --test integration metadata:: --run-ignored only || status=1
     "${test_command[@]}" nextest run --locked --profile oracle --lib csharp::oracle:: --run-ignored only || status=1
     # The remote executable doubles as an SSH fixture and uses a custom harness.

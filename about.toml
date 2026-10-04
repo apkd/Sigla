@@ -1,0 +1,100 @@
+accepted = ["MIT", "ISC", "BSD-3-Clause", "Apache-2.0", "Unicode-3.0", "Unicode-DFS-2016", "Zlib", "0BSD", "CC0-1.0", "OLDAP-2.8"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Combined license files and licenses omitted from published crates need explicit
+# sources. Checksums force review when their upstream terms change.
+[aws-lc-rs.clarify]
+license = "ISC AND (Apache-2.0 OR ISC)"
+files = [{ path = "LICENSE", checksum = "b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7" }]
+
+[aws-lc-sys.clarify]
+license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)"
+files = [{ path = "LICENSE", checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e" }]
+
+[chrono.clarify]
+license = "MIT OR Apache-2.0"
+files = [{ path = "LICENSE.txt", license = "MIT", checksum = "946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831" }]
+
+[encoding_rs.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+files = [
+    { path = "LICENSE-MIT", license = "MIT", checksum = "3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c" },
+    { path = "LICENSE-WHATWG", license = "BSD-3-Clause", checksum = "838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50" },
+    { path = "src/gb18030_2022.rs", license = "BSD-3-Clause", start = "// Copyright", end = "// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.", checksum = "7e6b25aaf4abf9e4c07f169875ef9d77d1cc3458979f749382d4fc70595d847d" },
+]
+
+[schemars.clarify]
+license = "MIT"
+files = [
+    { path = "LICENSE", checksum = "1954992a2b32e8a2af24a4c11b726902e344c1934b947a77f04d404908f8db30" },
+    { path = "src/_private/regex_syntax.rs", start = "// Copyright", end = "// DEALINGS IN THE SOFTWARE.", checksum = "271f2624842bf6b1d1b3a78e7b82693ad2cd2741480da32117a5169e58843392" },
+]
+
+[heed.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "6d4e3db586416994db32596f0a256eaeee6c3f79e783bf6ac0fab3cc2e36759b" }]
+
+[heed-traits.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "c4ea684839984235efcebff570a4d253dcc456789edbd4fdf3e96ca15004e730" }]
+
+[heed-types.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "c4ea684839984235efcebff570a4d253dcc456789edbd4fdf3e96ca15004e730" }]
+
+# The wrapper's manifest lists Apache-2.0 but also bundles LMDB under OLDAP-2.8.
+[lmdb-master-sys.clarify]
+license = "Apache-2.0 AND OLDAP-2.8"
+files = [
+    { path = "lmdb/libraries/liblmdb/LICENSE", license = "OLDAP-2.8", checksum = "310fe25c858a9515fc8c8d7d1f24a67c9496f84a91e0a0e41ea9975b1371e569" },
+    { path = "lmdb/libraries/liblmdb/COPYRIGHT", license = "OLDAP-2.8", checksum = "3c87f63656b6a12fda225b6f798c547fe89e3404f499e890b445761eb310fd4f" },
+]
+
+[ouroboros.clarify]
+license = "MIT OR Apache-2.0"
+files = [{ path = "LICENSE_MIT", license = "MIT", checksum = "b87740f87cbb0e8be9c4c21db4a265d5f297cd9ee3ea0ff4cf702de819ef6de7" }]
+
+[ouroboros_macro.clarify]
+license = "MIT OR Apache-2.0"
+files = [{ path = "LICENSE_MIT", license = "MIT", checksum = "b87740f87cbb0e8be9c4c21db4a265d5f297cd9ee3ea0ff4cf702de819ef6de7" }]
+
+[ra-ap-rustc_lexer.clarify]
+license = "MIT OR Apache-2.0"
+# This published crate has no .cargo_vcs_info.json.
+override-git-commit = "1.95.0"
+git = [{ path = "LICENSE-MIT", license = "MIT", checksum = "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1" }]
+
+[ra_ap_edition.clarify]
+license = "MIT OR Apache-2.0"
+git = [{ path = "LICENSE-MIT", license = "MIT", checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3" }]
+
+[ra_ap_parser.clarify]
+license = "MIT OR Apache-2.0"
+git = [{ path = "LICENSE-MIT", license = "MIT", checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3" }]
+
+[ra_ap_stdx.clarify]
+license = "MIT OR Apache-2.0"
+git = [{ path = "LICENSE-MIT", license = "MIT", checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3" }]
+
+[ra_ap_syntax.clarify]
+license = "MIT OR Apache-2.0"
+git = [{ path = "LICENSE-MIT", license = "MIT", checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3" }]
+
+[tree-sitter.clarify]
+license = "MIT AND Unicode-DFS-2016"
+git = [{ path = "LICENSE", license = "MIT", checksum = "5f9cf9fb6acb1972b35ae29119ce563bb60ec097656bc4b69b9bac2d04c7a147" }]
+files = [{ path = "src/unicode/LICENSE", license = "Unicode-DFS-2016", checksum = "6a18c5fac70d7860b57f5b72b4e2c9a1ba6b3d2741eef7ff9767c5379364f10d" }]
+
+[tree-sitter-cpp.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1" }]
+
+[tree-sitter-glsl.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "f44d7107a33801260dc82624c91a71ebf5918b4038a0fb0e3ef60e2dd9ba1999" }]
+
+[tree-sitter-hlsl.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "dec735ccc031754dd05e6556dd9e959915eb367cf01cf009c77a1a38786932b1" }]

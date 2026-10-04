@@ -55,6 +55,14 @@ sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 
+[build-dependencies]
+anyhow = "1"
+html-escape = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
 [dev-dependencies]
 flate2 = "1"
 tar = "0.4"
@@ -73,3 +81,7 @@ harness = false
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[test]]
+name = "licenses"
+path = "scripts/licenses.rs"
