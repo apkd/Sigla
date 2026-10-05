@@ -100,7 +100,10 @@ fn roots(
     }
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() && !ignored(&entry.path()) {
+        if entry.file_type()?.is_dir()
+            && !ignored(&entry.path())
+            && !crate::discovery::linked_worktree(&entry.path())
+        {
             roots(&entry.path(), found, observed, depth + 1)?;
         }
     }
@@ -126,7 +129,7 @@ fn inventory(
         }
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            if !is_root(&path) {
+            if !is_root(&path) && !crate::discovery::linked_worktree(&path) {
                 inventory(&path, files, directories, depth + 1, visual_graphs)?;
             }
         } else if kind.is_file()
@@ -277,7 +280,10 @@ pub fn build(
         } else {
             project_name
         };
-        let mut scopes = vec![project.join("Assets"), project.join("ProjectSettings")];
+        let mut scopes: Vec<_> = [project.join("Assets"), project.join("ProjectSettings")]
+            .into_iter()
+            .filter(|p| !crate::discovery::linked_worktree(p))
+            .collect();
         let mut mapped = false;
         for p in &manifest.projects {
             if p.source_roots
@@ -307,7 +313,8 @@ pub fn build(
                 dependencies
                     .keys()
                     .filter(|n| !n.contains('/') && !n.contains('\\') && !n.starts_with('.'))
-                    .map(|n| project.join("Packages").join(n)),
+                    .map(|n| project.join("Packages").join(n))
+                    .filter(|p| !crate::discovery::crosses_worktree(project, p)),
             );
         }
         let mut files = BTreeSet::new();
@@ -518,6 +525,75 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
+    #[test]
+    fn worktrees_are_excluded_from_project_and_asset_inventories() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let repository = fixture.path().join("repository");
+        let project_worktree = root.join("branches/feature");
+        let asset_worktree = root.join("One/Assets/branches/feature");
+        for worktree in [&project_worktree, &asset_worktree] {
+            crate::discovery::tests::add_worktree(&repository, worktree);
+        }
+        for project in [root.join("One"), project_worktree.clone()] {
+            write(&project, "ProjectSettings/ProjectVersion.txt", b"version\n");
+            write(
+                &project,
+                "Assets/Object.asset",
+                b"--- !u!1 &1\nGameObject:\n  m_Name: Example\n",
+            );
+            write(
+                &project,
+                "Assets/Object.asset.meta",
+                b"guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            );
+        }
+        write(
+            &asset_worktree,
+            "Object.asset",
+            b"--- !u!1 &1\nGameObject:\n  m_Name: Nested\n",
+        );
+        write(
+            &asset_worktree,
+            "Object.asset.meta",
+            b"guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        );
+        let store =
+            Store::open_workspace(&cache.path().join("store"), [0; 32], &root, None).unwrap();
+        let tx = store.read().unwrap();
+        let build_at = |path: &Path| {
+            build(
+                path,
+                &cache.path().join("assets"),
+                &Manifest::default(),
+                &store,
+                &tx,
+                BuildOptions {
+                    remote: false,
+                    omitted: &Default::default(),
+                    cancel: &tokio_util::sync::CancellationToken::new(),
+                },
+            )
+            .unwrap()
+        };
+        let index = build_at(&root);
+        assert_eq!(index.assets.len(), 1);
+        assert!(index.assets.values().all(|a| !a.path.contains("branches")));
+        for worktree in [&project_worktree, &asset_worktree] {
+            assert!(!index.observed.keys().any(|p| p.starts_with(worktree)));
+        }
+        write(
+            &asset_worktree,
+            "Object.asset",
+            b"Changed nested worktree asset",
+        );
+        assert!(index.current());
+        let direct = build_at(&project_worktree);
+        assert_eq!(direct.assets.len(), 1);
+        assert!(direct.assets.values().any(|a| !a.objects.is_empty()));
+    }
+
     #[test]
     fn independent_projects_binary_records_and_nested_boundaries() {
         let root = tempfile::tempdir().unwrap();

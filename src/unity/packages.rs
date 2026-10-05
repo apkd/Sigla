@@ -160,7 +160,10 @@ impl Packages {
         let mut watched = BTreeSet::from([manifest_path, lock_path, root.join("Packages")]);
         let mut embedded = BTreeMap::new();
         for (path, kind) in super::entries(&root.join("Packages"), &mut diagnostics) {
-            if kind.is_dir() && path.join("package.json").is_file() {
+            if kind.is_dir()
+                && !crate::discovery::crosses_worktree(root, &path)
+                && path.join("package.json").is_file()
+            {
                 watched.insert(path.join("package.json"));
                 let loaded = (|| -> Result<Package> {
                     let path = policy.canonical(&path)?;
@@ -214,6 +217,7 @@ impl Packages {
             watched.insert(cache_root.clone());
             for (path, kind) in super::entries(&cache_root, &mut diagnostics) {
                 if kind.is_dir()
+                    && !crate::discovery::crosses_worktree(root, &path)
                     && let Ok(info) = read::<PackageManifest>(&path.join("package.json"))
                 {
                     candidates.push((info, path));
@@ -394,6 +398,38 @@ impl Packages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_package_discovery_skips_worktrees_but_file_references_work() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let worktree = root.join("Packages/feature");
+        crate::discovery::tests::add_worktree(&fixture.path().join("repository"), &worktree);
+        std::fs::write(
+            worktree.join("package.json"),
+            r#"{"name":"com.example.feature","version":"1.0"}"#,
+        )
+        .unwrap();
+        let editor = Editor {
+            declared: "6000.3.0f1".parse().unwrap(),
+            selected: "6000.3.0f1".parse().unwrap(),
+            data: fixture.path().join("Editor"),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let policy = Policy::new(vec![fixture.path().into()]).unwrap();
+        let automatic = Packages::local(&root, &policy, &editor, fixture.path()).unwrap();
+        assert!(automatic.selected.is_empty());
+        assert!(!automatic.watched.iter().any(|p| p.starts_with(&worktree)));
+        std::fs::write(
+            root.join("Packages/manifest.json"),
+            r#"{"dependencies":{"com.example.feature":"file:feature"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("Packages/packages-lock.json"), r#"{"dependencies":{"com.example.feature":{"version":"file:feature","source":"local","depth":0}}}"#).unwrap();
+        let explicit = Packages::local(&root, &policy, &editor, fixture.path()).unwrap();
+        assert!(explicit.selected.iter().any(|p| p.root == worktree));
+    }
 
     #[test]
     fn editor_dependency_mismatch_keeps_available_packages() {

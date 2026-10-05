@@ -77,7 +77,7 @@ impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         hash.update(&serde_json::to_vec(&(
-            9u32,
+            10u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -134,6 +134,25 @@ pub struct Discovery {
 
 pub fn discover(entry: &Path, policy: &Policy) -> Result<Discovery> {
     discover_cached(entry, policy, Path::new("/tmp/sigla"))
+}
+
+/// Linked worktrees have a gitfile pointing to metadata with a common Git directory.
+/// Submodules also use gitfiles, but do not have this marker.
+pub(crate) fn linked_worktree(directory: &Path) -> bool {
+    let Ok(gitfile) = std::fs::read_to_string(directory.join(".git")) else {
+        return false;
+    };
+    let Some(gitdir) = gitfile.strip_prefix("gitdir: ") else {
+        return false;
+    };
+    let gitdir = gitdir.trim_end_matches(['\r', '\n']);
+    !gitdir.is_empty() && directory.join(gitdir).join("commondir").is_file()
+}
+
+pub(crate) fn crosses_worktree(base: &Path, path: &Path) -> bool {
+    path.ancestors()
+        .take_while(|p| *p != base)
+        .any(linked_worktree)
 }
 
 fn project_failure(error: &anyhow::Error) -> String {
@@ -372,6 +391,9 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                 }
             };
             if kind.is_dir() {
+                if linked_worktree(&path) {
+                    continue;
+                }
                 if matches!(
                     entry.file_name().to_str(),
                     Some("Library" | "Build" | "Builds")
@@ -551,11 +573,16 @@ fn fallback_sources(entry: &Path, policy: &Policy, result: &mut Discovery) -> Re
             };
             if kind.is_dir() {
                 let name = entry.file_name();
+                if linked_worktree(&path) {
+                    continue;
+                }
                 if crate::unity::assets::is_root(base) && crate::unity::assets::is_root(&path) {
                     continue;
                 }
                 if name == "Library" && base.join("Assets").is_dir() {
-                    if path.join("PackageCache").is_dir() {
+                    if path.join("PackageCache").is_dir()
+                        && !linked_worktree(&path.join("PackageCache"))
+                    {
                         pending.push(path.join("PackageCache"));
                     }
                 } else if !crate::unity::ignored_name(&name)
@@ -685,6 +712,7 @@ fn collect_entries(
                 entry.file_name().to_str(),
                 Some(".git" | "target" | "bin" | "obj" | "node_modules" | ".vs")
             )
+            && !linked_worktree(&path)
         {
             match policy.canonical(&path) {
                 Ok(path) => children.push(path),
@@ -905,6 +933,7 @@ fn watch_tree(directory: &Path, policy: &Policy, metadata: &mut BTreeSet<PathBuf
                 entry.file_name().to_str(),
                 Some(".git" | "bin" | "obj" | "target" | "node_modules")
             )
+            && !linked_worktree(&entry.path())
         {
             watch_tree(&entry.path(), policy, metadata)?;
         }
@@ -1057,6 +1086,7 @@ fn load_cargo(
             .and_then(toml::Value::as_bool)
             != Some(false)
             && base.join(default).is_file()
+            && !crosses_worktree(base, base.join(default).parent().unwrap())
         {
             roots.push((base.join(default), name.clone()));
         }
@@ -1089,6 +1119,9 @@ fn load_cargo(
         if package.get(automatic).and_then(toml::Value::as_bool) == Some(false) {
             continue;
         }
+        if crosses_worktree(base, &base.join(dir)) {
+            continue;
+        }
         if let Ok(entries) = std::fs::read_dir(base.join(dir)) {
             for e in entries {
                 let p = match e {
@@ -1100,6 +1133,9 @@ fn load_cargo(
                         continue;
                     }
                 };
+                if linked_worktree(&p) {
+                    continue;
+                }
                 if p.extension().is_some_and(|e| e == "rs") {
                     roots.push((p, name.clone()));
                 } else if p.join("main.rs").exists() {
@@ -1204,7 +1240,10 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
         for dir in dirs {
             for e in std::fs::read_dir(dir)? {
                 let e = e?;
-                if e.file_type()?.is_dir() && matcher.is_match(e.file_name()) {
+                if e.file_type()?.is_dir()
+                    && matcher.is_match(e.file_name())
+                    && !linked_worktree(&e.path())
+                {
                     next.push(e.path());
                 }
             }
@@ -1215,8 +1254,269 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn add_worktree(repository: &Path, worktree: &Path) {
+        std::fs::create_dir_all(repository).unwrap();
+        let git = |args: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init".as_ref()]);
+        git(&[
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-m".as_ref(),
+            "fixture".as_ref(),
+        ]);
+        git(&[
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--detach".as_ref(),
+            worktree.as_os_str(),
+        ]);
+    }
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn nested_worktrees_are_excluded_but_direct_searches_and_other_checkouts_work() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let worktree = root.join("branches/feature");
+        add_worktree(&fixture.path().join("repository"), &worktree);
+        let marker = std::fs::read_to_string(worktree.join(".git")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            marker.replacen("gitdir: ", "gitdir:", 1),
+        )
+        .unwrap();
+        assert!(!linked_worktree(&worktree));
+        std::fs::write(worktree.join(".git"), marker).unwrap();
+        write(&root, "Parent.cs", "class Parent {}");
+        for checkout in ["ordinary", "submodule", "malformed"] {
+            write(&root, &format!("{checkout}/Child.cs"), "class Child {}");
+        }
+        std::fs::create_dir(root.join("ordinary/.git")).unwrap();
+        std::fs::create_dir(root.join("submodule-admin")).unwrap();
+        write(&root, "submodule/.git", "gitdir: ../submodule-admin\n");
+        write(&root, "malformed/.git", "gitdir: \n");
+        write(&worktree, "Child.cs", "class WorktreeChild {}");
+        write(&worktree, "Native.cpp", "void worktree() {}");
+        write(&worktree, "Guide.md", "Worktree documentation");
+        let policy = Policy::new(vec![fixture.path().into()]).unwrap();
+        for relative in [false, true] {
+            if relative {
+                let marker = std::fs::read_to_string(worktree.join(".git")).unwrap();
+                let gitdir = Path::new(marker.trim().strip_prefix("gitdir: ").unwrap());
+                std::fs::write(
+                    worktree.join(".git"),
+                    format!(
+                        "gitdir: ../../../{}\n",
+                        gitdir.strip_prefix(fixture.path()).unwrap().display()
+                    ),
+                )
+                .unwrap();
+            }
+            assert!(linked_worktree(&worktree));
+            let found = discover(&root, &policy).unwrap();
+            assert!(!found.sources.iter().any(|s| s.path.starts_with(&worktree)));
+            assert!(!found.metadata.iter().any(|p| p.starts_with(&worktree)));
+            for path in [
+                "Parent.cs",
+                "ordinary/Child.cs",
+                "submodule/Child.cs",
+                "malformed/Child.cs",
+            ] {
+                assert!(found.sources.iter().any(|s| s.path == root.join(path)));
+            }
+            let direct = discover(&worktree, &policy).unwrap();
+            for path in ["Child.cs", "Native.cpp", "Guide.md"] {
+                assert!(direct.sources.iter().any(|s| s.path == worktree.join(path)));
+            }
+            let mut watched = BTreeSet::new();
+            watch_tree(&root, &policy, &mut watched).unwrap();
+            assert!(!watched.iter().any(|p| p.starts_with(&worktree)));
+        }
+        write(
+            &worktree,
+            "Cargo.toml",
+            "[package]\nname='child'\nversion='0.1.0'\n",
+        );
+        write(&worktree, "src/lib.rs", "pub fn child() {}");
+        let parent = discover(&root, &policy).unwrap();
+        assert!(
+            !parent
+                .projects
+                .iter()
+                .any(|p| p.origin.as_ref().is_some_and(|p| p.starts_with(&worktree)))
+        );
+        let direct = discover(&worktree, &policy).unwrap();
+        assert!(
+            direct
+                .sources
+                .iter()
+                .any(|s| s.path == worktree.join("src/lib.rs"))
+        );
+        let selected_manifest = discover(&worktree.join("Cargo.toml"), &policy).unwrap();
+        assert!(
+            selected_manifest
+                .sources
+                .iter()
+                .any(|s| s.path == worktree.join("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn cargo_automatic_targets_and_member_globs_stop_at_worktrees() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let worktree = root.join("src/bin/feature");
+        add_worktree(&fixture.path().join("repository"), &worktree);
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname='parent'\nversion='0.1.0'\n",
+        );
+        write(&root, "src/lib.rs", "pub fn parent() {}");
+        write(&root, "src/bin/ordinary/main.rs", "fn main() {}");
+        write(&worktree, "main.rs", "fn main() {}");
+        write(
+            &worktree,
+            "Cargo.toml",
+            "[package]\nname='child'\nversion='0.1.0'\n",
+        );
+        write(&worktree, "src/lib.rs", "pub fn child() {}");
+        let policy = Policy::new(vec![fixture.path().into()]).unwrap();
+        let found = discover(&root, &policy).unwrap();
+        assert!(
+            found
+                .sources
+                .iter()
+                .any(|s| s.path == root.join("src/bin/ordinary/main.rs"))
+        );
+        assert!(!found.sources.iter().any(|s| s.path.starts_with(&worktree)));
+        assert!(!member_dirs(&root, "src/bin/*").unwrap().contains(&worktree));
+        assert!(
+            !member_dirs(&root, "src/bin/*/src")
+                .unwrap()
+                .contains(&worktree.join("src"))
+        );
+        assert!(
+            member_dirs(&root, "src/bin/feature")
+                .unwrap()
+                .contains(&worktree)
+        );
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname='parent'\nversion='0.1.0'\n[[bin]]\nname='explicit'\npath='src/bin/feature/main.rs'\n[dependencies]\nchild={path='src/bin/feature'}\n",
+        );
+        let explicit = discover(&root, &policy).unwrap();
+        for path in ["main.rs", "src/lib.rs"] {
+            assert!(
+                explicit
+                    .sources
+                    .iter()
+                    .any(|s| s.path == worktree.join(path))
+            );
+        }
+    }
+
+    #[test]
+    fn rediscovery_removes_cached_worktree_sources_and_watches() {
+        for cached in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("workspace");
+            let worktree = root.join("branches/feature");
+            add_worktree(&fixture.path().join("repository"), &worktree);
+            write(&root, "Parent.cs", "class Parent {}");
+            write(&worktree, "Child.cs", "class Child {}");
+            let marker = worktree.join(".git");
+            let hidden_marker = worktree.join(".git.disabled");
+            std::fs::rename(&marker, &hidden_marker).unwrap();
+            let policy = Policy::new(vec![fixture.path().into()]).unwrap();
+            let monitor = std::sync::Arc::new(crate::watch::Monitor::default());
+            let open = || {
+                crate::workspace::Workspace::open(
+                    root.clone(),
+                    cache.path(),
+                    policy.clone(),
+                    &cache.path().join("analysis"),
+                    None,
+                    monitor.clone(),
+                )
+                .unwrap()
+            };
+            let mut workspace = open();
+            workspace.refresh().unwrap();
+            assert!(
+                workspace
+                    .manifest
+                    .files
+                    .values()
+                    .any(|f| f.path.starts_with(&worktree))
+            );
+            std::fs::rename(&hidden_marker, &marker).unwrap();
+            if cached {
+                let mut stale = (*workspace.manifest).clone();
+                stale.discovery_policy[0] ^= 1;
+                for (path, stamp) in &mut stale.metadata {
+                    *stamp = crate::workspace::Stamp::read(path).unwrap();
+                }
+                workspace.store.save_manifest(&stale).unwrap();
+                drop(workspace);
+                workspace = open();
+            }
+            workspace.refresh().unwrap();
+            assert!(
+                !workspace
+                    .manifest
+                    .files
+                    .values()
+                    .any(|f| f.path.starts_with(&worktree))
+            );
+            assert!(
+                !workspace
+                    .manifest
+                    .metadata
+                    .keys()
+                    .any(|p| p.starts_with(&worktree))
+            );
+            let watches = workspace.watch_snapshot();
+            write(&worktree, "Child.cs", "class ChangedChild {}");
+            assert!(
+                !watches.changed(),
+                "Excluded worktree edits must not dirty the parent workspace"
+            );
+        }
+    }
+
     #[test]
     fn cargo_custom_targets_and_build_scripts() {
         let root = tempfile::tempdir().unwrap();

@@ -122,12 +122,15 @@ fn discover_with_editor(
             format!("{prefix}/{tail}")
         }
     };
-    let mut scopes = vec![Scope {
-        path: policy.canonical(&root.join("Assets"))?,
-        logical: logical("Assets"),
-        package: false,
-        testable: true,
-    }];
+    let mut scopes = Vec::new();
+    if !crate::discovery::linked_worktree(&root.join("Assets")) {
+        scopes.push(Scope {
+            path: policy.canonical(&root.join("Assets"))?,
+            logical: logical("Assets"),
+            package: false,
+            testable: true,
+        });
+    }
     let mut versions = BTreeMap::from([("Unity".to_owned(), editor.selected.to_string())]);
     let mut modules = BTreeSet::new();
     let mut provenance = BTreeMap::new();
@@ -698,8 +701,9 @@ fn scan(
             continue;
         }
         if kind.is_dir() {
-            if path.join("Assets").is_dir()
-                && path.join("ProjectSettings/ProjectVersion.txt").is_file()
+            if crate::discovery::linked_worktree(&path)
+                || path.join("Assets").is_dir()
+                    && path.join("ProjectSettings/ProjectVersion.txt").is_file()
             {
                 continue;
             }
@@ -930,6 +934,34 @@ fn response_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_scan_skips_nested_worktrees_and_accepts_selected_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let worktree = root.join("Assets/branches/feature");
+        crate::discovery::tests::add_worktree(&fixture.path().join("repository"), &worktree);
+        let parent = root.join("Assets/Parent.cs");
+        let child = worktree.join("Child.cs");
+        std::fs::write(&parent, "class Parent {}").unwrap();
+        std::fs::write(&child, "class Child {}").unwrap();
+        let mut files = Vec::new();
+        let mut watched = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+        scan(
+            &root.join("Assets"),
+            0,
+            &mut files,
+            &mut watched,
+            &mut diagnostics,
+        );
+        assert!(files.iter().any(|(_, p)| *p == parent));
+        assert!(!files.iter().any(|(_, p)| p.starts_with(&worktree)));
+        assert!(!watched.iter().any(|p| p.starts_with(&worktree)));
+        scan(&worktree, 0, &mut files, &mut watched, &mut diagnostics);
+        assert!(files.iter().any(|(_, p)| *p == child));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
     #[test]
     fn native_graph_matches_observed_unity_6000_3_compilations() {
         compare_observed("6000.3.10f1");
