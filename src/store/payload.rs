@@ -23,7 +23,7 @@ pub const MODULES: &[u8] = &[9];
 const BODY: u8 = 10;
 const MEMBER: u8 = 11;
 const DECLARATION_NAME: u8 = 12;
-pub const ANALYSIS_VERSION: u32 = 3; // Bump for extractor, binder, profile, or record changes.
+pub const ANALYSIS_VERSION: u32 = 4; // Bump for extractor, binder, profile, or record changes.
 
 pub fn body_key(index: u32) -> Vec<u8> {
     let mut key = vec![BODY];

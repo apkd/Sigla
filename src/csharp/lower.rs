@@ -169,8 +169,9 @@ pub fn bodies(root: Node<'_>, source: &str, syntax: &mut FileSyntax) {
                     .map(|n| written(n, source))
                     .unwrap_or(WrittenType::Inferred),
             }),
-            "identifier" | "generic_name" | "this_expression" | "base_expression"
-            | "predefined_type" => Some(ExpressionKind::Name {
+            "this" => Some(ExpressionKind::This),
+            "base" => Some(ExpressionKind::Base),
+            "identifier" | "generic_name" | "predefined_type" => Some(ExpressionKind::Name {
                 name: if node.kind() == "generic_name" {
                     node.named_child(0)
                         .map(|n| name(n, source))

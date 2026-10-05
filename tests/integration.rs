@@ -8,6 +8,7 @@ mod metadata;
 mod msbuild;
 mod native;
 mod navigation;
+mod review_regressions;
 mod scope_regressions;
 mod sharing_analysis;
 mod storage;

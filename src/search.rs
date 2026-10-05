@@ -586,6 +586,7 @@ impl<'a> Search<'a> {
             })
             .min_by_key(|d| (d.scope.end - d.scope.start, usize::MAX - d.name_span.start));
         if !o.construction
+            && o.role == crate::model::OccurrenceRole::Value
             && o.receiver.is_empty()
             && let Some(d) = local
         {
@@ -632,6 +633,11 @@ impl<'a> Search<'a> {
             )?);
         }
         candidates.retain(|h| self.visible(m.project, h.membership.project) && !h.decl.local());
+        if o.role != crate::model::OccurrenceRole::Value {
+            candidates.retain(|h| {
+                h.decl.named_type() || h.decl.kind == "module" || h.decl.kind == "trait"
+            });
+        }
         self.prefer_source(&mut candidates)?;
         if o.call {
             candidates.retain(|h| h.decl.callable() || h.decl.named_type());

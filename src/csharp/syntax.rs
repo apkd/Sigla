@@ -106,6 +106,8 @@ pub struct Expression {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ExpressionKind {
+    This,
+    Base,
     Name {
         name: String,
         arguments: Vec<WrittenType>,

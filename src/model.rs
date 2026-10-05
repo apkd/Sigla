@@ -81,6 +81,7 @@ impl Declaration {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Occurrence {
+    pub role: OccurrenceRole,
     pub name: String,
     pub span: Range<usize>,
     pub call: bool,
@@ -89,6 +90,13 @@ pub struct Occurrence {
     pub receiver: String,
     pub arguments: Option<usize>,
     pub opaque: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OccurrenceRole {
+    Value,
+    Type,
+    PathQualifier,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

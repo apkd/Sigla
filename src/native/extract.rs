@@ -409,6 +409,7 @@ impl Walker<'_> {
             indirect_write: write.is_some_and(|w| w.indirect),
         });
         self.facts.occurrences.push(Occurrence {
+            role: crate::model::OccurrenceRole::Value,
             name,
             span,
             call: call.is_some(),
@@ -860,6 +861,7 @@ impl Walker<'_> {
             "template_declaration"
             | "compound_statement"
             | "for_statement"
+            | "while_statement"
             | "if_statement"
             | "switch_statement"
             | "catch_clause" => {

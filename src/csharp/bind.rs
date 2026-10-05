@@ -1119,6 +1119,40 @@ impl Binder {
                 }),
                 ..Default::default()
             },
+            ExpressionKind::This | ExpressionKind::Base => {
+                let mut owner = Some(context.clone());
+                while let Some(current) = owner {
+                    if current.declaration().named_type() {
+                        let mut ty = self.open_type(view, &current)?;
+                        if matches!(expression.kind, ExpressionKind::Base) {
+                            let mut class = None;
+                            for base in self.base_types(view, &current, &ty, depth + 1)? {
+                                let interface = matches!(&base, Type::Named { definition, .. }
+                                    if self.definitions.get(definition).is_some_and(|s| s.declaration().kind == "interface"));
+                                if !interface {
+                                    class = Some(base);
+                                    break;
+                                }
+                            }
+                            ty = class.unwrap_or_else(|| {
+                                if current.declaration().kind == "class"
+                                    && current.declaration().qualified != "System.Object"
+                                {
+                                    Type::Primitive(Primitive::Object)
+                                } else {
+                                    Type::Unsupported
+                                }
+                            });
+                        }
+                        return Ok(Bound {
+                            ty: Some(ty),
+                            ..Default::default()
+                        });
+                    }
+                    owner = self.owner(view, &current)?;
+                }
+                Bound::default()
+            }
             ExpressionKind::Name { name, arguments } => {
                 if let Some(ty) = locals.get(name) {
                     return Ok(Bound {
@@ -1231,12 +1265,6 @@ impl Binder {
                 while let Some(current) = owner {
                     if current.declaration().named_type() {
                         let ty = self.open_type(view, &current)?;
-                        if name == "this" {
-                            return Ok(Bound {
-                                ty: Some(ty),
-                                ..Default::default()
-                            });
-                        }
                         let members = self.members(view, &ty, name, context.project, depth + 1)?;
                         let members = self.accessible_members(
                             view,

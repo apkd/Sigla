@@ -10,6 +10,16 @@ type ReferenceResults = Selection<(String, usize, Option<usize>), SearchResult>;
 type HierarchyResults = Selection<(bool, String, usize), SearchResult>;
 
 impl Search<'_> {
+    fn native_declaration_language(&mut self, hit: &Hit) -> Result<Language> {
+        let data = self.data(&hit.file)?;
+        let native = data.facts.native.as_ref().unwrap();
+        Ok(native
+            .regions
+            .iter()
+            .find(|region| region.span.contains(&hit.decl.name_span.start))
+            .unwrap()
+            .language)
+    }
     pub(crate) fn file_language_filters(q: &Query, language: Language) -> bool {
         q.file_language_filters(language)
     }
@@ -50,7 +60,7 @@ impl Search<'_> {
             return Ok(Vec::new());
         }
         let name = written_name(data, occurrence, info);
-        let mut hits = self.declarations(
+        let hits = self.declarations(
             &Target {
                 name: occurrence.name.clone(),
                 ..Default::default()
@@ -58,11 +68,18 @@ impl Search<'_> {
             false,
         )?;
         let language = facts.regions[info.region as usize].language;
-        hits.retain(|h| {
-            native::compatible(language, self.manifest.files[&h.file].language)
-                && !h.decl.local()
-                && (!info.qualified || native::name_rank(&name, &h.decl.qualified, false).is_some())
-        });
+        let mut compatible = Vec::new();
+        for hit in hits {
+            if self.manifest.files[&hit.file].language.native()
+                && native::compatible(language, self.native_declaration_language(&hit)?)
+                && !hit.decl.local()
+                && (!info.qualified
+                    || native::name_rank(&name, &hit.decl.qualified, false).is_some())
+            {
+                compatible.push(hit);
+            }
+        }
+        let mut hits = compatible;
         let included = self.native_includes(key, facts);
         for hit in &mut hits {
             hit.rank = u8::from(hit.file != key) + u8::from(!included.contains(&hit.file));
@@ -154,6 +171,15 @@ impl Search<'_> {
             })
             .collect::<Result<_>>()?;
         let outgoing = q.target.name == "*";
+        let dialects: BTreeMap<_, _> = targets
+            .iter()
+            .map(|hit| {
+                Ok((
+                    (hit.file.as_str(), hit.decl.name_span.start),
+                    self.native_declaration_language(hit)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
         let mut names: BTreeSet<String> = targets.iter().map(|h| h.decl.name.clone()).collect();
         if q.target.location.is_none() {
             names.insert(native::simple_name(&q.target.name));
@@ -224,7 +250,10 @@ impl Search<'_> {
                     .iter()
                     .copied()
                     .filter(|h| {
-                        if !native::compatible(language, self.manifest.files[&h.file].language) {
+                        if !native::compatible(
+                            language,
+                            dialects[&(h.file.as_str(), h.decl.name_span.start)],
+                        ) {
                             return false;
                         }
                         if let Some(local) = local {

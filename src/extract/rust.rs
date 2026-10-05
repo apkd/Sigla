@@ -233,7 +233,7 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
                     .map(|t| vec![t.syntax().text().to_string()])
                     .unwrap_or_default();
                 let name_span = name_node.as_ref().map(range).unwrap_or(header.clone());
-                let decl_scope = if dk == "parameter" {
+                let mut decl_scope = if dk == "parameter" {
                     n.ancestors()
                         .skip(1)
                         .find(|n| matches!(kind(n).as_str(), "FN" | "CLOSURE_EXPR"))
@@ -242,6 +242,14 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
                 } else {
                     scope(&n)
                 };
+                if dk == "local"
+                    && let Some(statement) = n.ancestors().find_map(ast::LetStmt::cast)
+                    && statement
+                        .pat()
+                        .is_some_and(|pat| range(pat.syntax()).contains(&name_span.start))
+                {
+                    decl_scope.start = range(statement.syntax()).end;
+                }
                 facts.declarations.push(Declaration {
                     name,
                     qualified,
@@ -337,7 +345,20 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
             let opaque = n
                 .ancestors()
                 .any(|n| matches!(kind(&n).as_str(), "TOKEN_TREE" | "MACRO_CALL"));
+            let role = if n
+                .parent()
+                .and_then(ast::PathSegment::cast)
+                .and_then(|s| s.parent_path().parent_path())
+                .is_some()
+            {
+                crate::model::OccurrenceRole::PathQualifier
+            } else if expr.parent().is_some_and(|p| kind(&p) == "PATH_TYPE") {
+                crate::model::OccurrenceRole::Type
+            } else {
+                crate::model::OccurrenceRole::Value
+            };
             facts.occurrences.push(Occurrence {
+                role,
                 name,
                 span: range(&n),
                 call,

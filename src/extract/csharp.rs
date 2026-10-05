@@ -121,6 +121,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
             && let Some(arguments) = node.child_by_field_name("subscript")
         {
             facts.occurrences.push(Occurrence {
+                role: crate::model::OccurrenceRole::Value,
                 name: "Item".into(),
                 span: arguments.start_byte()..arguments.start_byte() + 1,
                 call: true,
@@ -164,6 +165,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                         &expression.kind
                     {
                         facts.occurrences.push(Occurrence {
+                            role: crate::model::OccurrenceRole::Value,
                             name: name.clone(),
                             span: expression.span.clone(),
                             call: !name.starts_with("op_")
@@ -465,6 +467,7 @@ fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
         }
     }
     facts.occurrences.push(Occurrence {
+        role: crate::model::OccurrenceRole::Value,
         name: normalize_name(text(n, s)),
         span: n.byte_range(),
         call,
