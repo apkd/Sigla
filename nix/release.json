@@ -1,13 +1,13 @@
 {
-  "version": "0.1.6",
+  "version": "0.1.7",
   "platforms": {
     "x86_64-linux": {
-      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.6-linux-x64",
-      "hash": "sha256-2j2bi6qtoAZVQfEEnZhOSc9lo2Pjne1vjPhtrQI/jds="
+      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.7-linux-x64",
+      "hash": "sha256-RLu9H0n7VVP4/zT0/MBDdaA7/hpN945CpPvnLv01yoQ="
     },
     "aarch64-linux": {
-      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.6-linux-arm64",
-      "hash": "sha256-2S1EKgwUmrg8JVKGzAyV200Se/we3iCrnF4GZLII2vk="
+      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.7-linux-arm64",
+      "hash": "sha256-AN3XI83RN/pjntP8gxM/cNaJKxdDEfUGXO/MvoT6ClI="
     }
   }
 }
