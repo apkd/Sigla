@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const LOCAL_LIMIT: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,7 +139,7 @@ fn inventory(
     }
     Ok(())
 }
-fn guid(path: &Path) -> Option<String> {
+fn metadata(path: &Path) -> Option<(Option<String>, bool)> {
     if std::fs::metadata(path).ok()?.len() > 1024 * 1024 {
         return None;
     }
@@ -147,10 +147,16 @@ fn guid(path: &Path) -> Option<String> {
     if bytes.len() > 1024 * 1024 {
         return None;
     }
-    std::str::from_utf8(&bytes).ok()?.lines().find_map(|l| {
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let guid = text.lines().find_map(|l| {
         let s = l.strip_prefix("guid:")?.trim();
         (s.len() == 32 && s.bytes().all(|c| c.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
-    })
+    });
+    let folder = text.lines().any(|l| {
+        l.strip_prefix("folderAsset:")
+            .is_some_and(|v| v.trim() == "yes")
+    });
+    Some((guid, folder))
 }
 fn key(project: &str, path: &str) -> String {
     format!("{project}|{path}")
@@ -324,6 +330,10 @@ pub fn build(
             } else {
                 file.clone()
             };
+            let meta = is_meta.then(|| metadata(&file)).flatten();
+            if physical.is_dir() || meta.as_ref().is_some_and(|(_, folder)| *folder) {
+                continue;
+            }
             let logical = physical
                 .strip_prefix(root)
                 .map(|p| p.to_string_lossy().to_string())
@@ -358,7 +368,7 @@ pub fn build(
                     unavailable: None,
                 });
             if is_meta {
-                if let Some(guid) = guid(&file) {
+                if let Some((Some(guid), _)) = meta {
                     asset.guid = guid;
                 }
                 if let Some(types) = type_files.get(&(project.clone(), physical.clone()))

@@ -6,6 +6,100 @@ fn write(root: &Path, path: &str, text: &str) {
     std::fs::write(file, text).unwrap();
 }
 #[tokio::test]
+async fn populated_results_report_limits_and_coverage_without_folder_placeholders() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "ProjectSettings/ProjectVersion.txt",
+        "m_EditorVersion: 6000.0.1f1\n",
+    );
+    write(
+        root.path(),
+        "Assets/Test.meta",
+        "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfolderAsset: yes\n",
+    );
+    write(
+        root.path(),
+        "Assets/AbsentFolder.meta",
+        "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfolderAsset: yes\n",
+    );
+    write(
+        root.path(),
+        "Assets/Missing.mat.meta",
+        "guid: cccccccccccccccccccccccccccccccc\n",
+    );
+    write(
+        root.path(),
+        "Assets/ZBroken.prefab",
+        "--- !u!1001 &1\nPrefabInstance:\n  m_SourcePrefab: {fileID: 100100000, guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, type: 3}\n",
+    );
+    write(
+        root.path(),
+        "Assets/Test/Scene.unity",
+        r#"--- !u!1 &1
+GameObject:
+  m_Name: Root
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+--- !u!20 &3
+Camera:
+  m_GameObject: {fileID: 1}
+--- !u!114 &4
+MonoBehaviour:
+  m_GameObject: {fileID: 1}
+  m_Script: {fileID: 11500000, guid: dddddddddddddddddddddddddddddddd, type: 3}
+"#,
+    );
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap(),
+    );
+    let path = root.path().to_str().unwrap();
+    for limit in [1, 2, 3] {
+        let result = app
+            .search(
+                path,
+                &format!(
+                    "instance:UnityEngine.Component path:Assets/Test/Scene.unity limit:{limit}"
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("unity@"), "{result}");
+        assert!(result.contains("unresolved script types"), "{result}");
+        assert_eq!(
+            result.contains("More asset matches"),
+            limit == 1,
+            "{result}"
+        );
+    }
+    let dependencies = app
+        .search(path, "dependencies:Assets/Test/Scene.unity limit:1")
+        .await
+        .unwrap();
+    assert!(
+        dependencies.contains("More asset matches"),
+        "{dependencies}"
+    );
+    let result = app
+        .search(path, "instance:UnityEngine.Component limit:1")
+        .await
+        .unwrap();
+    assert!(result.contains("1 unavailable assets"), "{result}");
+    assert!(result.contains("incomplete prefab composition"), "{result}");
+    for directory in ["Assets/Test", "Assets/Test/"] {
+        let browse = app.browse(path, directory).await.unwrap();
+        assert!(browse.contains("Scene.unity"), "{browse}");
+        assert!(!browse.contains("This is a file"), "{browse}");
+    }
+}
+#[tokio::test]
 async fn script_instances_inheritance_views_and_refresh() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

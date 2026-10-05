@@ -126,7 +126,14 @@ fn references(node: &Node, path: &str, offset: usize, out: &mut BTreeMap<String,
 }
 fn prefab(node: &Node) -> Prefab {
     let mut prefab = Prefab {
-        source: field_pointer(node, "m_SourcePrefab"),
+        source: field_pointer(
+            node,
+            if node.get("m_SourcePrefab").is_some() {
+                "m_SourcePrefab"
+            } else {
+                "m_ParentPrefab"
+            },
+        ),
         ..Default::default()
     };
     if let Some(mods) = node.get("m_Modification") {
@@ -279,6 +286,19 @@ pub fn parse(source: &str) -> Result<Parsed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_prefab_sources_preserve_identity_and_modern_precedence() {
+        let guid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for modern in ["", "  m_SourcePrefab: {fileID: 0}\n"] {
+            let parsed = parse(&format!("--- !u!1001 &1\nPrefabInstance:\n  m_ParentPrefab: {{fileID: 100100000, guid: {guid}, type: 3}}\n{modern}")).unwrap();
+            let source = &parsed.objects[0].prefab.as_ref().unwrap().source;
+            if modern.is_empty() {
+                assert_eq!(source.guid, guid);
+            } else {
+                assert!(source.null());
+            }
+        }
+    }
     #[test]
     fn malformed_and_ambiguous_yaml_fails_without_poisoning_the_next_parse() {
         for body in [

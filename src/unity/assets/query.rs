@@ -162,10 +162,11 @@ impl Index {
         let mut lines = Vec::new();
         let mut incomplete = false;
         let mut unresolved_types = false;
+        let mut unavailable = 0;
         let target = matches!(q.selector.as_str(), "references" | "dependencies")
             .then(|| self.target(&q.target.name))
             .transpose()?;
-        'assets: for (key, asset) in &self.assets {
+        for (key, asset) in &self.assets {
             if !selected(asset, q) {
                 continue;
             }
@@ -174,7 +175,10 @@ impl Index {
             {
                 continue;
             }
-            if let Some((target_asset, target_object)) = &target {
+            unavailable += usize::from(asset.unavailable.is_some());
+            if lines.len() <= q.limit
+                && let Some((target_asset, target_object)) = &target
+            {
                 for control in asset.objects.iter().filter(|o| o.prefab.is_some()) {
                     let prefab = control.prefab.as_ref().unwrap();
                     let Some(source) = self.resolve(&asset.project, &prefab.source.guid) else {
@@ -196,8 +200,8 @@ impl Index {
                             handle(key, &control.id.to_string()),
                             self.assets[source].path
                         ));
-                        if lines.len() >= q.limit {
-                            break 'assets;
+                        if lines.len() > q.limit {
+                            break;
                         }
                     }
                 }
@@ -209,6 +213,9 @@ impl Index {
                     .objects
                     .iter()
                     .any(|o| o.alive && o.object.class == 114 && o.ty.is_none());
+                if lines.len() > q.limit {
+                    continue;
+                }
                 for object in composition.objects.iter().filter(|o| o.alive) {
                     if q.selector == "instance" {
                         let Some(ty) = &object.ty else {
@@ -283,35 +290,39 @@ impl Index {
                                 "{}\n  {field} -> {to} {object_id}",
                                 describe(self, key, object, &composition)
                             ));
-                            if lines.len() >= q.limit {
-                                break 'assets;
+                            if lines.len() > q.limit {
+                                break;
                             }
                         }
                     }
-                    if lines.len() >= q.limit {
-                        break 'assets;
+                    if lines.len() > q.limit {
+                        break;
                     }
                 }
             }
-            if lines.len() >= q.limit {
-                break;
-            }
         }
+        let more = lines.len() > q.limit;
+        lines.truncate(q.limit);
         if lines.is_empty() {
-            let excluded = self
-                .assets
-                .values()
-                .filter(|a| a.unavailable.is_some() && selected(a, q))
-                .count();
-            return Ok(format!(
-                "No resolved asset matches found.{}",
-                if excluded > 0 || incomplete || unresolved_types {
-                    format!(
-                        " Coverage is incomplete ({excluded} unavailable assets; inspect asset views for details)."
-                    )
-                } else {
-                    String::new()
-                }
+            lines.push("No resolved asset matches found.".into());
+        }
+        if more {
+            lines.push("More asset matches exist; increase limit: to see them.".into());
+        }
+        let mut reasons = Vec::new();
+        if unavailable > 0 {
+            reasons.push(format!("{unavailable} unavailable assets"));
+        }
+        if unresolved_types {
+            reasons.push("unresolved script types".into());
+        }
+        if incomplete {
+            reasons.push("incomplete prefab composition".into());
+        }
+        if !reasons.is_empty() {
+            lines.push(format!(
+                "Coverage is incomplete ({}; inspect asset views for details).",
+                reasons.join("; ")
             ));
         }
         Ok(lines.join("\n\n"))
