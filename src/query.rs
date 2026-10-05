@@ -108,6 +108,39 @@ const FILTERS: &[&str] = &[
     "lang",
 ];
 
+fn qualifier(token: &str) -> Option<(&str, &str)> {
+    let split = token.find(':').filter(|&i| {
+        !token.starts_with('@')
+            && !token[i..].starts_with("::")
+            && token[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '-')
+    })?;
+    Some((&token[..split], &token[split + 1..]))
+}
+
+fn natural_language_guidance(input: &str, tokens: &[String]) -> &'static str {
+    if input.contains('"') || tokens.iter().any(|t| qualifier(t).is_some()) {
+        return "";
+    }
+    let words: Vec<_> = tokens
+        .iter()
+        .map(|t| t.trim_matches([',', '.', ';', '!', '?']))
+        .filter(|t| !t.is_empty() && t.chars().all(char::is_alphabetic))
+        .collect();
+    let connectives = [
+        "and", "or", "for", "with", "the", "to", "of", "how", "where",
+    ]
+    .iter()
+    .filter(|word| words.iter().any(|t| t.eq_ignore_ascii_case(word)))
+    .count();
+    if words.len() >= 6 && connectives >= 2 {
+        " This looks like natural language. Sigla uses structured queries. Split the request into separate searches, such as `symbol:Parser`, `text:\"TODO\"`, or `file:*.rs`; use `view` to inspect matching code."
+    } else {
+        ""
+    }
+}
+
 impl Query {
     pub fn parse(input: &str) -> Result<Self> {
         let tokens = lex(input)?;
@@ -118,17 +151,8 @@ impl Query {
         let mut limit = None;
         let mut offset = false;
         let mut wait_complete = false;
-        for token in tokens {
-            let split = token.find(':').filter(|&i| {
-                !token.starts_with('@')
-                    && !token[i..].starts_with("::")
-                    && token[..i]
-                        .chars()
-                        .all(|c| c.is_ascii_alphabetic() || c == '-')
-            });
-            let (raw_key, value) = split.map_or(("symbol", token.as_str()), |i| {
-                (&token[..i], &token[i + 1..])
-            });
+        for token in &tokens {
+            let (raw_key, value) = qualifier(token).unwrap_or(("symbol", token.as_str()));
             let negate = raw_key.starts_with('-');
             let key = match raw_key.trim_start_matches('-') {
                 "t" => "type",
@@ -182,7 +206,11 @@ impl Query {
                     negate,
                 }),
                 k if SELECTORS.contains(&k) => {
-                    ensure!(primary.is_none(), "Use one primary selector per query.");
+                    ensure!(
+                        primary.is_none(),
+                        "Use one primary selector per query.{}",
+                        natural_language_guidance(input, &tokens)
+                    );
                     primary = Some((k.to_owned(), value.to_owned()));
                 }
                 _ => bail!("Unknown qualifier {}.", crate::render::inline(key)),
@@ -578,6 +606,65 @@ pub fn qualified_name_rank(pattern: &str, value: &str, loose: bool) -> Option<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prose_errors_preserve_the_error_and_offer_valid_recovery_queries() {
+        let ordinary = Query::parse("Alpha Beta").unwrap_err().to_string();
+        for input in [
+            "Rust CLI argument parsing for --account and --to; grant summary/status output; authentication and execution identity handling; native error reporting and desktop session requirements",
+            "How are fields and methods used in the project?",
+        ] {
+            let message = Query::parse(input).unwrap_err().to_string();
+            assert!(message.starts_with(&ordinary));
+            assert!(message.len() > ordinary.len());
+            let suggestions: Vec<_> = message
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|s| s.contains(':'))
+                .map(|s| Query::parse(s).unwrap())
+                .collect();
+            assert!(suggestions.iter().any(|q| q.selector == "symbol"));
+            assert!(suggestions.iter().any(|q| q.selector == "text"));
+        }
+    }
+
+    #[test]
+    fn structured_and_ambiguous_errors_keep_the_ordinary_diagnostic() {
+        let ordinary = Query::parse("Alpha Beta").unwrap_err().to_string();
+        for input in [
+            "Alpha Beta",
+            "How Parse",
+            "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta",
+            "Alpha and Beta and Gamma and Delta and Epsilon",
+            "Find(the, fields, and, methods, for, project) Other",
+            "Find the fields and methods for a project \"name with spaces\"",
+            "method:Parse text:hello",
+        ] {
+            assert_eq!(
+                Query::parse(input).unwrap_err().to_string(),
+                ordinary,
+                "{input}"
+            );
+        }
+        for key in SELECTORS.iter().chain(FILTERS).chain(&[
+            "t", "c", "i", "m", "x", "language", "wait", "offset", "match", "limit",
+        ]) {
+            let input = format!("Find the fields and methods for a project {key}:Example");
+            assert_eq!(
+                Query::parse(&input).unwrap_err().to_string(),
+                ordinary,
+                "{input}"
+            );
+        }
+        for input in [
+            "\"find fields and methods for the project\"",
+            "text:\"find fields and methods for the project\"",
+            "method:Find(the, fields, and, methods, for, project)",
+        ] {
+            Query::parse(input).unwrap();
+        }
+    }
+
     #[test]
     fn offset_recovery_respects_selector_in_any_order() {
         for query in ["file:*.cs offset:1", "offset:1 file:*.cs"] {
