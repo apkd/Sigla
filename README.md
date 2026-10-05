@@ -8,10 +8,12 @@
                      .|....'
 ```
 
-[![MIT License](https://img.shields.io/github/license/apkd/sigla?style=flat&label=License&logo=listmonk&labelColor=2C3439&color=fff)](https://github.com/apkd/sigla/blob/master/LICENSE)
-[![CI workflow status](https://img.shields.io/github/actions/workflow/status/apkd/sigla/ci.yml?logo=githubactions&logoColor=white&label=Tests&labelColor=2C3439)](https://github.com/apkd/sigla/actions/workflows/ci.yml)
-[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/apkd/sigla?label=Commits&labelColor=2C3439&color=EBFF65&logo=git)](https://github.com/apkd/sigla/commits/master)
-[![GitHub last commit](https://img.shields.io/github/last-commit/apkd/sigla?labelColor=2C3439&color=f97&logoColor=f96&logo=tinder&label=Committed)](https://github.com/apkd/sigla/commit/HEAD~1)
+[![GitHub tag](https://img.shields.io/github/v/tag/apkd/sigla?label=Version&labelColor=2C3439&logo=rust)](https://github.com/apkd/sigla/releases)
+[![MIT License](https://img.shields.io/github/license/apkd/Sigla?style=flat&label=License&logo=listmonk&labelColor=2C3439&color=fff)](https://github.com/apkd/Sigla/blob/master/LICENSE)
+[![CI workflow status](https://img.shields.io/github/actions/workflow/status/apkd/Sigla/ci.yml?logo=githubactions&logoColor=white&label=Tests&labelColor=2C3439)](https://github.com/apkd/Sigla/actions/workflows/ci.yml)
+[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/apkd/Sigla?label=Commits&labelColor=2C3439&color=EBFF65&logo=git)](https://github.com/apkd/Sigla/commits/master)
+[![GitHub last commit](https://img.shields.io/github/last-commit/apkd/Sigla?labelColor=2C3439&color=f97&logoColor=f96&logo=tinder&label=Committed)](https://github.com/apkd/Sigla/commit/HEAD~1)
+[![GitHub last release](https://img.shields.io/github/release-date/apkd/Sigla?display_date=published_at&logo=hackthebox&logoColor=66DDFF&label=Updated&labelColor=2C3439&color=66DDFF)](https://github.com/apkd/Sigla/releases/tag/release)
 
 Sigla helps coding agents find their way around C# and Rust projects. It finds declarations, follows references, and returns the relevant code with a source location, ready to read.
 
