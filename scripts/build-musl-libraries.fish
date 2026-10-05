@@ -16,6 +16,7 @@ set -gx LDFLAGS "-L$prefix/lib"
 set -gx PKG_CONFIG_LIBDIR "$prefix/lib/pkgconfig"
 set -gx PKG_CONFIG_PATH ''
 set -l jobs (nproc)
+set -l host (uname -m)-linux-musl
 mkdir -p $prefix $work
 or exit 1
 function unpack --argument-names name --inherit-variable work --inherit-variable sources
@@ -23,7 +24,7 @@ function unpack --argument-names name --inherit-variable work --inherit-variable
     or exit 1
     set -l checksum (jq -er --arg name $name '.[$name].sha256' $sources)
     or exit 1
-    curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 $url -o "$work/$name.tar"
+    curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 10 $url -o "$work/$name.tar"
     or exit 1
     printf '%s  %s\n' $checksum "$work/$name.tar" | sha256sum -c -
     or exit 1
@@ -46,7 +47,7 @@ and install -m644 bzlib.h "$prefix/include/"
 or exit 1
 
 unpack xz
-./configure --host=x86_64-linux-musl --prefix=$prefix --libdir=$prefix/lib \
+./configure --host=$host --prefix=$prefix --libdir=$prefix/lib \
     --disable-shared --enable-static --disable-nls --disable-doc \
     --disable-xz --disable-xzdec --disable-lzmadec --disable-lzmainfo --disable-scripts
 and make -j$jobs
@@ -60,7 +61,7 @@ and install -m644 lib/zstd.h lib/zstd_errors.h "$prefix/include/"
 or exit 1
 
 unpack libarchive
-./configure --host=x86_64-linux-musl --prefix=$prefix --libdir=$prefix/lib \
+./configure --host=$host --prefix=$prefix --libdir=$prefix/lib \
     --disable-shared --enable-static --disable-bsdtar --disable-bsdcat \
     --disable-bsdcpio --disable-bsdunzip --disable-acl --disable-xattr \
     --without-openssl --without-nettle --without-mbedtls --without-xml2 \

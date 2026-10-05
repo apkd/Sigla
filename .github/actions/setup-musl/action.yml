@@ -21,10 +21,17 @@ runs:
       shell: bash
       run: |
         prefix="$GITHUB_WORKSPACE/target/musl-native"
+        case "$RUNNER_ARCH" in
+          X64) target=x86_64-unknown-linux-musl ;;
+          ARM64) target=aarch64-unknown-linux-musl ;;
+          *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+        esac
+        target_key="${target//-/_}"
         {
-          echo 'CARGO_BUILD_TARGET=x86_64-unknown-linux-musl'
-          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc'
-          echo 'CC_x86_64_unknown_linux_musl=musl-gcc'
+          echo "CARGO_BUILD_TARGET=$target"
+          echo "CARGO_TARGET_${target_key^^}_LINKER=musl-gcc"
+          echo "CC_$target_key=musl-gcc"
+          echo "RUSTFLAGS=${RUSTFLAGS:-} -C link-arg=-Wl,--no-dynamic-linker" # musl-gcc supplies a dynamic loader that LLD retains even with -static.
           echo "LIBARCHIVE_LIB_DIR=$prefix/lib"
           echo "LIBARCHIVE_INCLUDE_DIR=$prefix/include"
           echo 'LIBARCHIVE_STATIC=1'

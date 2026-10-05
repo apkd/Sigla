@@ -60,7 +60,17 @@ jobs:
         run: bash scripts/check-ci.sh lint
 
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -81,7 +91,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
@@ -123,13 +133,13 @@ jobs:
         if: ${{ !cancelled() && hashFiles('target/nextest/*/junit.xml') != '' }}
         uses: dorny/test-reporter@v3
         with:
-          name: Rust and SDK tests
+          name: Rust and SDK tests (${{ matrix.arch }})
           reporter: java-junit
           path: target/nextest/*/junit.xml
           list-tests: all
           fail-on-error: false
 
-  build:
+  plan-release:
     # avoid expensive optimized builds when this run cannot publish a release.
     if: >-
       github.ref == 'refs/heads/master' &&
@@ -158,7 +168,7 @@ jobs:
           # an interrupted release can archive a build before its version is committed.
           archive_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/build-archive" --jq '.id')"
           archived_versions="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$archive_id/assets?per_page=100" \
-            --jq '.[] | .name | capture("^sigla-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-linux-x64$") | .version')"
+            --jq '.[] | .name | capture("^sigla-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-linux-(x64|arm64)$") | .version')"
           current="$(printf '%s\n' "$current" "$archived_versions" | sort -V | tail -n 1)"
           IFS='.' read -r major minor patch <<< "$current"
           case "$BUMP_LEVEL" in
@@ -173,9 +183,26 @@ jobs:
             echo "version=$version"
             echo "previous_tag=$previous_tag"
           } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
@@ -190,18 +217,18 @@ jobs:
           tool: cargo-about@0.9.2
       - name: Build release binary
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.plan-release.outputs.version }}
         run: |
           sed -i '/^\[package\]$/,/^\[dependencies\]$/s/^version = ".*"$/version = "'"$VERSION"'"/' Cargo.toml
           sed -i '/^name = "sigla"$/,/^\[\[package\]\]$/s/^version = ".*"$/version = "'"$VERSION"'"/' Cargo.lock
           cargo build --locked --release --bin sigla
           mkdir -p release-assets
-          cp target/x86_64-unknown-linux-musl/release/sigla release-assets/sigla-linux-x64
+          cp "target/$CARGO_BUILD_TARGET/release/sigla" release-assets/sigla-linux-${{ matrix.arch }}
       - name: Smoke-test the release binary
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.plan-release.outputs.version }}
         run: |
-          executable="$PWD/release-assets/sigla-linux-x64"
+          executable="$PWD/release-assets/sigla-linux-${{ matrix.arch }}"
           # reject an interpreter or shared libraries, including accidental host linkage.
           if readelf -l "$executable" | grep -q 'INTERP'; then
             echo '::error::Release binary requires a dynamic loader.'
@@ -248,12 +275,13 @@ jobs:
           response "$work/result.json" | jq -e '.result | .isError != true and any(.content[]; .text | contains("ReleaseSmoke"))'
       - uses: actions/upload-artifact@v6
         with:
-          name: sigla-linux-x64
-          path: release-assets/sigla-linux-x64
+          name: sigla-linux-${{ matrix.arch }}
+          path: release-assets/sigla-linux-${{ matrix.arch }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
       - uses: actions/upload-artifact@v6
+        if: matrix.arch == 'x64'
         with:
           name: release-version
           path: |
@@ -263,7 +291,7 @@ jobs:
           retention-days: 7
 
   test-nix:
-    needs: build
+    needs: [plan-release, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -276,7 +304,7 @@ jobs:
       - name: Package and test this run's binary
         env:
           SIGLA_ARTIFACT: ${{ runner.temp }}/sigla-binary/sigla-linux-x64
-          SIGLA_VERSION: ${{ needs.build.outputs.version }}
+          SIGLA_VERSION: ${{ needs.plan-release.outputs.version }}
         run: |
           nix build --impure --print-build-logs --out-link "$RUNNER_TEMP/sigla-nix" --expr '
             let flake = builtins.getFlake (toString ./.);
@@ -297,7 +325,7 @@ jobs:
           grep -q NixSmoke "$work/query.txt"
 
   prepare:
-    needs: [lint, test, build, test-nix]
+    needs: [lint, test, plan-release, build, test-nix]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -312,12 +340,13 @@ jobs:
           path: ${{ runner.temp }}/release-version
       - uses: actions/download-artifact@v8
         with:
-          name: sigla-linux-x64
+          pattern: sigla-linux-*
+          merge-multiple: true
           path: release-assets
       - name: Archive, commit and tag the tested version
         id: push
         env:
-          VERSION: ${{ needs.build.outputs.version }}
+          VERSION: ${{ needs.plan-release.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           git fetch origin master --quiet
@@ -327,13 +356,8 @@ jobs:
           fi
           fail() { echo "::error::$*" >&2; exit 1; }
           api="repos/$GITHUB_REPOSITORY"
-          binary=release-assets/sigla-linux-x64
-          name="sigla-$VERSION-linux-x64"
           work="$RUNNER_TEMP/build-archive"
           mkdir -p "$work"
-          test -s "$binary" || fail "Missing or empty binary: $binary"
-          digest="sha256:$(sha256sum "$binary" | cut -d ' ' -f 1)"
-          hash="sha256-$(openssl dgst -sha256 -binary "$binary" | base64 -w0)"
 
           archive="$(gh api "$api/releases/tags/build-archive")"
           jq -e '.draft == false and .prerelease == false and (.immutable != true)' <<< "$archive" >/dev/null \
@@ -346,29 +370,38 @@ jobs:
             gh api --paginate --slurp "$api/releases/$archive_id/assets?per_page=100" > "$work/assets.json" || return
             jq -c --arg name "$name" '.[][] | select(.name == $name)' "$work/assets.json"
           }
-          asset="$(find_asset)"
-          if [[ -z "$asset" ]]; then
-            [[ "$(jq '[.[][]] | length' "$work/assets.json")" -lt 1000 ]] \
-              || fail "The archive has reached GitHub's 1,000-asset limit. Create a new archive before publishing."
-            cp "$binary" "$work/$name"
-            # upload once; an existing version is never replaced.
-            gh release upload build-archive "$work/$name" --repo "$GITHUB_REPOSITORY"
+          for arch in x64 arm64; do
+            binary="release-assets/sigla-linux-$arch"
+            name="sigla-$VERSION-linux-$arch"
+            test -s "$binary" || fail "Missing or empty binary: $binary"
+            digest="sha256:$(sha256sum "$binary" | cut -d ' ' -f 1)"
             asset="$(find_asset)"
-            [[ -n "$asset" ]] || fail "Uploaded asset is missing: $name"
-          fi
+            if [[ -z "$asset" ]]; then
+              [[ "$(jq '[.[][]] | length' "$work/assets.json")" -lt 1000 ]] \
+                || fail "The archive has reached GitHub's 1,000-asset limit. Create a new archive before publishing."
+              cp "$binary" "$work/$name"
+              # upload once; an existing version is never replaced.
+              gh release upload build-archive "$work/$name" --repo "$GITHUB_REPOSITORY"
+              asset="$(find_asset)"
+              [[ -n "$asset" ]] || fail "Uploaded asset is missing: $name"
+            fi
 
-          recorded_digest="$(jq -r '.digest // empty' <<< "$asset")"
-          if [[ ! "$recorded_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            asset_id="$(jq -r '.id' <<< "$asset")"
-            gh api -H 'Accept: application/octet-stream' "$api/releases/assets/$asset_id" > "$work/download"
-            recorded_digest="sha256:$(sha256sum "$work/download" | cut -d ' ' -f 1)"
-          fi
-          [[ "$recorded_digest" == "$digest" ]] || fail "Archived bytes differ: $name. Nothing will be overwritten."
+            recorded_digest="$(jq -r '.digest // empty' <<< "$asset")"
+            if [[ ! "$recorded_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              asset_id="$(jq -r '.id' <<< "$asset")"
+              gh api -H 'Accept: application/octet-stream' "$api/releases/assets/$asset_id" > "$work/download"
+              recorded_digest="sha256:$(sha256sum "$work/download" | cut -d ' ' -f 1)"
+            fi
+            [[ "$recorded_digest" == "$digest" ]] || fail "Archived bytes differ: $name. Nothing will be overwritten."
 
-          # only verified, publicly available binaries may enter the Nix metadata.
-          jq -n --arg version "$VERSION" --arg hash "$hash" \
-            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/build-archive/$name" \
-            '{version: $version, url: $url, hash: $hash}' > nix/release.json
+            # the Nix package currently supports x64 only.
+            if [[ "$arch" == x64 ]]; then
+              hash="sha256-$(openssl dgst -sha256 -binary "$binary" | base64 -w0)"
+              jq -n --arg version "$VERSION" --arg hash "$hash" \
+                --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/build-archive/$name" \
+                '{version: $version, url: $url, hash: $hash}' > nix/release.json
+            fi
+          done
           cp "$RUNNER_TEMP/release-version/Cargo.toml" Cargo.toml
           cp "$RUNNER_TEMP/release-version/Cargo.lock" Cargo.lock
           git config user.name 'github-actions[bot]'
@@ -386,7 +419,7 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   release:
-    needs: [build, prepare]
+    needs: [plan-release, prepare]
     if: needs.prepare.outputs.sha != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -395,8 +428,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
-      VERSION: ${{ needs.build.outputs.version }}
-      PREVIOUS_TAG: ${{ needs.build.outputs.previous_tag }}
+      VERSION: ${{ needs.plan-release.outputs.version }}
+      PREVIOUS_TAG: ${{ needs.plan-release.outputs.previous_tag }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -404,7 +437,8 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
-          name: sigla-linux-x64
+          pattern: sigla-linux-*
+          merge-multiple: true
           path: release-assets
       - name: Prepare release notes
         run: |
@@ -423,7 +457,7 @@ jobs:
 
           Installation
           --------------
-          Compatibility: ***Linux x64, including NixOS and Alpine***
+          Compatibility: ***Linux x64 and ARM64, including NixOS and Alpine***
 
           Download and run the binary:
 
@@ -433,12 +467,14 @@ jobs:
           ./sigla-linux-x64 serve
           \`\`\`
 
+          On ARM64, use \`sigla-linux-arm64\` instead of \`sigla-linux-x64\`.
+
           The binary bundles musl, libarchive, and its compression libraries.
           Run \`./sigla-linux-x64 licenses\` to read the bundled license notices.
           C# project discovery also requires a .NET SDK and bubblewrap 0.11 or newer.
           See the [setup instructions]($repo_url/blob/release/README.md).
 
-          With Nix: \`nix run github:$GITHUB_REPOSITORY -- --help\`.
+          With Nix (x64): \`nix run github:$GITHUB_REPOSITORY -- --help\`.
           The Nix package uses a versioned binary from the
           [historical build archive]($repo_url/releases/tag/build-archive).
 
@@ -509,7 +545,7 @@ jobs:
       - name: Create or update rolling release
         if: steps.verify.outputs.changed == 'false'
         run: |
-          files=(release-assets/sigla-linux-x64)
+          files=(release-assets/sigla-linux-x64 release-assets/sigla-linux-arm64)
           for file in "${files[@]}"; do test -s "$file"; done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -526,7 +562,7 @@ jobs:
           mapfile -t published < <(jq -r '.assets[].name' <<< "$assets")
           for asset in "${published[@]}"; do
             case "$asset" in
-              sigla-linux-x64) ;;
+              sigla-linux-x64|sigla-linux-arm64) ;;
               *) gh release delete-asset release "$asset" --yes ;;
             esac
           done
