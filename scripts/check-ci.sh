@@ -26,7 +26,7 @@ cargo run --locked --example metadata_compare -- tests/metadata-fixture/bin/Rele
 
 test_command=(cargo)
 if [[ ${SIGLA_TEST_WITH_SUDO:-0} == 1 ]]; then
-    # Sandboxed tests drop capabilities, so their .NET home must belong to root.
+    # sandboxed tests drop capabilities, so their .NET home must belong to root.
     test_dotnet_home=$(sudo mktemp -d /tmp/sigla-ci-dotnet.XXXXXXXX)
     trap 'sudo rm -r -- "$test_dotnet_home"' EXIT
     test_command=(sudo --preserve-env=CARGO_BUILD_TARGET,CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER,CC_x86_64_unknown_linux_musl,LIBARCHIVE_LIB_DIR,LIBARCHIVE_INCLUDE_DIR,LIBARCHIVE_STATIC,LIBARCHIVE_LDFLAGS
@@ -38,12 +38,12 @@ if [[ ${SIGLA_TEST_WITH_SUDO:-0} == 1 ]]; then
 fi
 
 if [[ ${SIGLA_TEST_REPORTS:-0} == 1 ]]; then
-    # Separate reports prevent the SDK-only runs from overwriting the main suite.
+    # separate reports prevent the SDK-only runs from overwriting the main suite.
     status=0
     "${test_command[@]}" nextest run --locked --profile ci --lib --bins --test integration --test licenses || status=1
     "${test_command[@]}" nextest run --locked --profile metadata --test integration metadata:: --run-ignored only || status=1
     "${test_command[@]}" nextest run --locked --profile oracle --lib csharp::oracle:: --run-ignored only || status=1
-    # The remote executable doubles as an SSH fixture and uses a custom harness.
+    # the remote executable doubles as an SSH fixture and uses a custom harness.
     remote_result=Passed
     "${test_command[@]}" test --locked --test remote || { status=1; remote_result=Failed; }
     if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
@@ -52,9 +52,9 @@ if [[ ${SIGLA_TEST_REPORTS:-0} == 1 ]]; then
     exit "$status"
 fi
 
-# Examples are checked by Clippy; they contain no tests and need no test executables.
+# examples are checked by Clippy; they contain no tests and need no test executables.
 "${test_command[@]}" test --locked --lib --tests
-# CI provides the fixtures and SDK for these ignored tests. Other ignored tests
+# run these ignored tests with CI's fixtures and SDK. Other ignored tests
 # require manual tools or external data and must be requested separately.
 "${test_command[@]}" test --locked --test integration metadata:: -- --ignored
 "${test_command[@]}" test --locked --lib csharp::oracle:: -- --ignored

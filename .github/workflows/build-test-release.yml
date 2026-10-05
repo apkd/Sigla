@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Finish publication on master. Other refs can discard superseded work.
+  # finish publication on master. Other refs can discard superseded work.
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 defaults:
@@ -130,7 +130,7 @@ jobs:
           fail-on-error: false
 
   build:
-    # Avoid expensive optimized builds when this run cannot publish a release.
+    # avoid expensive optimized builds when this run cannot publish a release.
     if: >-
       github.ref == 'refs/heads/master' &&
       (github.event_name == 'workflow_dispatch' ||
@@ -148,12 +148,18 @@ jobs:
         id: version
         env:
           BUMP_LEVEL: ${{ inputs.bump_level || 'patch' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           current="$(sed -n '/^\[package\]$/,/^\[dependencies\]$/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)"
           if [[ ! "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Expected a package version in x.y.z form; got '$current'."
             exit 1
           fi
+          # an interrupted release can archive a build before its version is committed.
+          archive_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/build-archive" --jq '.id')"
+          archived_versions="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$archive_id/assets?per_page=100" \
+            --jq '.[] | .name | capture("^sigla-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-linux-x64$") | .version')"
+          current="$(printf '%s\n' "$current" "$archived_versions" | sort -V | tail -n 1)"
           IFS='.' read -r major minor patch <<< "$current"
           case "$BUMP_LEVEL" in
             major) major=$((major + 1)); minor=0; patch=0 ;;
@@ -173,7 +179,7 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-      # Use the checked-in manifests for cache lookup, before build-only version edits.
+      # use the checked-in manifests for cache lookup, before build-only version edits.
       - uses: Swatinem/rust-cache@v2
         with:
           key: musl-release
@@ -196,7 +202,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           executable="$PWD/release-assets/sigla-linux-x64"
-          # Reject an interpreter or shared libraries, including accidental host linkage.
+          # reject an interpreter or shared libraries, including accidental host linkage.
           if readelf -l "$executable" | grep -q 'INTERP'; then
             echo '::error::Release binary requires a dynamic loader.'
             exit 1
@@ -222,7 +228,7 @@ jobs:
           server=$!
           trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; cat "$work/server.log"' EXIT
           url=http://127.0.0.1:17331/mcp
-          # MCP permits either JSON or an SSE stream carrying the JSON response.
+          # accept either JSON or an SSE stream carrying the MCP response.
           response() {
             jq -Rse 'fromjson? // ([split("\n")[] | select(startswith("data:")) | .[5:] | fromjson? | select(.id != null)] | last)' "$1"
           }
@@ -256,10 +262,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  prepare:
-    needs: [lint, test, build]
+  test-nix:
+    needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/download-artifact@v8
+        with:
+          name: sigla-linux-x64
+          path: ${{ runner.temp }}/sigla-binary
+      - name: Package and test this run's binary
+        env:
+          SIGLA_ARTIFACT: ${{ runner.temp }}/sigla-binary/sigla-linux-x64
+          SIGLA_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          nix build --impure --print-build-logs --out-link "$RUNNER_TEMP/sigla-nix" --expr '
+            let flake = builtins.getFlake (toString ./.);
+            in flake.packages.x86_64-linux.sigla.overrideAttrs (_: {
+              src = builtins.path { path = builtins.getEnv "SIGLA_ARTIFACT"; name = "sigla-linux-x64"; };
+              version = builtins.getEnv "SIGLA_VERSION";
+            })'
+          executable="$RUNNER_TEMP/sigla-nix/bin/sigla"
+          [[ "$("$executable" --version)" == "sigla $SIGLA_VERSION" ]]
+          cmp "$SIGLA_ARTIFACT" "$executable"
+          "$executable" licenses > "$RUNNER_TEMP/licenses.txt"
+          test -s "$RUNNER_TEMP/licenses.txt"
+          work="$RUNNER_TEMP/nix-smoke"
+          mkdir -p "$work/src"
+          printf '[package]\nname = "nix-smoke"\nversion = "0.0.0"\nedition = "2024"\n' > "$work/Cargo.toml"
+          printf 'pub struct NixSmoke;\n' > "$work/src/lib.rs"
+          "$executable" --cache-dir "$work/cache" query "$work" type:NixSmoke | tee "$work/query.txt"
+          grep -q NixSmoke "$work/query.txt"
+
+  prepare:
+    needs: [lint, test, build, test-nix]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     outputs:
@@ -270,24 +310,78 @@ jobs:
         with:
           name: release-version
           path: ${{ runner.temp }}/release-version
-      - name: Commit and tag the tested version
+      - uses: actions/download-artifact@v8
+        with:
+          name: sigla-linux-x64
+          path: release-assets
+      - name: Archive, commit and tag the tested version
         id: push
         env:
           VERSION: ${{ needs.build.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git fetch origin master --quiet
           if [[ "$(git rev-parse origin/master)" != "$GITHUB_SHA" ]]; then
             echo '::notice::Master advanced; skipping this release.'
             exit 0
           fi
+          fail() { echo "::error::$*" >&2; exit 1; }
+          api="repos/$GITHUB_REPOSITORY"
+          binary=release-assets/sigla-linux-x64
+          name="sigla-$VERSION-linux-x64"
+          work="$RUNNER_TEMP/build-archive"
+          mkdir -p "$work"
+          test -s "$binary" || fail "Missing or empty binary: $binary"
+          digest="sha256:$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          hash="sha256-$(openssl dgst -sha256 -binary "$binary" | base64 -w0)"
+
+          archive="$(gh api "$api/releases/tags/build-archive")"
+          jq -e '.draft == false and .prerelease == false and (.immutable != true)' <<< "$archive" >/dev/null \
+            || fail 'Build archive must be public and mutable, without a prerelease label.'
+          archive_id="$(jq -r '.id' <<< "$archive")"
+          latest_id="$(gh api "$api/releases/latest" --jq '.id')"
+          [[ "$latest_id" != "$archive_id" ]] || fail 'The build archive must not be the Latest release.'
+
+          find_asset() {
+            gh api --paginate --slurp "$api/releases/$archive_id/assets?per_page=100" > "$work/assets.json" || return
+            jq -c --arg name "$name" '.[][] | select(.name == $name)' "$work/assets.json"
+          }
+          asset="$(find_asset)"
+          if [[ -z "$asset" ]]; then
+            [[ "$(jq '[.[][]] | length' "$work/assets.json")" -lt 1000 ]] \
+              || fail "The archive has reached GitHub's 1,000-asset limit. Create a new archive before publishing."
+            cp "$binary" "$work/$name"
+            # upload once; an existing version is never replaced.
+            gh release upload build-archive "$work/$name" --repo "$GITHUB_REPOSITORY"
+            asset="$(find_asset)"
+            [[ -n "$asset" ]] || fail "Uploaded asset is missing: $name"
+          fi
+
+          recorded_digest="$(jq -r '.digest // empty' <<< "$asset")"
+          if [[ ! "$recorded_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            asset_id="$(jq -r '.id' <<< "$asset")"
+            gh api -H 'Accept: application/octet-stream' "$api/releases/assets/$asset_id" > "$work/download"
+            recorded_digest="sha256:$(sha256sum "$work/download" | cut -d ' ' -f 1)"
+          fi
+          [[ "$recorded_digest" == "$digest" ]] || fail "Archived bytes differ: $name. Nothing will be overwritten."
+
+          # only verified, publicly available binaries may enter the Nix metadata.
+          jq -n --arg version "$VERSION" --arg hash "$hash" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/build-archive/$name" \
+            '{version: $version, url: $url, hash: $hash}' > nix/release.json
           cp "$RUNNER_TEMP/release-version/Cargo.toml" Cargo.toml
           cp "$RUNNER_TEMP/release-version/Cargo.lock" Cargo.lock
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock nix/release.json
           git commit -m "Sigla $VERSION [release] [skip ci]"
+          git fetch origin master --quiet
+          if [[ "$(git rev-parse origin/master)" != "$GITHUB_SHA" ]]; then
+            echo '::notice::Master advanced during archiving; keeping the archived build and skipping publication.'
+            exit 0
+          fi
           git tag "v$VERSION"
-          # A normal atomic push rejects branch races and leaves neither ref half-updated.
+          # a normal atomic push rejects branch races and leaves neither ref half-updated.
           git push --atomic origin HEAD:refs/heads/master "refs/tags/v$VERSION"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -344,13 +438,17 @@ jobs:
           C# project discovery also requires a .NET SDK and bubblewrap 0.11 or newer.
           See the [setup instructions]($repo_url/blob/release/README.md).
 
+          With Nix: \`nix run github:$GITHUB_REPOSITORY -- --help\`.
+          The Nix package uses a versioned binary from the
+          [historical build archive]($repo_url/releases/tag/build-archive).
+
           Latest changes
           --------------
           | Author | Release | Commit | SHA |
           | ------ | ------- | ------ | --- |
           MD
 
-          # One API request supplies author profiles for the whole table.
+          # one API request supplies author profiles for the whole table.
           gh api "repos/$GITHUB_REPOSITORY/commits?sha=$RELEASE_SHA&per_page=24" > "$RUNNER_TEMP/commits.json"
           mapfile -t rel_tags < <(git for-each-ref --sort=creatordate --format='%(refname:short)' refs/tags | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/')
           declare -A tag_commits=()
@@ -387,7 +485,7 @@ jobs:
                 break
               fi
             done
-            if [[ -n "${since[$sha]:-}" ]]; then version="✨ $version"; fi
+            if [[ -n "${since[$sha]:-}" ]]; then version="$version ✨"; fi
             printf '| %s | %s | %s | %s |\n' "$author_cell" "$version" "$msg" "$shortlink" >> "$notes"
             count=$((count + 1))
             if [[ "$count" -ge 16 ]]; then break; fi
@@ -436,7 +534,7 @@ jobs:
           info="$(gh release view release --json apiUrl,publishedAt)"
           release_api="$(jq -r '.apiUrl' <<< "$info")"
           previous_date="$(jq -r '.publishedAt // ""' <<< "$info")"
-          # Republish the same release to refresh its date without losing reactions.
+          # republish the same release to refresh its date without losing reactions.
           trap 'echo "::warning::Release refresh failed; retrying publication."; gh api --method PATCH "$release_api" -f tag_name=release -F draft=false -f make_latest=true >/dev/null' EXIT
           gh api --method PATCH "$release_api" -f tag_name=release -F draft=true >/dev/null
           refreshed="$(gh api --method PATCH "$release_api" -f tag_name=release -F draft=false -f make_latest=true)"

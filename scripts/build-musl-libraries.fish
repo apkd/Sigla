@@ -1,5 +1,4 @@
 #!/run/current-system/sw/bin/fish
-# Build only the archive formats used by Sigla. CI caches the installed libraries.
 if test (count $argv) -ne 1
     echo 'Usage: fish scripts/build-musl-libraries.fish INSTALL_DIRECTORY' >&2
     exit 2
