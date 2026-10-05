@@ -292,24 +292,37 @@ jobs:
 
   test-nix:
     needs: [plan-release, build]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
       - uses: actions/download-artifact@v8
         with:
-          name: sigla-linux-x64
+          name: sigla-linux-${{ matrix.arch }}
           path: ${{ runner.temp }}/sigla-binary
       - name: Package and test this run's binary
         env:
-          SIGLA_ARTIFACT: ${{ runner.temp }}/sigla-binary/sigla-linux-x64
+          SIGLA_ARTIFACT: ${{ runner.temp }}/sigla-binary/sigla-linux-${{ matrix.arch }}
+          SIGLA_SYSTEM: ${{ matrix.system }}
           SIGLA_VERSION: ${{ needs.plan-release.outputs.version }}
         run: |
           nix build --impure --print-build-logs --out-link "$RUNNER_TEMP/sigla-nix" --expr '
-            let flake = builtins.getFlake (toString ./.);
-            in flake.packages.x86_64-linux.sigla.overrideAttrs (_: {
-              src = builtins.path { path = builtins.getEnv "SIGLA_ARTIFACT"; name = "sigla-linux-x64"; };
+            let
+              flake = builtins.getFlake (toString ./.);
+              packages = builtins.getAttr (builtins.getEnv "SIGLA_SYSTEM") flake.packages;
+            in packages.sigla.overrideAttrs (_: {
+              src = builtins.path { path = builtins.getEnv "SIGLA_ARTIFACT"; name = "sigla"; };
               version = builtins.getEnv "SIGLA_VERSION";
             })'
           executable="$RUNNER_TEMP/sigla-nix/bin/sigla"
@@ -370,6 +383,7 @@ jobs:
             gh api --paginate --slurp "$api/releases/$archive_id/assets?per_page=100" > "$work/assets.json" || return
             jq -c --arg name "$name" '.[][] | select(.name == $name)' "$work/assets.json"
           }
+          jq -n --arg version "$VERSION" '{version: $version, platforms: {}}' > "$work/release.json"
           for arch in x64 arm64; do
             binary="release-assets/sigla-linux-$arch"
             name="sigla-$VERSION-linux-$arch"
@@ -394,14 +408,17 @@ jobs:
             fi
             [[ "$recorded_digest" == "$digest" ]] || fail "Archived bytes differ: $name. Nothing will be overwritten."
 
-            # the Nix package currently supports x64 only.
-            if [[ "$arch" == x64 ]]; then
-              hash="sha256-$(openssl dgst -sha256 -binary "$binary" | base64 -w0)"
-              jq -n --arg version "$VERSION" --arg hash "$hash" \
-                --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/build-archive/$name" \
-                '{version: $version, url: $url, hash: $hash}' > nix/release.json
-            fi
+            case "$arch" in
+              x64) system=x86_64-linux ;;
+              arm64) system=aarch64-linux ;;
+            esac
+            hash="sha256-$(openssl dgst -sha256 -binary "$binary" | base64 -w0)"
+            jq --arg system "$system" --arg hash "$hash" \
+              --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/build-archive/$name" \
+              '.platforms[$system] = {url: $url, hash: $hash}' "$work/release.json" > "$work/release-next.json"
+            mv "$work/release-next.json" "$work/release.json"
           done
+          cp "$work/release.json" nix/release.json
           cp "$RUNNER_TEMP/release-version/Cargo.toml" Cargo.toml
           cp "$RUNNER_TEMP/release-version/Cargo.lock" Cargo.lock
           git config user.name 'github-actions[bot]'
@@ -474,7 +491,7 @@ jobs:
           C# project discovery also requires a .NET SDK and bubblewrap 0.11 or newer.
           See the [setup instructions]($repo_url/blob/release/README.md).
 
-          With Nix (x64): \`nix run github:$GITHUB_REPOSITORY -- --help\`.
+          With Nix: \`nix run github:$GITHUB_REPOSITORY -- --help\`.
           The Nix package uses a versioned binary from the
           [historical build archive]($repo_url/releases/tag/build-archive).
 

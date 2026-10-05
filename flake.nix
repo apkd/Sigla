@@ -4,12 +4,11 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { nixpkgs, ... }: let
-    system = "x86_64-linux";
-    pkgs = nixpkgs.legacyPackages.${system};
+    systems = [ "x86_64-linux" "aarch64-linux" ];
   in {
-    packages.${system} = rec {
-      sigla = pkgs.callPackage ./nix/package.nix { };
+    packages = nixpkgs.lib.genAttrs systems (system: rec {
+      sigla = nixpkgs.legacyPackages.${system}.callPackage ./nix/package.nix { };
       default = sigla;
-    };
+    });
   };
 }
