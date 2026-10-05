@@ -31,6 +31,9 @@ impl Ticket {
     pub fn running(&self) -> bool {
         matches!(*self.0.borrow(), Progress::Pending | Progress::Files(_))
     }
+    pub fn retained_inventory(&self) -> bool {
+        matches!(*self.0.borrow(), Progress::Failed(_, Some(_)))
+    }
     pub async fn inventory(&mut self) -> Result<Arc<Inventory>> {
         loop {
             match self.0.borrow().clone() {

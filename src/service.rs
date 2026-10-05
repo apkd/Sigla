@@ -578,7 +578,9 @@ impl App {
             let _ = preparation.complete().await;
         };
         if indexes::navigation(&request, query.as_ref())
-            && (preparation.running() || indexes::source_only(&request, query.as_ref()))
+            && (preparation.running()
+                || preparation.retained_inventory()
+                || indexes::source_only(&request, query.as_ref()))
         {
             return self
                 .navigate_early(
@@ -1063,6 +1065,62 @@ impl ServerHandler for Mcp {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn advertised_tool_arguments_match_deserialization() {
+        for tool in Mcp::tool_router().list_all() {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .unwrap()
+                .as_object()
+                .unwrap();
+            let arguments: serde_json::Map<String, serde_json::Value> = properties
+                .keys()
+                .filter(|key| key.as_str() != "mode")
+                .map(|key| (key.clone(), serde_json::Value::String(String::new())))
+                .collect();
+            let value = serde_json::Value::Object(arguments);
+            match tool.name.as_ref() {
+                "search" => {
+                    serde_json::from_value::<Arguments>(value).unwrap();
+                }
+                "browse" => {
+                    serde_json::from_value::<BrowseArguments>(value).unwrap();
+                }
+                "view" => {
+                    serde_json::from_value::<ViewArguments>(value).unwrap();
+                }
+                _ => panic!("Uncovered tool: {}", tool.name),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn failed_indexing_retains_source_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub struct Available;").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        // Closing the indexing gate fails preparation after publishing inventory.
+        app.indexing_pause.close();
+        let path = root.path().to_str().unwrap();
+        assert!(app.search(path, "type:Available").await.is_err());
+        assert!(app.browse(path, "").await.unwrap().contains("lib.rs"));
+        assert!(app.search(path, "file:*").await.unwrap().contains("lib.rs"));
+        assert!(
+            app.view(path, "lib.rs", "exact")
+                .await
+                .unwrap()
+                .contains("Available")
+        );
+        assert!(app.search(path, "file:* wait:complete").await.is_err());
+    }
     #[tokio::test]
     async fn navigation_precedes_indexing_and_cancelled_waiters_do_not_stop_it() {
         use std::time::Duration;
