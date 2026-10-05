@@ -1040,13 +1040,55 @@ fn load_cargo(
             for t in ts {
                 if let Some(p) = t.get("path").and_then(toml::Value::as_str) {
                     roots.push((base.join(p), name.clone()));
+                } else if let Some(target_name) = t.get("name").and_then(toml::Value::as_str) {
+                    let single = base.join("src/bin").join(format!("{target_name}.rs"));
+                    let root = if target_name == name && base.join(default).is_file() {
+                        base.join(default)
+                    } else if single.is_file() {
+                        single
+                    } else {
+                        base.join("src/bin").join(target_name).join("main.rs")
+                    };
+                    roots.push((root, name.clone()));
                 }
             }
-        } else if base.join(default).is_file() {
+        } else if package
+            .get(if kind == "lib" { "autolib" } else { "autobins" })
+            .and_then(toml::Value::as_bool)
+            != Some(false)
+            && base.join(default).is_file()
+        {
             roots.push((base.join(default), name.clone()));
         }
     }
-    for dir in ["src/bin", "tests", "examples", "benches"] {
+    for (kind, dir, automatic) in [
+        ("bin", "src/bin", "autobins"),
+        ("test", "tests", "autotests"),
+        ("example", "examples", "autoexamples"),
+        ("bench", "benches", "autobenches"),
+    ] {
+        if kind != "bin"
+            && let Some(targets) = value.get(kind).and_then(toml::Value::as_array)
+        {
+            for target in targets {
+                if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+                    roots.push((base.join(path), name.clone()));
+                } else if let Some(target_name) = target.get("name").and_then(toml::Value::as_str) {
+                    let single = base.join(dir).join(format!("{target_name}.rs"));
+                    roots.push((
+                        if single.is_file() {
+                            single
+                        } else {
+                            base.join(dir).join(target_name).join("main.rs")
+                        },
+                        name.clone(),
+                    ));
+                }
+            }
+        }
+        if package.get(automatic).and_then(toml::Value::as_bool) == Some(false) {
+            continue;
+        }
         if let Ok(entries) = std::fs::read_dir(base.join(dir)) {
             for e in entries {
                 let p = match e {
@@ -1066,6 +1108,13 @@ fn load_cargo(
             }
         }
     }
+    match package.get("build") {
+        Some(toml::Value::Boolean(false)) => (),
+        Some(toml::Value::String(path)) => roots.push((base.join(path), name.clone())),
+        _ if base.join("build.rs").is_file() => roots.push((base.join("build.rs"), name.clone())),
+        _ => (),
+    }
+    let mut target_paths = BTreeSet::new();
     for (root, module) in roots {
         let root = match policy.canonical(&root) {
             Ok(root) => root,
@@ -1076,6 +1125,9 @@ fn load_cargo(
                 continue;
             }
         };
+        if !target_paths.insert(root.clone()) {
+            continue;
+        }
         result.sources.push(SourceInput {
             path: root,
             project,
@@ -1165,6 +1217,76 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cargo_custom_targets_and_build_scripts() {
+        let root = tempfile::tempdir().unwrap();
+        for path in [
+            "src/lib.rs",
+            "scripts/check.rs",
+            "scripts/example.rs",
+            "scripts/bench.rs",
+            "scripts/build.rs",
+            "build.rs",
+            "tests/ignored.rs",
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "pub fn fixture() {}").unwrap();
+        }
+        let policy = Policy::new(vec![root.path().into()]).unwrap();
+        for (build, expected) in [
+            ("build='scripts/build.rs'", Some("scripts/build.rs")),
+            ("build=false", None),
+            ("", Some("build.rs")),
+        ] {
+            std::fs::write(
+                root.path().join("Cargo.toml"),
+                format!(
+                    r#"
+[package]
+name='fixture'
+version='0.1.0'
+autotests=false
+{build}
+[[test]]
+name='check'
+path='scripts/check.rs'
+[[example]]
+name='example'
+path='scripts/example.rs'
+[[bench]]
+name='bench'
+path='scripts/bench.rs'
+"#
+                ),
+            )
+            .unwrap();
+            let found = discover(root.path(), &policy).unwrap();
+            let paths: BTreeSet<_> = found
+                .sources
+                .iter()
+                .map(|s| {
+                    s.path
+                        .strip_prefix(root.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            for path in [
+                "src/lib.rs",
+                "scripts/check.rs",
+                "scripts/example.rs",
+                "scripts/bench.rs",
+            ] {
+                assert!(paths.contains(path), "{paths:?}");
+            }
+            assert!(!paths.contains("tests/ignored.rs"));
+            for path in ["build.rs", "scripts/build.rs"] {
+                assert_eq!(paths.contains(path), expected == Some(path), "{paths:?}");
+            }
+        }
+    }
     #[test]
     fn cargo_edition_defaults_and_workspace_inheritance() {
         let root = tempfile::tempdir().unwrap();

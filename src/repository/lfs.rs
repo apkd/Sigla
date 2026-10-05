@@ -358,7 +358,11 @@ pub fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Resu
                 Path::new(path).extension().and_then(|e| e.to_str()),
                 Some("cs" | "rs" | "dll" | "meta")
             );
-            if !asset && !code && crate::documents::language(Path::new(path)).is_none() {
+            if !asset
+                && !code
+                && crate::documents::language(Path::new(path)).is_none()
+                && crate::native::language(Path::new(path)).is_none()
+            {
                 prepared.omitted.insert(
                     path.clone(),
                     "LFS payload format was not selected for analysis".into(),
@@ -497,6 +501,27 @@ mod tests {
         assert!(recovered.unavailable.is_empty());
         assert_eq!(fs::read(sources.join(path)).unwrap(), contents);
         assert_eq!(recovered.selected, failed.selected);
+        for extension in ["cpp", "h", "vert", "frag", "rs", "hlsl"] {
+            let path = format!("cached.{extension}");
+            fs::write(
+                sources.join(&path),
+                format!(
+                    "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+                    contents.len()
+                ),
+            )
+            .unwrap();
+            let mut cached = prepared();
+            cached.selected = BTreeMap::from([(path.clone(), "git-blob".into())]);
+            hydrate(&request, &mut cached, root.path()).unwrap();
+            assert!(
+                cached.omitted.is_empty(),
+                "{extension}: {:?}",
+                cached.omitted
+            );
+            assert!(cached.unavailable.is_empty());
+            assert_eq!(fs::read(sources.join(path)).unwrap(), contents);
+        }
     }
     #[test]
     fn pointers_and_downloads_require_valid_identity_and_size() {
