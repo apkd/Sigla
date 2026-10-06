@@ -1,4 +1,4 @@
-{ lib, stdenvNoCC, fetchurl }:
+{ lib, stdenvNoCC, fetchurl, makeWrapper, coreutils }:
 let
   release = builtins.fromJSON (builtins.readFile ./release.json);
   artifact = release.platforms.${stdenvNoCC.hostPlatform.system};
@@ -8,9 +8,11 @@ in stdenvNoCC.mkDerivation {
   src = fetchurl { inherit (artifact) url hash; };
   dontUnpack = true;
   dontStrip = true;
+  nativeBuildInputs = [ makeWrapper ];
   installPhase = ''
     runHook preInstall
     install -Dm755 "$src" "$out/bin/sigla"
+    wrapProgram "$out/bin/sigla" --prefix PATH : ${lib.makeBinPath [ coreutils ]}
     runHook postInstall
   '';
   meta = {

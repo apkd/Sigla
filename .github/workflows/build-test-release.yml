@@ -327,7 +327,7 @@ jobs:
             })'
           executable="$RUNNER_TEMP/sigla-nix/bin/sigla"
           [[ "$("$executable" --version)" == "sigla $SIGLA_VERSION" ]]
-          cmp "$SIGLA_ARTIFACT" "$executable"
+          cmp "$SIGLA_ARTIFACT" "$RUNNER_TEMP/sigla-nix/bin/.sigla-wrapped"
           "$executable" licenses > "$RUNNER_TEMP/licenses.txt"
           test -s "$RUNNER_TEMP/licenses.txt"
           work="$RUNNER_TEMP/nix-smoke"

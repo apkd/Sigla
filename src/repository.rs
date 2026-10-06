@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use url::Url;
 pub mod cache;
+mod credentials;
 mod github;
 pub mod job;
 mod lfs;

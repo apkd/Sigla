@@ -179,10 +179,7 @@ fn endpoint(
     };
     if allow_private {
         let result = crate::process::capture(
-            Command::new("git")
-                .args(["credential", "fill"])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env("GIT_ASKPASS", "/bin/false"),
+            super::credentials::noninteractive(Command::new("git").args(["credential", "fill"])),
             Duration::from_secs(30),
             Some(format!("url={base}\n\n").into_bytes()),
             None,
