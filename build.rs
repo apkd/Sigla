@@ -155,7 +155,12 @@ struct NativeSource {
     sha256: String,
 }
 
-fn native_source(output: &Path, name: &str, source: &NativeSource) -> Result<PathBuf> {
+fn archive_source(
+    output: &Path,
+    name: &str,
+    source: &NativeSource,
+    files: &[String],
+) -> Result<PathBuf> {
     let archive = output.join(format!("{}.tar", source.sha256));
     let temporary = archive.with_extension("tmp");
     if !archive.exists() {
@@ -199,6 +204,7 @@ fn native_source(output: &Path, name: &str, source: &NativeSource) -> Result<Pat
             .arg("-C")
             .arg(&root)
             .arg("--strip-components=1")
+            .args(files)
             .status()?
             .success(),
         "Cannot extract {name}"
@@ -212,7 +218,7 @@ fn build_licenses(output: &Path) -> Result<()> {
         serde_json::from_slice(&fs::read("scripts/native-libraries.json")?)?;
     for library in ["libarchive", "zstd", "musl"] {
         let source = &sources[library];
-        let root = native_source(output, library, source)?;
+        let root = archive_source(output, library, source, &[])?;
         let name = format!(
             "{library} {}",
             source
@@ -222,15 +228,61 @@ fn build_licenses(output: &Path) -> Result<()> {
         );
         notices.extend(licenses::native_notices(&root, library, &name)?);
     }
-    let sysroot = Command::new(env::var_os("RUSTC").context("Missing RUSTC")?)
-        .args(["--print", "sysroot"])
+    let version = Command::new(env::var_os("RUSTC").context("Missing RUSTC")?)
+        .arg("--version")
         .output()?;
-    ensure!(
-        sysroot.status.success(),
-        "Cannot locate Rust's license files"
-    );
-    let docs = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim()).join("share/doc/rust");
-    let runtime = fs::read_to_string(docs.join("COPYRIGHT-library.html"))?;
+    ensure!(version.status.success(), "Cannot identify Rust version");
+    let version = String::from_utf8(version.stdout)?.trim().to_owned();
+    let release = version
+        .split_whitespace()
+        .nth(1)
+        .context("Missing Rust release number")?;
+    // License documents are platform-independent; use one official archive on every host.
+    let archive = format!("rustc-{release}-x86_64-unknown-linux-gnu");
+    let url = format!("https://static.rust-lang.org/dist/{archive}.tar.xz");
+    let checksum_path = output.join(format!("{archive}.sha256"));
+    let checksum = if checksum_path.exists() {
+        fs::read_to_string(&checksum_path)?
+    } else {
+        let checksum = Command::new("curl")
+            .args([
+                "-fsSL",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "120",
+                "--retry",
+                "3",
+            ])
+            .arg(format!("{url}.sha256"))
+            .output()?;
+        ensure!(
+            checksum.status.success(),
+            "Cannot download checksum for {archive}"
+        );
+        let checksum = String::from_utf8(checksum.stdout)?;
+        fs::write(&checksum_path, &checksum)?;
+        checksum
+    };
+    let source = NativeSource {
+        version: Some(release.into()),
+        url,
+        sha256: checksum
+            .split_whitespace()
+            .next()
+            .context("Missing Rust archive checksum")?
+            .into(),
+    };
+    let files = ["COPYRIGHT-library.html", "licenses/Unicode-3.0.txt"]
+        .map(|file| format!("{archive}/rustc/share/doc/rust/{file}"));
+    let docs =
+        archive_source(output, "rust-licenses", &source, &files)?.join("rustc/share/doc/rust");
+    let read_document = |name: &str| -> Result<String> {
+        let path = docs.join(name);
+        fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read Rust license document {}", path.display()))
+    };
+    let runtime = read_document("COPYRIGHT-library.html")?;
     let apache = regex::Regex::new(
         r"(?s)<summary><code>LICENSE-APACHE</code></summary>\s*<pre>(.*?)</pre>",
     )?
@@ -238,16 +290,7 @@ fn build_licenses(output: &Path) -> Result<()> {
     .context("Rust runtime Apache license was not found")?[1]
         .to_string();
     let apache = html_escape::decode_html_entities(&apache).into_owned();
-    let version = Command::new(env::var_os("RUSTC").context("Missing RUSTC")?)
-        .arg("--version")
-        .output()?;
-    ensure!(version.status.success(), "Cannot identify Rust version");
-    let version = String::from_utf8(version.stdout)?.trim().to_owned();
     let target = env::var("TARGET")?;
-    let release = version
-        .split_whitespace()
-        .nth(1)
-        .context("Missing Rust release number")?;
     let runtime_name = format!("Rust standard library {release} ({target})");
     let target_libdir = Command::new(env::var_os("RUSTC").context("Missing RUSTC")?)
         .args(["--print", "target-libdir", "--target", &target])
@@ -320,7 +363,7 @@ fn build_licenses(output: &Path) -> Result<()> {
     notices.push(licenses::Notice {
         name: format!("{runtime_name} / Unicode data"),
         source: "licenses/Unicode-3.0.txt".into(),
-        text: fs::read_to_string(docs.join("licenses/Unicode-3.0.txt"))?,
+        text: read_document("licenses/Unicode-3.0.txt")?,
         license: "Unicode-3.0".into(),
         note: None,
     });
