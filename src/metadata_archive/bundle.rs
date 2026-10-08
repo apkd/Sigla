@@ -99,11 +99,22 @@ impl Builder {
                 &self.profiles[..1]
             };
             for defines in profiles {
-                let id = crate::store::source_id(&source, language, defines, "")?;
+                let context = || format!("Cannot analyze source {path} with defines {defines:?}");
+                let id = match crate::store::source_id(&source, language, defines, "") {
+                    Ok(id) => id,
+                    // A source file can require editor/platform symbols to be valid.
+                    // Keep its source, but cache only profiles it can compile under.
+                    Err(error) if error.is::<crate::extract::preprocess::InvalidDirectives>() => {
+                        tracing::debug!(%path, ?defines, %error, "Skipping invalid source profile");
+                        continue;
+                    }
+                    Err(error) => return Err(error).with_context(context),
+                };
                 if !seen.insert(id) {
                     continue;
                 }
-                let facts = crate::extract::extract(&source, language, defines, "")?;
+                let facts = crate::extract::extract(&source, language, defines, "")
+                    .with_context(context)?;
                 analyses.push(Analysis {
                     id,
                     encoded: records::encode(FileData {
@@ -314,19 +325,19 @@ fn validate_analysis(analysis: &ArchivedAnalysis) -> Result<()> {
             2 => {
                 binary::view::<Vec<crate::model::Declaration>>(bytes)?;
             }
-            3 | 11 => {
+            3 | 12 => {
                 binary::view::<crate::csharp::syntax::DeclarationFile>(bytes)?;
             }
             4 => {
                 binary::view::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
             }
-            5 => {
+            5 | 13 => {
                 binary::view::<Vec<crate::csharp::syntax::Import>>(bytes)?;
             }
             6 => {
                 binary::view::<Vec<(String, String)>>(bytes)?;
             }
-            7 | 12 => {
+            7 => {
                 std::str::from_utf8(bytes)?;
             }
             8 => ensure!(bytes.len() == 32, "Invalid declaration fingerprint"),
@@ -335,6 +346,9 @@ fn validate_analysis(analysis: &ArchivedAnalysis) -> Result<()> {
             }
             10 => {
                 binary::view::<crate::csharp::syntax::BodyFile>(bytes)?;
+            }
+            14..=17 => {
+                binary::view::<Vec<u32>>(bytes)?;
             }
             _ => anyhow::bail!("Unknown analysis record"),
         }

@@ -50,15 +50,15 @@ impl Lexical {
                     }
                     let quote = line[i];
                     if quote == b'"' {
+                        if i > 0 && line[i - 1] == b'@' {
+                            *self = Self::Verbatim;
+                            i += 1;
+                            continue;
+                        }
                         let count = line[i..].iter().take_while(|&&b| b == b'"').count();
                         if count >= 3 {
                             *self = Self::Raw(count);
                             i += count;
-                            continue;
-                        }
-                        if i > 0 && line[i - 1] == b'@' {
-                            *self = Self::Verbatim;
-                            i += 1;
                             continue;
                         }
                     }
@@ -81,7 +81,22 @@ impl Lexical {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct InvalidDirectives(anyhow::Error);
+
+impl std::fmt::Display for InvalidDirectives {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for InvalidDirectives {}
+
 pub fn active_source(source: &str, defines: &[String]) -> Result<String> {
+    preprocess(source, defines).map_err(|error| InvalidDirectives(error).into())
+}
+
+fn preprocess(source: &str, defines: &[String]) -> Result<String> {
     let mut symbols: HashSet<String> = defines.iter().cloned().collect();
     let mut output = Vec::with_capacity(source.len());
     let mut stack: Vec<(bool, bool)> = Vec::new();
@@ -95,10 +110,11 @@ pub fn active_source(source: &str, defines: &[String]) -> Result<String> {
             None
         };
         if let Some(d) = directive {
-            let (key, rest) = d
-                .trim()
-                .split_once(char::is_whitespace)
-                .unwrap_or((d.trim(), ""));
+            let d = d.trim_start();
+            let end = d
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(d.len());
+            let (key, rest) = d.split_at(end);
             let expr = rest.split("//").next().unwrap_or("").trim();
             match key {
                 "if" => {
@@ -246,5 +262,34 @@ mod tests {
         assert!(a.contains("class Live"));
         assert!(a.contains("#if TEXT"));
         assert_eq!(a.len(), s.len());
+    }
+
+    #[test]
+    fn escaped_verbatim_quotes_do_not_hide_directives() {
+        for literal in [r#"@"""value""#, r#"$@"""{value}""#] {
+            let source = format!(
+                "#if true\nclass C {{ string s = {literal}; }}\n#endif\n#if false\nclass Hidden {{}}\n#endif\n"
+            );
+            let active = active_source(&source, &[]).unwrap();
+            assert!(active.contains(literal));
+            assert!(!active.contains("Hidden"));
+            assert_eq!(active.len(), source.len());
+        }
+    }
+
+    #[test]
+    fn directives_need_no_space_before_expressions_or_comments() {
+        let source = "#if(FIRST)\nclass First {}\n#elif(!SECOND)\nclass Fallback {}\n#else// another branch\nclass Second {}\n#endif// end\n";
+        for (defines, expected) in [
+            (vec!["FIRST".into()], "First"),
+            (vec![], "Fallback"),
+            (vec!["SECOND".into()], "Second"),
+        ] {
+            let active = active_source(source, &defines).unwrap();
+            assert_eq!(active.len(), source.len());
+            assert_eq!(active.matches("class ").count(), 1);
+            assert!(active.contains(expected));
+            assert_eq!(active.find(expected), source.find(expected));
+        }
     }
 }

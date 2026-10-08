@@ -5,7 +5,9 @@ use crate::csharp::{
 };
 use crate::signature::*;
 use anyhow::{Context, Result};
-use dotscope::metadata::{cilassemblyview::CilAssemblyView, tables::*};
+use dotscope::metadata::{
+    cilassemblyview::CilAssemblyView, tables::*, validation::ValidationConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
 
@@ -457,7 +459,14 @@ pub fn extract(path: &Path) -> Result<AssemblyFacts> {
 }
 
 pub fn extract_bytes(bytes: Vec<u8>, fallback_stem: &str) -> Result<AssemblyFacts> {
-    let view = CilAssemblyView::from_mem(bytes).context("Cannot parse assembly bytes")?;
+    // Unity ships assemblies with unpadded heap sizes. Dotscope's parser supports
+    // these, but its optional structural validator rejects them.
+    let validation = ValidationConfig {
+        enable_structural_validation: false,
+        ..ValidationConfig::production()
+    };
+    let view = CilAssemblyView::from_mem_with_validation(bytes, validation)
+        .context("Cannot parse assembly bytes")?;
     let tables = view
         .tables()
         .ok_or_else(|| anyhow::anyhow!("Missing metadata tables"))?;

@@ -24,6 +24,7 @@ function unpack --argument-names name --inherit-variable work --inherit-variable
     or exit 1
     set -l checksum (jq -er --arg name $name '.[$name].sha256' $sources)
     or exit 1
+    echo "Downloading $name from $url"
     curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 10 $url -o "$work/$name.tar"
     or exit 1
     printf '%s  %s\n' $checksum "$work/$name.tar" | sha256sum -c -

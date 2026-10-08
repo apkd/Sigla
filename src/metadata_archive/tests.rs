@@ -112,6 +112,24 @@ fn records_reject_corruption_incompatibility_and_excessive_recursion() {
 }
 
 #[test]
+fn editor_only_generated_directives_do_not_block_other_profiles() {
+    let output = tempfile::tempdir().unwrap();
+    let defines = vec!["UNITY_EDITOR".into()];
+    let mut builder = bundle::Builder::new(origin(), vec![vec![], defines.clone()]).unwrap();
+    let source = "#if UNITY_EDITOR\nclass Generator { string text = @\"\n#if GENERATED\nclass Generated {}\n\"; }\n#endif\n";
+    builder
+        .add("Generator.cs".into(), source.as_bytes().to_vec(), "package")
+        .unwrap();
+    let artifact = builder.finish(output.path()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    bundle::unpack(&output.path().join(artifact.name), cache.path(), None).unwrap();
+    let path = cache.path().join("Generator.cs");
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    let id = crate::store::source_id(source, Language::CSharp, &defines, "").unwrap();
+    assert!(source_analysis(&path, &id).unwrap().is_some());
+}
+
+#[test]
 fn bundles_reject_missing_duplicate_and_escaping_objects() {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
