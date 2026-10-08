@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -16,7 +17,10 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, watch};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
+    Semaphore, watch,
+};
 
 fn now() -> u64 {
     SystemTime::now()
@@ -55,12 +59,14 @@ mod refresh_tests {
                 .unwrap(),
             name: "main".into(),
             target,
-            state: Arc::new(AsyncMutex::new(None)),
+            state: Arc::new(AsyncRwLock::new(None)),
+            analysis: Arc::new(AsyncRwLock::new(())),
             last_use: AtomicU64::new(last_use),
             generation: AtomicU64::new(0),
             running: Mutex::new(None),
             retry_after: AtomicU64::new(0),
             acquiring: AsyncMutex::new(()),
+            inventory: watch::channel(None).0,
         }
     }
 
@@ -130,6 +136,64 @@ mod refresh_tests {
         ));
         assert_eq!(short.selector(&prepared), "abcdef1");
     }
+
+    #[tokio::test]
+    async fn expiry_uses_live_activity_and_loaded_state_before_retirement() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let mut branch = branch(Target::Branch("main".into()), now());
+        branch.root = cache.path().join("repositories/branch");
+        // A branch still being acquired has no persisted inventory.
+        assert!(!manager.branch_expired(&branch).unwrap());
+        let state = State {
+            schema: 1,
+            repository: branch.repository.identity.clone(),
+            transport: branch.repository.transport.clone(),
+            branch: branch.name.clone(),
+            target: Some(branch.target.clone()),
+            last_use: now(),
+            refreshed: now(),
+            policy: String::new(),
+            prepared: Prepared {
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+                branch: Some(branch.name.clone()),
+                revision: "a".repeat(40),
+                selected: Default::default(),
+                tracked: Default::default(),
+                directories: Default::default(),
+            },
+            indexed_revision: None,
+            repair: false,
+            additional: Default::default(),
+        };
+        *branch.state.try_write().unwrap() = Some(state.clone());
+        branch.last_use.store(0, Ordering::Relaxed);
+        assert!(manager.branch_expired(&branch).unwrap());
+        branch.record_use();
+        assert!(!manager.branch_expired(&branch).unwrap());
+
+        fs::create_dir_all(&branch.root).unwrap();
+        write_json(&branch.root.join("state.json"), &state).unwrap();
+        branch.last_use.store(0, Ordering::Relaxed);
+        let _publication = branch.state.try_write().unwrap();
+        assert!(manager.branch_expired(&branch).unwrap());
+        drop(_publication);
+
+        let branch = Arc::new(branch);
+        manager
+            .branches
+            .lock()
+            .unwrap()
+            .insert(branch.name.clone(), branch.clone());
+        assert!(manager.maintain(false).await.unwrap().is_empty());
+        let expired = manager.maintain(true).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert!(Arc::ptr_eq(&expired[0], &branch));
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -150,20 +214,76 @@ pub struct State {
     pub additional: std::collections::BTreeSet<String>,
 }
 
+pub(crate) struct Inventory {
+    pub(crate) prepared: Prepared,
+    pub(crate) source: Option<Arc<tempfile::TempDir>>,
+    _pin: Arc<super::cache::Pin>,
+}
+
+pub(crate) struct AnalysisGuard {
+    state: OwnedRwLockReadGuard<Option<State>>,
+    _analysis: OwnedRwLockReadGuard<()>,
+}
+impl std::ops::Deref for AnalysisGuard {
+    type Target = Option<State>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+pub(crate) struct PublicationGuard {
+    state: OwnedRwLockWriteGuard<Option<State>>,
+    _analysis: OwnedRwLockWriteGuard<()>,
+}
+impl std::ops::Deref for PublicationGuard {
+    type Target = Option<State>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for PublicationGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
 pub struct Branch {
     pub root: PathBuf,
     pub repository: Repository,
     pub name: String,
     pub target: Target,
-    pub state: Arc<AsyncMutex<Option<State>>>,
+    /// Short metadata/navigation reads. Long readers use analyze(); writers use publish().
+    pub state: Arc<AsyncRwLock<Option<State>>>,
+    analysis: Arc<AsyncRwLock<()>>,
     pub last_use: AtomicU64,
     pub generation: AtomicU64,
     running: Mutex<Option<Running>>,
     retry_after: AtomicU64,
     acquiring: AsyncMutex<()>,
+    pub(crate) inventory: watch::Sender<Option<Arc<Inventory>>>,
 }
 
 impl Branch {
+    /// Publishers wait for long analyses before queuing a state writer. Short
+    /// navigation readers can therefore use the stable files while analyses run.
+    pub(crate) async fn analyze(&self) -> AnalysisGuard {
+        let analysis = self.analysis.clone().read_owned().await;
+        let state = self.state.clone().read_owned().await;
+        AnalysisGuard {
+            state,
+            _analysis: analysis,
+        }
+    }
+
+    pub(crate) async fn publish(&self) -> PublicationGuard {
+        let analysis = self.analysis.clone().write_owned().await;
+        let state = self.state.clone().write_owned().await;
+        PublicationGuard {
+            state,
+            _analysis: analysis,
+        }
+    }
+
     fn acquisition_target<'a>(&'a self, prepared: Option<&'a Prepared>) -> &'a Target {
         prepared
             .and_then(|prepared| prepared.resolved_target.as_ref())
@@ -241,7 +361,10 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         .context("Managed metadata parent is missing")?;
     fs::create_dir_all(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(&mut file, value)?;
+    let mut writer = BufWriter::new(&mut file);
+    serde_json::to_writer(&mut writer, value)?;
+    writer.flush()?;
+    drop(writer);
     file.as_file().sync_all()?;
     file.persist(path)?;
     Ok(())
@@ -286,19 +409,32 @@ impl Manager {
         Ok((protection.is_some(), ttl))
     }
 
-    fn state_expired(&self, state: &State) -> Result<bool> {
+    fn state_expired(&self, state: &State, last_use: u64) -> Result<bool> {
         let (pinned, ttl) = self.retention(state)?;
-        Ok(!pinned && now().saturating_sub(state.last_use) >= ttl.as_millis() as u64)
+        Ok(!pinned && now().saturating_sub(last_use) >= ttl.as_millis() as u64)
     }
     fn branch_expired(&self, branch: &Branch) -> Result<bool> {
+        let last_use = branch.last_use.load(Ordering::Relaxed);
+        // Most maintenance ticks cannot expire anything. Do not deserialize
+        // entire file inventories just to discover that their TTL has not elapsed.
+        let shortest_ttl = self.options.repo_ttl.min(self.options.branch_ttl);
+        if now().saturating_sub(last_use) < shortest_ttl.as_millis() as u64 {
+            return Ok(false);
+        }
+        if let Ok(state) = branch.state.try_read() {
+            return state
+                .as_ref()
+                .map_or(Ok(false), |state| self.state_expired(state, last_use));
+        }
+        // Final retirement checks run with the publication lock held. Only
+        // those candidates need the persisted snapshot as a fallback.
         let bytes = match fs::read(branch.root.join("state.json")) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let mut state: State = serde_json::from_slice(&bytes)?;
-        state.last_use = branch.last_use.load(Ordering::Relaxed);
-        self.state_expired(&state)
+        let state: State = serde_json::from_slice(&bytes)?;
+        self.state_expired(&state, last_use)
     }
 
     pub fn cached(&self) -> Result<Vec<(PathBuf, State)>> {
@@ -317,7 +453,7 @@ impl Manager {
                         .unwrap()
                         .as_ref()
                         .is_some_and(|job| job.borrow().is_none())
-                    || branch.state.try_lock().is_err()
+                    || branch.state.try_write().is_err()
             })
             .map(|branch| branch.source())
             .collect()
@@ -335,7 +471,7 @@ impl Manager {
             {
                 return Ok(false);
             }
-            let Ok(gate) = branch.state.clone().try_lock_owned() else {
+            let Ok(gate) = branch.state.clone().try_write_owned() else {
                 return Ok(false);
             };
             Some(gate)
@@ -371,7 +507,7 @@ impl Manager {
             {
                 return Ok(false);
             }
-            let Ok(gate) = branch.state.clone().try_lock_owned() else {
+            let Ok(gate) = branch.state.clone().try_write_owned() else {
                 return Ok(false);
             };
             Some(gate)
@@ -382,7 +518,7 @@ impl Manager {
         if let Some(branch) = &branch {
             state.last_use = branch.last_use.load(Ordering::Relaxed);
         }
-        if self.retention(&state)?.0 || !pressure && !self.state_expired(&state)? {
+        if self.retention(&state)?.0 || !pressure && !self.state_expired(&state, state.last_use)? {
             return Ok(false);
         }
         retire()?;
@@ -452,6 +588,7 @@ impl Manager {
                 tokio::spawn(async move {
                     let result = async {
                         let request = Request {
+                            contents: super::materialize::Contents::All,
                             transfer_used: 0,
                             unlimited_transfer: manager
                                 .options
@@ -510,16 +647,16 @@ impl Manager {
         }
     }
 
-    /// Returns idle expired branches for the service to close before deleting their stores.
-    pub async fn maintain(self: &Arc<Self>) -> Result<Vec<Arc<Branch>>> {
+    /// Refresh repositories; check expiry only on the slower cleanup cycle.
+    pub async fn maintain(self: &Arc<Self>, collect: bool) -> Result<Vec<Arc<Branch>>> {
         let branches: Vec<_> = self.branches.lock().unwrap().values().cloned().collect();
         let mut expired = Vec::new();
         for branch in branches {
-            if self.branch_expired(&branch)? {
+            if collect && self.branch_expired(&branch)? {
                 expired.push(branch);
                 continue;
             }
-            if let Ok(mut state) = branch.state.try_lock()
+            if let Ok(mut state) = branch.state.try_write()
                 && let Some(state) = state.as_mut()
             {
                 let last_use = branch.last_use.load(Ordering::Relaxed);
@@ -534,16 +671,6 @@ impl Manager {
             }
         }
         Ok(expired)
-    }
-
-    pub fn expired(&self) -> Vec<Arc<Branch>> {
-        self.branches
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|branch| self.branch_expired(branch).unwrap_or(false))
-            .cloned()
-            .collect()
     }
 
     pub async fn expire(
@@ -570,6 +697,85 @@ impl Manager {
     }
 
     pub async fn resolve(self: &Arc<Self>, repository: Repository) -> Result<Arc<Branch>> {
+        self.resolve_with(repository, false).await
+    }
+
+    pub(crate) async fn resolve_inventory(
+        self: &Arc<Self>,
+        repository: Repository,
+    ) -> Result<Arc<Branch>> {
+        self.resolve_with(repository, true).await
+    }
+
+    pub(crate) async fn ready(&self, branch: &Branch) -> Result<()> {
+        if branch
+            .state
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|s| !s.repair)
+        {
+            return Ok(());
+        }
+        let mut running = branch
+            .running
+            .lock()
+            .unwrap()
+            .clone()
+            .context("Repository preparation was not scheduled")?;
+        loop {
+            if let Some(outcome) = running.borrow().clone() {
+                return outcome.map_err(anyhow::Error::msg);
+            }
+            running
+                .changed()
+                .await
+                .context("Repository preparation stopped")?;
+        }
+    }
+
+    pub(crate) async fn sources_ready(&self, branch: &Branch) -> Result<()> {
+        let mut inventory = branch.inventory.subscribe();
+        loop {
+            if inventory
+                .borrow()
+                .as_ref()
+                .is_some_and(|i| i.source.is_some())
+            {
+                return Ok(());
+            }
+            tokio::select! {
+                result = self.ready(branch) => return result,
+                result = inventory.changed() => result.context("Repository inventory stopped")?,
+            }
+        }
+    }
+
+    pub(crate) fn source_blob(
+        &self,
+        branch: &Branch,
+        prepared: &Prepared,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let oid = prepared
+            .selected
+            .get(path)
+            .context("Source is not selected")?;
+        let private = authorize(&self.options.rules, &branch.repository)?;
+        match super::github::blob(&branch.repository, oid, private) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                tracing::warn!(%error, "On-demand source read failed; awaiting repository acquisition");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn resolve_with(
+        self: &Arc<Self>,
+        repository: Repository,
+        inventory_only: bool,
+    ) -> Result<Arc<Branch>> {
         if !authorize(&self.options.rules, &repository)? {
             let repository = repository.clone();
             tokio::task::spawn_blocking(move || super::transport::verify_public(&repository))
@@ -632,16 +838,18 @@ impl Manager {
                         state.as_ref().map_or_else(now, |state| state.last_use),
                     ),
                     generation: AtomicU64::new(0),
-                    state: Arc::new(AsyncMutex::new(state)),
+                    state: Arc::new(AsyncRwLock::new(state)),
+                    analysis: Arc::new(AsyncRwLock::new(())),
                     running: Mutex::new(None),
                     retry_after: AtomicU64::new(0),
                     acquiring: AsyncMutex::new(()),
+                    inventory: watch::channel(None).0,
                 });
                 branches.insert(key, branch.clone());
                 branch
             }
         };
-        let state = branch.state.lock().await;
+        let state = branch.state.read().await;
         let usable = state.as_ref().is_some_and(|s| {
             !s.repair
                 && branch.source().is_dir()
@@ -658,6 +866,7 @@ impl Manager {
             self.schedule(branch.clone(), !usable);
         }
         if !usable {
+            let mut inventory = branch.inventory.subscribe();
             let mut running = branch
                 .running
                 .lock()
@@ -665,14 +874,17 @@ impl Manager {
                 .clone()
                 .context("Repository preparation was not scheduled")?;
             loop {
+                if inventory_only && inventory.borrow().is_some() {
+                    break;
+                }
                 if let Some(outcome) = running.borrow().clone() {
                     outcome.map_err(anyhow::Error::msg)?;
                     break;
                 }
-                running
-                    .changed()
-                    .await
-                    .context("Repository preparation stopped")?;
+                tokio::select! {
+                    result = running.changed() => result.context("Repository preparation stopped")?,
+                    result = inventory.changed(), if inventory_only => result.context("Repository inventory stopped")?,
+                }
             }
         }
         Ok(branch)
@@ -712,7 +924,7 @@ impl Manager {
         let _operation = branch.acquiring.lock().await;
         let before = branch
             .state
-            .lock()
+            .read()
             .await
             .clone()
             .context("Repository inputs are unavailable")?;
@@ -725,6 +937,7 @@ impl Manager {
             .tempdir_in(&branch.root)?;
         let request = Request {
             transfer_used: before.prepared.transfer_bytes,
+            contents: super::materialize::Contents::All,
             unlimited_transfer: self
                 .options
                 .rules
@@ -754,7 +967,7 @@ impl Manager {
             tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
         prepared.branch = before.prepared.branch.clone();
         prepared.resolved_target = before.prepared.resolved_target.clone();
-        let mut state = branch.state.lock().await;
+        let mut state = branch.publish().await;
         let mut next = before;
         next.additional.extend(paths);
         next.prepared = prepared;
@@ -787,10 +1000,12 @@ impl Manager {
         authorize(&self.options.rules, &branch.repository)?;
         let _operation = branch.acquiring.lock().await;
         let _permit = self.acquisitions.acquire().await?;
-        let before = branch.state.lock().await.clone();
-        let stage = tempfile::Builder::new()
-            .prefix("incoming-")
-            .tempdir_in(&branch.root)?;
+        let before = branch.state.read().await.clone();
+        let stage = Arc::new(
+            tempfile::Builder::new()
+                .prefix("incoming-")
+                .tempdir_in(&branch.root)?,
+        );
         let previous = before
             .as_ref()
             .filter(|s| !s.repair)
@@ -808,8 +1023,9 @@ impl Manager {
             .and_then(|state| state.prepared.resolved_target.clone());
         let target =
             Target::clone(branch.acquisition_target(before.as_ref().map(|state| &state.prepared)));
-        let request = Request {
+        let mut request = Request {
             transfer_used: 0,
+            contents: super::materialize::Contents::All,
             unlimited_transfer: self
                 .options
                 .rules
@@ -832,13 +1048,61 @@ impl Manager {
             subdirectory: None,
         };
         let cache = self.cache.clone();
+        let inventory = if before.is_none() {
+            let mut inventory_request = request.clone();
+            inventory_request.contents = super::materialize::Contents::Inventory;
+            let cache = cache.clone();
+            let (prepared, pin) = tokio::task::spawn_blocking(move || {
+                super::cache::acquire(&inventory_request, &cache)
+            })
+            .await??;
+            fs::create_dir_all(branch.source())?;
+            let inventory = Arc::new(Inventory {
+                prepared,
+                source: None,
+                _pin: Arc::new(pin),
+            });
+            request.target = Target::Commit(inventory.prepared.revision.clone());
+            request.transfer_used = inventory.prepared.transfer_bytes;
+            branch.inventory.send_replace(Some(inventory.clone()));
+            Some(inventory)
+        } else {
+            None
+        };
         // No publication lock is held while fetching or extracting objects.
-        let (mut prepared, _pool_pin) =
-            tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
+        let git_request = request.clone();
+        let git_cache = cache.clone();
+        let (mut prepared, pin) = tokio::task::spawn_blocking(move || {
+            super::cache::acquire_git(&git_request, &git_cache)
+        })
+        .await??;
+        let _pool_pin = Arc::new(pin);
+        if let Some(inventory) = &inventory {
+            prepared.branch = inventory.prepared.branch.clone();
+            prepared.resolved_target = inventory.prepared.resolved_target.clone();
+        }
         if resolved_target.is_some() {
             prepared.resolved_target = resolved_target;
         }
-        let mut state = branch.state.lock().await;
+        if inventory.is_some() {
+            let mut sources = prepared.clone();
+            let source = stage.clone();
+            sources = tokio::task::spawn_blocking(move || -> Result<Prepared> {
+                let pending = super::lfs::pending(source.path(), &sources)?;
+                sources.unavailable.extend(pending);
+                Ok(sources)
+            })
+            .await??;
+            branch.inventory.send_replace(Some(Arc::new(Inventory {
+                prepared: sources,
+                source: Some(stage.clone()),
+                _pin: _pool_pin.clone(),
+            })));
+        }
+        prepared =
+            tokio::task::spawn_blocking(move || super::cache::complete(&request, &cache, prepared))
+                .await??;
+        let mut state = branch.publish().await;
         let mut next = State {
             schema: 4,
             repository: branch.repository.identity.clone(),
@@ -885,7 +1149,14 @@ impl Manager {
             if staged.is_file() {
                 let target = source.join(path);
                 fs::create_dir_all(target.parent().unwrap())?;
-                fs::rename(staged, target)?;
+                if inventory.is_some() {
+                    if target.is_file() {
+                        fs::remove_file(&target)?;
+                    }
+                    fs::hard_link(staged, target)?;
+                } else {
+                    fs::rename(staged, target)?;
+                }
             }
         }
         for directory in &next.prepared.directories {
@@ -903,6 +1174,7 @@ impl Manager {
         branch.persist(&next)?;
         *state = Some(next);
         branch.generation.fetch_add(1, Ordering::Release);
+        branch.inventory.send_replace(None);
         Ok(())
     }
 }

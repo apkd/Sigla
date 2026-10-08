@@ -66,8 +66,18 @@ impl Target {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum Contents {
+    #[default]
+    All,
+    Inventory,
+    Only(BTreeSet<String>),
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default)]
+    pub contents: Contents,
     #[serde(default)]
     pub transfer_used: u64,
     #[serde(default)]
@@ -538,12 +548,39 @@ fn prepare_with(
             }
         }
     }
-    let sizes = super::github::sizes(
-        &repository,
-        &revision.to_string(),
-        &request.store,
-        request.allow_private,
-    )?;
+    if let Contents::Only(paths) = &request.contents {
+        ensure!(
+            paths.iter().all(|path| selected.contains_key(path)),
+            "Requested file was not selected for acquisition"
+        );
+        selected.retain(|path, _| paths.contains(path));
+    }
+    if matches!(request.contents, Contents::Inventory) {
+        return Ok(Prepared {
+            omitted: BTreeMap::new(),
+            transfer_bytes,
+            unavailable: BTreeSet::new(),
+            transport,
+            resolved_target,
+            branch,
+            revision: revision.to_string(),
+            selected,
+            tracked,
+            directories,
+        });
+    }
+    let sizes = if selected.keys().any(|path| {
+        super::selection::asset(Path::new(path)) || super::selection::visual_graph(Path::new(path))
+    }) {
+        super::github::sizes(
+            &repository,
+            &revision.to_string(),
+            &request.store,
+            request.allow_private,
+        )?
+    } else {
+        None
+    };
     if let Some(sizes) = &sizes {
         ensure!(
             selected.keys().all(|p| sizes.contains_key(p)),
@@ -577,6 +614,7 @@ fn prepare_with(
         .map(|(p, i)| (p.clone(), i.clone()))
         .collect();
     let ids: BTreeSet<_> = changed.values().cloned().collect();
+    let mut transfer_session = None;
     for chunk in ids.iter().collect::<Vec<_>>().chunks(2048) {
         let input = chunk
             .iter()
@@ -601,16 +639,23 @@ fn prepare_with(
             .map(parse_id)
             .collect::<Result<Vec<_>>>()?;
         if !missing.is_empty() {
-            let mut session = connect(&repository)?;
+            if transfer_session.is_none() {
+                transfer_session = Some(connect(&repository)?);
+            }
+            let session = transfer_session.as_mut().unwrap();
             transfer_bytes += receive(
-                &mut session,
+                session,
                 &request.store,
                 missing,
                 false,
                 request.remaining(transfer_bytes),
             )?;
+            if !session.can_fetch_again() {
+                transfer_session = None;
+            }
         }
     }
+    drop(transfer_session);
     // Inspect decompressed lengths before extracting payloads into staging files.
     let mut blob_sizes = BTreeMap::new();
     for chunk in ids.iter().collect::<Vec<_>>().chunks(2048) {
@@ -798,6 +843,7 @@ mod tests {
 
     fn request(root: &Path) -> Request {
         Request {
+            contents: Contents::All,
             transfer_used: 0,
             unlimited_transfer: false,
             allow_private: false,
@@ -813,6 +859,82 @@ mod tests {
             previous: BTreeMap::new(),
             subdirectory: None,
         }
+    }
+
+    #[test]
+    fn one_session_receives_multiple_blob_packs() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let mut request = request(root.path());
+        request.include.push("asset.bin".into());
+        request.contents = Contents::Inventory;
+        let inventory = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        let mut session = Session::local(&upstream_path).unwrap();
+        for (path, id) in &inventory.selected {
+            receive(
+                &mut session,
+                &request.store,
+                vec![parse_id(id).unwrap()],
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(session.can_fetch_again());
+            assert_eq!(
+                run(git(&request.store).args(["cat-file", "blob", id])).unwrap(),
+                fs::read(upstream_path.join(path)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_defers_blobs_and_targeted_acquisition_fetches_only_requested_files() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let mut request = request(root.path());
+        request.include.push("asset.bin".into());
+        request.contents = Contents::Inventory;
+        let inventory = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert!(inventory.selected.contains_key("Code.cs"));
+        assert!(inventory.selected.contains_key("asset.bin"));
+        assert!(!request.staging.exists());
+        let available = |id: &str| {
+            crate::process::capture(
+                git(&request.store).args(["cat-file", "-e", id]),
+                Duration::from_secs(10),
+                None,
+                None,
+            )
+            .unwrap()
+            .status
+            .success()
+        };
+        for id in inventory.selected.values() {
+            assert!(!available(id));
+        }
+
+        request.target = Target::Commit(inventory.revision.clone());
+        request.contents = Contents::Only(BTreeSet::from(["Code.cs".into()]));
+        let file = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(file.revision, inventory.revision);
+        assert_eq!(
+            fs::read(request.staging.join("Code.cs")).unwrap(),
+            fs::read(upstream_path.join("Code.cs")).unwrap()
+        );
+        assert!(!request.staging.join("asset.bin").exists());
+        assert!(!available(&inventory.selected["asset.bin"]));
+        assert_eq!(file.tracked, inventory.tracked);
+
+        request.contents = Contents::All;
+        request.staging = root.path().join("complete");
+        let complete = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(complete.selected, inventory.selected);
+        assert_eq!(
+            fs::read(request.staging.join("asset.bin")).unwrap(),
+            fs::read(upstream_path.join("asset.bin")).unwrap()
+        );
     }
 
     #[test]
@@ -1042,6 +1164,12 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        request.contents = Contents::Inventory;
+        let inventory = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert!(inventory.selected.contains_key("Large.asset"));
+        assert!(inventory.omitted.is_empty());
+        assert!(!request.staging.join("Code.cs").exists());
+        request.contents = Contents::All;
         let prepared = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
         assert!(request.staging.join("Code.cs").is_file());
         assert!(!request.staging.join("Large.asset").exists());

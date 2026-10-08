@@ -3,7 +3,35 @@ use super::materialize::{Prepared, Request};
 use anyhow::{Result, ensure};
 use std::{fs, path::Path, process::Command, time::Duration};
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Output {
+    result: std::result::Result<Prepared, String>,
+    git_ms: u128,
+    lfs_ms: u128,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Input {
+    request: Request,
+    prepared: Option<Prepared>,
+}
+
 pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
+    run(request, cache, None)
+}
+
+pub fn hydrate(request: &Request, cache: &Path, prepared: Prepared) -> Result<Prepared> {
+    if matches!(request.contents, super::materialize::Contents::Inventory)
+        || prepared.selected.is_empty()
+    {
+        return Ok(prepared);
+    }
+    run(request, cache, Some(prepared))
+}
+
+fn run(request: &Request, cache: &Path, prepared: Option<Prepared>) -> Result<Prepared> {
+    let lfs = prepared.is_some();
+    let started = std::time::Instant::now();
     let repository = super::Repository::parse(&request.repository)?
         .ok_or_else(|| anyhow::anyhow!("Expected a repository identifier"))?;
     let preference = cache
@@ -24,7 +52,13 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
         .tempdir_in(cache)?;
     let input = directory.path().join("request.json");
     let output = directory.path().join("result.json");
-    fs::write(&input, serde_json::to_vec(&request)?)?;
+    fs::write(
+        &input,
+        serde_json::to_vec(&Input {
+            request: request.clone(),
+            prepared,
+        })?,
+    )?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("__git-job")
@@ -50,13 +84,21 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
         fs::metadata(&output)?.len() <= 256 * 1024 * 1024,
         "Repository inventory exceeds size limit"
     );
-    let result: std::result::Result<Prepared, String> = serde_json::from_slice(&fs::read(output)?)?;
-    let prepared = result.map_err(anyhow::Error::msg)?;
+    let output: Output = serde_json::from_slice(&fs::read(output)?)?;
+    let prepared = output.result.map_err(anyhow::Error::msg)?;
     tracing::info!(
-        git_pack_bytes = prepared.transfer_bytes,
-        "Repository acquisition completed"
+        repository = %repository.identity,
+        phase = if lfs { "lfs" } else { "git" },
+        target = ?request.target,
+        elapsed_ms = started.elapsed().as_millis(),
+        git_ms = output.git_ms,
+        lfs_ms = output.lfs_ms,
+        transfer_bytes = prepared.transfer_bytes,
+        files = prepared.selected.len(),
+        unavailable = prepared.unavailable.len(),
+        "Repository acquisition phase completed"
     );
-    if let Some(endpoint) = &prepared.transport {
+    if !lfs && let Some(endpoint) = &prepared.transport {
         fs::create_dir_all(preference.parent().unwrap())?;
         let mut temporary = tempfile::NamedTempFile::new_in(preference.parent().unwrap())?;
         std::io::Write::write_all(&mut temporary, endpoint.as_bytes())?;
@@ -71,17 +113,28 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
         fs::metadata(input)?.len() <= 256 * 1024 * 1024,
         "Repository request exceeds size limit"
     );
-    let request: Request = serde_json::from_slice(&fs::read(input)?)?;
-    let result = (|| -> Result<Prepared> {
-        let mut prepared = super::materialize::prepare(&request)?;
+    let Input { request, prepared } = serde_json::from_slice(&fs::read(input)?)?;
+    let started = std::time::Instant::now();
+    let lfs = prepared.is_some();
+    let result = if let Some(mut prepared) = prepared {
         super::lfs::hydrate(
             &request,
             &mut prepared,
             input.parent().unwrap().parent().unwrap(),
-        )?;
-        Ok(prepared)
-    })()
+        )
+        .map(|()| prepared)
+    } else {
+        super::materialize::prepare(&request)
+    }
     .map_err(|error| format!("{error:#}"));
-    fs::write(output, serde_json::to_vec(&result)?)?;
+    let elapsed = started.elapsed().as_millis();
+    fs::write(
+        output,
+        serde_json::to_vec(&Output {
+            result,
+            git_ms: if lfs { 0 } else { elapsed },
+            lfs_ms: if lfs { elapsed } else { 0 },
+        })?,
+    )?;
     Ok(())
 }

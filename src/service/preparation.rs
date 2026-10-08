@@ -1,6 +1,7 @@
 //! One preparation job per workspace. Callers choose inventory or full-index readiness.
 use super::*;
 use crate::workspace::Manifest;
+use anyhow::Context;
 use tokio::sync::watch;
 
 type RepositoryContext = (crate::repository::Identity, String, String, usize);
@@ -28,6 +29,9 @@ enum Progress {
 #[derive(Clone)]
 pub(super) struct Ticket(watch::Receiver<Progress>);
 impl Ticket {
+    pub fn discovering(&self) -> bool {
+        matches!(*self.0.borrow(), Progress::Pending)
+    }
     pub fn running(&self) -> bool {
         matches!(*self.0.borrow(), Progress::Pending | Progress::Files(_))
     }
@@ -72,6 +76,64 @@ fn context(
 }
 
 impl App {
+    /// Repository paths and bytes are usable before build discovery acquires dependencies.
+    pub(super) async fn navigate_repository(
+        self: &Arc<Self>,
+        branch: Arc<crate::repository::manager::Branch>,
+        request: super::Request,
+        activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Option<CallToolResult>> {
+        let result = self
+            .navigate_repository_snapshot(branch.clone(), request.clone(), activity.clone())
+            .await?;
+        if result.is_some() || !matches!(request, super::Request::View(..)) {
+            return Ok(result);
+        }
+        self.remote.as_ref().unwrap().sources_ready(&branch).await?;
+        self.navigate_repository_snapshot(branch, request, activity)
+            .await
+    }
+
+    async fn navigate_repository_snapshot(
+        self: &Arc<Self>,
+        branch: Arc<crate::repository::manager::Branch>,
+        request: super::Request,
+        activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Option<CallToolResult>> {
+        let permit = self.navigation_workers.clone().acquire_owned().await?;
+        let state = branch.state.clone().read_owned().await;
+        let state = state.as_ref().is_some().then_some(state);
+        let inventory = branch.inventory.borrow().clone();
+        let remote = self.remote.as_ref().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _activity = activity;
+            let _permit = permit;
+            let root = branch.source();
+            let (prepared, contents) = if let Some(state) = state.as_ref().and_then(|s| s.as_ref()) {
+                ensure!(!state.repair, "Repository materialization requires repair");
+                (&state.prepared, Some(root.as_path()))
+            } else {
+                let inventory = inventory.as_ref().context("Repository inventory is unavailable")?;
+                (&inventory.prepared, inventory.source.as_ref().map(|s| s.path()))
+            };
+            let (path, mode) = match request {
+                super::Request::Browse(path) => (path, None),
+                super::Request::View(path, mode) => (path, Some(mode)),
+                super::Request::Search(_) => unreachable!(),
+            };
+            let Some(text) = crate::navigation::sources::repository(
+                &root, contents, prepared, &path, mode,
+                |path| remote.source_blob(&branch, prepared, path),
+            )? else {
+                return Ok(None);
+            };
+            branch.record_use();
+            Ok(Some(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{text}\n\n> Repository inventory available; preparation and indexing are still running."
+            ))])))
+        }).await?
+    }
+
     pub(super) async fn navigate_early(
         self: &Arc<Self>,
         inventory: Arc<Inventory>,
@@ -147,11 +209,14 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         let outcome = async {
             #[cfg(test)]
             preparing_app.preparation_started.notify_one();
-            // Request lock order: workspace -> branch state. RequiredInputs
-            // releases and reacquires branch state while retaining the workspace.
+            // Lock order: workspace -> branch analysis -> branch state.
+            // RequiredInputs releases both branch guards before acquisition.
             let mut state = workspace.clone().lock_owned().await;
+            if let Some(branch) = &preparing_branch {
+                preparing_app.remote.as_ref().unwrap().ready(branch).await?;
+            }
             let mut branch_state = match &preparing_branch {
-                Some(branch) => Some(branch.state.clone().lock_owned().await),
+                Some(branch) => Some(branch.analyze().await),
                 None => None,
             };
             let mut policy = policy;
@@ -233,7 +298,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .unwrap()
                             .require_inputs(branch, &revision, paths)
                             .await?;
-                        let gate = branch.state.clone().lock_owned().await;
+                        let gate = branch.analyze().await;
                         let applied = gate
                             .as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
@@ -275,14 +340,6 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 .await??;
             }
 
-            if let (Some(branch), Some(gate)) = (&preparing_branch, branch_state.as_mut()) {
-                let metadata = gate.as_mut().unwrap();
-                if metadata.indexed_revision.as_ref() != Some(&metadata.prepared.revision) {
-                    metadata.indexed_revision = Some(metadata.prepared.revision.clone());
-                    metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
-                    branch.persist(metadata)?;
-                }
-            }
             let code = state.as_ref().unwrap();
             let inventory = Arc::new(Inventory {
                 manifest: code.manifest.clone(),
@@ -292,6 +349,25 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     branch_state.as_ref().and_then(|s| s.as_ref()),
                 ),
             });
+            let generation = preparing_branch
+                .as_ref()
+                .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
+            drop(branch_state);
+            if let Some(branch) = &preparing_branch {
+                let mut gate = branch.publish().await;
+                let metadata = gate.as_mut().unwrap();
+                // Publication can win the gap between releasing the read guard and
+                // acquiring the writer. Only mark the generation we actually indexed.
+                if !metadata.repair
+                    && Some(branch.generation.load(std::sync::atomic::Ordering::Acquire))
+                        == generation
+                    && metadata.indexed_revision.as_ref() != Some(&metadata.prepared.revision)
+                {
+                    metadata.indexed_revision = Some(metadata.prepared.revision.clone());
+                    metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
+                    branch.persist(metadata)?;
+                }
+            }
             preparing_app.start_assets(
                 workspace.clone(),
                 preparing_branch.clone(),

@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{Read, Write},
+    os::fd::AsFd,
     path::{Component, Path},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
@@ -93,17 +94,46 @@ pub fn https(url: &str) -> Result<url::Url> {
     Ok(url)
 }
 
-pub fn download(
+pub fn download_extract(
     client: &reqwest::blocking::Client,
     url: &str,
-    file: &mut File,
+    destination: &Path,
     integrity: Option<&str>,
-) -> Result<()> {
+    retain: impl Fn(&Path) -> bool,
+) -> Result<(Vec<String>, u64)> {
     let response = client
         .get(https(url)?)
         .send()
         .map_err(|_| anyhow::anyhow!("Dependency download connection failed"))?;
-    transfer(response, file, integrity)
+    extract_transfer(response, destination, integrity, retain)
+}
+
+fn extract_transfer(
+    response: reqwest::blocking::Response,
+    destination: &Path,
+    integrity: Option<&str>,
+    retain: impl Fn(&Path) -> bool,
+) -> Result<(Vec<String>, u64)> {
+    let (mut reader, mut writer) = std::io::pipe()?;
+    std::thread::scope(|scope| {
+        let download = scope.spawn(move || transfer_verified(response, &mut writer, integrity));
+        let extracted = extract(reader.as_fd(), destination, retain);
+        // Tar readers may stop before the compressed stream ends. Drain the
+        // bounded pipe so every downloaded byte participates in verification.
+        let drained = if extracted.is_ok() {
+            std::io::copy(&mut reader, &mut std::io::sink()).map(|_| ())
+        } else {
+            Ok(())
+        };
+        // On extraction failure, closing the reader releases a blocked writer.
+        drop(reader);
+        let downloaded = download
+            .join()
+            .map_err(|_| anyhow::anyhow!("Archive download worker panicked"))?;
+        let inventory = extracted?;
+        drained?;
+        Ok((inventory, downloaded?))
+    })
 }
 
 pub fn transfer(
@@ -111,6 +141,16 @@ pub fn transfer(
     file: &mut File,
     integrity: Option<&str>,
 ) -> Result<()> {
+    transfer_verified(response, file, integrity)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn transfer_verified(
+    response: reqwest::blocking::Response,
+    output: &mut impl Write,
+    integrity: Option<&str>,
+) -> Result<u64> {
     ensure!(
         response.status().is_success(),
         "Dependency download returned HTTP {}",
@@ -147,7 +187,7 @@ pub fn transfer(
         if count == 0 {
             break;
         }
-        file.write_all(&bytes[..count])?;
+        output.write_all(&bytes[..count])?;
         if let Some((hash, _)) = &mut integrity {
             hash.update(&bytes[..count]);
         }
@@ -157,7 +197,6 @@ pub fn transfer(
         length.is_none_or(|expected| size == expected),
         "Dependency archive transfer was truncated"
     );
-    file.sync_all()?;
     if let Some((hash, expected)) = integrity {
         let digest = hash.finalize().to_vec();
         // Unity encodes the hexadecimal MD5 text; registry SRI normally encodes raw digest bytes.
@@ -167,11 +206,11 @@ pub fn transfer(
             "Dependency archive integrity check failed"
         );
     }
-    Ok(())
+    Ok(size)
 }
 
 pub fn extract(
-    reader: File,
+    reader: impl std::os::fd::AsRawFd,
     destination: &Path,
     retain: impl Fn(&Path) -> bool,
 ) -> Result<Vec<String>> {
@@ -266,6 +305,110 @@ mod tests {
             let inventory = extract(archive(&compressed), root.path(), analysis_input).unwrap();
             assert_eq!(inventory.len(), 1);
             assert_eq!(fs::read(root.path().join("package/Code.cs")).unwrap(), b"x");
+        }
+    }
+
+    #[test]
+    fn streamed_extraction_verifies_trailing_bytes_and_releases_failed_readers() {
+        use std::{io::BufRead, net::TcpListener};
+
+        fn response(
+            bytes: Vec<u8>,
+            length: usize,
+            extracted: Option<std::sync::mpsc::Receiver<()>>,
+        ) -> reqwest::blocking::Response {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                for line in std::io::BufReader::new(&mut stream).lines() {
+                    if line.unwrap().is_empty() {
+                        break;
+                    }
+                }
+                // The client may close early when the archive is invalid.
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                )
+                .and_then(|_| {
+                    if let Some(extracted) = extracted {
+                        let (prefix, remaining) = bytes.split_at(128 * 1024);
+                        stream.write_all(prefix)?;
+                        extracted.recv_timeout(Duration::from_secs(10)).unwrap();
+                        stream.write_all(remaining)
+                    } else {
+                        stream.write_all(&bytes)
+                    }
+                });
+            });
+            reqwest::blocking::get(format!("http://{address}")).unwrap()
+        }
+
+        let mut bytes = tar(&["package/Code.cs"]);
+        // Exceed the pipe capacity after tar's end marker: the consumer must
+        // drain these bytes rather than blocking or accepting a partial hash.
+        bytes.resize(bytes.len() + 512 * 1024, 0);
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes))
+        );
+        let root = tempfile::tempdir().unwrap();
+        let (ready, extracted) = std::sync::mpsc::sync_channel(0);
+        let (inventory, size) = extract_transfer(
+            response(bytes.clone(), bytes.len(), Some(extracted)),
+            root.path(),
+            Some(&integrity),
+            |path| {
+                ready.send(()).unwrap();
+                analysis_input(path)
+            },
+        )
+        .unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(size, bytes.len() as u64);
+        assert_eq!(fs::read(root.path().join("package/Code.cs")).unwrap(), b"x");
+
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&bytes).unwrap();
+        for body in [
+            gzip.finish().unwrap(),
+            zstd::encode_all(bytes.as_slice(), 0).unwrap(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let integrity = format!(
+                "sha256-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body))
+            );
+            let (inventory, size) = extract_transfer(
+                response(body.clone(), body.len(), None),
+                root.path(),
+                Some(&integrity),
+                analysis_input,
+            )
+            .unwrap();
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(size, body.len() as u64);
+            assert_eq!(fs::read(root.path().join("package/Code.cs")).unwrap(), b"x");
+        }
+
+        let mut corrupt = bytes.clone();
+        *corrupt.last_mut().unwrap() = 1;
+        for (body, length) in [
+            (corrupt, bytes.len()),
+            (bytes.clone(), bytes.len() + 1),
+            (vec![b'x'; bytes.len()], bytes.len()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            assert!(
+                extract_transfer(
+                    response(body, length, None),
+                    root.path(),
+                    Some(&integrity),
+                    analysis_input,
+                )
+                .is_err()
+            );
         }
     }
 

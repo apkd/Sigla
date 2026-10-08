@@ -165,6 +165,18 @@ impl Store {
             || payload::encode(build()?),
         )
     }
+    pub(crate) fn prepare_install<R: Serialize>(
+        &self,
+        file: &str,
+        revision: &R,
+        id: ObjectId,
+        build: impl FnOnce() -> Result<FileData>,
+    ) -> Result<shared::PendingInstall> {
+        self.scope
+            .prepare_install(file, postcard::to_allocvec(revision)?, id, now(), || {
+                payload::encode(build()?)
+            })
+    }
     pub fn modules(&self, file: &str) -> Result<Vec<ModuleFile>> {
         let tx = self.read()?;
         Ok(postcard::from_bytes(

@@ -34,6 +34,17 @@ pub struct Encoded {
     pub records: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
+type EncodedObject = (Encoded, Vec<u8>, u64);
+
+pub(crate) struct PendingInstall {
+    file: String,
+    revision: Vec<u8>,
+    object: ObjectId,
+    now: u64,
+    expected: Option<Binding>,
+    encoded: Option<EncodedObject>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub object: ObjectId,
@@ -97,6 +108,35 @@ fn inspect_env(
         visit(&info, control.get(&tx, &manifest_key(info.id))?)?;
     }
     Ok(stats)
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_manifest(
+    path: &Path,
+    entry: &Path,
+    accept: impl Fn(&[u8]) -> Result<bool>,
+) -> Result<Vec<u8>> {
+    // Register a reader so a live writer cannot recycle the snapshot's pages.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(8)
+            .flags(heed::EnvFlags::READ_ONLY)
+            .open(path)
+    }?;
+    let mut manifest: Option<(u64, Phase, Vec<u8>)> = None;
+    inspect_env(&env, &mut |info, bytes| {
+        if info.entry == entry
+            && let Some(bytes) = bytes
+            && accept(bytes)?
+            && manifest.as_ref().is_none_or(|(id, _, _)| info.id > *id)
+        {
+            manifest = Some((info.id, info.phase, bytes.to_vec()));
+        }
+        Ok(())
+    })?;
+    let (_, phase, bytes) = manifest.context("Workspace snapshot is unavailable")?;
+    ensure!(phase == Phase::Clean, "Snapshot refresh has not finished");
+    Ok(bytes)
 }
 
 /// The caller must hold exclusive service-cache ownership for the entire read.
@@ -573,134 +613,210 @@ impl Scope {
         mut verify: impl FnMut() -> Result<()>,
         build: impl FnOnce() -> Result<Encoded>,
     ) -> Result<Installed> {
+        let gate = self.database.gate(object)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Object build interrupted"))?;
+        let mut build = Some(build);
+        let mut pending =
+            self.prepare_install_inner(file, revision, object, now, || build.take().unwrap()())?;
+        loop {
+            verify()?;
+            let mut tx = self.database.env.write_txn()?;
+            if let Some(installed) = self.install_in(&mut tx, &pending)? {
+                tx.commit()?;
+                return Ok(installed);
+            }
+            // A zero-reference hit was collected after preparation. Build outside the writer.
+            drop(tx);
+            pending.encoded = Some(
+                self.encode_object(build.take().context("Object builder already consumed")?()?)?,
+            );
+        }
+    }
+
+    pub(crate) fn prepare_install(
+        &self,
+        file: &str,
+        revision: Vec<u8>,
+        object: ObjectId,
+        now: u64,
+        build: impl FnOnce() -> Result<Encoded>,
+    ) -> Result<PendingInstall> {
+        let gate = self.database.gate(object)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Object build interrupted"))?;
+        self.prepare_install_inner(file, revision, object, now, build)
+    }
+
+    fn prepare_install_inner(
+        &self,
+        file: &str,
+        revision: Vec<u8>,
+        object: ObjectId,
+        now: u64,
+        build: impl FnOnce() -> Result<Encoded>,
+    ) -> Result<PendingInstall> {
         ensure!(
             !file.is_empty()
                 && 8 + file.len() <= self.database.env.max_key_size()
                 && file.len() <= self.database.env.max_key_size(),
             "File key exceeds LMDB limit"
         );
-        let expected = {
+        let (expected, present) = {
             let tx = self.read()?;
             self.writable(&tx)?;
-            self.binding(&tx, file)?
+            (
+                self.binding(&tx, file)?,
+                self.database.live(&tx, &object)?.is_some(),
+            )
         };
-        let gate = self.database.gate(object)?;
-        let _guard = gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Object build interrupted"))?;
-        let mut build = Some(build);
-        let mut encoded: Option<(Encoded, Vec<u8>, u64)> = None;
-        loop {
-            let present = {
-                let tx = self.read()?;
-                self.database.live(&tx, &object)?.is_some()
-            };
-            if !present && encoded.is_none() {
-                let value = build.take().context("Object builder already consumed")?()?;
-                ensure!(
-                    value
-                        .records
-                        .keys()
-                        .all(|k| !k.is_empty() && 32 + k.len() <= self.database.env.max_key_size()),
-                    "Invalid analysis record key"
-                );
-                for name in value
-                    .names
-                    .declarations
-                    .iter()
-                    .chain(&value.names.occurrences)
-                {
-                    ensure!(
-                        !name.is_empty()
-                            && name.len() <= 480
-                            && 8 + name.len() <= self.database.env.max_key_size(),
-                        "Indexed name exceeds LMDB limit"
-                    );
-                }
-                let names = encode(&value.names)?;
-                let bytes = value
-                    .records
-                    .values()
-                    .try_fold(names.len() as u64, |sum, v| {
-                        sum.checked_add(v.len() as u64)
-                            .context("Object size overflow")
-                    })?;
-                encoded = Some((value, names, bytes));
-            }
-            verify()?;
-            let mut tx = self.database.env.write_txn()?;
-            self.writable(&tx)?;
-            let old = self.binding(&tx, file)?;
-            // Another caller may already have installed exactly this revision.
-            if old
-                .as_ref()
-                .is_some_and(|b| b.object == object && b.revision == revision)
-            {
-                let bytes = self
-                    .database
-                    .live(&tx, &object)?
-                    .context("Missing bound object")?
-                    .encoded_bytes;
-                return Ok(Installed {
-                    reused: true,
-                    encoded_bytes: bytes,
-                    ..Default::default()
-                });
-            }
+        Ok(PendingInstall {
+            file: file.to_owned(),
+            revision,
+            object,
+            now,
+            expected,
+            encoded: if present {
+                None
+            } else {
+                Some(self.encode_object(build()?)?)
+            },
+        })
+    }
+
+    fn encode_object(&self, value: Encoded) -> Result<EncodedObject> {
+        ensure!(
+            value
+                .records
+                .keys()
+                .all(|k| !k.is_empty() && 32 + k.len() <= self.database.env.max_key_size()),
+            "Invalid analysis record key"
+        );
+        for name in value
+            .names
+            .declarations
+            .iter()
+            .chain(&value.names.occurrences)
+        {
             ensure!(
-                old == expected,
-                "File binding changed during extraction; retry refresh"
+                !name.is_empty()
+                    && name.len() <= 480
+                    && 8 + name.len() <= self.database.env.max_key_size(),
+                "Indexed name exceeds LMDB limit"
             );
-            let absent = self.database.live(&tx, &object)?.is_none();
-            if absent && encoded.is_none() {
-                // A zero-reference hit was collected after our read. Build on retry.
-                drop(tx);
-                continue;
+        }
+        let names = encode(&value.names)?;
+        let bytes = value
+            .records
+            .values()
+            .try_fold(names.len() as u64, |sum, v| {
+                sum.checked_add(v.len() as u64)
+                    .context("Object size overflow")
+            })?;
+        Ok((value, names, bytes))
+    }
+
+    /// Every object and binding in a batch becomes durable in one transaction.
+    /// None means a prepared cache hit was collected and must be rebuilt.
+    pub(crate) fn install_batch(
+        &self,
+        pending: &[PendingInstall],
+        mut verify: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<Option<Installed>>> {
+        let mut tx = self.database.env.write_txn()?;
+        let mut installed = Vec::with_capacity(pending.len());
+        for (index, pending) in pending.iter().enumerate() {
+            verify(index)?;
+            installed.push(self.install_in(&mut tx, pending)?);
+        }
+        tx.commit()?;
+        Ok(installed)
+    }
+
+    fn install_in(
+        &self,
+        tx: &mut RwTxn<'_>,
+        pending: &PendingInstall,
+    ) -> Result<Option<Installed>> {
+        let PendingInstall {
+            file,
+            revision,
+            object,
+            now,
+            expected,
+            encoded,
+        } = pending;
+        let now = *now;
+        self.writable(tx)?;
+        let old = self.binding(tx, file)?;
+        // Another caller may already have installed exactly this revision.
+        if old
+            .as_ref()
+            .is_some_and(|b| &b.object == object && &b.revision == revision)
+        {
+            let bytes = self
+                .database
+                .live(tx, object)?
+                .context("Missing bound object")?
+                .encoded_bytes;
+            return Ok(Some(Installed {
+                reused: true,
+                encoded_bytes: bytes,
+                ..Default::default()
+            }));
+        }
+        ensure!(
+            &old == expected,
+            "File binding changed during extraction; retry refresh"
+        );
+        let absent = self.database.live(tx, object)?.is_none();
+        if absent && encoded.is_none() {
+            return Ok(None);
+        }
+        self.dirty_in(tx)?;
+        if absent {
+            let (value, names, bytes) = encoded.as_ref().unwrap();
+            self.database.records.put(tx, object, names)?;
+            for (key, bytes) in &value.records {
+                self.database
+                    .records
+                    .put(tx, &record_key(object, key), bytes)?;
             }
-            self.dirty_in(&mut tx)?;
-            if absent {
-                let (value, names, bytes) = encoded.as_ref().unwrap();
-                self.database.records.put(&mut tx, &object, names)?;
-                for (key, bytes) in &value.records {
-                    self.database
-                        .records
-                        .put(&mut tx, &record_key(&object, key), bytes)?;
-                }
-                self.database.objects.put(
-                    &mut tx,
-                    &object,
-                    &encode(&Liveness {
-                        bindings: 0,
-                        unused_since: Some(now),
-                        encoded_bytes: *bytes,
-                    })?,
-                )?;
-            }
-            let changed = old.as_ref().is_none_or(|b| b.object != object);
-            if changed {
-                if let Some(old) = &old {
-                    self.postings(&mut tx, file, &old.object, false)?;
-                    self.database.adjust(&mut tx, &old.object, false, now)?;
-                }
-                self.postings(&mut tx, file, &object, true)?;
-                self.database.adjust(&mut tx, &object, true, now)?;
-            }
-            let bytes = self.database.live(&tx, &object)?.unwrap().encoded_bytes;
-            self.database.bindings.put(
-                &mut tx,
-                &scope_key(self.id, file.as_bytes()),
-                &encode(&Binding {
-                    object,
-                    revision: revision.clone(),
+            self.database.objects.put(
+                tx,
+                object,
+                &encode(&Liveness {
+                    bindings: 0,
+                    unused_since: Some(now),
+                    encoded_bytes: *bytes,
                 })?,
             )?;
-            tx.commit()?;
-            return Ok(Installed {
-                built: absent,
-                reused: !absent,
-                encoded_bytes: bytes,
-            });
         }
+        let changed = old.as_ref().is_none_or(|b| &b.object != object);
+        if changed {
+            if let Some(old) = &old {
+                self.postings(tx, file, &old.object, false)?;
+                self.database.adjust(tx, &old.object, false, now)?;
+            }
+            self.postings(tx, file, object, true)?;
+            self.database.adjust(tx, object, true, now)?;
+        }
+        let bytes = self.database.live(tx, object)?.unwrap().encoded_bytes;
+        self.database.bindings.put(
+            tx,
+            &scope_key(self.id, file.as_bytes()),
+            &encode(&Binding {
+                object: *object,
+                revision: revision.clone(),
+            })?,
+        )?;
+        Ok(Some(Installed {
+            built: absent,
+            reused: !absent,
+            encoded_bytes: bytes,
+        }))
     }
 
     fn postings(&self, tx: &mut RwTxn<'_>, file: &str, object: &ObjectId, add: bool) -> Result<()> {

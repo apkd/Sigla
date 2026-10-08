@@ -25,7 +25,7 @@ struct WorkspaceSlot {
     preparing: Option<preparation::Ticket>,
     used: Instant,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Request {
     Search(String),
     Browse(String),
@@ -241,16 +241,22 @@ impl App {
                 loop {
                     tokio::time::sleep(interval).await;
                     let Some(app) = weak.upgrade() else { return };
+                    let collect = last_collection.elapsed() >= std::time::Duration::from_secs(60);
                     if let Some(remote) = &app.remote {
                         // Fetch failures stay on the branch preparation state, never on valid query results.
-                        if let Err(error) = remote.maintain().await {
-                            tracing::error!(%error, "Cannot persist repository ownership state");
-                        }
-                        if let Err(error) = app.expire_idle().await {
-                            tracing::error!(%error, "Cannot expire repository storage");
+                        match remote.maintain(collect).await {
+                            Ok(expired) if !expired.is_empty() => {
+                                if let Err(error) = app.expire_idle(expired).await {
+                                    tracing::error!(%error, "Cannot expire repository storage");
+                                }
+                            }
+                            Ok(_) => (),
+                            Err(error) => {
+                                tracing::error!(%error, "Cannot maintain repository ownership state");
+                            }
                         }
                     }
-                    if last_collection.elapsed() < std::time::Duration::from_secs(60) {
+                    if !collect {
                         continue;
                     }
                     last_collection = Instant::now();
@@ -288,17 +294,23 @@ impl App {
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r.map_err(|e| e.to_string()));
+            if let Err(error) = &result {
+                tracing::warn!(%error, "Unity editor prefetch failed");
+            }
             let _ = send.send(Some(result));
         });
     }
 
-    async fn expire_idle(&self) -> Result<()> {
+    async fn expire_idle(
+        &self,
+        expired: Vec<Arc<crate::repository::manager::Branch>>,
+    ) -> Result<()> {
         let _activity = self.activity.read().await;
         let Some(remote) = &self.remote else {
             return Ok(());
         };
-        for branch in remote.expired() {
-            let Ok(_gate) = branch.state.try_lock() else {
+        for branch in expired {
+            let Ok(_gate) = branch.state.try_write() else {
                 continue;
             };
             let retired = {
@@ -381,16 +393,6 @@ impl App {
         Ok(())
     }
 
-    async fn ready(self: &Arc<Self>) -> Result<()> {
-        self.start_setup();
-        let mut ready = self.startup.lock().unwrap().as_ref().unwrap().clone();
-        loop {
-            if let Some(result) = ready.borrow().clone() {
-                return result.map_err(|e| anyhow::anyhow!("Startup setup failed: {e}"));
-            }
-            ready.changed().await?;
-        }
-    }
     pub async fn search(self: &Arc<Self>, path: &str, query: &str) -> Result<String> {
         ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit");
         result_text(self.dispatch(path, Request::Search(query.into())).await?)
@@ -465,16 +467,21 @@ impl App {
             ),
             _ => None,
         };
-        self.ready().await?;
+        self.start_setup();
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
         let branch = match repository {
-            Some(repository) => Some(
-                self.remote
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Repository identifiers require --mode remote"))?
-                    .resolve(repository)
-                    .await?,
-            ),
+            Some(repository) => {
+                let remote = self.remote.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Repository identifiers require --mode remote")
+                })?;
+                Some(
+                    if matches!(request, Request::Browse(_) | Request::View(..)) {
+                        remote.resolve_inventory(repository).await?
+                    } else {
+                        remote.resolve(repository).await?
+                    },
+                )
+            }
             None => None,
         };
         let (entry, policy, cache) = if let Some(branch) = &branch {
@@ -568,6 +575,16 @@ impl App {
                 (state, ticket, retired)
             };
             drop(retired);
+            if preparation.discovering()
+                && let Some(branch) = &branch
+                && (matches!(request, Request::Browse(_))
+                    || matches!(request, Request::View(..)) && indexes::source_only(&request, None))
+                && let Some(result) = self
+                    .navigate_repository(branch.clone(), request.clone(), activity.clone())
+                    .await?
+            {
+                return Ok(result);
+            }
             let inventory = preparation.inventory().await?;
             if inventory.current().await? {
                 break (workspace, preparation, inventory);
@@ -596,7 +613,7 @@ impl App {
         let asset_workspace = workspace.clone();
         let mut state = workspace.lock_owned().await;
         let mut branch_state = match &branch {
-            Some(branch) => Some(branch.state.clone().lock_owned().await),
+            Some(branch) => Some(branch.analyze().await),
             None => None,
         };
         let context = branch.as_ref().map(|branch| {
@@ -689,7 +706,7 @@ impl App {
             }
             state = asset_workspace.clone().lock_owned().await;
             branch_state = match &branch {
-                Some(branch) => Some(branch.state.clone().lock_owned().await),
+                Some(branch) => Some(branch.analyze().await),
                 None => None,
             };
             ensure!(
@@ -1352,7 +1369,7 @@ mod tests {
         app.shutdown().await;
     }
     #[tokio::test]
-    async fn queued_preparation_does_not_block_branch_reacquisition() {
+    async fn remote_navigation_does_not_wait_for_indexing_or_retain_queued_branch_guards() {
         use crate::repository::{Repository, Rule, materialize::Target};
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let cache = tempfile::tempdir().unwrap();
@@ -1381,7 +1398,7 @@ mod tests {
             "last_use": now, "refreshed": now, "store_created": now,
             "policy": selection.identity, "repair": false, "indexed_revision": null,
             "prepared": {"branch": "main", "revision": "a".repeat(40),
-                "selected": {}, "tracked": {"Cargo.toml": "b", "src/lib.rs": "c"}, "directories": ["src"]}
+                "selected": {"Cargo.toml": "b", "src/lib.rs": "c"}, "tracked": {"Cargo.toml": "b", "src/lib.rs": "c"}, "directories": ["src"]}
         });
         std::fs::write(
             owner.join("state.json"),
@@ -1422,6 +1439,7 @@ mod tests {
         );
         // Stand in for A's workspace guard while it releases branch state to
         // handle RequiredInputs. B must not retain branch state while queued.
+        let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
         let held_workspace = workspace.lock().await;
         let request = {
             let app = app.clone();
@@ -1430,8 +1448,68 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), app.preparation_started.notified())
             .await
             .unwrap();
-        let reacquired = branch.state.try_lock().is_ok();
+        let reacquired = branch.state.try_write().is_ok();
+        let tree = tokio::time::timeout(Duration::from_secs(5), app.browse(project, "src"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tree.contains("lib.rs"), "{tree}");
+        let source = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.view(project, "src/lib.rs", "exact"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(source.contains("pub struct Prepared;"), "{source}");
+        assert!(!request.is_finished());
         drop(held_workspace);
+        let mut ticket = app
+            .workspaces
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .preparing
+            .clone()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ticket.inventory())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut publication = Box::pin(branch.publish());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                publication.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        let tree = tokio::time::timeout(Duration::from_secs(5), app.browse(project, "src"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tree.contains("lib.rs"), "{tree}");
+        let source = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.view(project, "src/lib.rs", "exact"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(source.contains("pub struct Prepared;"), "{source}");
+        assert!(
+            branch.state.try_write().is_err(),
+            "Indexing must protect its source generation from publication"
+        );
+        drop(pause);
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), publication)
+                .await
+                .unwrap(),
+        );
         let result = tokio::time::timeout(Duration::from_secs(10), request)
             .await
             .unwrap()
@@ -1444,7 +1522,8 @@ mod tests {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         drop(branch);
         drop(workspace);
-        app.expire_idle().await.unwrap();
+        let expired = app.remote.as_ref().unwrap().maintain(true).await.unwrap();
+        app.expire_idle(expired).await.unwrap();
         assert!(!owner.exists());
         app.maintain_analysis(false).unwrap();
         assert!(
@@ -1523,6 +1602,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editor_prefetch_does_not_gate_unrelated_requests() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='prefetch'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub struct Available;").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let (prefetch, pending) = tokio::sync::watch::channel(None);
+        *app.startup.lock().unwrap() = Some(pending);
+        let path = root.path().to_str().unwrap();
+        let tree = tokio::time::timeout(Duration::from_secs(5), app.browse(path, "src"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tree.contains("lib.rs"), "{tree}");
+        let source = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.view(path, "src/lib.rs", "exact"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(source.contains("pub struct Available;"), "{source}");
+        prefetch
+            .send(Some(Err("Editor download unavailable".into())))
+            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.search(path, "type:Available"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(result.contains("Available"), "{result}");
+    }
+
+    #[tokio::test]
     async fn preparation_survives_idle_timeout_but_idle_sessions_still_expire() {
         use rmcp::transport::streamable_http_server::{
             StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -1546,8 +1672,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (ready, waiting) = tokio::sync::watch::channel(None);
-        *app.startup.lock().unwrap() = Some(waiting);
+        let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
         let mut manager = LocalSessionManager::default();
         manager.session_config.keep_alive = Some(Duration::from_millis(500));
         let ct = tokio_util::sync::CancellationToken::new();
@@ -1628,14 +1753,14 @@ mod tests {
                 panic!("MCP stream ended without a response");
             })
         };
-        // More than one idle interval elapses while the service-owned setup waits.
+        // More than one idle interval elapses while indexing waits.
         for _ in 0..8 {
             tokio::time::timeout(Duration::from_secs(3), received.recv())
                 .await
                 .unwrap()
                 .unwrap();
         }
-        ready.send(Some(Ok(()))).unwrap();
+        drop(pause);
         let response = search.await.unwrap();
         assert!(
             response["result"]["content"][0]["text"]

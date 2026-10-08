@@ -3,6 +3,7 @@ mod compose;
 pub mod jobs;
 mod parse;
 mod query;
+mod records;
 mod yaml;
 
 use crate::{
@@ -18,7 +19,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const VERSION: u32 = 3;
 const LOCAL_LIMIT: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,13 +50,6 @@ impl Index {
             .iter()
             .all(|(path, stamp)| Stamp::read(path).as_ref().ok() == Some(stamp))
     }
-}
-#[derive(Serialize, Deserialize)]
-struct Cached {
-    version: u32,
-    stamp: Stamp,
-    parsed: Parsed,
-    unavailable: Option<String>,
 }
 
 pub fn is_asset(path: &Path) -> bool {
@@ -189,28 +182,14 @@ pub struct BuildOptions<'a> {
     pub cancel: &'a tokio_util::sync::CancellationToken,
 }
 
-pub fn build(
+fn script_types(
     root: &Path,
-    cache: &Path,
+    projects: &[PathBuf],
     manifest: &Manifest,
     store: &Store,
     tx: &heed::RoTxn<'_>,
-    options: BuildOptions<'_>,
-) -> Result<Index> {
-    let BuildOptions {
-        remote,
-        omitted,
-        cancel,
-    } = options;
-    ensure!(
-        !cancel.is_cancelled(),
-        "Asset indexing cancelled or superseded"
-    );
-    std::fs::create_dir_all(cache)?;
-    let mut projects = Vec::new();
-    let mut observed = BTreeMap::new();
-    roots(root, &mut projects, &mut observed, 0)?;
-    let mut index = Index::default();
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<BTreeMap<(PathBuf, PathBuf), Vec<ScriptType>>> {
     let mut type_files = BTreeMap::<(PathBuf, PathBuf), Vec<ScriptType>>::new();
     let view = crate::csharp::catalog::View {
         store,
@@ -218,7 +197,7 @@ pub fn build(
         manifest,
         cancel,
     };
-    let mut binder = crate::csharp::bind::Binder::default();
+    let types_started = std::time::Instant::now();
     for (file, entry) in &manifest.files {
         ensure!(
             !cancel.is_cancelled(),
@@ -227,6 +206,15 @@ pub fn build(
         if entry.language != Language::CSharp || entry.metadata {
             continue;
         }
+        // Only a script's .meta entry can publish its type in index.scripts.
+        // Avoid binding package/generated sources that have no such asset entry.
+        let mut meta = entry.path.as_os_str().to_os_string();
+        meta.push(".meta");
+        if !Path::new(&meta).is_file() {
+            continue;
+        }
+        // Each source file is an independent binding query with its own budget.
+        let mut binder = crate::csharp::bind::Binder::default();
         let stem = entry
             .path
             .file_stem()
@@ -273,6 +261,34 @@ pub fn build(
             }
         }
     }
+    tracing::info!(workspace = %root.display(), scripts = type_files.len(), elapsed_ms = types_started.elapsed().as_millis(), "Unity script types resolved");
+    Ok(type_files)
+}
+
+pub fn build(
+    root: &Path,
+    cache: &Path,
+    manifest: &Manifest,
+    store: &Store,
+    tx: &heed::RoTxn<'_>,
+    options: BuildOptions<'_>,
+) -> Result<Index> {
+    let BuildOptions {
+        remote,
+        omitted,
+        cancel,
+    } = options;
+    ensure!(
+        !cancel.is_cancelled(),
+        "Asset indexing cancelled or superseded"
+    );
+    std::fs::create_dir_all(cache)?;
+    let mut projects = Vec::new();
+    let mut observed = BTreeMap::new();
+    roots(root, &mut projects, &mut observed, 0)?;
+    let mut index = Index::default();
+    let type_files = script_types(root, &projects, manifest, store, tx, cancel)?;
+    let assets_started = std::time::Instant::now();
     for project in &projects {
         let project_name = project.strip_prefix(root)?.to_string_lossy().to_string();
         let project_name = if project_name.is_empty() {
@@ -280,7 +296,7 @@ pub fn build(
         } else {
             project_name
         };
-        let mut scopes: Vec<_> = [project.join("Assets"), project.join("ProjectSettings")]
+        let mut scopes: BTreeSet<_> = [project.join("Assets"), project.join("ProjectSettings")]
             .into_iter()
             .filter(|p| !crate::discovery::linked_worktree(p))
             .collect();
@@ -317,6 +333,8 @@ pub fn build(
                     .filter(|p| !crate::discovery::crosses_worktree(project, p)),
             );
         }
+        let inventory_started = std::time::Instant::now();
+        let scope_count = scopes.len();
         let mut files = BTreeSet::new();
         for scope in scopes {
             if scope.is_dir() {
@@ -326,6 +344,19 @@ pub fn build(
         for file in &files {
             observed.insert(file.clone(), Stamp::read(file)?);
         }
+        tracing::info!(workspace = %project.display(), scopes = scope_count, files = files.len(), elapsed_ms = inventory_started.elapsed().as_millis(), "Unity asset inventory ready");
+        let limit = if remote {
+            crate::repository::selection::ASSET_LIMIT
+        } else {
+            LOCAL_LIMIT
+        };
+        let inputs = files
+            .iter()
+            .filter(|file| file.extension().is_none_or(|e| e != "meta"))
+            .filter(|file| observed[*file].size <= limit)
+            .map(|file| (file.clone(), observed[file].clone()))
+            .collect();
+        let mut records = records::load_all(cache, &inputs, cancel)?;
         for file in files {
             ensure!(
                 !cancel.is_cancelled(),
@@ -392,80 +423,34 @@ pub fn build(
                 }
                 continue;
             }
-            let size = std::fs::metadata(&file)?.len();
-            let limit = if remote {
-                crate::repository::selection::ASSET_LIMIT
-            } else {
-                LOCAL_LIMIT
-            };
+            let stamp = Stamp::read(&file)?;
+            ensure!(
+                observed[&file] == stamp,
+                "Asset changed while indexing; retry query"
+            );
+            let size = stamp.size;
             if size > limit {
                 asset.unavailable = Some(format!("Asset exceeds size limit ({size} bytes)"));
                 continue;
             }
-            let stamp = Stamp::read(&file)?;
-            let record = cache.join(format!(
-                "{}.zst",
-                blake3::hash(&serde_json::to_vec(&(VERSION, &file, &stamp))?).to_hex()
-            ));
-            let cached = std::fs::File::open(&record)
-                .ok()
-                .and_then(|f| zstd::stream::decode_all(f).ok())
-                .and_then(|bytes| postcard::from_bytes::<Cached>(&bytes).ok())
-                .filter(|c| c.version == VERSION && c.stamp == stamp);
-            let cached = if let Some(cached) = cached {
-                cached
-            } else {
-                let bytes = std::fs::read(&file)?;
-                let (parsed, unavailable) = match std::str::from_utf8(&bytes) {
-                    Ok(text)
-                        if !text.contains('\0')
-                            && !text.bytes().any(|c| c < 9 || (c > 13 && c < 32)) =>
-                    {
-                        match parse::parse(text) {
-                            Ok(parsed) => (parsed, None),
-                            Err(error) => (
-                                Parsed::default(),
-                                Some(format!("Unsupported serialized contents: {error}")),
-                            ),
-                        }
-                    }
-                    _ => (
-                        Parsed::default(),
-                        Some(format!("Binary asset ({size} bytes)")),
-                    ),
-                };
-                ensure!(
-                    Stamp::read(&file)? == stamp,
-                    "Asset changed while being read; retry query"
-                );
-                let cached = Cached {
-                    version: VERSION,
-                    stamp,
-                    parsed,
-                    unavailable,
-                };
-                let mut output = tempfile::NamedTempFile::new_in(cache)?;
-                let bytes = postcard::to_allocvec(&cached)?;
-                zstd::stream::copy_encode(bytes.as_slice(), &mut output, 3)?;
-                output.persist(&record)?;
-                cached
-            };
-            asset.objects = cached
-                .parsed
-                .objects
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect();
-            asset.unavailable = cached.unavailable;
-            asset.content = asset.unavailable.is_none().then_some(record);
+            let record = records.remove(&file).unwrap();
+            asset.objects = record.objects;
+            asset.unavailable = record.unavailable;
+            asset.content = record.content;
         }
     }
-    for (path, reason) in omitted {
-        if !index.assets.values().any(|a| a.path == *path)
-            && let Some(project) = projects
-                .iter()
-                .filter(|p| root.join(path).starts_with(p))
-                .max_by_key(|p| p.components().count())
+    let mut missing: BTreeMap<_, _> = omitted.iter().collect();
+    for asset in index.assets.values_mut() {
+        if let Some(reason) = omitted.get(&asset.path) {
+            asset.unavailable = Some(reason.clone());
+            missing.remove(&asset.path);
+        }
+    }
+    for (path, reason) in missing {
+        if let Some(project) = projects
+            .iter()
+            .filter(|p| root.join(path).starts_with(p))
+            .max_by_key(|p| p.components().count())
         {
             let name = project.strip_prefix(root)?.to_string_lossy();
             let name = if name.is_empty() { "." } else { &name };
@@ -481,9 +466,6 @@ pub fn build(
                 },
             );
         }
-        for asset in index.assets.values_mut().filter(|a| a.path == *path) {
-            asset.unavailable = Some(reason.clone());
-        }
     }
     for (key, asset) in &index.assets {
         if !asset.guid.is_empty() {
@@ -494,27 +476,27 @@ pub fn build(
                 .push(key.clone());
         }
     }
-    for (path, stamp) in &observed {
-        ensure!(
-            Stamp::read(path).as_ref().ok() == Some(stamp),
-            "Unity inputs changed during indexing; retry query"
-        );
-    }
     index.observed = observed;
+    tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = assets_started.elapsed().as_millis(), "Unity asset records ready");
     compose::build(&mut index)?;
+    ensure!(
+        !cancel.is_cancelled(),
+        "Asset indexing cancelled or superseded"
+    );
+    ensure!(
+        index.current(),
+        "Unity inputs changed during indexing; retry query"
+    );
     Ok(index)
 }
 
 fn content(asset: &Asset) -> Result<Parsed> {
-    let file = std::fs::File::open(
+    records::content(
         asset
             .content
             .as_ref()
             .context("Asset contents unavailable")?,
-    )?;
-    let bytes = zstd::stream::decode_all(file)?;
-    let cached: Cached = postcard::from_bytes(&bytes)?;
-    Ok(cached.parsed)
+    )
 }
 
 #[cfg(test)]
@@ -525,6 +507,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
+
     #[test]
     fn worktrees_are_excluded_from_project_and_asset_inventories() {
         let fixture = tempfile::tempdir().unwrap();
@@ -617,6 +600,16 @@ mod tests {
             );
         }
         write(root.path(), "One/Assets/Binary.asset", b"\0\x01\x02");
+        let omitted = BTreeMap::from([
+            (
+                "One/Assets/Binary.asset".into(),
+                "Excluded binary input".into(),
+            ),
+            (
+                "Two/Assets/Missing.asset".into(),
+                "Unavailable download".into(),
+            ),
+        ]);
         let store =
             Store::open_workspace(&cache.path().join("store"), [0; 32], root.path(), None).unwrap();
         let tx = store.read().unwrap();
@@ -628,7 +621,7 @@ mod tests {
             &tx,
             BuildOptions {
                 remote: false,
-                omitted: &Default::default(),
+                omitted: &omitted,
                 cancel: &tokio_util::sync::CancellationToken::new(),
             },
         )
@@ -642,6 +635,11 @@ mod tests {
         assert!(binary.unavailable.is_some());
         assert!(binary.content.is_none());
         assert!(binary.objects.is_empty());
+        for (path, reason) in &omitted {
+            let records: Vec<_> = index.assets.values().filter(|a| &a.path == path).collect();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].unavailable.as_ref(), Some(reason));
+        }
         assert!(index.current());
         write(
             root.path(),

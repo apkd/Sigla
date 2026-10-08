@@ -41,6 +41,64 @@ fn clean(scope: &Scope, files: &[&str]) {
 }
 
 #[test]
+fn batch_publication_rolls_back_together_and_shares_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let a = scope(&db, 1);
+    let pending: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|file| {
+            a.prepare_install(file, vec![1], [7; 32], 100, || Ok(object("Name", b"body")))
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        a.install_batch(&pending, |index| {
+            ensure!(index == 0, "Source changed");
+            Ok(())
+        })
+        .is_err()
+    );
+    {
+        let tx = a.read().unwrap();
+        assert_eq!(db.object_count(&tx).unwrap(), 0);
+        assert!(a.binding(&tx, "one").unwrap().is_none());
+        assert!(
+            a.candidates(&tx, "Name", false, true, |_| false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let results = a.install_batch(&pending, |_| Ok(())).unwrap();
+    assert!(results[0].unwrap().built);
+    assert!(results[1].unwrap().reused);
+    clean(&a, &["one", "two"]);
+    let tx = a.read().unwrap();
+    assert_eq!(db.object_count(&tx).unwrap(), 1);
+    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(2));
+    assert_eq!(
+        a.candidates(&tx, "Name", false, true, |_| false).unwrap(),
+        BTreeSet::from(["one".into(), "two".into()])
+    );
+}
+
+#[test]
+fn batch_hits_collected_before_publication_request_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let a = scope(&db, 1);
+    put(&a, "old", 1, 7, "Name");
+    let pending = a
+        .prepare_install("new", vec![1], [7; 32], 100, || panic!("cache hit rebuilt"))
+        .unwrap();
+    a.detach("old", 100).unwrap();
+    db.collect(100 + RETENTION_MS, 32).unwrap();
+    assert!(a.install_batch(&[pending], |_| Ok(())).unwrap()[0].is_none());
+    let tx = a.read().unwrap();
+    assert!(a.binding(&tx, "new").unwrap().is_none());
+}
+
+#[test]
 fn shares_payload_not_file_identity_or_workspace_candidates() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();

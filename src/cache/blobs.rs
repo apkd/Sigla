@@ -132,7 +132,36 @@ impl Store {
 
     pub fn import_tree(&self, root: &Path) -> Result<()> {
         let _lease = self.lease()?;
-        self.visit(root)
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        Self::inventory(root, &mut files, &mut directories)?;
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+            .min(files.len());
+        std::thread::scope(|scope| -> Result<()> {
+            let jobs: Vec<_> = (0..workers)
+                .map(|worker| {
+                    let files = &files;
+                    scope.spawn(move || -> Result<()> {
+                        for path in files.iter().skip(worker).step_by(workers) {
+                            self.import(path)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for job in jobs {
+                job.join()
+                    .map_err(|_| anyhow::anyhow!("Cache import worker panicked"))??;
+            }
+            Ok(())
+        })?;
+        // All file replacements are durable before syncing directories, children first.
+        for directory in directories {
+            File::open(directory)?.sync_all()?;
+        }
+        Ok(())
     }
     pub fn link_tree(&self, source: &Path, destination: &Path) -> Result<()> {
         let _lease = self.lease()?;
@@ -156,7 +185,11 @@ impl Store {
         visit(source, destination)
     }
 
-    fn visit(&self, root: &Path) -> Result<()> {
+    fn inventory(
+        root: &Path,
+        files: &mut Vec<PathBuf>,
+        directories: &mut Vec<PathBuf>,
+    ) -> Result<()> {
         ensure!(
             fs::symlink_metadata(root)?.is_dir(),
             "Invalid managed input directory"
@@ -165,17 +198,17 @@ impl Store {
             let entry = entry?;
             let kind = entry.file_type()?;
             if kind.is_dir() {
-                self.visit(&entry.path())?;
+                Self::inventory(&entry.path(), files, directories)?;
             } else {
                 ensure!(
                     kind.is_file(),
                     "Managed input is not a regular file: {}",
                     entry.path().display()
                 );
-                self.import(&entry.path())?;
+                files.push(entry.path());
             }
         }
-        File::open(root)?.sync_all()?;
+        directories.push(root.to_owned());
         Ok(())
     }
 
@@ -332,6 +365,41 @@ pub fn allocated(root: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tree_import_preserves_files_and_shares_duplicates() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let root = cache.path().join("source");
+        fs::create_dir_all(root.join("empty/nested")).unwrap();
+        let mut expected = Vec::new();
+        for directory in ["a", "b"] {
+            fs::create_dir(root.join(directory)).unwrap();
+            for index in 0..16 {
+                let path = root.join(directory).join(index.to_string());
+                let contents = format!("source {index}");
+                fs::write(&path, &contents).unwrap();
+                expected.push((path, contents));
+            }
+        }
+        store.import_tree(&root).unwrap();
+        for (path, contents) in expected {
+            assert_eq!(fs::read_to_string(path).unwrap(), contents);
+        }
+        for index in 0..16 {
+            assert_eq!(
+                fs::metadata(root.join("a").join(index.to_string()))
+                    .unwrap()
+                    .ino(),
+                fs::metadata(root.join("b").join(index.to_string()))
+                    .unwrap()
+                    .ino()
+            );
+        }
+        assert!(root.join("empty/nested").is_dir());
+        store.import_tree(&root).unwrap();
+        assert_eq!(store.collect().unwrap(), 0);
+    }
+
     #[test]
     fn views_share_bytes_and_collection_waits_for_the_last_view() {
         let cache = tempfile::tempdir().unwrap();

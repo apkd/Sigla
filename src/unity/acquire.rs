@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 const FORMAT: u32 = 3;
@@ -163,20 +163,21 @@ pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
         let staging = tempfile::Builder::new()
             .prefix("extract-")
             .tempdir_in(&root)?;
-        let mut archive = tempfile::tempfile_in(&root)?;
-        acquisition::download(
+        let started = Instant::now();
+        tracing::info!(version = %pin.version, "Downloading and extracting Unity editor references");
+        let (inventory, bytes) = acquisition::download_extract(
             &acquisition::client()?,
             &pin.url,
-            &mut archive,
+            staging.path(),
             pin.integrity.as_deref(),
+            retained,
         )?;
-        archive.seek(SeekFrom::Start(0))?;
-        let inventory = acquisition::extract(archive, staging.path(), retained)?;
         validate(&staging.path().join("Editor/Data"), version)?;
         if content.exists() {
             fs::remove_dir_all(&content)?;
         }
         fs::rename(staging.path(), &content)?;
+        let files = inventory.len();
         write_json(
             &complete,
             &Complete {
@@ -185,6 +186,7 @@ pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
                 inventory,
             },
         )?;
+        tracing::info!(version = %version, files, bytes, elapsed_ms = started.elapsed().as_millis(), "Unity editor references ready");
         Ok(content.join("Editor/Data"))
     })
 }

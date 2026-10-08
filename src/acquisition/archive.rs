@@ -1,11 +1,11 @@
 //! Streaming libarchive driver. It never creates filesystem entries.
 use anyhow::{Context, Result, ensure};
 use libarchive3_sys::ffi;
-use std::{ffi::CStr, fs::File, os::fd::AsRawFd, path::PathBuf};
+use std::{ffi::CStr, os::fd::AsRawFd, path::PathBuf};
 
-pub struct Archive {
+pub struct Archive<R: AsRawFd> {
     handle: *mut ffi::Struct_archive,
-    _file: File,
+    reader: R,
 }
 
 pub struct Entry {
@@ -14,22 +14,19 @@ pub struct Entry {
     pub link: bool,
 }
 
-impl Archive {
-    pub fn open(file: File) -> Result<Self> {
-        // SAFETY: The handle is owned by this driver and freed in Drop. The file
+impl<R: AsRawFd> Archive<R> {
+    pub fn open(reader: R) -> Result<Self> {
+        // SAFETY: The handle is owned by this driver and freed in Drop. The input
         // remains open until after archive_read_free and is never read elsewhere.
         unsafe {
             let handle = ffi::archive_read_new();
             ensure!(!handle.is_null(), "Cannot allocate archive reader");
-            let archive = Self {
-                handle,
-                _file: file,
-            };
+            let archive = Self { handle, reader };
             archive.check(ffi::archive_read_support_filter_all(handle))?;
             archive.check(ffi::archive_read_support_format_tar(handle))?;
             archive.check(ffi::archive_read_open_fd(
                 handle,
-                archive._file.as_raw_fd(),
+                archive.reader.as_raw_fd(),
                 64 * 1024,
             ))?;
             Ok(archive)
@@ -95,9 +92,9 @@ impl Archive {
     }
 }
 
-impl Drop for Archive {
+impl<R: AsRawFd> Drop for Archive<R> {
     fn drop(&mut self) {
-        // SAFETY: This is the only owner; free precedes dropping the backing file.
+        // SAFETY: This is the only owner; free precedes dropping the input.
         unsafe {
             ffi::archive_read_free(self.handle);
         }

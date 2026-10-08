@@ -327,6 +327,11 @@ impl Pool {
 /// lock is held, so rebuild/replacement cannot race abbreviation resolution.
 /// Return the pin alongside Prepared rather than dropping it inside this function.
 pub fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
+    let (prepared, pin) = acquire_git(request, cache)?;
+    Ok((complete(request, cache, prepared)?, pin))
+}
+
+pub(super) fn acquire_git(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
     ensure!(
         !matches!(request.target, super::materialize::Target::DefaultBranch),
         "Default-branch discovery must keep using the metadata-only job"
@@ -346,12 +351,27 @@ pub fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
     request.store = pool.root.join("current");
     // execute() is synchronous and does not return until its bounded child is stopped.
     let prepared = super::job::execute(&request, cache)?;
-    crate::cache::blobs::Store::open(cache)?.import_tree(&request.staging)?;
     state.used = now();
     state.retained = None;
     pool.persist(&state)?;
     let pin = pool.pin(&prepared)?; // Still under operation lock: no unprotected handoff.
+    drop(_operation);
     Ok((prepared, pin))
+}
+
+pub(super) fn complete(request: &Request, cache: &Path, prepared: Prepared) -> Result<Prepared> {
+    // Hydration only uses staged pointers and the LFS cache. It must not hold
+    // the Git pool gate while downloading large objects.
+    let prepared = super::job::hydrate(request, cache, prepared)?;
+    let started = std::time::Instant::now();
+    if !matches!(request.contents, super::materialize::Contents::Inventory) {
+        crate::cache::blobs::Store::open(cache)?.import_tree(&request.staging)?;
+    }
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "Repository files imported"
+    );
+    Ok(prepared)
 }
 
 /// Invoke separately from selector expiration, on a blocking worker, without any

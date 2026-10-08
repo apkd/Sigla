@@ -109,6 +109,7 @@ impl Jobs {
         );
         let workers = self.workers.clone();
         tokio::spawn(async move {
+            let log_root = root.clone();
             let outcome = async {
                 let permit = tokio::select! {
                     _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
@@ -116,7 +117,7 @@ impl Jobs {
                 };
                 let state = workspace.lock_owned().await;
                 let branch_state = match &branch {
-                    Some(branch) => Some(branch.state.clone().lock_owned().await),
+                    Some(branch) => Some(branch.state.clone().read_owned().await),
                     None => None,
                 };
                 tokio::task::spawn_blocking(move || -> Result<Arc<Index>> {
@@ -148,6 +149,7 @@ impl Jobs {
                     if let Some(previous) = previous.filter(|index| branch.is_none() && index.current()) {
                         return Ok(previous);
                     }
+                    let started = std::time::Instant::now();
                     let index = super::build(
                         &root,
                         &cache,
@@ -159,19 +161,23 @@ impl Jobs {
                     if let Some(branch) = &branch {
                         let state = branch
                             .state
-                            .try_lock()
+                            .try_read()
                             .context("Repository is refreshing; retry asset query")?;
                         ensure!(
                             state.as_ref().map(|s| &s.prepared.revision) == revision.as_ref(),
                             "Repository changed during asset indexing; retry query"
                         );
                     }
+                    tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = started.elapsed().as_millis(), "Unity asset index ready");
                     Ok(Arc::new(index))
                 })
                 .await?
             }
             .await
             .map_err(|error| format!("{error:#}"));
+            if let Err(error) = &outcome {
+                tracing::warn!(workspace = %log_root.display(), %error, "Unity asset index failed");
+            }
             sender.send_replace(Some(outcome));
         });
         ticket

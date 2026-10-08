@@ -374,6 +374,16 @@ fn lifecycle() -> Result<()> {
     );
     let main = "git@github.com:fixture/repo.git#main";
     let feature = "git@github.com:fixture/repo.git#feature/search";
+    let (error, tree) = server.call("browse", json!({"codebase":main,"path":"src"}))?;
+    ensure!(
+        !error && tree.contains("lib.rs"),
+        "Cold browse failed: {tree}"
+    );
+    let (error, source) = server.call("view", json!({"codebase":main,"path":"src/lib.rs"}))?;
+    ensure!(
+        !error && source.contains("pub struct Main;"),
+        "Source view after cold browse failed: {source}"
+    );
     let (error, first) = server.query(main, "type:Main")?;
     ensure!(
         !error && first.contains("| Repository |") && first.contains("fixture/repo"),

@@ -234,6 +234,10 @@ impl Session {
             .map_err(|_| anyhow::anyhow!("Repository reference lookup failed"))
     }
 
+    pub fn can_fetch_again(&self) -> bool {
+        self.handshake.server_protocol_version == gix_transport::Protocol::V2
+    }
+
     /// Stream a filtered pack to staging. Explicit blob wants are used only by the materializer.
     pub fn pack(
         &mut self,

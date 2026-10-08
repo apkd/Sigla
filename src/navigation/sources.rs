@@ -3,8 +3,75 @@ use crate::{
     query::{Query, wildcard},
     workspace::{FileEntry, Manifest, Membership},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Navigate materialized repository inputs while dependency discovery is pending.
+/// Unknown paths fall through to discovery, which may supply package or generated files.
+pub(crate) fn repository(
+    root: &std::path::Path,
+    contents: Option<&std::path::Path>,
+    prepared: &crate::repository::materialize::Prepared,
+    path: &str,
+    mode: Option<crate::navigation::Mode>,
+    read_remote: impl FnOnce(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<Option<String>> {
+    let language = |path: &std::path::Path| match path.extension().and_then(|e| e.to_str()) {
+        Some("cs") => Some(crate::model::Language::CSharp),
+        Some("rs") => Some(crate::model::Language::Rust),
+        _ => crate::native::language(path).or_else(|| crate::documents::language(path)),
+    };
+    let files: BTreeMap<_, _> = prepared
+        .selected
+        .keys()
+        .filter(|p| !prepared.unavailable.contains(*p))
+        .filter_map(|p| {
+            let path = std::path::Path::new(p);
+            let language = language(path);
+            (language.is_some() || crate::unity::assets::is_asset(path))
+                .then(|| (p.clone(), language))
+        })
+        .collect();
+    let Some(mode) = mode else {
+        let dirs = crate::navigation::Directory::new(files.keys().map(String::as_str)).paths();
+        let normalized = crate::navigation::normalize_indexed(path, root, false, |p| {
+            files.contains_key(p) || dirs.iter().any(|d| d == p)
+        })?;
+        if !normalized.is_empty()
+            && !files.contains_key(&normalized)
+            && crate::navigation::matches(dirs.iter().map(String::as_str), &normalized).is_empty()
+        {
+            return Ok(None);
+        }
+        return browse(&files, root, path, false).map(Some);
+    };
+    let files: BTreeMap<_, _> = files
+        .into_iter()
+        .filter_map(|(p, l)| l.map(|l| (p.clone(), (p, l))))
+        .collect();
+    let mut resolved = false;
+    let text = view(&files, root, path, mode, false, |(path, language)| {
+        resolved = true;
+        let local = contents.map(|contents| contents.join(path));
+        let _admission = local
+            .as_ref()
+            .map(std::fs::metadata)
+            .transpose()?
+            .map(|metadata| crate::memory::admit_file(metadata.len(), false));
+        let bytes = if let Some(path) = local {
+            std::fs::read(path)?
+        } else if let Some(bytes) = read_remote(path)? {
+            bytes
+        } else {
+            return Ok(None);
+        };
+        Ok(Some((
+            *language,
+            crate::model::decode_owned(bytes, *language)?,
+        )))
+    })?;
+    Ok(resolved.then_some(text).flatten())
+}
 
 pub(crate) struct Sources<'a> {
     pub manifest: &'a Manifest,
@@ -161,28 +228,7 @@ impl Sources<'_> {
     }
     pub fn browse(&self, root: &std::path::Path, path: &str, absolute: bool) -> Result<String> {
         self.check()?;
-        let files = self.source_paths(root);
-        let tree = crate::navigation::Directory::new(files.keys().map(String::as_str));
-        let dirs = tree.paths();
-        let path = crate::navigation::normalize_indexed(path, root, absolute, |p| {
-            files.contains_key(p) || dirs.iter().any(|d| d == p)
-        })?;
-        if files.contains_key(&path) {
-            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
-            return Ok(format!(
-                "This is a file. Use {}, or {}.",
-                crate::render::inline(&format!("view({})", serde_json::to_string(&path)?)),
-                crate::render::inline(&format!("browse({})", serde_json::to_string(parent)?))
-            ));
-        }
-        if path.is_empty() {
-            return Ok(tree.render(""));
-        }
-        let matches = crate::navigation::matches(dirs.iter().map(String::as_str), &path);
-        if matches.len() != 1 {
-            return Ok(crate::navigation::choices(&matches, "directories"));
-        }
-        Ok(tree.at(matches[0]).render(matches[0]))
+        browse(&self.source_paths(root), root, path, absolute)
     }
     pub fn view(
         &self,
@@ -197,78 +243,183 @@ impl Sources<'_> {
         {
             return Ok(text);
         }
-        let files = self.source_paths(root);
-        let indexed = |p: &str| {
-            files.contains_key(p)
-                || files.keys().any(|f| {
-                    f.strip_suffix(p)
-                        .is_some_and(|prefix| prefix.ends_with('/'))
-                })
-        };
-        let literal = crate::navigation::normalize_indexed(path, root, absolute, indexed)?;
-        let (path, requested) = if files.contains_key(&literal)
-            || files.keys().any(|p| {
-                p.strip_suffix(&literal)
+        view(
+            &self.source_paths(root),
+            root,
+            path,
+            mode,
+            absolute,
+            |key| {
+                let file = self
+                    .manifest
+                    .files
+                    .get(key)
+                    .or_else(|| self.manifest.deferred.get(key))
+                    .unwrap();
+                Ok(Some((file.language, file.read_source()?)))
+            },
+        )?
+        .context("Source contents are unavailable")
+    }
+}
+
+fn browse<T>(
+    files: &BTreeMap<String, T>,
+    root: &std::path::Path,
+    path: &str,
+    absolute: bool,
+) -> Result<String> {
+    let tree = crate::navigation::Directory::new(files.keys().map(String::as_str));
+    let dirs = tree.paths();
+    let path = crate::navigation::normalize_indexed(path, root, absolute, |p| {
+        files.contains_key(p) || dirs.iter().any(|d| d == p)
+    })?;
+    if files.contains_key(&path) {
+        let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        return Ok(format!(
+            "This is a file. Use {}, or {}.",
+            crate::render::inline(&format!("view({})", serde_json::to_string(&path)?)),
+            crate::render::inline(&format!("browse({})", serde_json::to_string(parent)?))
+        ));
+    }
+    if path.is_empty() {
+        return Ok(tree.render(""));
+    }
+    let matches = crate::navigation::matches(dirs.iter().map(String::as_str), &path);
+    if matches.len() != 1 {
+        return Ok(crate::navigation::choices(&matches, "directories"));
+    }
+    Ok(tree.at(matches[0]).render(matches[0]))
+}
+fn view<T>(
+    files: &BTreeMap<String, T>,
+    root: &std::path::Path,
+    path: &str,
+    mode: crate::navigation::Mode,
+    absolute: bool,
+    read: impl FnOnce(&T) -> Result<Option<(crate::model::Language, String)>>,
+) -> Result<Option<String>> {
+    let indexed = |p: &str| {
+        files.contains_key(p)
+            || files.keys().any(|f| {
+                f.strip_suffix(p)
                     .is_some_and(|prefix| prefix.ends_with('/'))
-            }) {
-            (literal, None)
+            })
+    };
+    let literal = crate::navigation::normalize_indexed(path, root, absolute, indexed)?;
+    let (path, requested) = if files.contains_key(&literal)
+        || files.keys().any(|p| {
+            p.strip_suffix(&literal)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+        }) {
+        (literal, None)
+    } else {
+        // An indexed filename can itself contain location delimiters.
+        // Split after the longest known filename before validating a suffix.
+        let boundary = literal.char_indices().rev().find_map(|(i, c)| {
+            (matches!(c, ':' | '#' | '(') && indexed(&literal[..i])).then_some(i)
+        });
+        let (path, lines) = if let Some(i) = boundary {
+            let (_, lines) = crate::navigation::location(&format!("file{}", &literal[i..]))?;
+            ensure!(
+                lines.is_some(),
+                "Invalid line range; use `path:1-20` (1-based, inclusive)"
+            );
+            (&literal[..i], lines)
         } else {
-            // An indexed filename can itself contain location delimiters.
-            // Split after the longest known filename before validating a suffix.
-            let boundary = literal.char_indices().rev().find_map(|(i, c)| {
-                (matches!(c, ':' | '#' | '(') && indexed(&literal[..i])).then_some(i)
-            });
-            let (path, lines) = if let Some(i) = boundary {
-                let (_, lines) = crate::navigation::location(&format!("file{}", &literal[i..]))?;
-                ensure!(
-                    lines.is_some(),
-                    "Invalid line range; use `path:1-20` (1-based, inclusive)"
-                );
-                (&literal[..i], lines)
-            } else {
-                crate::navigation::location(path)?
-            };
-            let path = if files.contains_key(path) {
-                path
-            } else {
-                path.strip_prefix("…/").unwrap_or(path)
-            };
-            (
-                crate::navigation::normalize_indexed(path, root, absolute, indexed)?,
-                lines,
-            )
+            crate::navigation::location(path)?
         };
-        let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
-        if matches.len() != 1 {
-            return Ok(crate::navigation::choices(&matches, "files"));
-        }
-        let path = matches[0];
-        let key = &files[path];
-        let file = self
-            .manifest
-            .files
-            .get(key)
-            .or_else(|| self.manifest.deferred.get(key))
-            .unwrap();
-        let language = file.language;
-        let source = file.read_source()?;
-        let (range, first, last) = crate::navigation::lines(&source, requested)?;
-        let (body, tag) = match mode {
-            crate::navigation::Mode::Exact => (source[range].to_owned(), language.tag()),
-            crate::navigation::Mode::Minified => {
-                (crate::minify::render(&source, language, range), "")
-            }
+        let path = if files.contains_key(path) {
+            path
+        } else {
+            path.strip_prefix("…/").unwrap_or(path)
         };
-        let fence =
-            "`".repeat(3.max(body.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
-        let separator = if body.ends_with('\n') { "" } else { "\n" };
-        Ok(format!(
-            "{}\n{fence}{tag}\n{body}{separator}{fence}",
-            crate::render::inline(&crate::render::location(
-                &crate::navigation::quote(path),
-                first,
-                last
-            ))
+        (
+            crate::navigation::normalize_indexed(path, root, absolute, indexed)?,
+            lines,
+        )
+    };
+    let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
+    if matches.len() != 1 {
+        return Ok(Some(crate::navigation::choices(&matches, "files")));
+    }
+    let path = matches[0];
+    let Some((language, source)) = read(&files[path])? else {
+        return Ok(None);
+    };
+    let (range, first, last) = crate::navigation::lines(&source, requested)?;
+    let (body, tag) = match mode {
+        crate::navigation::Mode::Exact => (source[range].to_owned(), language.tag()),
+        crate::navigation::Mode::Minified => (crate::minify::render(&source, language, range), ""),
+    };
+    let fence = "`".repeat(3.max(body.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
+    let separator = if body.ends_with('\n') { "" } else { "\n" };
+    Ok(Some(format!(
+        "{}\n{fence}{tag}\n{body}{separator}{fence}",
+        crate::render::inline(&crate::render::location(
+            &crate::navigation::quote(path),
+            first,
+            last
         ))
+    )))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_view_reads_only_the_resolved_source_and_can_defer_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let prepared = crate::repository::materialize::Prepared {
+            omitted: Default::default(),
+            transfer_bytes: 0,
+            unavailable: Default::default(),
+            transport: None,
+            resolved_target: None,
+            branch: None,
+            revision: String::new(),
+            selected: BTreeMap::from([("src/Code.cs".into(), "object".into())]),
+            tracked: Default::default(),
+            directories: Default::default(),
+        };
+        let text = repository(
+            root.path(),
+            None,
+            &prepared,
+            "Code.cs:2",
+            Some(crate::navigation::Mode::Exact),
+            |path| {
+                assert_eq!(path, "src/Code.cs");
+                Ok(Some(b"// first line\nclass Example {}\n".to_vec()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(text.contains("class Example {}"));
+        assert!(!text.contains("first line"));
+        assert!(
+            repository(
+                root.path(),
+                None,
+                &prepared,
+                "Code.cs",
+                Some(crate::navigation::Mode::Exact),
+                |_| Ok(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            repository(
+                root.path(),
+                None,
+                &prepared,
+                "Missing.cs",
+                Some(crate::navigation::Mode::Exact),
+                |_| panic!("Unknown files must not be downloaded"),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

@@ -744,12 +744,79 @@ fn input_key(input: &SourceInput, project: &Project, stamp: &Stamp) -> String {
         .to_string()
 }
 
+#[derive(Default)]
 struct Indexed {
     changed: bool,
     reused: bool,
     encoded_bytes: u64,
     extraction: std::time::Duration,
     storage: std::time::Duration,
+}
+
+enum InputContents {
+    Metadata {
+        bytes: Vec<u8>,
+        stem: String,
+    },
+    Source {
+        source: String,
+        language: Language,
+        defines: Vec<String>,
+        edition: String,
+    },
+}
+impl InputContents {
+    fn read(input: &SourceInput, project: &Project) -> Result<Self> {
+        if input.metadata {
+            Ok(Self::Metadata {
+                bytes: std::fs::read(&input.path)?,
+                stem: input
+                    .path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+        } else {
+            Ok(Self::Source {
+                source: read_stable(&input.path, input.language)?,
+                language: input.language,
+                defines: crate::store::canonical_defines(&project.defines),
+                edition: project.edition.clone(),
+            })
+        }
+    }
+
+    fn identity(&self) -> Result<crate::store::ObjectId> {
+        match self {
+            Self::Metadata { bytes, stem } => crate::store::metadata_id(bytes, stem),
+            Self::Source {
+                source,
+                language,
+                defines,
+                edition,
+            } => crate::store::source_id(source, *language, defines, edition),
+        }
+    }
+
+    fn extract(self) -> Result<FileData> {
+        match self {
+            Self::Metadata { bytes, stem } => crate::metadata::file_data_bytes(bytes, &stem),
+            Self::Source {
+                source,
+                language,
+                defines,
+                edition,
+            } => {
+                let facts = crate::extract::extract(&source, language, &defines, &edition)?;
+                Ok(FileData {
+                    source,
+                    facts,
+                    assembly: None,
+                })
+            }
+        }
+    }
 }
 
 fn index_input(
@@ -780,40 +847,16 @@ fn index_input(
     }
     let mut extraction = std::time::Duration::ZERO;
     let installed = (|| -> Result<_> {
-        if input.metadata {
-            verify()?;
-            let bytes = std::fs::read(&input.path)?;
-            verify()?;
-            let stem = input
-                .path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let id = crate::store::metadata_id(&bytes, &stem)?;
-            store.install(key, stamp, id, verify, || {
-                let start = std::time::Instant::now();
-                let data = crate::metadata::file_data_bytes(bytes, &stem);
-                extraction = start.elapsed();
-                data
-            })
-        } else {
-            let source = read_stable(&input.path, input.language)?;
-            verify()?;
-            let defines = crate::store::canonical_defines(&project.defines);
-            let id = crate::store::source_id(&source, input.language, &defines, &project.edition)?;
-            store.install(key, stamp, id, verify, || {
-                let start = std::time::Instant::now();
-                let facts =
-                    crate::extract::extract(&source, input.language, &defines, &project.edition);
-                extraction = start.elapsed();
-                Ok(FileData {
-                    source,
-                    facts: facts?,
-                    assembly: None,
-                })
-            })
-        }
+        verify()?;
+        let contents = InputContents::read(input, project)?;
+        verify()?;
+        let id = contents.identity()?;
+        store.install(key, stamp, id, verify, || {
+            let start = std::time::Instant::now();
+            let data = contents.extract();
+            extraction = start.elapsed();
+            data
+        })
     })()
     .with_context(|| {
         format!(
@@ -833,6 +876,116 @@ fn index_input(
 }
 
 type IndexedSources = BTreeMap<String, (Stamp, Result<Indexed>)>;
+
+type SourceJob<'a> = (String, (Stamp, &'a SourceInput, &'a Project));
+
+fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
+    let mut results = BTreeMap::new();
+    let mut retry = Vec::new();
+    {
+        // Reserve the whole batch at once: retaining individual reservations
+        // while acquiring the next one could deadlock the bounded parser budget.
+        let metadata = jobs[0].1.1.metadata;
+        debug_assert!(
+            jobs.iter()
+                .all(|(_, (_, input, _))| input.metadata == metadata)
+        );
+        let _admission =
+            crate::memory::admit_file(jobs.iter().map(|(_, (s, _, _))| s.size).sum(), metadata);
+        let mut pending = Vec::new();
+        let mut prepared = Vec::new();
+        for (key, (stamp, input, project)) in jobs {
+            let started = std::time::Instant::now();
+            let mut extraction = std::time::Duration::ZERO;
+            let stage = (|| -> Result<_> {
+                if store.current(key, stamp)?.is_some() {
+                    ensure!(
+                        Stamp::read(&input.path)? == *stamp,
+                        "File changed during indexing; retry query"
+                    );
+                    return Ok(None);
+                }
+                ensure!(
+                    Stamp::read(&input.path)? == *stamp,
+                    "File changed before extraction; retry query"
+                );
+                let contents = InputContents::read(input, project)?;
+                ensure!(
+                    Stamp::read(&input.path)? == *stamp,
+                    "File changed during indexing; retry query"
+                );
+                let id = contents.identity()?;
+                store
+                    .prepare_install(key, stamp, id, || {
+                        let started = std::time::Instant::now();
+                        let data = contents.extract();
+                        extraction = started.elapsed();
+                        data
+                    })
+                    .map(Some)
+            })();
+            let timing = Indexed {
+                extraction,
+                storage: started.elapsed().saturating_sub(extraction),
+                ..Default::default()
+            };
+            match stage {
+                Ok(Some(value)) => {
+                    pending.push(value);
+                    prepared.push((key, stamp, input, project, timing));
+                }
+                Ok(None) => {
+                    results.insert(key.clone(), (stamp.clone(), Ok(timing)));
+                }
+                Err(error) => {
+                    results.insert(key.clone(), (stamp.clone(), Err(error)));
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let started = std::time::Instant::now();
+            let installed = store.scope.install_batch(&pending, |index| {
+                let (_, stamp, input, _, _) = &prepared[index];
+                ensure!(
+                    Stamp::read(&input.path)? == **stamp,
+                    "File changed during indexing; retry query"
+                );
+                Ok(())
+            });
+            let storage = started.elapsed() / pending.len() as u32;
+            match installed {
+                Ok(installed) => {
+                    for ((key, stamp, input, project, mut timing), installed) in
+                        prepared.into_iter().zip(installed)
+                    {
+                        if let Some(installed) = installed {
+                            timing.changed = installed.built;
+                            timing.reused = installed.reused;
+                            timing.encoded_bytes = installed.encoded_bytes;
+                            timing.storage += storage;
+                            results.insert(key.clone(), (stamp.clone(), Ok(timing)));
+                        } else {
+                            retry.push((key, stamp, input, project));
+                        }
+                    }
+                }
+                // The transaction was aborted. Retry individually so one
+                // changed source does not exclude its unchanged neighbors.
+                Err(_) => retry.extend(prepared.into_iter().map(|(k, s, i, p, _)| (k, s, i, p))),
+            }
+        }
+    }
+    for (key, stamp, input, project) in retry {
+        results.insert(
+            key.clone(),
+            (
+                stamp.clone(),
+                index_input(store, key, input, project, stamp),
+            ),
+        );
+    }
+    results
+}
 
 pub(crate) fn index_native(
     store: &Store,
@@ -861,8 +1014,8 @@ pub(crate) fn index_native(
     Ok(())
 }
 
-/// C# discovery already supplies all sources. Extract independent compilation
-/// contexts concurrently, then assemble the manifest in discovery order.
+/// Extract independent source and metadata inputs concurrently, then assemble
+/// the manifest in discovery order.
 fn index_sources(
     store: &Store,
     inputs: &VecDeque<SourceInput>,
@@ -872,35 +1025,50 @@ fn index_sources(
     let mut jobs = BTreeMap::new();
     for input in inputs
         .iter()
-        .filter(|i| !i.metadata && i.language == Language::CSharp)
+        .filter(|i| i.metadata || i.language == Language::CSharp)
         .take(1_000_000)
     {
         let Ok(stamp) = Stamp::read(&input.path) else {
             continue;
         };
-        if stamp.size as usize > MAX_SOURCE_BYTES {
+        if !input.metadata && stamp.size as usize > MAX_SOURCE_BYTES {
             continue;
         }
         let project = &projects[input.project];
         let key = input_key(input, project, &stamp);
         jobs.entry(key).or_insert((stamp, input, project));
     }
-    let jobs: Vec<_> = jobs.into_iter().collect();
+    let mut jobs: Vec<_> = jobs.into_iter().collect();
+    // Keep each admission class together so hash order cannot fragment batches.
+    jobs.sort_by_key(|(_, (_, input, _))| input.metadata);
+    // Bound retained encodings and amortize durable commits across small files.
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, (_, (stamp, input, _))) in jobs.iter().enumerate() {
+        if index > start
+            && (index - start >= 128
+                || bytes + stamp.size > 1024 * 1024
+                || input.metadata != jobs[start].1.1.metadata)
+        {
+            batches.push(&jobs[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += stamp.size;
+    }
+    if start < jobs.len() {
+        batches.push(&jobs[start..]);
+    }
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(4)
-        .min(jobs.len());
-    let build = |(key, (stamp, input, project)): &(String, (Stamp, &SourceInput, &Project))| {
-        (
-            key.clone(),
-            (
-                stamp.clone(),
-                index_input(store, key, input, project, stamp),
-            ),
-        )
-    };
+        .min(batches.len());
     if workers <= 1 {
-        return Ok(jobs.iter().map(build).collect());
+        return Ok(batches
+            .iter()
+            .flat_map(|batch| index_source_batch(store, batch))
+            .collect());
     }
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -908,8 +1076,8 @@ fn index_sources(
             .map(|_| {
                 scope.spawn(|| {
                     let mut results = Vec::new();
-                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        results.push(build(job));
+                    while let Some(batch) = batches.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        results.extend(index_source_batch(store, batch));
                     }
                     results
                 })
