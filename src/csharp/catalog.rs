@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     model::{Declaration, Language},
-    store::Store,
+    store::{DeclarationLookup, Store},
     workspace::Manifest,
 };
 use anyhow::{Result, ensure};
@@ -32,7 +32,7 @@ pub(crate) struct Symbol {
     pub file: String,
     pub project: usize,
     position: usize,
-    pub facts: Arc<DeclarationFile>,
+    facts: Arc<DeclarationFile>,
     pub id: DefinitionId,
 }
 impl Symbol {
@@ -48,7 +48,8 @@ impl Symbol {
 pub(crate) struct Catalog {
     headers: HashMap<String, Arc<DeclarationFile>>,
     bytes: usize,
-    lookups: HashMap<(String, usize), Vec<Symbol>>,
+    lookups: HashMap<(String, usize, DeclarationLookup), Vec<Symbol>>,
+    imports: HashMap<String, Vec<super::syntax::Import>>,
     globals: Option<HashMap<usize, Vec<super::syntax::Import>>>,
     assemblies: Option<HashMap<String, Vec<String>>>,
     forwarders: HashMap<String, Vec<(String, String)>>,
@@ -136,9 +137,13 @@ impl Catalog {
             }
             self.globals = Some(globals);
         }
-        let mut imports: Vec<_> = symbol
-            .facts
-            .imports
+        if !self.imports.contains_key(&symbol.file) {
+            self.imports.insert(
+                symbol.file.clone(),
+                view.store.csharp_imports(view.tx, &symbol.file)?,
+            );
+        }
+        let mut imports: Vec<_> = self.imports[&symbol.file]
             .iter()
             .filter(|i| !i.global && i.scope.contains(&symbol.declaration().span.start))
             .cloned()
@@ -208,24 +213,35 @@ impl Catalog {
         project: usize,
         index: u32,
     ) -> Result<Symbol> {
-        let facts = if view.manifest.files[file].metadata {
-            let facts = view
-                .store
-                .csharp_declaration(view.tx, file, index)?
-                .ok_or_else(|| anyhow::anyhow!("Missing metadata declaration"))?;
-            let key = format!("name:{file}:{}", facts.declarations[0].name);
-            self.retain_headers(&key, facts)?
-        } else {
-            self.headers(view, file)?
-        };
+        let facts = self.declaration(view, file, index)?;
         let position = facts
             .headers
             .iter()
             .position(|h| h.declaration == index)
             .ok_or_else(|| anyhow::anyhow!("Missing declaration index"))?;
-        Self::symbol_with_facts(view, file, project, position as u32, facts)
+        self.symbol_with_facts(view, file, project, position as u32, facts)
+    }
+    fn declaration(
+        &mut self,
+        view: &View<'_>,
+        file: &str,
+        index: u32,
+    ) -> Result<Arc<DeclarationFile>> {
+        self.check(view)?;
+        let key = format!("declaration:{file}:{index}");
+        let facts = if let Some(facts) = self.headers.get(&key) {
+            facts.clone()
+        } else {
+            let facts = view
+                .store
+                .csharp_declaration(view.tx, file, index)?
+                .ok_or_else(|| anyhow::anyhow!("Missing C# declaration"))?;
+            self.retain_headers(&key, facts)?
+        };
+        Ok(facts)
     }
     fn symbol_with_facts(
+        &mut self,
         view: &View<'_>,
         file: &str,
         project: usize,
@@ -243,11 +259,12 @@ impl Catalog {
         if !view.manifest.files[file].metadata {
             let mut owner = header.owner;
             while let Some(index) = owner {
-                let header = &facts.headers[index as usize];
+                let facts = self.declaration(view, file, index)?;
+                let header = &facts.headers[0];
                 owners.push((
-                    facts.declarations[index as usize].name.as_str(),
+                    facts.declarations[0].name.clone(),
                     header.generics.len(),
-                    &header.parameters,
+                    header.parameters.clone(),
                 ));
                 owner = header.owner;
             }
@@ -295,9 +312,60 @@ impl Catalog {
             .map(|i| self.symbol(view, &symbol.file, symbol.project, i))
             .transpose()
     }
-    pub fn lookup(&mut self, view: &View<'_>, name: &str, project: usize) -> Result<Vec<Symbol>> {
+    pub fn in_file(
+        &mut self,
+        view: &View<'_>,
+        file: &str,
+        project: usize,
+        name: &str,
+        kind: DeclarationLookup,
+    ) -> Result<Vec<Symbol>> {
+        view.store
+            .csharp_lookup(view.tx, file, name, kind)?
+            .into_iter()
+            .map(|index| self.symbol(view, file, project, index))
+            .collect()
+    }
+    pub fn members(&mut self, view: &View<'_>, owner: &Symbol, name: &str) -> Result<Vec<Symbol>> {
+        let parts = if owner.declaration().modifiers.iter().any(|m| m == "partial") {
+            self.lookup(
+                view,
+                &owner.declaration().name,
+                owner.project,
+                DeclarationLookup::Type,
+            )?
+            .into_iter()
+            .filter(|s| s.id == owner.id)
+            .collect()
+        } else {
+            vec![owner.clone()]
+        };
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for part in parts {
+            result.extend(
+                self.in_file(
+                    view,
+                    &part.file,
+                    part.project,
+                    name,
+                    DeclarationLookup::Members(part.header().declaration),
+                )?
+                .into_iter()
+                .filter(|member| seen.insert(member.id.clone())),
+            );
+        }
+        Ok(result)
+    }
+    pub fn lookup(
+        &mut self,
+        view: &View<'_>,
+        name: &str,
+        project: usize,
+        kind: DeclarationLookup,
+    ) -> Result<Vec<Symbol>> {
         self.check(view)?;
-        let lookup_key = (name.to_owned(), project);
+        let lookup_key = (name.to_owned(), project, kind);
         if let Some(cached) = self.lookups.get(&lookup_key) {
             return Ok(cached.clone());
         }
@@ -320,15 +388,6 @@ impl Catalog {
             }) {
                 continue;
             }
-            let facts = if file.metadata {
-                let facts = view
-                    .store
-                    .csharp_members(view.tx, &key, name)?
-                    .ok_or_else(|| anyhow::anyhow!("Missing metadata name record"))?;
-                self.retain_headers(&format!("name:{key}:{name}"), facts)?
-            } else {
-                self.headers(view, &key)?
-            };
             for membership in &file.memberships {
                 if if file.metadata {
                     membership.project != project || !view.manifest.metadata_visible(file, project)
@@ -337,17 +396,8 @@ impl Catalog {
                 } {
                     continue;
                 }
-                for (index, declaration) in facts.declarations.iter().enumerate() {
-                    if declaration.name != name || facts.headers[index].local {
-                        continue;
-                    }
-                    let symbol = Self::symbol_with_facts(
-                        view,
-                        &key,
-                        membership.project,
-                        index as u32,
-                        facts.clone(),
-                    )?;
+                for symbol in self.in_file(view, &key, membership.project, name, kind)? {
+                    let declaration = symbol.declaration();
                     if seen.insert((symbol.id.context.clone(), symbol.id.key.clone()))
                         || declaration.named_type()
                             && declaration.modifiers.iter().any(|m| m == "partial")

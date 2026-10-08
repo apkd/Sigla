@@ -2,6 +2,48 @@ use sigla::{discovery::Policy, service::App};
 use std::sync::Arc;
 
 #[tokio::test]
+async fn caller_search_with_common_names_keeps_only_the_requested_receiver() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Test.csproj"),
+        "<Project><ItemGroup><Compile Include=\"Target.cs\"/><Compile Include=\"Noise.cs\"/></ItemGroup></Project>").unwrap();
+    std::fs::write(
+        root.path().join("Target.cs"),
+        r#"
+class Player { public void Play() {} }
+class Derived : Player {}
+class Usage {
+    void Direct(Player player) { player.Play(); }
+    void Inherited(Derived player) { player.Play(); }
+}
+"#,
+    )
+    .unwrap();
+    let noise: String = (0..150)
+        .map(|i| format!("class Other{i} {{ public void Play() {{}} void Use() {{ Play(); }} }}\n"))
+        .collect();
+    std::fs::write(root.path().join("Noise.cs"), noise).unwrap();
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            2,
+        )
+        .unwrap(),
+    );
+    for _ in 0..2 {
+        let result = app
+            .search(root.path().to_str().unwrap(), "calls:Player.Play")
+            .await
+            .unwrap();
+        assert!(result.contains("Usage.Direct"), "{result}");
+        assert!(result.contains("Usage.Inherited"), "{result}");
+        assert!(!result.contains("Noise.cs"), "{result}");
+        assert!(!result.contains("Possible"), "{result}");
+    }
+}
+
+#[tokio::test]
 async fn reflection_receivers_resolve_inside_interpolation_and_loops() {
     check(
         r#"
@@ -167,6 +209,15 @@ partial class Split<T> { }
 class Item { public void Run() {} }
 class Task { void Execute(Split<Item> split) { split.Value./*partial-base*/Run(); } }
 "#, "using Parent = Library; namespace Library { class Base<T> { public T Value => default; } } partial class Split<T> : Parent.Base<T> {}", &[("/*partial-base*/", "Item.Run")]).await;
+}
+
+#[tokio::test]
+async fn partial_members_keep_overloads_from_each_part() {
+    check_extra(
+        "partial class Player { public partial void Play(); void Use() { /*first*/Play(); /*second*/Play(1); } } class Other { public void Play(int value) {} }",
+        "partial class Player { public partial void Play() {} public void Play(int value) {} }",
+        &[("/*first*/", "Player.Play"), ("/*second*/", "Player.Play")],
+    ).await;
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ use super::{
     syntax::*,
     types::*,
 };
+use crate::store::DeclarationLookup;
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -108,11 +109,19 @@ impl Binder {
     fn site(&mut self, view: &View<'_>, site: &Site<'_>) -> Result<Option<Symbol>> {
         if view.manifest.files[site.file].metadata {
             Ok(self
-                .lookup(view, &site.declaration.name, site.project)?
+                .catalog
+                .in_file(
+                    view,
+                    site.file,
+                    site.project,
+                    &site.declaration.name,
+                    DeclarationLookup::Name,
+                )?
                 .into_iter()
                 .find(|s| {
                     s.file == site.file && s.declaration().name_span == site.declaration.name_span
-                }))
+                })
+                .map(|s| self.remember(s)))
         } else {
             let headers = self.catalog.headers(view, site.file)?;
             let Some(index) = headers
@@ -276,7 +285,8 @@ impl Binder {
     ) -> Result<Option<DefinitionId>> {
         if view.manifest.files[file].metadata {
             return Ok(self
-                .lookup(view, name, project)?
+                .catalog
+                .in_file(view, file, project, name, DeclarationLookup::Name)?
                 .into_iter()
                 .find(|s| s.file == file && s.declaration().name_span.start == position)
                 .map(|s| s.id));
@@ -297,8 +307,10 @@ impl Binder {
         self.definitions.insert(symbol.id.clone(), symbol.clone());
         symbol
     }
-    fn lookup(&mut self, view: &View<'_>, name: &str, project: usize) -> Result<Vec<Symbol>> {
-        let symbols = self.catalog.lookup(view, name, project)?;
+    fn lookup_types(&mut self, view: &View<'_>, name: &str, project: usize) -> Result<Vec<Symbol>> {
+        let symbols = self
+            .catalog
+            .lookup(view, name, project, DeclarationLookup::Type)?;
         let mut seen = std::collections::HashSet::new();
         Ok(symbols
             .into_iter()
@@ -320,7 +332,12 @@ impl Binder {
             .any(|m| m == "partial")
         {
             self.catalog
-                .lookup(view, &symbol.declaration().name, symbol.project)?
+                .lookup(
+                    view,
+                    &symbol.declaration().name,
+                    symbol.project,
+                    DeclarationLookup::Type,
+                )?
                 .into_iter()
                 .filter(|s| s.id == symbol.id)
                 .collect()
@@ -536,7 +553,7 @@ impl Binder {
                 let assembly_scope = assembly
                     .map(|name| self.catalog.assembly_scope(view, name, sought))
                     .transpose()?;
-                let candidates = self.lookup(
+                let candidates = self.lookup_types(
                     view,
                     sought.rsplit('.').next().unwrap_or(simple),
                     context.project,
@@ -695,7 +712,7 @@ impl Binder {
             // Use every visible definition conservatively if references disagree.
             let mut result = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            for symbol in self.lookup(view, primitive.metadata_name(), project)? {
+            for symbol in self.lookup_types(view, primitive.metadata_name(), project)? {
                 if symbol.declaration().qualified == format!("System.{}", primitive.metadata_name())
                     && seen.insert(symbol.id.clone())
                 {
@@ -712,7 +729,8 @@ impl Binder {
             return Ok(vec![]);
         };
         let mut direct = Vec::new();
-        for member in self.lookup(view, name, owner.project)? {
+        for member in self.catalog.members(view, &owner, name)? {
+            let member = self.remember(member);
             if member.header().explicit_interface.is_none()
                 && member.declaration().owner == owner.declaration().qualified
                 && member.id.context == owner.id.context
@@ -864,6 +882,16 @@ impl Binder {
         Ok(result)
     }
 
+    fn release_occurrence(&mut self) {
+        // Results own their declarations. Only work accounting spans independent bindings;
+        // reusable decoded records and binding results live in the bounded shared caches.
+        let work = self.catalog.work;
+        self.catalog = Catalog::default();
+        self.catalog.work = work;
+        self.definitions.clear();
+        self.observed.clear();
+    }
+
     pub fn resolve(
         &mut self,
         view: &View<'_>,
@@ -873,7 +901,7 @@ impl Binder {
         construction: bool,
         occurrence_name: &str,
     ) -> Result<Vec<(Symbol, bool)>> {
-        self.observed.clear();
+        self.release_occurrence();
         self.catalog.check(view)?;
         let key = *blake3::hash(&postcard::to_allocvec(&(
             view.manifest.environment,
@@ -890,9 +918,12 @@ impl Binder {
             let mut result = Vec::new();
             for target in targets {
                 let symbol = if view.manifest.files[&target.file].metadata {
-                    self.lookup(view, &target.name, project)?
-                        .into_iter()
-                        .find(|s| s.id == target.id && s.file == target.file)
+                    Some(self.catalog.symbol(
+                        view,
+                        &target.file,
+                        target.project,
+                        target.declaration,
+                    )?)
                 } else {
                     let facts = self.catalog.headers(view, &target.file)?;
                     let mut found = None;
@@ -1031,6 +1062,7 @@ impl Binder {
                         id: s.id.clone(),
                         file: s.file.clone(),
                         name: s.declaration().name.clone(),
+                        declaration: s.header().declaration,
                         uncertain,
                     })
                     .collect(),
@@ -1160,13 +1192,13 @@ impl Binder {
                         ..Default::default()
                     });
                 }
-                if let Some((index, _)) = context
-                    .facts
+                let headers = self.catalog.headers(view, &context.file)?;
+                if let Some((index, _)) = headers
                     .declarations
                     .iter()
                     .enumerate()
                     .filter(|(i, d)| {
-                        context.facts.headers[*i].local
+                        headers.headers[*i].local
                             && d.callable()
                             && d.name == *name
                             && d.scope.contains(&expression.span.start)
@@ -1219,7 +1251,7 @@ impl Binder {
                     }
                     // Keep inferred types and navigation identity together. A type-only
                     // result loses the use even when the local declaration is indexed.
-                    let declaration = context.facts.declarations.iter().position(|d| {
+                    let declaration = headers.declarations.iter().position(|d| {
                         d.local() && d.name == local.name && d.name_span == local.span
                     });
                     let symbols = if let Some(index) = declaration {
@@ -1241,8 +1273,7 @@ impl Binder {
                         ..Default::default()
                     });
                 }
-                if let Some((index, _)) = context
-                    .facts
+                if let Some((index, _)) = headers
                     .declarations
                     .iter()
                     .enumerate()
@@ -1994,8 +2025,15 @@ impl Binder {
             };
             if let Some(name) = name {
                 let imports = self.catalog.imports(view, context)?;
+                let headers = self.catalog.headers(view, &context.file)?;
                 let mut scopes: std::collections::BTreeMap<usize, Vec<Symbol>> = Default::default();
-                for candidate in self.lookup(view, &name, context.project)? {
+                for candidate in self.catalog.lookup(
+                    view,
+                    &name,
+                    context.project,
+                    DeclarationLookup::Extension,
+                )? {
+                    let candidate = self.remember(candidate);
                     if !candidate
                         .header()
                         .parameters
@@ -2034,8 +2072,7 @@ impl Binder {
                             let depth = if import.global {
                                 0
                             } else {
-                                context
-                                    .facts
+                                headers
                                     .declarations
                                     .iter()
                                     .filter(|d| {
@@ -2779,4 +2816,83 @@ fn strip_arity(name: &str) -> String {
         .map(|part| part.split('`').next().unwrap_or(part))
         .collect::<Vec<_>>()
         .join(".")
+}
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use crate::{discovery::Policy, workspace::Workspace};
+
+    #[test]
+    fn common_members_load_only_their_owner_and_release_previous_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Test.csproj"),
+            "<Project><ItemGroup><Compile Include=\"Alpha.cs\"/><Compile Include=\"Beta.cs\"/><Compile Include=\"Noise.cs\"/></ItemGroup></Project>").unwrap();
+        for name in ["Alpha", "Beta"] {
+            std::fs::write(
+                root.path().join(format!("{name}.cs")),
+                format!("class {name} {{ public void Play() {{}} void Use() {{ Play(); }} }}"),
+            )
+            .unwrap();
+        }
+        let noise: String = (0..200).map(|i| format!(
+            "class Noise{i} {{ public void Play() {{}} public int Alpha; public int Beta; }}\n"
+        )).collect();
+        std::fs::write(root.path().join("Noise.cs"), noise).unwrap();
+        let mut workspace = Workspace::open(
+            root.path().into(),
+            cache.path(),
+            Policy::new(vec![root.path().into()]).unwrap(),
+            &cache.path().join("analysis"),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        workspace.refresh().unwrap();
+        let tx = workspace.store.read().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let view = View {
+            store: &workspace.store,
+            tx: &tx,
+            manifest: &workspace.manifest,
+            cancel: &cancel,
+        };
+        let mut binder = Binder::default();
+        let mut work = 0;
+        // Repeat with warm binding results, using the same binder as a caller search.
+        for name in ["Alpha", "Beta", "Alpha", "Beta"] {
+            let (file, entry) = workspace
+                .manifest
+                .files
+                .iter()
+                .find(|(_, entry)| entry.path.ends_with(format!("{name}.cs")))
+                .unwrap();
+            let source = std::fs::read_to_string(root.path().join(format!("{name}.cs"))).unwrap();
+            let result = binder
+                .resolve(
+                    &view,
+                    file,
+                    entry.memberships[0].project,
+                    source.rfind("Play()").unwrap(),
+                    false,
+                    "Play",
+                )
+                .unwrap();
+            assert_eq!(result.len(), 1);
+            assert!(!result[0].1);
+            assert_eq!(result[0].0.declaration().owner, name);
+            assert!(
+                binder
+                    .definitions
+                    .values()
+                    .all(|symbol| symbol.file == *file),
+                "Unrelated or previous declarations remain retained"
+            );
+            assert!(
+                binder.catalog.work > work,
+                "Work accounting must survive occurrence resets"
+            );
+            work = binder.catalog.work;
+        }
+    }
 }

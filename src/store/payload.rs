@@ -18,8 +18,15 @@ pub const ASSEMBLY: &[u8] = &[7];
 pub const ENVIRONMENT: &[u8] = &[8];
 pub const MODULES: &[u8] = &[9];
 const BODY: u8 = 10;
-const MEMBER: u8 = 11;
-const DECLARATION_NAME: u8 = 12;
+const DECLARATION: u8 = 12;
+pub const IMPORTS: &[u8] = &[13];
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DeclarationLookup {
+    Name,
+    Type,
+    Extension,
+    Members(u32),
+}
 pub const ANALYSIS_VERSION: &str = env!("SIGLA_ANALYSIS_FINGERPRINT");
 
 pub fn body_key(index: u32) -> Vec<u8> {
@@ -27,14 +34,23 @@ pub fn body_key(index: u32) -> Vec<u8> {
     key.extend_from_slice(&index.to_be_bytes());
     key
 }
-pub fn member_key(name: &str) -> Vec<u8> {
+pub(crate) fn lookup_key(kind: DeclarationLookup, name: &str) -> Vec<u8> {
     // 32-byte object ID + tag + 480-byte name would exceed LMDB's default key limit.
-    let mut key = vec![MEMBER];
+    let mut key = match kind {
+        DeclarationLookup::Name => vec![14],
+        DeclarationLookup::Type => vec![15],
+        DeclarationLookup::Extension => vec![16],
+        DeclarationLookup::Members(owner) => {
+            let mut key = vec![17];
+            key.extend_from_slice(&owner.to_be_bytes());
+            key
+        }
+    };
     key.extend_from_slice(blake3::hash(name.as_bytes()).as_bytes());
     key
 }
 pub fn declaration_key(index: u32) -> Vec<u8> {
-    let mut key = vec![DECLARATION_NAME];
+    let mut key = vec![DECLARATION];
     key.extend_from_slice(&index.to_be_bytes());
     key
 }
@@ -148,36 +164,46 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
             FORWARDERS.to_vec(),
             crate::binary::encode(&syntax.forwarders)?,
         );
-        if data.assembly.is_some() {
-            // Exactly the previous metadata grouping; original declaration indices survive.
-            let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
-            for (index, declaration) in data.facts.declarations.iter().enumerate() {
-                ensure!(
-                    index < syntax.headers.len(),
-                    "Missing metadata declaration header"
-                );
-                groups.entry(&declaration.name).or_default().push(index);
-                records.insert(
-                    declaration_key(index.try_into()?),
-                    declaration.name.as_bytes().to_vec(),
-                );
+        records.insert(IMPORTS.to_vec(), crate::binary::encode(&syntax.imports)?);
+        let mut groups: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+        for (index, declaration) in data.facts.declarations.iter().enumerate() {
+            let header = syntax
+                .headers
+                .get(index)
+                .context("Missing C# declaration header")?;
+            let index: u32 = index.try_into()?;
+            records.insert(
+                declaration_key(index),
+                crate::binary::encode(&crate::csharp::syntax::DeclarationFile {
+                    declarations: vec![declaration.clone()],
+                    headers: vec![header.clone()],
+                    imports: Vec::new(),
+                })?,
+            );
+            if header.local {
+                continue;
             }
-            for (name, indices) in groups {
-                let declarations: Vec<_> = indices
-                    .iter()
-                    .map(|i| data.facts.declarations[*i].clone())
-                    .collect();
-                let headers: Vec<_> = indices.iter().map(|i| syntax.headers[*i].clone()).collect();
-                records.insert(
-                    member_key(name),
-                    crate::binary::encode(&crate::csharp::syntax::DeclarationFile {
-                        declarations,
-                        headers,
-                        imports: syntax.imports.clone(),
-                    })?,
-                );
+            let mut add = |kind| {
+                groups
+                    .entry(lookup_key(kind, &declaration.name))
+                    .or_default()
+                    .push(index)
+            };
+            add(DeclarationLookup::Name);
+            if declaration.named_type() {
+                add(DeclarationLookup::Type);
             }
-        } else {
+            if header.parameters.first().is_some_and(|p| p.receiver) {
+                add(DeclarationLookup::Extension);
+            }
+            if let Some(owner) = header.owner {
+                add(DeclarationLookup::Members(owner));
+            }
+        }
+        for (key, indices) in groups {
+            records.insert(key, crate::binary::encode(&indices)?);
+        }
+        if data.assembly.is_none() {
             records.insert(
                 HEADERS.to_vec(),
                 crate::binary::encode(&crate::csharp::syntax::DeclarationFile {

@@ -15,6 +15,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+pub(crate) use payload::DeclarationLookup;
 pub use payload::{ANALYSIS_VERSION, canonical_defines, metadata_id, source_id};
 pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
@@ -246,13 +247,31 @@ impl Store {
     ) -> Result<Option<Arc<DeclarationFile>>> {
         self.headers_record(tx, file, payload::HEADERS)
     }
-    pub fn csharp_members(
+    pub(crate) fn csharp_lookup(
         &self,
         tx: &RoTxn<'_>,
         file: &str,
         name: &str,
-    ) -> Result<Option<Arc<DeclarationFile>>> {
-        self.headers_record(tx, file, &payload::member_key(name))
+        kind: DeclarationLookup,
+    ) -> Result<Vec<u32>> {
+        let Some(bytes) = self
+            .scope
+            .record(tx, file, &payload::lookup_key(kind, name))?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(payload::decode(bytes, 16)?.0)
+    }
+    pub(crate) fn csharp_imports(
+        &self,
+        tx: &RoTxn<'_>,
+        file: &str,
+    ) -> Result<Vec<crate::csharp::syntax::Import>> {
+        let bytes = self
+            .scope
+            .record(tx, file, payload::IMPORTS)?
+            .context("Missing C# imports")?;
+        Ok(payload::decode(bytes, 16)?.0)
     }
     pub fn csharp_declaration(
         &self,
@@ -260,13 +279,7 @@ impl Store {
         file: &str,
         index: u32,
     ) -> Result<Option<Arc<DeclarationFile>>> {
-        let Some(name) = self
-            .scope
-            .record(tx, file, &payload::declaration_key(index))?
-        else {
-            return Ok(None);
-        };
-        self.csharp_members(tx, file, std::str::from_utf8(name)?)
+        self.headers_record(tx, file, &payload::declaration_key(index))
     }
     pub fn csharp_body(
         &self,

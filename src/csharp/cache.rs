@@ -11,6 +11,7 @@ pub(super) struct Target {
     pub file: String,
     pub project: usize,
     pub name: String,
+    pub declaration: u32,
     pub uncertain: bool,
 }
 
