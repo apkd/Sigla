@@ -178,13 +178,9 @@ impl App {
                 let entry = entry?;
                 let path = entry.path();
                 ensure!(entry.file_type()?.is_dir(), "Invalid cache view directory");
-                let configured = kind == "editors"
+                let configured = kind == "unity-metadata"
                     && self.remote.as_ref().is_some_and(|remote| {
-                        remote
-                            .options
-                            .unity_versions
-                            .iter()
-                            .any(|version| entry.file_name() == version.to_string().as_str())
+                        crate::metadata_archive::configured(&path, &remote.options.unity_versions)
                     });
                 if configured || owners.retains(&path) {
                     continue;

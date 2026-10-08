@@ -43,7 +43,7 @@ fn validate(path: &Path) -> Result<Vec<(String, u64)>> {
             .open_database::<Bytes, Bytes>(&tx, Some("control"))?
             .ok_or_else(|| anyhow::anyhow!("Missing analysis control database"))?;
         ensure!(
-            control.get(&tx, b"format")? == Some(b"sigla-shared-analysis-1".as_slice()),
+            control.get(&tx, b"format")? == Some(crate::store::ANALYSIS_VERSION.as_bytes()),
             "Unknown analysis format"
         );
         let mut counts = Vec::new();
@@ -191,7 +191,8 @@ mod tests {
                     || Ok(()),
                     || {
                         Ok(Encoded {
-                            names: Default::default(),
+                            names: crate::binary::encode(&crate::store::shared::Names::default())
+                                .unwrap(),
                             records: BTreeMap::from([(vec![1], vec![42; 64 * 1024])]),
                         })
                     },

@@ -405,6 +405,30 @@ fn build_licenses(output: &Path) -> Result<()> {
 }
 
 fn main() {
+    fn sources(path: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, files);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
+    sources(Path::new("src"), &mut files);
+    files.sort();
+    let mut fingerprint = Sha256::new();
+    for file in files {
+        println!("cargo:rerun-if-changed={}", file.display());
+        fingerprint.update(file.to_string_lossy().as_bytes());
+        fingerprint.update([0]);
+        fingerprint.update(fs::read(file).unwrap());
+    }
+    println!(
+        "cargo:rustc-env=SIGLA_ANALYSIS_FINGERPRINT={:x}",
+        fingerprint.finalize()
+    );
     for input in [
         "Cargo.toml",
         "Cargo.lock",

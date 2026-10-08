@@ -1,7 +1,18 @@
 //! Written types retain lookup context; semantic types carry definition identity.
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct DefinitionId {
     /// Compilation or immutable assembly revision.
     pub context: String,
@@ -9,19 +20,59 @@ pub struct DefinitionId {
     pub key: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct ParameterId {
     pub owner: DefinitionId,
     pub ordinal: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext, __C::Error: rkyv::rancor::Source)))]
 pub struct NamePart {
     pub name: String,
+    #[rkyv(omit_bounds)]
     pub arguments: Vec<WrittenType>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext, __C::Error: rkyv::rancor::Source)))]
 pub enum WrittenType {
     /// ECMA parameter slots are resolved against the declaring type/method,
     /// including the containing type's parameters for nested metadata types.
@@ -31,17 +82,19 @@ pub enum WrittenType {
     },
     External {
         assembly: String,
+        #[rkyv(omit_bounds)]
         ty: Box<Self>,
     },
     Name {
         alias: Option<String>,
+        #[rkyv(omit_bounds)]
         parts: Vec<NamePart>,
     },
     Parameter(ParameterId),
-    Array(Box<Self>, u32),
-    Pointer(Box<Self>),
-    Nullable(Box<Self>),
-    Tuple(Vec<(Self, Option<String>)>),
+    Array(#[rkyv(omit_bounds)] Box<Self>, u32),
+    Pointer(#[rkyv(omit_bounds)] Box<Self>),
+    Nullable(#[rkyv(omit_bounds)] Box<Self>),
+    Tuple(#[rkyv(omit_bounds)] Vec<(Self, Option<String>)>),
     Dynamic,
     Inferred,
     Unsupported(String),
@@ -171,7 +224,19 @@ impl Primitive {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum PassingMode {
     #[default]
     Value,
@@ -180,7 +245,17 @@ pub enum PassingMode {
     In,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum Constant {
     Integer(i128),
     Unsupported,

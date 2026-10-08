@@ -1,5 +1,5 @@
 mod csharp;
-mod preprocess;
+pub(crate) mod preprocess;
 mod rust;
 pub(crate) use rust::modules as rust_modules;
 

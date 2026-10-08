@@ -1,5 +1,5 @@
 //! Workspace views over shared immutable analysis. See store/shared.rs for ownership.
-mod payload;
+pub(crate) mod payload;
 pub mod shared;
 
 use crate::{
@@ -27,7 +27,7 @@ pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<Option<crate::workspace::
         .transpose()
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FileData {
     pub source: String,
     pub facts: Facts,
@@ -146,7 +146,7 @@ impl Store {
             .database
             .record(&tx, &binding.object, payload::MODULES)?
             .context("Bound object is missing its module list")?;
-        Ok(Some(postcard::from_bytes(bytes)?))
+        Ok(Some(crate::binary::decode(bytes)?))
     }
     pub fn install<R: Serialize>(
         &self,
@@ -156,13 +156,23 @@ impl Store {
         verify: impl FnMut() -> Result<()>,
         build: impl FnOnce() -> Result<FileData>,
     ) -> Result<Installed> {
+        self.install_encoded(file, revision, id, verify, || payload::encode(build()?))
+    }
+    pub(crate) fn install_encoded<R: Serialize>(
+        &self,
+        file: &str,
+        revision: &R,
+        id: ObjectId,
+        verify: impl FnMut() -> Result<()>,
+        build: impl FnOnce() -> Result<shared::Encoded>,
+    ) -> Result<Installed> {
         self.scope.install(
             file,
             postcard::to_allocvec(revision)?,
             id,
             now(),
             verify,
-            || payload::encode(build()?),
+            build,
         )
     }
     pub(crate) fn prepare_install<R: Serialize>(
@@ -170,20 +180,18 @@ impl Store {
         file: &str,
         revision: &R,
         id: ObjectId,
-        build: impl FnOnce() -> Result<FileData>,
+        build: impl FnOnce() -> Result<shared::Encoded>,
     ) -> Result<shared::PendingInstall> {
         self.scope
-            .prepare_install(file, postcard::to_allocvec(revision)?, id, now(), || {
-                payload::encode(build()?)
-            })
+            .prepare_install(file, postcard::to_allocvec(revision)?, id, now(), build)
     }
     pub fn modules(&self, file: &str) -> Result<Vec<ModuleFile>> {
         let tx = self.read()?;
-        Ok(postcard::from_bytes(
+        crate::binary::decode(
             self.scope
                 .record(&tx, file, payload::MODULES)?
                 .context("Missing module record")?,
-        )?)
+        )
     }
     pub fn load(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<FileData>> {
         self.scope
@@ -269,17 +277,20 @@ impl Store {
         let Some(bytes) = self.scope.record(tx, file, payload::BODY_INDEX)? else {
             return Ok(None);
         };
-        let index: Vec<(std::ops::Range<usize>, u32)> = postcard::from_bytes(bytes)?;
-        let Some((_, ordinal)) = index
+        let index = crate::binary::view::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
+        let Some(entry) = index
             .iter()
-            .filter(|(r, _)| r.contains(&position))
-            .min_by_key(|(r, _)| r.len())
+            .filter(|v| {
+                v.0.start.to_native() as usize <= position
+                    && position < v.0.end.to_native() as usize
+            })
+            .min_by_key(|v| v.0.end.to_native() - v.0.start.to_native())
         else {
             return Ok(None);
         };
         let bytes = self
             .scope
-            .record(tx, file, &payload::body_key(*ordinal))?
+            .record(tx, file, &payload::body_key(entry.1.to_native()))?
             .context("Missing body group")?;
         let key = *blake3::hash(bytes).as_bytes();
         if let Some(Decoded::Body(value)) = DECODED.lock().unwrap().get(&key) {
@@ -301,7 +312,7 @@ impl Store {
             .global_files(tx)?
             .into_iter()
             .map(|file| {
-                let imports = postcard::from_bytes(
+                let imports = crate::binary::decode(
                     self.scope
                         .record(tx, &file, payload::GLOBALS)?
                         .context("Missing global-import record")?,
@@ -331,7 +342,7 @@ impl Store {
     pub fn assembly_forwarders(&self, tx: &RoTxn<'_>, file: &str) -> Result<Vec<(String, String)>> {
         self.scope
             .record(tx, file, payload::FORWARDERS)?
-            .map(|b| Ok(postcard::from_bytes(b)?))
+            .map(crate::binary::decode)
             .transpose()
             .map(|v| v.unwrap_or_default())
     }

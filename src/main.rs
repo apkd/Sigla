@@ -28,6 +28,11 @@ struct Cli {
 enum Command {
     /// show licenses and copyright notices for bundled components.
     Licenses,
+    /// Build and publish precomputed Unity metadata.
+    Metadata {
+        #[command(subcommand)]
+        command: sigla::metadata_archive::Command,
+    },
     /// inspect managed disk usage and preview eviction without changing the cache.
     Cache {
         #[command(subcommand)]
@@ -121,6 +126,9 @@ async fn main() -> Result<()> {
         })
         .await?;
     }
+    if let Command::Metadata { command } = cli.command {
+        return tokio::task::spawn_blocking(move || command.run()).await?;
+    }
     let remote = cli.options.validate()?;
     let cache_limits = cli.options.cache_limits();
     let mut policy = Policy::new(cli.options.local_roots())?;
@@ -144,6 +152,7 @@ async fn main() -> Result<()> {
     );
     match cli.command {
         Command::Licenses
+        | Command::Metadata { .. }
         | Command::GitJob { .. }
         | Command::GitRebuild { .. }
         | Command::Cache { .. } => {

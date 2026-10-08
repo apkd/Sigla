@@ -1,14 +1,28 @@
 //! Native Unity discovery. This module never starts Unity or a managed process.
 pub mod acquire;
-mod catalog;
+pub(crate) mod catalog;
 mod graph;
 mod package_acquire;
 mod packages;
 mod settings;
-mod symbols;
+pub(crate) mod symbols;
 mod version;
 pub(crate) use graph::discover;
 pub use version::{ReleaseBranch, UnityVersion};
+
+fn package_version(value: &str) -> Option<semver::Version> {
+    let (core, suffix) = value
+        .find(['-', '+'])
+        .map_or((value, ""), |i| (&value[..i], &value[i..]));
+    format!(
+        "{}{}{}",
+        core,
+        ".0".repeat(2usize.saturating_sub(core.matches('.').count())),
+        suffix
+    )
+    .parse()
+    .ok()
+}
 
 pub(crate) fn ignored_name(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy();

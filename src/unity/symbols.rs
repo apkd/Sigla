@@ -3,7 +3,7 @@
 use super::{Platform, UnityVersion};
 use std::collections::BTreeSet;
 
-pub(super) fn symbols(
+pub(crate) fn symbols(
     version: UnityVersion,
     platform: Platform,
     api: u32,
@@ -12,7 +12,7 @@ pub(super) fn symbols(
     let mut result = BTreeSet::new();
     let mut add = |words: &str| result.extend(words.split_whitespace().map(str::to_owned));
     add(COMMON);
-    add(if version.branch.major == 2022 {
+    add(if version.branch.major < 6000 {
         UNITY_2022
     } else {
         UNITY_6
@@ -40,7 +40,24 @@ pub(super) fn symbols(
         (2021, 1, 3),
         (2022, 1, 3),
         (2023, 1, 3),
-        (6000, 0, 3),
+        (
+            6000,
+            0,
+            if version.branch.major == 6000 {
+                version.branch.minor
+            } else {
+                7
+            },
+        ),
+        (
+            7000,
+            0,
+            if version.branch.major == 7000 {
+                version.branch.minor
+            } else {
+                0
+            },
+        ),
     ] {
         for minor in first..=last {
             if (major, minor) <= (version.branch.major, version.branch.minor) {

@@ -754,6 +754,7 @@ struct Indexed {
 }
 
 enum InputContents {
+    Archived(crate::metadata_archive::Analysis),
     Metadata {
         bytes: Vec<u8>,
         stem: String,
@@ -768,6 +769,11 @@ enum InputContents {
 impl InputContents {
     fn read(input: &SourceInput, project: &Project) -> Result<Self> {
         if input.metadata {
+            if crate::metadata_archive::assembly_path(&input.path) {
+                return Ok(Self::Archived(crate::metadata_archive::load_analysis(
+                    &input.path,
+                )?));
+            }
             Ok(Self::Metadata {
                 bytes: std::fs::read(&input.path)?,
                 stem: input
@@ -789,6 +795,7 @@ impl InputContents {
 
     fn identity(&self) -> Result<crate::store::ObjectId> {
         match self {
+            Self::Archived(analysis) => Ok(analysis.id),
             Self::Metadata { bytes, stem } => crate::store::metadata_id(bytes, stem),
             Self::Source {
                 source,
@@ -799,8 +806,24 @@ impl InputContents {
         }
     }
 
+    fn encode(
+        self,
+        path: &Path,
+        id: &crate::store::ObjectId,
+    ) -> Result<crate::store::shared::Encoded> {
+        if let Self::Archived(analysis) = self {
+            return Ok(analysis.encoded);
+        }
+        if matches!(self, Self::Source { .. })
+            && let Some(encoded) = crate::metadata_archive::source_analysis(path, id)?
+        {
+            return Ok(encoded);
+        }
+        crate::store::payload::encode(self.extract()?)
+    }
     fn extract(self) -> Result<FileData> {
         match self {
+            Self::Archived(_) => unreachable!(),
             Self::Metadata { bytes, stem } => crate::metadata::file_data_bytes(bytes, &stem),
             Self::Source {
                 source,
@@ -851,9 +874,9 @@ fn index_input(
         let contents = InputContents::read(input, project)?;
         verify()?;
         let id = contents.identity()?;
-        store.install(key, stamp, id, verify, || {
+        store.install_encoded(key, stamp, id, verify, || {
             let start = std::time::Instant::now();
-            let data = contents.extract();
+            let data = contents.encode(&input.path, &id);
             extraction = start.elapsed();
             data
         })
@@ -918,7 +941,7 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                 store
                     .prepare_install(key, stamp, id, || {
                         let started = std::time::Instant::now();
-                        let data = contents.extract();
+                        let data = contents.encode(&input.path, &id);
                         extraction = started.elapsed();
                         data
                     })

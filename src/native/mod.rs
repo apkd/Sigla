@@ -45,7 +45,9 @@ pub fn language(path: &Path) -> Option<Language> {
     })
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Default, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct File {
     /// These tables have the same ordinals as Facts' declaration/occurrence tables.
     pub declarations: Vec<DeclarationInfo>,
@@ -56,13 +58,17 @@ pub struct File {
     pub regions: Vec<Region>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Region {
     pub span: Range<usize>,
     pub language: Language,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct DeclarationInfo {
     pub parent: Option<u32>,
     pub region: u32,
@@ -70,7 +76,19 @@ pub struct DeclarationInfo {
     pub conditional: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum Role {
     #[default]
     Identifier,
@@ -80,7 +98,9 @@ pub enum Role {
     Label,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Default, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct OccurrenceInfo {
     pub owner: Option<u32>,
     pub local: Option<u32>,
@@ -92,7 +112,9 @@ pub struct OccurrenceInfo {
     pub indirect_write: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Include {
     pub path: String,
     pub span: Range<usize>,

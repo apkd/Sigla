@@ -10,11 +10,12 @@ fn scope(db: &Arc<Database>, n: u8) -> Scope {
 }
 fn object(name: &str, body: &[u8]) -> Encoded {
     Encoded {
-        names: Names {
+        names: crate::binary::encode(&Names {
             declarations: BTreeSet::from([name.to_owned()]),
             occurrences: BTreeSet::from(["Use".into()]),
             global_imports: true,
-        },
+        })
+        .unwrap(),
         records: BTreeMap::from([(vec![1], body.to_vec())]),
     }
 }

@@ -69,9 +69,14 @@ fn profiles_are_canonical_and_metadata_fallback_is_part_of_identity() {
         source_id("x", Language::CSharp, &defs, "unused").unwrap(),
         source_id("x", Language::CSharp, &["A".into(), "B".into()], "").unwrap()
     );
-    assert_ne!(
+    assert_eq!(
         source_id("x", Language::CSharp, &defs, "").unwrap(),
         source_id("x", Language::CSharp, &[], "").unwrap()
+    );
+    let conditional = "#if A\nclass Enabled {}\n#else\nclass Disabled {}\n#endif\n";
+    assert_ne!(
+        source_id(conditional, Language::CSharp, &defs, "").unwrap(),
+        source_id(conditional, Language::CSharp, &[], "").unwrap()
     );
     assert_ne!(
         source_id("x", Language::Rust, &[], "2021").unwrap(),

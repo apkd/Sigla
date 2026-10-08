@@ -14,13 +14,15 @@ use std::{
 };
 
 pub type ObjectId = [u8; 32];
-const FORMAT: &[u8] = b"sigla-shared-analysis-1";
+const FORMAT: &[u8] = super::ANALYSIS_VERSION.as_bytes();
 pub const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const BATCH: usize = 128;
 static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Database>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Default, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Names {
     pub declarations: BTreeSet<String>,
     pub occurrences: BTreeSet<String>,
@@ -29,12 +31,13 @@ pub struct Names {
 
 /// Local record keys must be nonempty. The empty key is reserved for Names.
 /// Values are already encoded/compressed when they enter the writer.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Encoded {
-    pub names: Names,
+    pub names: Vec<u8>,
     pub records: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
-type EncodedObject = (Encoded, Vec<u8>, u64);
+type EncodedObject = (Encoded, u64);
 
 pub(crate) struct PendingInstall {
     file: String,
@@ -259,15 +262,7 @@ impl Database {
         }?;
         let mut tx = env.write_txn()?;
         let control: Table<Bytes, Bytes> = env.create_database(&mut tx, Some("control"))?;
-        match control.get(&tx, b"format")? {
-            Some(format) => ensure!(
-                format == FORMAT,
-                "Analysis format changed; perform cold cache migration"
-            ),
-            None => {
-                control.put(&mut tx, b"format", FORMAT)?;
-            }
-        }
+        let obsolete = control.get(&tx, b"format")? != Some(FORMAT);
         let spaces = env.create_database(&mut tx, Some("workspaces"))?;
         let bindings = env.create_database(&mut tx, Some("bindings"))?;
         let objects = env.create_database(&mut tx, Some("objects"))?;
@@ -290,6 +285,17 @@ impl Database {
             .name("global-import-files")
             .flags(DatabaseFlags::DUP_SORT)
             .create(&mut tx)?;
+        if obsolete {
+            control.clear(&mut tx)?;
+            spaces.clear(&mut tx)?;
+            bindings.clear(&mut tx)?;
+            objects.clear(&mut tx)?;
+            records.clear(&mut tx)?;
+            declarations.clear(&mut tx)?;
+            occurrences.clear(&mut tx)?;
+            globals.clear(&mut tx)?;
+            control.put(&mut tx, b"format", FORMAT)?;
+        }
         tx.commit()?;
         let db = Arc::new(Self {
             env,
@@ -404,12 +410,6 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&'t [u8]>> {
         Ok(self.records.get(tx, &record_key(id, key))?)
-    }
-    fn names(&self, tx: &RoTxn<'_>, id: &ObjectId) -> Result<Names> {
-        decode(
-            self.record(tx, id, &[])?
-                .context("Object descriptor is missing")?,
-        )
     }
     fn live(&self, tx: &RoTxn<'_>, id: &ObjectId) -> Result<Option<Liveness>> {
         self.objects.get(tx, id)?.map(decode).transpose()
@@ -694,11 +694,11 @@ impl Scope {
                 .all(|k| !k.is_empty() && 32 + k.len() <= self.database.env.max_key_size()),
             "Invalid analysis record key"
         );
-        for name in value
-            .names
+        let decoded_names = crate::binary::view::<Names>(&value.names)?;
+        for name in decoded_names
             .declarations
             .iter()
-            .chain(&value.names.occurrences)
+            .chain(decoded_names.occurrences.iter())
         {
             ensure!(
                 !name.is_empty()
@@ -707,15 +707,14 @@ impl Scope {
                 "Indexed name exceeds LMDB limit"
             );
         }
-        let names = encode(&value.names)?;
         let bytes = value
             .records
             .values()
-            .try_fold(names.len() as u64, |sum, v| {
+            .try_fold(value.names.len() as u64, |sum, v| {
                 sum.checked_add(v.len() as u64)
                     .context("Object size overflow")
             })?;
-        Ok((value, names, bytes))
+        Ok((value, bytes))
     }
 
     /// Every object and binding in a batch becomes durable in one transaction.
@@ -777,8 +776,8 @@ impl Scope {
         }
         self.dirty_in(tx)?;
         if absent {
-            let (value, names, bytes) = encoded.as_ref().unwrap();
-            self.database.records.put(tx, object, names)?;
+            let (value, bytes) = encoded.as_ref().unwrap();
+            self.database.records.put(tx, object, &value.names)?;
             for (key, bytes) in &value.records {
                 self.database
                     .records
@@ -820,12 +819,17 @@ impl Scope {
     }
 
     fn postings(&self, tx: &mut RwTxn<'_>, file: &str, object: &ObjectId, add: bool) -> Result<()> {
-        let names = self.database.names(tx, object)?;
+        let bytes = self
+            .database
+            .record(tx, object, &[])?
+            .context("Object descriptor is missing")?
+            .to_vec();
+        let names = crate::binary::view::<Names>(&bytes)?;
         for (table, names) in [
-            (self.database.declarations, names.declarations),
-            (self.database.occurrences, names.occurrences),
+            (self.database.declarations, &names.declarations),
+            (self.database.occurrences, &names.occurrences),
         ] {
-            for name in names {
+            for name in names.iter() {
                 let key = scope_key(self.id, name.as_bytes());
                 if add {
                     table.put(tx, &key, file)?;

@@ -1,4 +1,5 @@
 mod acquisition;
+pub(crate) mod binary;
 pub mod cache;
 mod cache_migration;
 pub mod config;
@@ -9,6 +10,7 @@ mod documents;
 pub mod extract;
 mod memory;
 pub mod metadata;
+pub mod metadata_archive;
 mod minify;
 pub mod model;
 mod msbuild;

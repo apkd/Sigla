@@ -36,7 +36,7 @@ impl References {
         backend: u32,
     ) -> Result<Self> {
         ensure!(
-            supported(version),
+            supported(version) || data.join("manifest.bin").is_file(),
             "Unsupported Unity editor reference layout {version}"
         );
         let module_path = data.join("Resources/modules.asset");
@@ -80,6 +80,61 @@ impl References {
             "Unity module catalog lacks Core"
         );
         let mut watched = BTreeSet::from([module_path]);
+        if data.join("manifest.bin").is_file() {
+            watched.insert(data.join("manifest.bin"));
+            let manifest = crate::metadata_archive::manifest(&data.join("manifest.bin"))?;
+            let group = if platform == Platform::EditorLinux {
+                "editor"
+            } else if backend == 0 {
+                "player-mono"
+            } else {
+                "player-il2cpp"
+            };
+            let paths = |group: &str| -> Vec<PathBuf> {
+                manifest
+                    .entries
+                    .iter()
+                    .filter(|e| e.group == group && e.path.ends_with(".sigla"))
+                    .filter_map(|e| e.path.strip_prefix("Editor/Data/").map(|p| data.join(p)))
+                    .collect()
+            };
+            let engine: Vec<_> = paths(group)
+                .into_iter()
+                .filter(|p| {
+                    platform != Platform::EditorLinux
+                        || p.starts_with(data.join("Managed/UnityEngine"))
+                })
+                .collect();
+            let standard = paths("standard")
+                .into_iter()
+                .filter(|p| {
+                    let path = p.to_string_lossy();
+                    path.contains("/ref/2.1.0/")
+                        || path.contains("/compat/2.1.0/")
+                        || path.contains("/Extensions/2.0.0/")
+                })
+                .collect();
+            let framework = paths("framework")
+                .into_iter()
+                .filter(|p| {
+                    p.parent().is_some_and(|p| p.ends_with("Facades"))
+                        || FRAMEWORK
+                            .split_whitespace()
+                            .any(|name| p.file_stem().is_some_and(|n| n == name))
+                })
+                .collect();
+            if engine.is_empty() {
+                diagnostics.push(format!("Archived editor has no {group} references"));
+            }
+            return Ok(Self {
+                engine,
+                standard,
+                framework,
+                modules,
+                watched,
+                diagnostics,
+            });
+        }
         let mut directory = |relative: &str| -> Result<Vec<PathBuf>> {
             let path = data.join(relative);
             watched.insert(path.clone());
@@ -330,7 +385,7 @@ impl Editor {
                 if !layout
                     .engine
                     .iter()
-                    .any(|p| p.file_name().is_some_and(|n| n == filename.as_str()))
+                    .any(|p| crate::metadata_archive::logical_filename(p) == filename)
                 {
                     diagnostics.push(format!(
                         "Unity editor lacks the managed reference for {package}"
@@ -338,7 +393,7 @@ impl Editor {
                 }
             }
             for path in &layout.engine {
-                let name = path.file_name().unwrap().to_string_lossy();
+                let name = crate::metadata_archive::logical_filename(path);
                 if let Some(module) = name
                     .strip_prefix("UnityEngine.")
                     .and_then(|n| n.strip_suffix("Module.dll"))
@@ -373,7 +428,11 @@ impl Editor {
             if platform == Platform::EditorLinux
                 && (editor_only || !predefined && editor_compatible)
             {
-                references.extend(EDITOR_PRECOMPILED.iter().map(|p| self.data.join(p)));
+                references.extend(
+                    EDITOR_PRECOMPILED
+                        .iter()
+                        .map(|p| crate::metadata_archive::reference(self.data.join(p))),
+                );
             }
         }
         references.retain(|path| {

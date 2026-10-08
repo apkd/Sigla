@@ -169,10 +169,16 @@ fn discover_with_editor(
     }
     let mut plugins = Vec::new();
     for (_, path) in &files {
-        if path.extension().is_none_or(|e| e != "dll") {
+        if path.extension().is_none_or(|e| e != "dll")
+            && !crate::metadata_archive::assembly_path(path)
+        {
             continue;
         }
-        let managed = match crate::metadata::is_managed(path) {
+        let managed = match if crate::metadata_archive::assembly_path(path) {
+            Ok(true)
+        } else {
+            crate::metadata::is_managed(path)
+        } {
             Ok(managed) => managed,
             Err(error) => {
                 result
@@ -182,7 +188,12 @@ fn discover_with_editor(
             }
         };
         if managed {
-            let meta = PathBuf::from(format!("{}.meta", path.display()));
+            let meta_path = if crate::metadata_archive::assembly_path(path) {
+                path.with_extension("dll")
+            } else {
+                path.clone()
+            };
+            let meta = PathBuf::from(format!("{}.meta", meta_path.display()));
             let settings = if meta.is_file() {
                 result.metadata.insert(meta.clone());
                 match super::settings::yaml(&meta) {
@@ -516,7 +527,7 @@ fn discover_with_editor(
                 let explicit = settings.as_ref().is_some_and(|s| {
                     s["PluginImporter"]["isExplicitlyReferenced"].as_i64() == Some(1)
                 });
-                let filename = path.file_name().unwrap().to_string_lossy();
+                let filename = crate::metadata_archive::logical_filename(path);
                 let selected = if descriptor.override_references {
                     descriptor
                         .precompiled_references
@@ -535,7 +546,7 @@ fn discover_with_editor(
                             continue;
                         }
                     };
-                    selected_plugins.insert(filename.into_owned());
+                    selected_plugins.insert(filename);
                     metadata.push(MetadataReference {
                         path,
                         aliases: Vec::new(),
@@ -710,7 +721,10 @@ fn scan(
             scan(&path, scope, files, watched, diagnostics);
         } else if kind.is_file()
             && path.extension().is_some_and(|e| {
-                matches!(e.to_str(), Some("cs" | "asmdef" | "asmref" | "dll" | "rsp"))
+                matches!(
+                    e.to_str(),
+                    Some("cs" | "asmdef" | "asmref" | "dll" | "sigla" | "rsp")
+                )
             })
         {
             files.push((scope, path));
@@ -917,11 +931,11 @@ fn response_file(
             .strip_prefix("reference:")
             .or_else(|| token.strip_prefix("r:"))
         {
-            let relative = root.join(value);
+            let relative = crate::metadata_archive::reference(root.join(value));
             let path = if relative.is_file() {
                 relative
             } else {
-                path.parent().unwrap().join(value)
+                crate::metadata_archive::reference(path.parent().unwrap().join(value))
             };
             references.push(policy.canonical(&path)?);
         } else if token.starts_with('@') {

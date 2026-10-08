@@ -5,7 +5,9 @@ use std::ops::Range;
 
 pub type ExprId = u32;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Default, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FileSyntax {
     pub forwarders: Vec<(String, String)>,
     pub headers: Vec<Header>,
@@ -14,20 +16,26 @@ pub struct FileSyntax {
     pub locals: Vec<Local>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct DeclarationFile {
     pub declarations: Vec<crate::model::Declaration>,
     pub headers: Vec<Header>,
     pub imports: Vec<Import>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct BodyFile {
     pub expressions: Vec<Expression>,
     pub locals: Vec<Local>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Header {
     pub local: bool,
     pub declaration: u32,
@@ -42,14 +50,18 @@ pub struct Header {
     pub accessors: Vec<Accessor>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Accessor {
     pub role: String,
     pub access: String,
     pub metadata_method: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct WrittenMember {
     pub owner: WrittenType,
     pub name: String,
@@ -57,7 +69,9 @@ pub struct WrittenMember {
     pub generic_arity: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct GenericParameter {
     pub name: String,
     pub variance: Variance,
@@ -65,7 +79,17 @@ pub struct GenericParameter {
     pub special_constraints: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum Variance {
     #[default]
     Invariant,
@@ -73,7 +97,9 @@ pub enum Variance {
     Out,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Parameter {
     pub name: String,
     pub ty: WrittenType,
@@ -83,14 +109,18 @@ pub struct Parameter {
     pub receiver: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum ImportKind {
     Namespace,
     Static,
     Alias(String),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Import {
     pub kind: ImportKind,
     pub ty: WrittenType,
@@ -98,13 +128,17 @@ pub struct Import {
     pub global: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Expression {
     pub span: Range<usize>,
     pub kind: ExpressionKind,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum ExpressionKind {
     This,
     Base,
@@ -159,14 +193,18 @@ pub enum ExpressionKind {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Argument {
     pub name: Option<String>,
     pub mode: PassingMode,
     pub value: ExprId,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Local {
     pub name: String,
     pub span: Range<usize>,

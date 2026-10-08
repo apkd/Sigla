@@ -5,11 +5,8 @@ use super::{
 };
 use crate::model::{Facts, Language};
 use anyhow::{Context, Result, ensure};
-use serde::{Serialize, de::DeserializeOwned};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    io::{BufWriter, Read, Write},
-};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const DATA: &[u8] = &[1];
 pub const SUMMARY: &[u8] = &[2];
@@ -23,7 +20,7 @@ pub const MODULES: &[u8] = &[9];
 const BODY: u8 = 10;
 const MEMBER: u8 = 11;
 const DECLARATION_NAME: u8 = 12;
-pub const ANALYSIS_VERSION: u32 = 4; // Bump for extractor, binder, profile, or record changes.
+pub const ANALYSIS_VERSION: &str = env!("SIGLA_ANALYSIS_FINGERPRINT");
 
 pub fn body_key(index: u32) -> Vec<u8> {
     let mut key = vec![BODY];
@@ -49,7 +46,7 @@ pub fn canonical_defines(defines: &[String]) -> Vec<String> {
 }
 #[derive(Serialize)]
 enum Profile<'a> {
-    CSharp(Vec<String>),
+    CSharp([u8; 32]),
     Rust(&'a str),
     Document,
     Native,
@@ -61,7 +58,14 @@ pub fn source_id(
     edition: &str,
 ) -> Result<ObjectId> {
     let profile = match language {
-        Language::CSharp => Profile::CSharp(canonical_defines(defines)),
+        Language::CSharp => {
+            let active = if source.contains('#') {
+                std::borrow::Cow::Owned(crate::extract::preprocess::active_source(source, defines)?)
+            } else {
+                std::borrow::Cow::Borrowed(source)
+            };
+            Profile::CSharp(*blake3::hash(active.as_bytes()).as_bytes())
+        }
         Language::Rust => Profile::Rust(edition),
         Language::Markdown | Language::Text => Profile::Document,
         _ => Profile::Native,
@@ -84,60 +88,30 @@ pub fn metadata_id(bytes: &[u8], fallback_stem: &str) -> Result<ObjectId> {
     ))?)
     .as_bytes())
 }
-fn compressed(value: &impl Serialize) -> Result<Vec<u8>> {
-    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
-    {
-        let mut writer = BufWriter::with_capacity(64 * 1024, &mut encoder);
-        postcard::to_io(value, &mut writer)?;
-        writer.flush()?;
-    }
-    Ok(encoder.finish()?)
-}
-
-#[cfg(test)]
-#[test]
-fn streaming_preserves_postcard_across_buffer_boundaries() {
-    for length in [0, 17, 200_000] {
-        let value = (
-            "source",
-            (0..length).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
-        );
-        let encoded = compressed(&value).unwrap();
-        assert_eq!(
-            zstd::stream::decode_all(encoded.as_slice()).unwrap(),
-            postcard::to_allocvec(&value).unwrap()
-        );
-        let (decoded, _): ((String, Vec<u8>), _) = decode(&encoded, 1).unwrap();
-        assert_eq!(decoded.1, value.1);
-    }
-}
-pub fn decode<T: DeserializeOwned>(bytes: &[u8], multiplier: usize) -> Result<(T, usize)> {
+pub fn decode<T: rkyv::Archive>(bytes: &[u8], multiplier: usize) -> Result<(T, usize)>
+where
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+{
     let bound = MAX_SOURCE_BYTES
         .checked_mul(multiplier)
         .context("Decode bound overflow")?;
-    let mut decoded = Vec::new();
-    zstd::stream::read::Decoder::new(bytes)?
-        .take((bound + 1) as u64)
-        .read_to_end(&mut decoded)?;
-    ensure!(
-        decoded.len() <= bound,
-        "Analysis record exceeds safety bound"
-    );
-    Ok((
-        postcard::from_bytes(&decoded).context("Invalid encoded analysis")?,
-        decoded.len(),
-    ))
+    ensure!(bytes.len() <= bound, "Analysis record exceeds safety bound");
+    Ok((crate::binary::decode(bytes)?, bytes.len()))
 }
 
 pub fn encode(mut data: FileData) -> Result<Encoded> {
     validate(&data)?;
     let mut records = BTreeMap::new();
-    records.insert(DATA.to_vec(), compressed(&data)?); // Facts.csharp is stored separately below.
-    records.insert(SUMMARY.to_vec(), compressed(&data.facts.declarations)?);
+    records.insert(DATA.to_vec(), crate::binary::encode(&data)?);
+    records.insert(
+        SUMMARY.to_vec(),
+        crate::binary::encode(&data.facts.declarations)?,
+    );
     records.insert(ENVIRONMENT.to_vec(), declaration_revision(&data)?.to_vec());
     records.insert(
         MODULES.to_vec(),
-        postcard::to_allocvec(&data.facts.modules)?,
+        crate::binary::encode(&data.facts.modules)?,
     );
     let eligible = |name: &&str| !name.is_empty() && name.len() <= 480;
     let mut names = Names {
@@ -162,12 +136,17 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
         global_imports: false,
     };
     if let Some(syntax) = data.facts.csharp.take() {
-        let globals: Vec<_> = syntax.imports.iter().filter(|i| i.global).collect();
+        let globals: Vec<_> = syntax
+            .imports
+            .iter()
+            .filter(|i| i.global)
+            .cloned()
+            .collect();
         names.global_imports = !globals.is_empty();
-        records.insert(GLOBALS.to_vec(), postcard::to_allocvec(&globals)?);
+        records.insert(GLOBALS.to_vec(), crate::binary::encode(&globals)?);
         records.insert(
             FORWARDERS.to_vec(),
-            postcard::to_allocvec(&syntax.forwarders)?,
+            crate::binary::encode(&syntax.forwarders)?,
         );
         if data.assembly.is_some() {
             // Exactly the previous metadata grouping; original declaration indices survive.
@@ -186,18 +165,26 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
             for (name, indices) in groups {
                 let declarations: Vec<_> = indices
                     .iter()
-                    .map(|i| &data.facts.declarations[*i])
+                    .map(|i| data.facts.declarations[*i].clone())
                     .collect();
-                let headers: Vec<_> = indices.iter().map(|i| &syntax.headers[*i]).collect();
+                let headers: Vec<_> = indices.iter().map(|i| syntax.headers[*i].clone()).collect();
                 records.insert(
                     member_key(name),
-                    compressed(&(declarations, headers, &syntax.imports))?,
+                    crate::binary::encode(&crate::csharp::syntax::DeclarationFile {
+                        declarations,
+                        headers,
+                        imports: syntax.imports.clone(),
+                    })?,
                 );
             }
         } else {
             records.insert(
                 HEADERS.to_vec(),
-                compressed(&(&data.facts.declarations, &syntax.headers, &syntax.imports))?,
+                crate::binary::encode(&crate::csharp::syntax::DeclarationFile {
+                    declarations: data.facts.declarations.clone(),
+                    headers: syntax.headers.clone(),
+                    imports: syntax.imports.clone(),
+                })?,
             );
             let groups = crate::csharp::syntax::split_bodies(
                 syntax,
@@ -207,16 +194,19 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
             let mut index = Vec::new();
             for (ordinal, (range, body)) in groups.into_iter().enumerate() {
                 let ordinal: u32 = ordinal.try_into()?;
-                records.insert(body_key(ordinal), compressed(&body)?);
+                records.insert(body_key(ordinal), crate::binary::encode(&body)?);
                 index.push((range, ordinal));
             }
-            records.insert(BODY_INDEX.to_vec(), postcard::to_allocvec(&index)?);
+            records.insert(BODY_INDEX.to_vec(), crate::binary::encode(&index)?);
         }
     }
     if let Some(assembly) = &data.assembly {
         records.insert(ASSEMBLY.to_vec(), assembly.as_bytes().to_vec());
     }
-    Ok(Encoded { names, records })
+    Ok(Encoded {
+        names: crate::binary::encode(&names)?,
+        records,
+    })
 }
 
 // Preserve the existing C# binding-generation semantics. This is NOT ObjectId.
@@ -372,6 +362,84 @@ pub fn validate(data: &FileData) -> Result<()> {
                         .get(i as usize)
                         .is_some_and(|o| o.owner == Some(owner))
                         && data.facts.occurrences[i as usize].call),
+                "Invalid native call lookup"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_archived(data: &super::ArchivedFileData) -> Result<()> {
+    let source = data.source.as_str();
+    let valid = |r: &rkyv::Archived<std::ops::Range<usize>>| {
+        let start = r.start.to_native() as usize;
+        let end = r.end.to_native() as usize;
+        start <= end
+            && end <= source.len()
+            && source.is_char_boundary(start)
+            && source.is_char_boundary(end)
+    };
+    for d in data.facts.declarations.iter() {
+        ensure!(
+            valid(&d.span) && valid(&d.name_span) && valid(&d.header) && valid(&d.scope),
+            "Invalid declaration span"
+        );
+    }
+    for o in data.facts.occurrences.iter() {
+        ensure!(valid(&o.span), "Invalid occurrence span");
+    }
+    if let Some(native) = data.facts.native.as_ref() {
+        ensure!(
+            native.declarations.len() == data.facts.declarations.len()
+                && native.occurrences.len() == data.facts.occurrences.len(),
+            "Inconsistent native ordinals"
+        );
+        let declaration =
+            |id: &rkyv::Archived<u32>| (id.to_native() as usize) < native.declarations.len();
+        for region in native.regions.iter() {
+            ensure!(valid(&region.span), "Invalid native region");
+        }
+        for info in native.declarations.iter() {
+            ensure!(
+                (info.region.to_native() as usize) < native.regions.len()
+                    && info.parent.as_ref().is_none_or(declaration),
+                "Invalid declaration owner"
+            );
+        }
+        for info in native.occurrences.iter() {
+            ensure!(
+                (info.region.to_native() as usize) < native.regions.len()
+                    && info.owner.as_ref().is_none_or(declaration)
+                    && info.local.as_ref().is_none_or(declaration)
+                    && info.receiver.as_ref().is_none_or(&valid)
+                    && info.assignment.as_ref().is_none_or(&valid),
+                "Invalid occurrence details"
+            );
+        }
+        for include in native.includes.iter() {
+            ensure!(valid(&include.span), "Invalid include span");
+        }
+        for (name, indices) in native.names.iter() {
+            ensure!(
+                indices.iter().all(|i| data
+                    .facts
+                    .occurrences
+                    .get(i.to_native() as usize)
+                    .is_some_and(|o| o.name.as_str() == name.as_str())),
+                "Invalid native name lookup"
+            );
+        }
+        for (owner, indices) in native.calls.iter() {
+            ensure!(
+                declaration(owner)
+                    && indices.iter().all(|i| {
+                        let i = i.to_native() as usize;
+                        native
+                            .occurrences
+                            .get(i)
+                            .is_some_and(|o| o.owner.as_ref() == Some(owner))
+                            && data.facts.occurrences[i].call
+                    }),
                 "Invalid native call lookup"
             );
         }

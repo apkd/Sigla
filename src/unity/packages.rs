@@ -88,6 +88,22 @@ fn package(
 
 impl Packages {
     pub fn local(root: &Path, policy: &Policy, editor: &Editor, cache: &Path) -> Result<Self> {
+        Self::resolve(
+            root,
+            policy,
+            editor,
+            cache,
+            crate::metadata_archive::package,
+        )
+    }
+
+    fn resolve(
+        root: &Path,
+        policy: &Policy,
+        editor: &Editor,
+        cache: &Path,
+        acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<(PathBuf, String)>,
+    ) -> Result<Self> {
         let cache = policy
             .remote
             .as_ref()
@@ -232,7 +248,14 @@ impl Packages {
             .chain(embedded.keys())
             .cloned()
             .collect();
+        let roots: BTreeSet<_> = pending.iter().cloned().collect();
         let mut visited = BTreeSet::new();
+        let mut requirements: BTreeMap<String, String> = lock
+            .dependencies
+            .iter()
+            .filter(|(_, node)| matches!(node.source.as_str(), "registry" | "builtin"))
+            .map(|(name, node)| (name.clone(), node.version.clone()))
+            .collect();
         let mut selected = Vec::new();
         while let Some(package_name) = pending.pop_front() {
             if !visited.insert(package_name.clone()) {
@@ -244,11 +267,18 @@ impl Packages {
                 selected.push(package);
                 continue;
             }
-            let Some(node) = lock.dependencies.get(&package_name) else {
+            let derived = requirements.get(&package_name).map(|version| Locked {
+                version: version.clone(),
+                source: "registry".into(),
+                depth: 1,
+                dependencies: BTreeMap::new(),
+                url: None,
+                hash: None,
+            });
+            let Some(node) = lock.dependencies.get(&package_name).or(derived.as_ref()) else {
                 diagnostics.push(format!("Excluded package {package_name}: no usable lock entry. References to this package remain unresolved."));
                 continue;
             };
-            pending.extend(node.dependencies.keys().cloned());
             let registry = manifest
                 .scoped_registries
                 .iter()
@@ -272,7 +302,23 @@ impl Packages {
                 &node.hash,
             ))?;
             let testable = manifest.testables.contains(&package_name);
+            let official = policy.remote.is_some()
+                && matches!(node.source.as_str(), "registry" | "builtin")
+                && registry.trim_end_matches('/') == "https://packages.unity.com";
+            if official {
+                selected.retain(|p: &Package| p.manifest.name != package_name);
+            } else {
+                pending.extend(node.dependencies.keys().cloned());
+            }
             let available = (|| -> Result<Package> {
+                if official {
+                    let requested = requirements
+                        .get(&package_name)
+                        .map_or(node.version.as_str(), String::as_str);
+                    let (path, identity) =
+                        acquire(cache, &package_name, requested, editor.selected)?;
+                    return package(path, &package_name, None, identity, testable);
+                }
                 match node.source.as_str() {
                     "builtin" => package(
                         editor
@@ -357,6 +403,7 @@ impl Packages {
                 }
             })();
             let available = available.or_else(|error| {
+                if official { return Err(error); }
                 let mut matching: Vec<_> = candidates.iter().filter(|(info, _)| info.name == package_name).collect();
                 matching.sort_by(|a, b| a.1.cmp(&b.1));
                 if let Some((info, path)) = matching.first() {
@@ -366,6 +413,21 @@ impl Packages {
             });
             match available {
                 Ok(package) => {
+                    if official {
+                        for (dependency, requested) in &package.manifest.dependencies {
+                            let increased = requirements.get(dependency).is_none_or(|previous| {
+                                if requested == "default" { false } else if previous == "default" { true }
+                                else { super::package_version(requested) > super::package_version(previous) }
+                            });
+                            if increased {
+                                requirements.insert(dependency.clone(), requested.clone());
+                                visited.remove(dependency);
+                            }
+                            if !visited.contains(dependency) {
+                                pending.push_back(dependency.clone());
+                            }
+                        }
+                    }
                     if matches!(node.source.as_str(), "registry" | "builtin") && package.manifest.version != node.version {
                         tracing::info!("Package {package_name} requests {}, using available version {}.", node.version, package.manifest.version);
                     }
@@ -387,6 +449,22 @@ impl Packages {
                 Err(error) => diagnostics.push(format!("Excluded package {package_name}: {error}. References to this package remain unresolved.")),
             }
         }
+        if policy.remote.is_some() {
+            let by_name: BTreeMap<_, _> = selected
+                .iter()
+                .map(|p| (p.manifest.name.as_str(), p))
+                .collect();
+            let mut reachable = BTreeSet::new();
+            let mut pending: VecDeque<_> = roots.into_iter().collect();
+            while let Some(name) = pending.pop_front() {
+                if reachable.insert(name.clone())
+                    && let Some(package) = by_name.get(name.as_str())
+                {
+                    pending.extend(package.manifest.dependencies.keys().cloned());
+                }
+            }
+            selected.retain(|p| reachable.contains(&p.manifest.name));
+        }
         Ok(Self {
             selected,
             diagnostics,
@@ -398,6 +476,76 @@ impl Packages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archived_upgrades_follow_selected_dependencies_and_stop_at_cycles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Packages")).unwrap();
+        std::fs::write(
+            root.join("Packages/manifest.json"),
+            r#"{"dependencies":{"com.example.a":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("Packages/packages-lock.json"), r#"{"dependencies":{"com.example.a":{"version":"1.0.0","source":"registry","depth":0,"dependencies":{"com.example.obsolete":"1.0.0"}}}}"#).unwrap();
+        let mut policy = Policy::new(vec![temp.path().into()]).unwrap();
+        policy.remote = Some(crate::discovery::RemoteContext {
+            workspace: root.clone(),
+            writable: temp.path().join("write"),
+            shared: temp.path().join("cache"),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: Default::default(),
+        });
+        let editor = Editor {
+            declared: "6000.3.0f1".parse().unwrap(),
+            selected: "6000.3.0f1".parse().unwrap(),
+            data: temp.path().join("Editor"),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let packages = Packages::resolve(
+            &root,
+            &policy,
+            &editor,
+            temp.path(),
+            |_, name, requested, _| {
+                let deps = match name {
+                    "com.example.a" => {
+                        assert_eq!(requested, "1.0.0");
+                        serde_json::json!({"com.example.b":"2.0.0"})
+                    }
+                    "com.example.b" => {
+                        assert_eq!(requested, "2.0.0");
+                        serde_json::json!({"com.example.a":"1.0.0"})
+                    }
+                    _ => panic!("Requested obsolete dependency"),
+                };
+                let path = temp.path().join(name);
+                std::fs::create_dir_all(&path)?;
+                std::fs::write(
+                    path.join("package.json"),
+                    serde_json::to_vec(
+                        &serde_json::json!({"name":name,"version":"2.0.0","dependencies":deps}),
+                    )?,
+                )?;
+                Ok((path, format!("archive:{name}@2.0.0")))
+            },
+        )
+        .unwrap();
+        assert_eq!(packages.selected.len(), 2);
+        assert!(
+            packages.diagnostics.is_empty(),
+            "{:?}",
+            packages.diagnostics
+        );
+        assert!(
+            packages
+                .selected
+                .iter()
+                .all(|p| p.manifest.version == "2.0.0" && p.identity.starts_with("archive:"))
+        );
+    }
 
     #[test]
     fn automatic_package_discovery_skips_worktrees_but_file_references_work() {
