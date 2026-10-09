@@ -61,7 +61,7 @@ pub enum Command {
         repo: String,
     },
 }
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub(super) struct Plan {
     pub editors: Vec<Origin>,
     pub previous: Catalog,

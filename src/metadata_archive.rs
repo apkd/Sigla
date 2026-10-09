@@ -17,7 +17,7 @@ use crate::{
     store::{ObjectId, shared::Encoded},
 };
 use anyhow::{Context, Result, ensure};
-use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
@@ -30,7 +30,7 @@ const MAGIC: &[u8] = b"SIGLABIN";
 const HEADER: usize = 8 + 64 + 32;
 const MAX_RECORD: u64 = 1024 * 1024 * 1024;
 
-#[derive(Clone, Debug, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Origin {
     pub kind: String,
     pub name: String,
@@ -39,21 +39,21 @@ pub struct Origin {
     pub url: String,
     pub integrity: Option<String>,
 }
-#[derive(Clone, Debug, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Package {
     pub name: String,
     pub version: String,
     pub minimum_editor: Option<String>,
     pub dependencies: BTreeMap<String, String>,
 }
-#[derive(Clone, Debug, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub path: String,
     pub hash: [u8; 32],
     pub size: u64,
     pub group: String,
 }
-#[derive(Clone, Debug, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
     pub origin: Origin,
     pub entries: Vec<Entry>,
@@ -61,7 +61,7 @@ pub struct Manifest {
     pub package_names: Vec<String>,
     pub recommended: BTreeMap<String, String>,
 }
-#[derive(Clone, Debug, Archive, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
     pub name: String,
     pub hash: [u8; 32],
@@ -69,12 +69,12 @@ pub struct Artifact {
     pub release: String,
     pub manifest: Manifest,
 }
-#[derive(Clone, Debug, Default, Archive, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
     pub artifacts: Vec<Artifact>,
     pub unavailable: Vec<String>,
 }
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Analysis {
     pub id: ObjectId,
     pub encoded: Encoded,
@@ -180,14 +180,10 @@ pub(crate) fn source_analysis(path: &Path, id: &ObjectId) -> Result<Option<Encod
         return Ok(None);
     }
     let bytes = read(&sidecar)?;
-    let records = binary::view::<Vec<Analysis>>(payload(&bytes)?)?;
+    let records = binary::decode::<Vec<(ObjectId, &[u8])>>(payload(&bytes)?)?;
     records
         .iter()
-        .find(|record| record.id == *id)
-        .map(|record| {
-            Ok(rkyv::deserialize::<Encoded, rkyv::rancor::Error>(
-                &record.encoded,
-            )?)
-        })
+        .find(|record| record.0 == *id)
+        .map(|record| binary::decode(record.1))
         .transpose()
 }

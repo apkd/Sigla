@@ -1,18 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{ops::Range, path::PathBuf};
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Language {
     CSharp,
     Rust,
@@ -53,9 +42,7 @@ impl Language {
     }
 }
 
-#[derive(
-    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Declaration {
     pub name: String,
     pub qualified: String,
@@ -92,9 +79,7 @@ impl Declaration {
     }
 }
 
-#[derive(
-    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Occurrence {
     pub role: OccurrenceRole,
     pub name: String,
@@ -107,39 +92,14 @@ pub struct Occurrence {
     pub opaque: bool,
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OccurrenceRole {
     Value,
     Type,
     PathQualifier,
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum WriteKind {
     #[default]
     None,
@@ -148,9 +108,7 @@ pub enum WriteKind {
     Ref,
 }
 
-#[derive(
-    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Import {
     pub alias: String,
     pub path: String,
@@ -158,21 +116,16 @@ pub struct Import {
     pub global: bool,
 }
 
-#[derive(
-    Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModuleFile {
     pub name: String,
     pub path: Option<String>,
     pub inline: Vec<String>,
 }
 
-#[derive(
-    Clone, Debug, Default, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Facts {
     #[serde(skip)]
-    #[rkyv(with = rkyv::with::Skip)]
     pub csharp: Option<crate::csharp::syntax::FileSyntax>,
     pub native: Option<crate::native::File>,
     pub declarations: Vec<Declaration>,

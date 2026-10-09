@@ -9,15 +9,20 @@ fn scope(db: &Arc<Database>, n: u8) -> Scope {
         .unwrap()
 }
 fn object(name: &str, body: &[u8]) -> Encoded {
-    Encoded {
-        names: crate::binary::encode(&Names {
+    let mut records = BTreeMap::from([(vec![1], body.to_vec())]);
+    let names = crate::store::format::write(
+        &[],
+        None,
+        true,
+        &Names {
             declarations: BTreeSet::from([name.to_owned()]),
             occurrences: BTreeSet::from(["Use".into()]),
             global_imports: true,
-        })
-        .unwrap(),
-        records: BTreeMap::from([(vec![1], body.to_vec())]),
-    }
+        },
+        &mut records,
+    )
+    .unwrap();
+    Encoded { names, records }
 }
 fn put(scope: &Scope, file: &str, revision: u8, id: u8, name: &str) -> Installed {
     scope

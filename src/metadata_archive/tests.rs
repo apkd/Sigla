@@ -96,12 +96,12 @@ fn records_reject_corruption_incompatibility_and_excessive_recursion() {
         assert!(payload(&corrupt).is_err());
     }
     assert!(payload(&bytes[..HEADER - 1]).is_err());
-    let mut ty = crate::csharp::types::WrittenType::Dynamic;
-    for _ in 0..256 {
-        ty = crate::csharp::types::WrittenType::Pointer(Box::new(ty));
-    }
-    let bytes = binary::encode(&ty).unwrap();
-    assert!(binary::view::<crate::csharp::types::WrittenType>(&bytes).is_err());
+    use crate::csharp::types::WrittenType;
+    let leaf = binary::encode(&WrittenType::Dynamic).unwrap();
+    let pointer = binary::encode(&WrittenType::Pointer(Box::new(WrittenType::Dynamic))).unwrap();
+    let mut bytes = pointer[..pointer.len() - leaf.len()].repeat(1024);
+    bytes.extend_from_slice(&leaf);
+    assert!(binary::decode::<crate::csharp::types::WrittenType>(&bytes).is_err());
     let bytes = binary::encode(&vec!["unaligned".to_owned()]).unwrap();
     let mut shifted = vec![0];
     shifted.extend_from_slice(&bytes);
@@ -109,6 +109,67 @@ fn records_reject_corruption_incompatibility_and_excessive_recursion() {
         binary::decode::<Vec<String>>(&shifted[1..]).unwrap(),
         vec!["unaligned"]
     );
+}
+
+#[test]
+fn oversized_compression_windows_are_rejected() {
+    use std::io::{Read, Write};
+    let manifest = Manifest {
+        origin: origin(),
+        entries: Vec::new(),
+        packages: Vec::new(),
+        package_names: Vec::new(),
+        recommended: BTreeMap::new(),
+    };
+    let mut tar = tar::Builder::new(Vec::new());
+    let bytes = envelope(&binary::encode(&manifest).unwrap());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "manifest.bin", bytes.as_slice())
+        .unwrap();
+    let raw = tar.into_inner().unwrap();
+    let mut compressor = zstd::Encoder::new(Vec::new(), 1).unwrap();
+    compressor.window_log(30).unwrap();
+    compressor.write_all(&raw).unwrap();
+    compressor.flush().unwrap();
+    let compressed = compressor.finish().unwrap();
+    let mut unrestricted = zstd::Decoder::new(compressed.as_slice()).unwrap();
+    unrestricted.window_log_max(30).unwrap();
+    let mut restored = Vec::new();
+    unrestricted.read_to_end(&mut restored).unwrap();
+    assert_eq!(restored, raw);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized-window.tar.zst");
+    fs::write(&path, compressed).unwrap();
+    assert!(bundle::verify(&path, None).is_err());
+}
+
+#[test]
+fn selecting_a_profile_does_not_decode_other_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Code.cs");
+    let encoded = records::encode(FileData {
+        source: String::new(),
+        facts: Default::default(),
+        assembly: None,
+    })
+    .unwrap();
+    let selected = [1; 32];
+    let other = [2; 32];
+    save(
+        &dir.path().join("Code.cs.analysis"),
+        &binary::encode(&vec![
+            (selected, binary::encode(&encoded).unwrap()),
+            (other, vec![255]),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let restored = source_analysis(&path, &selected).unwrap().unwrap();
+    assert_eq!(restored.records, encoded.records);
+    assert!(source_analysis(&path, &other).is_err());
 }
 
 #[test]
@@ -227,38 +288,4 @@ fn precomputed_assembly_matches_local_pe_analysis() {
     if let Some(path) = std::env::var_os("SIGLA_TEST_BUNDLE") {
         fs::copy(output.path().join(&artifact.name), path).unwrap();
     }
-}
-
-#[test]
-#[ignore = "manual record-format benchmark"]
-fn record_format_benchmark() {
-    use std::{hint::black_box, time::Instant};
-    let path = Path::new("tests/metadata-fixture/bin/Release/net10.0/MetadataFixture.dll");
-    let data = crate::metadata::file_data(path).unwrap();
-    let archived = binary::encode(&data).unwrap();
-    let postcard = postcard::to_allocvec(&data).unwrap();
-    let compressed = zstd::encode_all(postcard.as_slice(), 1).unwrap();
-    let wire = zstd::encode_all(archived.as_slice(), 12).unwrap();
-    let start = Instant::now();
-    for _ in 0..1000 {
-        black_box(binary::decode::<FileData>(black_box(&archived)).unwrap());
-    }
-    let archived_read = start.elapsed();
-    let start = Instant::now();
-    for _ in 0..1000 {
-        black_box(binary::view::<FileData>(black_box(&archived)).unwrap());
-    }
-    let borrowed_read = start.elapsed();
-    let start = Instant::now();
-    for _ in 0..1000 {
-        let bytes = zstd::decode_all(black_box(compressed.as_slice())).unwrap();
-        black_box(postcard::from_bytes::<FileData>(&bytes).unwrap());
-    }
-    let old_read = start.elapsed();
-    eprintln!(
-        "rkyv={} bytes, transport={} bytes, old_store={} bytes, 1000 reads: rkyv_owned={archived_read:?}, rkyv_borrowed={borrowed_read:?}, postcard+zstd={old_read:?}",
-        archived.len(),
-        wire.len(),
-        compressed.len()
-    );
 }

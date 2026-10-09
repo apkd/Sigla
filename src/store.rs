@@ -1,4 +1,5 @@
 //! Workspace views over shared immutable analysis. See store/shared.rs for ownership.
+pub(crate) mod format;
 pub(crate) mod payload;
 pub mod shared;
 
@@ -10,7 +11,7 @@ use anyhow::{Context, Result};
 use heed::RoTxn;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, LazyLock, Mutex},
 };
@@ -28,7 +29,7 @@ pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<Option<crate::workspace::
         .transpose()
 }
 
-#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FileData {
     pub source: String,
     pub facts: Facts,
@@ -44,38 +45,43 @@ pub struct Store {
 enum Decoded {
     Headers(Arc<DeclarationFile>),
     Body(Arc<BodyFile>),
+    Shared(Arc<format::Shared>),
+    Directory(Arc<format::Directory>),
+    Page(Arc<format::PageIndex>),
 }
-#[derive(Default)]
 struct DecodedCache {
-    entries: HashMap<[u8; 32], (Decoded, usize)>,
-    order: VecDeque<[u8; 32]>,
+    entries: lru::LruCache<[u8; 32], (Decoded, usize)>,
     bytes: usize,
+}
+impl Default for DecodedCache {
+    fn default() -> Self {
+        Self {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        }
+    }
 }
 static DECODED: LazyLock<Mutex<DecodedCache>> =
     LazyLock::new(|| Mutex::new(DecodedCache::default()));
 impl DecodedCache {
     fn get(&mut self, key: &[u8; 32]) -> Option<Decoded> {
-        let value = self.entries.get(key)?.0.clone();
-        self.order.retain(|k| k != key);
-        self.order.push_back(*key);
-        Some(value)
+        self.entries.get(key).map(|entry| entry.0.clone())
     }
     fn put(&mut self, key: [u8; 32], value: Decoded, bytes: usize) {
         const LIMIT: usize = 64 * 1024 * 1024;
-        if bytes > LIMIT || self.entries.contains_key(&key) {
+        // Include the Arc and LRU entry, in addition to the decoded allocation.
+        let bytes = bytes.saturating_add(128);
+        if bytes > LIMIT || self.entries.contains(&key) {
             return;
         }
         while self.bytes + bytes > LIMIT {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((_, (_, bytes))) = self.entries.pop_lru() else {
                 break;
             };
-            if let Some((_, bytes)) = self.entries.remove(&oldest) {
-                self.bytes -= bytes;
-            }
+            self.bytes -= bytes;
         }
         self.bytes += bytes;
-        self.order.push_back(key);
-        self.entries.insert(key, (value, bytes));
+        self.entries.put(key, (value, bytes));
     }
 }
 fn now() -> u64 {
@@ -198,7 +204,14 @@ impl Store {
         self.scope
             .record(tx, file, payload::DATA)?
             .map(|bytes| {
-                let (data, _) = payload::decode::<FileData>(bytes, 32)?;
+                let (mut data, _) = payload::decode::<FileData>(bytes, 32)?;
+                data.facts.declarations = self.declarations_in(tx, file)?;
+                data.facts.modules = crate::binary::decode(
+                    self.scope
+                        .record(tx, file, payload::MODULES)?
+                        .context("Missing module record")?,
+                )?;
+                data.assembly = self.assembly_name_in(tx, file)?;
                 payload::validate(&data)?;
                 Ok(data)
             })
@@ -213,11 +226,7 @@ impl Store {
         tx: &RoTxn<'_>,
         file: &str,
     ) -> Result<Vec<crate::model::Declaration>> {
-        let bytes = self
-            .scope
-            .record(tx, file, payload::SUMMARY)?
-            .context("Missing declaration record")?;
-        Ok(payload::decode(bytes, 16)?.0)
+        format::Reader::new(|key| self.scope.record(tx, file, key))?.declarations()
     }
     fn headers_record(
         &self,
@@ -225,19 +234,44 @@ impl Store {
         file: &str,
         key: &[u8],
     ) -> Result<Option<Arc<DeclarationFile>>> {
-        let Some(bytes) = self.scope.record(tx, file, key)? else {
+        let Some(binding) = self.scope.binding(tx, file)? else {
             return Ok(None);
         };
-        let key = *blake3::hash(bytes).as_bytes();
-        if let Some(Decoded::Headers(value)) = DECODED.lock().unwrap().get(&key) {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&binding.object);
+        hash.update(key);
+        let cache_key = *hash.finalize().as_bytes();
+        if let Some(Decoded::Headers(value)) = DECODED.lock().unwrap().get(&cache_key) {
             return Ok(Some(value));
         }
-        let (data, size) = payload::decode::<DeclarationFile>(bytes, 16)?;
+        let mut reader =
+            format::Reader::for_analysis(|key| self.scope.record(tx, file, key), binding.object)?;
+        if !reader.directory.csharp {
+            return Ok(None);
+        }
+        let data = if key == payload::HEADERS {
+            if !reader.directory.source {
+                return Ok(None);
+            }
+            reader.all()?
+        } else {
+            let index = u32::from_be_bytes(key[1..].try_into()?);
+            if index >= reader.directory.count {
+                return Ok(None);
+            }
+            let (declaration, header) = reader.declaration(index)?;
+            DeclarationFile {
+                declarations: vec![declaration],
+                headers: vec![header],
+                imports: Vec::new(),
+            }
+        };
+        let size = format::declaration_bytes(&data);
         let data = Arc::new(data);
         DECODED
             .lock()
             .unwrap()
-            .put(key, Decoded::Headers(data.clone()), size.saturating_mul(4));
+            .put(cache_key, Decoded::Headers(data.clone()), size);
         Ok(Some(data))
     }
     pub fn csharp_headers(
@@ -290,20 +324,17 @@ impl Store {
         let Some(bytes) = self.scope.record(tx, file, payload::BODY_INDEX)? else {
             return Ok(None);
         };
-        let index = crate::binary::view::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
+        let index = crate::binary::decode::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
         let Some(entry) = index
             .iter()
-            .filter(|v| {
-                v.0.start.to_native() as usize <= position
-                    && position < v.0.end.to_native() as usize
-            })
-            .min_by_key(|v| v.0.end.to_native() - v.0.start.to_native())
+            .filter(|v| v.0.start <= position && position < v.0.end)
+            .min_by_key(|v| v.0.end - v.0.start)
         else {
             return Ok(None);
         };
         let bytes = self
             .scope
-            .record(tx, file, &payload::body_key(entry.1.to_native()))?
+            .record(tx, file, &payload::body_key(entry.1))?
             .context("Missing body group")?;
         let key = *blake3::hash(bytes).as_bytes();
         if let Some(Decoded::Body(value)) = DECODED.lock().unwrap().get(&key) {
@@ -314,7 +345,7 @@ impl Store {
         DECODED
             .lock()
             .unwrap()
-            .put(key, Decoded::Body(data.clone()), size.saturating_mul(4));
+            .put(key, Decoded::Body(data.clone()), size);
         Ok(Some(data))
     }
     pub fn csharp_global_imports(
@@ -325,11 +356,11 @@ impl Store {
             .global_files(tx)?
             .into_iter()
             .map(|file| {
-                let imports = crate::binary::decode(
-                    self.scope
-                        .record(tx, &file, payload::GLOBALS)?
-                        .context("Missing global-import record")?,
-                )?;
+                let imports = self
+                    .csharp_imports(tx, &file)?
+                    .into_iter()
+                    .filter(|import| import.global)
+                    .collect();
                 Ok((file, imports))
             })
             .collect()

@@ -3,16 +3,17 @@ use super::{
     FileData, MAX_SOURCE_BYTES,
     shared::{Encoded, Names, ObjectId},
 };
-use crate::model::{Facts, Language};
+use crate::{
+    binary,
+    model::{Facts, Language},
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const DATA: &[u8] = &[1];
-pub const SUMMARY: &[u8] = &[2];
 pub const HEADERS: &[u8] = &[3];
 pub const BODY_INDEX: &[u8] = &[4];
-pub const GLOBALS: &[u8] = &[5];
 pub const FORWARDERS: &[u8] = &[6];
 pub const ASSEMBLY: &[u8] = &[7];
 pub const ENVIRONMENT: &[u8] = &[8];
@@ -104,62 +105,37 @@ pub fn metadata_id(bytes: &[u8], fallback_stem: &str) -> Result<ObjectId> {
     ))?)
     .as_bytes())
 }
-pub fn decode<T: rkyv::Archive>(bytes: &[u8], multiplier: usize) -> Result<(T, usize)>
-where
-    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
-        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
-{
+pub fn decode<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    multiplier: usize,
+) -> Result<(T, usize)> {
     let bound = MAX_SOURCE_BYTES
         .checked_mul(multiplier)
         .context("Decode bound overflow")?;
     ensure!(bytes.len() <= bound, "Analysis record exceeds safety bound");
-    Ok((crate::binary::decode(bytes)?, bytes.len()))
+    crate::binary::decode_with_size(bytes)
 }
 
 pub fn encode(mut data: FileData) -> Result<Encoded> {
     validate(&data)?;
     let mut records = BTreeMap::new();
-    records.insert(DATA.to_vec(), crate::binary::encode(&data)?);
-    records.insert(
-        SUMMARY.to_vec(),
-        crate::binary::encode(&data.facts.declarations)?,
-    );
     records.insert(ENVIRONMENT.to_vec(), declaration_revision(&data)?.to_vec());
     records.insert(
         MODULES.to_vec(),
-        crate::binary::encode(&data.facts.modules)?,
+        crate::binary::encode(&std::mem::take(&mut data.facts.modules))?,
     );
-    let eligible = |name: &&str| !name.is_empty() && name.len() <= 480;
-    let mut names = Names {
-        declarations: data
-            .facts
-            .declarations
-            .iter()
-            .map(|d| d.name.as_str())
-            .filter(eligible)
-            .map(str::to_owned)
-            .chain(relationship_names(&data.facts))
-            .collect(),
-        occurrences: data
-            .facts
-            .occurrences
-            .iter()
-            .map(|o| o.name.as_str())
-            .chain(data.facts.imports.iter().map(|i| i.alias.as_str()))
-            .filter(eligible)
-            .map(str::to_owned)
-            .collect(),
-        global_imports: false,
-    };
+    let names = names(&data);
+    let encoded_names = super::format::write(
+        &data.facts.declarations,
+        data.facts
+            .csharp
+            .as_ref()
+            .map(|syntax| syntax.headers.as_slice()),
+        data.assembly.is_none(),
+        &names,
+        &mut records,
+    )?;
     if let Some(syntax) = data.facts.csharp.take() {
-        let globals: Vec<_> = syntax
-            .imports
-            .iter()
-            .filter(|i| i.global)
-            .cloned()
-            .collect();
-        names.global_imports = !globals.is_empty();
-        records.insert(GLOBALS.to_vec(), crate::binary::encode(&globals)?);
         records.insert(
             FORWARDERS.to_vec(),
             crate::binary::encode(&syntax.forwarders)?,
@@ -172,14 +148,6 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
                 .get(index)
                 .context("Missing C# declaration header")?;
             let index: u32 = index.try_into()?;
-            records.insert(
-                declaration_key(index),
-                crate::binary::encode(&crate::csharp::syntax::DeclarationFile {
-                    declarations: vec![declaration.clone()],
-                    headers: vec![header.clone()],
-                    imports: Vec::new(),
-                })?,
-            );
             if header.local {
                 continue;
             }
@@ -204,14 +172,6 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
             records.insert(key, crate::binary::encode(&indices)?);
         }
         if data.assembly.is_none() {
-            records.insert(
-                HEADERS.to_vec(),
-                crate::binary::encode(&crate::csharp::syntax::DeclarationFile {
-                    declarations: data.facts.declarations.clone(),
-                    headers: syntax.headers.clone(),
-                    imports: syntax.imports.clone(),
-                })?,
-            );
             let groups = crate::csharp::syntax::split_bodies(
                 syntax,
                 &data.facts.declarations,
@@ -229,14 +189,17 @@ pub fn encode(mut data: FileData) -> Result<Encoded> {
     if let Some(assembly) = &data.assembly {
         records.insert(ASSEMBLY.to_vec(), assembly.as_bytes().to_vec());
     }
+    data.facts.declarations.clear();
+    data.assembly = None;
+    records.insert(DATA.to_vec(), crate::binary::encode(&data)?);
     Ok(Encoded {
-        names: crate::binary::encode(&names)?,
+        names: encoded_names,
         records,
     })
 }
 
 // Preserve the existing C# binding-generation semantics. This is NOT ObjectId.
-fn declaration_revision(data: &FileData) -> Result<[u8; 32]> {
+pub(crate) fn declaration_revision(data: &FileData) -> Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
     if let Some(syntax) = &data.facts.csharp {
         for header in &syntax.headers {
@@ -340,6 +303,15 @@ pub fn validate(data: &FileData) -> Result<()> {
     for o in &data.facts.occurrences {
         ensure!(valid(&o.span), "Invalid occurrence span in analysis object");
     }
+    ensure!(
+        data.facts.imports.iter().all(|import| valid(&import.scope))
+            && data
+                .facts
+                .csharp
+                .as_ref()
+                .is_none_or(|syntax| syntax.imports.iter().all(|import| valid(&import.scope))),
+        "Invalid import scope in analysis object"
+    );
     if let Some(native) = &data.facts.native {
         ensure!(
             native.declarations.len() == data.facts.declarations.len()
@@ -395,80 +367,218 @@ pub fn validate(data: &FileData) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_archived(data: &super::ArchivedFileData) -> Result<()> {
-    let source = data.source.as_str();
-    let valid = |r: &rkyv::Archived<std::ops::Range<usize>>| {
-        let start = r.start.to_native() as usize;
-        let end = r.end.to_native() as usize;
-        start <= end
-            && end <= source.len()
-            && source.is_char_boundary(start)
-            && source.is_char_boundary(end)
+pub(crate) fn names(data: &FileData) -> Names {
+    let eligible = |name: &&str| !name.is_empty() && name.len() <= 480;
+    Names {
+        declarations: data
+            .facts
+            .declarations
+            .iter()
+            .map(|d| d.name.as_str())
+            .filter(eligible)
+            .map(str::to_owned)
+            .chain(relationship_names(&data.facts))
+            .collect(),
+        occurrences: data
+            .facts
+            .occurrences
+            .iter()
+            .map(|o| o.name.as_str())
+            .chain(data.facts.imports.iter().map(|i| i.alias.as_str()))
+            .filter(eligible)
+            .map(str::to_owned)
+            .collect(),
+        global_imports: data
+            .facts
+            .csharp
+            .as_ref()
+            .is_some_and(|syntax| syntax.imports.iter().any(|i| i.global)),
+    }
+}
+pub(crate) fn validate_encoded(encoded: &Encoded) -> Result<()> {
+    let records = &encoded.records;
+    ensure!(
+        records
+            .get(ENVIRONMENT)
+            .is_some_and(|bytes| bytes.len() == 32),
+        "Missing declaration fingerprint"
+    );
+    let mut data = binary::decode::<FileData>(
+        records
+            .iter()
+            .find(|(key, _)| key.as_slice() == DATA)
+            .map(|(_, bytes)| bytes.as_slice())
+            .context("Missing source facts")?,
+    )?;
+    let mut reader =
+        crate::store::format::Reader::new(|key| Ok(records.get(key).map(Vec::as_slice)))?;
+    reader.validate_pages()?;
+    let headers = reader.all()?;
+    let mut owners = vec![0u8; headers.headers.len()];
+    for start in 0..owners.len() {
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if owners[index] == 2 {
+                break;
+            }
+            ensure!(owners[index] == 0, "Cyclic declaration owner");
+            owners[index] = 1;
+            current = headers.headers[index].owner.map(|owner| owner as usize);
+        }
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if owners[index] != 1 {
+                break;
+            }
+            owners[index] = 2;
+            current = headers.headers[index].owner.map(|owner| owner as usize);
+        }
+    }
+    let mut lookups: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
+    for (declaration, header) in headers.declarations.iter().zip(&headers.headers) {
+        if header.local {
+            continue;
+        }
+        let mut add = |kind| {
+            lookups
+                .entry(lookup_key(kind, &declaration.name))
+                .or_default()
+                .push(header.declaration)
+        };
+        add(DeclarationLookup::Name);
+        if declaration.named_type() {
+            add(DeclarationLookup::Type);
+        }
+        if header
+            .parameters
+            .first()
+            .is_some_and(|parameter| parameter.receiver)
+        {
+            add(DeclarationLookup::Extension);
+        }
+        if let Some(owner) = header.owner {
+            add(DeclarationLookup::Members(owner));
+        }
+    }
+    ensure!(
+        data.facts.declarations.is_empty()
+            && data.facts.modules.is_empty()
+            && data.assembly.is_none(),
+        "Duplicate analysis records"
+    );
+    data.facts.declarations = headers.declarations;
+    data.facts.modules = binary::decode(records.get(MODULES).context("Missing module record")?)?;
+    data.assembly = records
+        .get(ASSEMBLY)
+        .map(|bytes| std::str::from_utf8(bytes).map(str::to_owned))
+        .transpose()?;
+    ensure!(
+        reader.directory.source == data.assembly.is_none(),
+        "Invalid declaration source kind"
+    );
+    if reader.directory.csharp {
+        data.facts.csharp = Some(crate::csharp::syntax::FileSyntax {
+            headers: headers.headers,
+            imports: headers.imports,
+            forwarders: binary::decode(
+                records.get(FORWARDERS).context("Missing type forwarders")?,
+            )?,
+            ..Default::default()
+        });
+    }
+    validate(&data)?;
+    ensure!(
+        records[ENVIRONMENT] == declaration_revision(&data)?,
+        "Invalid declaration fingerprint"
+    );
+    let valid_span = |span: &std::ops::Range<usize>| {
+        span.start <= span.end
+            && span.end <= data.source.len()
+            && data.source.is_char_boundary(span.start)
+            && data.source.is_char_boundary(span.end)
     };
-    for d in data.facts.declarations.iter() {
+    let mut bodies = BTreeSet::new();
+    if reader.directory.csharp && reader.directory.source {
+        let index: Vec<(std::ops::Range<usize>, u32)> =
+            binary::decode(records.get(BODY_INDEX).context("Missing body index")?)?;
+        for (range, id) in index {
+            ensure!(
+                valid_span(&range) && bodies.insert(body_key(id)),
+                "Invalid body index"
+            );
+        }
+    }
+    let actual_names = crate::store::format::names(&encoded.names, |key| {
+        Ok(records.get(key).map(Vec::as_slice))
+    })?;
+    let expected_names = names(&data);
+    ensure!(
+        actual_names.declarations == expected_names.declarations
+            && actual_names.occurrences == expected_names.occurrences
+            && actual_names.global_imports == expected_names.global_imports,
+        "Invalid analysis name index"
+    );
+    for (key, bytes) in records.iter() {
+        ensure!(!key.is_empty() && key.len() <= 479, "Invalid analysis key");
         ensure!(
-            valid(&d.span) && valid(&d.name_span) && valid(&d.header) && valid(&d.scope),
-            "Invalid declaration span"
+            match key[0] {
+                1 | 4 | 6..=9 | 13 => key.len() == 1,
+                10 => key.len() == 5,
+                14..=16 => key.len() == 33,
+                17 => key.len() == 37,
+                18..=22 => reader.contains_key(key),
+                _ => false,
+            },
+            "Invalid analysis key"
         );
-    }
-    for o in data.facts.occurrences.iter() {
-        ensure!(valid(&o.span), "Invalid occurrence span");
-    }
-    if let Some(native) = data.facts.native.as_ref() {
-        ensure!(
-            native.declarations.len() == data.facts.declarations.len()
-                && native.occurrences.len() == data.facts.occurrences.len(),
-            "Inconsistent native ordinals"
-        );
-        let declaration =
-            |id: &rkyv::Archived<u32>| (id.to_native() as usize) < native.declarations.len();
-        for region in native.regions.iter() {
-            ensure!(valid(&region.span), "Invalid native region");
-        }
-        for info in native.declarations.iter() {
-            ensure!(
-                (info.region.to_native() as usize) < native.regions.len()
-                    && info.parent.as_ref().is_none_or(declaration),
-                "Invalid declaration owner"
-            );
-        }
-        for info in native.occurrences.iter() {
-            ensure!(
-                (info.region.to_native() as usize) < native.regions.len()
-                    && info.owner.as_ref().is_none_or(declaration)
-                    && info.local.as_ref().is_none_or(declaration)
-                    && info.receiver.as_ref().is_none_or(&valid)
-                    && info.assignment.as_ref().is_none_or(&valid),
-                "Invalid occurrence details"
-            );
-        }
-        for include in native.includes.iter() {
-            ensure!(valid(&include.span), "Invalid include span");
-        }
-        for (name, indices) in native.names.iter() {
-            ensure!(
-                indices.iter().all(|i| data
-                    .facts
-                    .occurrences
-                    .get(i.to_native() as usize)
-                    .is_some_and(|o| o.name.as_str() == name.as_str())),
-                "Invalid native name lookup"
-            );
-        }
-        for (owner, indices) in native.calls.iter() {
-            ensure!(
-                declaration(owner)
-                    && indices.iter().all(|i| {
-                        let i = i.to_native() as usize;
-                        native
-                            .occurrences
-                            .get(i)
-                            .is_some_and(|o| o.owner.as_ref() == Some(owner))
-                            && data.facts.occurrences[i].call
-                    }),
-                "Invalid native call lookup"
-            );
+        match key[0] {
+            1 => {}
+            4 => {
+                binary::decode::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
+            }
+            13 => {
+                binary::decode::<Vec<crate::csharp::syntax::Import>>(bytes)?;
+            }
+            6 => {
+                binary::decode::<Vec<(String, String)>>(bytes)?;
+            }
+            7 => {
+                std::str::from_utf8(bytes)?;
+            }
+            8 => ensure!(bytes.len() == 32, "Invalid declaration fingerprint"),
+            9 => {
+                binary::decode::<Vec<crate::model::ModuleFile>>(bytes)?;
+            }
+            10 => {
+                ensure!(bodies.remove(key), "Body is absent from its index");
+                let body = binary::decode::<crate::csharp::syntax::BodyFile>(bytes)?;
+                ensure!(
+                    body.expressions
+                        .iter()
+                        .all(|expression| valid_span(&expression.span))
+                        && body.locals.iter().all(|local| valid_span(&local.span)
+                            && valid_span(&local.scope)
+                            && local
+                                .value
+                                .is_none_or(|id| (id as usize) < body.expressions.len())
+                            && local
+                                .out_argument
+                                .is_none_or(|id| (id as usize) < body.expressions.len())),
+                    "Invalid body span or reference"
+                );
+            }
+            14..=17 => {
+                let indices = binary::decode::<Vec<u32>>(bytes)?;
+                ensure!(
+                    lookups.remove(key).as_ref() == Some(&indices),
+                    "Invalid declaration lookup"
+                );
+            }
+            18..=22 => {}
+            _ => anyhow::bail!("Unknown analysis record"),
         }
     }
+    ensure!(lookups.is_empty(), "Missing declaration lookup");
+    ensure!(bodies.is_empty(), "Missing indexed body");
     Ok(())
 }

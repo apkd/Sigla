@@ -1,42 +1,51 @@
-//! Portable, checked records shared by the store and metadata archive.
-use anyhow::Result;
-use rkyv::{
-    Archive, Deserialize, Serialize,
-    api::high::{HighDeserializer, HighSerializer, HighValidator},
-    bytecheck::CheckBytes,
-    rancor::Error,
-    ser::allocator::ArenaHandle,
-    util::AlignedVec,
-};
+//! Portable records shared by the store and metadata archive.
+mod bounded;
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
 
-pub fn encode<T>(value: &T) -> Result<Vec<u8>>
-where
-    T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
-{
-    Ok(rkyv::to_bytes::<Error>(value)?.to_vec())
+pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    Ok(postcard::to_allocvec(value)?)
 }
 
-pub fn view<T: Archive>(bytes: &[u8]) -> Result<&T::Archived>
-where
-    T::Archived: for<'a> CheckBytes<HighValidator<'a, Error>>,
-{
-    let mut validator = rkyv::validation::Validator::new(
-        rkyv::validation::archive::ArchiveValidator::with_max_depth(
-            bytes,
-            std::num::NonZeroUsize::new(128),
-        ),
-        rkyv::validation::shared::SharedValidator::new(),
+pub fn decode<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T> {
+    Ok(decode_with_size(bytes)?.0)
+}
+
+pub fn decode_with_size<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<(T, usize)> {
+    let mut decoder = postcard::Deserializer::from_bytes(bytes);
+    let mut budget = bounded::Budget::new(bytes.len());
+    let value =
+        T::deserialize(bounded::Decoder::new(&mut decoder, &mut budget)).map_err(|error| {
+            match budget.failure {
+                Some(message) => anyhow::anyhow!(message),
+                None => error.into(),
+            }
+        })?;
+    ensure!(
+        decoder.finalize()?.is_empty(),
+        "Trailing binary record data"
     );
-    Ok(rkyv::api::access_with_context::<T::Archived, _, Error>(
-        bytes,
-        &mut validator,
-    )?)
+    Ok((
+        value,
+        budget.allocated().saturating_add(std::mem::size_of::<T>()),
+    ))
 }
 
-pub fn decode<T: Archive>(bytes: &[u8]) -> Result<T>
-where
-    T::Archived:
-        for<'a> CheckBytes<HighValidator<'a, Error>> + Deserialize<T, HighDeserializer<Error>>,
-{
-    Ok(rkyv::deserialize::<T, Error>(view::<T>(bytes)?)?)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_trailing_truncated_and_unbounded_sequences() {
+        let bytes = encode(&vec!["one", "two"]).unwrap();
+        for end in 0..bytes.len() {
+            assert!(decode::<Vec<String>>(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode::<Vec<String>>(&trailing).is_err());
+        let count = encode(&u64::MAX).unwrap();
+        assert!(decode::<Vec<String>>(&count).is_err());
+        // Unit values consume no input bytes; work still consumes the allocation budget.
+        assert!(decode::<Vec<()>>(&count).is_err());
+    }
 }

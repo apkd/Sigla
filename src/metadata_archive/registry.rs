@@ -107,12 +107,12 @@ pub(super) fn profiles(editors: &[String]) -> Result<Vec<Vec<String>>> {
     Ok(result.into_iter().collect())
 }
 
-#[derive(Clone, Archive, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Request {
     pub origin: Origin,
     pub editors: Vec<String>,
 }
-#[derive(Default, Archive, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct Plan {
     pub requests: Vec<Request>,
     pub unavailable: Vec<String>,

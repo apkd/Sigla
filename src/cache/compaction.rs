@@ -190,11 +190,15 @@ mod tests {
                     1,
                     || Ok(()),
                     || {
-                        Ok(Encoded {
-                            names: crate::binary::encode(&crate::store::shared::Names::default())
-                                .unwrap(),
-                            records: BTreeMap::from([(vec![1], vec![42; 64 * 1024])]),
-                        })
+                        let mut records = BTreeMap::from([(vec![1], vec![42; 64 * 1024])]);
+                        let names = crate::store::format::write(
+                            &[],
+                            None,
+                            true,
+                            &crate::store::shared::Names::default(),
+                            &mut records,
+                        )?;
+                        Ok(Encoded { names, records })
                     },
                 )
                 .unwrap();

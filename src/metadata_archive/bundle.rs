@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(test)]
+#[path = "benchmark.rs"]
+mod benchmark;
 use crate::{
     acquisition,
     model::Language,
@@ -115,14 +118,14 @@ impl Builder {
                 }
                 let facts = crate::extract::extract(&source, language, defines, "")
                     .with_context(context)?;
-                analyses.push(Analysis {
+                analyses.push((
                     id,
-                    encoded: records::encode(FileData {
+                    binary::encode(&records::encode(FileData {
                         source: source.clone(),
                         facts,
                         assembly: None,
-                    })?,
-                });
+                    })?)?,
+                ));
             }
             self.object(
                 format!("{path}.analysis"),
@@ -154,7 +157,9 @@ impl Builder {
         let path = output.join(&name);
         let mut temporary = tempfile::NamedTempFile::new_in(output)?;
         {
-            let compressed = zstd::stream::write::Encoder::new(temporary.as_file_mut(), 12)?;
+            let mut compressed = zstd::stream::write::Encoder::new(temporary.as_file_mut(), 22)?;
+            compressed.window_log(27)?;
+            compressed.long_distance_matching(true)?;
             let mut tar = tar::Builder::new(compressed);
             fn append<W: Write>(tar: &mut tar::Builder<W>, path: &str, bytes: &[u8]) -> Result<()> {
                 let mut header = tar::Header::new_gnu();
@@ -223,7 +228,8 @@ pub(super) fn unpack(
             "Bundle digest or size mismatch"
         );
     }
-    let reader = zstd::stream::read::Decoder::new(fs::File::open(path)?)?;
+    let mut reader = zstd::stream::read::Decoder::new(fs::File::open(path)?)?;
+    reader.window_log_max(27)?;
     let mut archive = tar::Archive::new(reader);
     let mut entries = archive.entries()?;
     let mut first = entries.next().context("Empty metadata bundle")??;
@@ -280,10 +286,13 @@ pub(super) fn unpack(
         );
         for target in targets {
             if target.path.ends_with(".sigla") {
-                validate_analysis(binary::view::<Analysis>(payload(&bytes)?)?)?;
+                validate_analysis(&binary::decode::<Analysis>(payload(&bytes)?)?)?;
             } else if target.path.ends_with(".analysis") {
-                for analysis in binary::view::<Vec<Analysis>>(payload(&bytes)?)?.iter() {
-                    validate_analysis(analysis)?;
+                for (id, encoded) in binary::decode::<Vec<(ObjectId, &[u8])>>(payload(&bytes)?)? {
+                    validate_analysis(&Analysis {
+                        id,
+                        encoded: binary::decode(encoded)?,
+                    })?;
                 }
             }
             let path = destination.join(&target.path);
@@ -307,51 +316,6 @@ pub(super) fn verify(path: &Path, expected: Option<&Artifact>) -> Result<Manifes
     let temp = tempfile::tempdir()?;
     unpack(path, temp.path(), expected)
 }
-fn validate_analysis(analysis: &ArchivedAnalysis) -> Result<()> {
-    let records = &analysis.encoded.records;
-    let data = binary::view::<FileData>(
-        records
-            .iter()
-            .find(|(key, _)| key.as_slice() == records::DATA)
-            .map(|(_, bytes)| bytes.as_slice())
-            .context("Missing source facts")?,
-    )?;
-    records::validate_archived(data)?;
-    binary::view::<crate::store::shared::Names>(&analysis.encoded.names)?;
-    for (key, bytes) in records.iter() {
-        ensure!(!key.is_empty() && key.len() <= 479, "Invalid analysis key");
-        match key[0] {
-            1 => {}
-            2 => {
-                binary::view::<Vec<crate::model::Declaration>>(bytes)?;
-            }
-            3 | 12 => {
-                binary::view::<crate::csharp::syntax::DeclarationFile>(bytes)?;
-            }
-            4 => {
-                binary::view::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
-            }
-            5 | 13 => {
-                binary::view::<Vec<crate::csharp::syntax::Import>>(bytes)?;
-            }
-            6 => {
-                binary::view::<Vec<(String, String)>>(bytes)?;
-            }
-            7 => {
-                std::str::from_utf8(bytes)?;
-            }
-            8 => ensure!(bytes.len() == 32, "Invalid declaration fingerprint"),
-            9 => {
-                binary::view::<Vec<crate::model::ModuleFile>>(bytes)?;
-            }
-            10 => {
-                binary::view::<crate::csharp::syntax::BodyFile>(bytes)?;
-            }
-            14..=17 => {
-                binary::view::<Vec<u32>>(bytes)?;
-            }
-            _ => anyhow::bail!("Unknown analysis record"),
-        }
-    }
-    Ok(())
+fn validate_analysis(analysis: &Analysis) -> Result<()> {
+    records::validate_encoded(&analysis.encoded)
 }

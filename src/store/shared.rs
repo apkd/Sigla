@@ -20,9 +20,7 @@ const BATCH: usize = 128;
 static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Database>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(
-    Clone, Debug, Default, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Names {
     pub declarations: BTreeSet<String>,
     pub occurrences: BTreeSet<String>,
@@ -31,7 +29,7 @@ pub struct Names {
 
 /// Local record keys must be nonempty. The empty key is reserved for Names.
 /// Values are already encoded/compressed when they enter the writer.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Encoded {
     pub names: Vec<u8>,
     pub records: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -694,7 +692,9 @@ impl Scope {
                 .all(|k| !k.is_empty() && 32 + k.len() <= self.database.env.max_key_size()),
             "Invalid analysis record key"
         );
-        let decoded_names = crate::binary::view::<Names>(&value.names)?;
+        let decoded_names = super::format::names(&value.names, |key| {
+            Ok(value.records.get(key).map(Vec::as_slice))
+        })?;
         for name in decoded_names
             .declarations
             .iter()
@@ -824,7 +824,7 @@ impl Scope {
             .record(tx, object, &[])?
             .context("Object descriptor is missing")?
             .to_vec();
-        let names = crate::binary::view::<Names>(&bytes)?;
+        let names = super::format::names(&bytes, |key| self.database.record(tx, object, key))?;
         for (table, names) in [
             (self.database.declarations, &names.declarations),
             (self.database.occurrences, &names.occurrences),
