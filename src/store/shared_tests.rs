@@ -47,6 +47,32 @@ fn clean(scope: &Scope, files: &[&str]) {
 }
 
 #[test]
+fn dirty_workspace_read_is_retryable_until_refresh_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let workspace = scope(&db, 1);
+    clean(&workspace, &[]);
+    assert!(workspace.query_read().is_ok());
+
+    workspace.begin_refresh().unwrap();
+    let error = workspace.query_read().err().expect("dirty read must fail");
+    let details = crate::diagnostics::details(&error, "refresh-read");
+    assert_eq!(details["error_code"], "UNAVAILABLE");
+    assert_eq!(details["retryable"], true);
+    clean(&workspace, &[]);
+    assert!(workspace.query_read().is_ok());
+
+    workspace.mark_deleting().unwrap();
+    let error = workspace
+        .query_read()
+        .err()
+        .expect("retired read must fail");
+    let details = crate::diagnostics::details(&error, "retired-read");
+    assert_eq!(details["error_code"], "QUERY_FAILED");
+    assert!(details["retryable"].is_null());
+}
+
+#[test]
 fn batch_publication_rolls_back_together_and_shares_objects() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();

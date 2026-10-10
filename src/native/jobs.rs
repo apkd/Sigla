@@ -22,7 +22,7 @@ pub struct Snapshot {
     pub store: Arc<Store>,
     pub manifest: Manifest,
 }
-type Outcome = std::result::Result<Arc<Snapshot>, String>;
+type Outcome = std::result::Result<Arc<Snapshot>, Arc<anyhow::Error>>;
 #[derive(Clone)]
 pub struct Ticket {
     outcome: watch::Receiver<Option<Outcome>>,
@@ -35,7 +35,7 @@ impl Ticket {
     pub async fn wait(mut self) -> Result<Arc<Snapshot>> {
         loop {
             if let Some(result) = self.ready() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(crate::diagnostics::shared_error);
             }
             self.outcome
                 .changed()
@@ -272,14 +272,19 @@ impl Jobs {
                 // A completed superseded worker must never publish over its successor.
                 let state = workspace.lock_owned().await;
                 let current = state.as_ref().context("Code workspace unavailable")?;
+                ensure!(!cancel.is_cancelled(), "Source indexing superseded");
                 ensure!(
-                    self::generation(&current.manifest, group)? == generation && !cancel.is_cancelled(),
-                    "Workspace changed during source indexing; retry query",
+                    self::generation(&current.manifest, group)? == generation,
+                    crate::diagnostics::RefreshRequired(
+                        "Workspace changed during source indexing; retry query"
+                    ),
                 );
                 for file in snapshot.files.values() {
                     ensure!(
                         crate::workspace::Stamp::read(&file.path)? == file.stamp,
-                        "Source changed during indexing; retry query",
+                        crate::diagnostics::RefreshRequired(
+                            "Source changed during indexing; retry query"
+                        ),
                     );
                 }
                 store.save_manifest(&snapshot)?;
@@ -295,7 +300,7 @@ impl Jobs {
                 drop(state);
                 drop(branch);
                 Ok(snapshot)
-            }.await.map_err(|e: anyhow::Error| format!("{e:#}"));
+            }.await.map_err(Arc::<anyhow::Error>::new);
             if outcome.is_err() {
                 send.send_replace(Some(outcome));
             }

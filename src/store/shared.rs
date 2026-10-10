@@ -561,10 +561,12 @@ impl Scope {
         Ok(tx)
     }
     pub fn check_read(&self, tx: &RoTxn<'_>) -> Result<()> {
+        let phase = self.info(tx)?.phase;
         ensure!(
-            self.info(tx)?.phase == Phase::Clean,
-            "Workspace needs a completed refresh"
+            phase != Phase::Dirty,
+            crate::diagnostics::RefreshRequired("Workspace needs a completed refresh")
         );
+        ensure!(phase == Phase::Clean, "Workspace is being retired");
         Ok(())
     }
     pub fn begin_refresh(&self) -> Result<()> {

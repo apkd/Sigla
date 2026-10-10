@@ -24,7 +24,7 @@ enum Progress {
     Pending,
     Files(Arc<Inventory>),
     Ready(Arc<Inventory>),
-    Failed(String, Option<Arc<Inventory>>),
+    Failed(Arc<anyhow::Error>, Option<Arc<Inventory>>),
 }
 #[derive(Clone)]
 pub(super) struct Ticket(watch::Receiver<Progress>);
@@ -44,7 +44,9 @@ impl Ticket {
                 Progress::Files(files)
                 | Progress::Ready(files)
                 | Progress::Failed(_, Some(files)) => return Ok(files),
-                Progress::Failed(error, None) => anyhow::bail!(error),
+                Progress::Failed(error, None) => {
+                    return Err(crate::diagnostics::shared_error(error));
+                }
                 Progress::Pending => (),
             }
             self.0.changed().await?;
@@ -54,7 +56,9 @@ impl Ticket {
         loop {
             match self.0.borrow().clone() {
                 Progress::Ready(_) => return Ok(()),
-                Progress::Failed(error, _) => anyhow::bail!(error),
+                Progress::Failed(error, _) => {
+                    return Err(crate::diagnostics::shared_error(error));
+                }
                 _ => (),
             }
             self.0.changed().await?;
@@ -407,7 +411,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     Progress::Files(inventory) => Some(inventory.clone()),
                     _ => None,
                 };
-                Progress::Failed(format!("{error:#}"), inventory)
+                Progress::Failed(Arc::new(error), inventory)
             }
         };
         send.send_replace(progress);

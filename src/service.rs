@@ -712,7 +712,9 @@ impl App {
             ensure!(
                 crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?
                     == asset_generation,
-                "Workspace changed during indexing; retry query"
+                crate::diagnostics::RefreshRequired(
+                    "Workspace changed during indexing; retry query"
+                )
             );
             ensure!(
                 branch_state
@@ -720,7 +722,9 @@ impl App {
                     .and_then(|s| s.as_ref())
                     .map(|s| &s.prepared.revision)
                     == context.as_ref().map(|(_, _, revision, _)| revision),
-                "Repository changed during indexing; retry query"
+                crate::diagnostics::RefreshRequired(
+                    "Repository changed during indexing; retry query"
+                )
             );
         }
         let permit = self.workers.clone().acquire_owned().await?;

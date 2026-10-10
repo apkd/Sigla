@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::{Semaphore, watch};
-type Outcome = std::result::Result<Arc<Index>, String>;
+type Outcome = std::result::Result<Arc<Index>, Arc<anyhow::Error>>;
 pub type Ticket = watch::Receiver<Option<Outcome>>;
 pub fn empty() -> Ticket {
     watch::channel(Some(Ok(Arc::new(Index::default())))).1
@@ -126,7 +126,9 @@ impl Jobs {
                     let code = state.as_ref().context("Code workspace unavailable")?;
                     ensure!(
                         self::generation(&code.manifest)? == expected,
-                        "Workspace changed before asset indexing; retry query"
+                        crate::diagnostics::RefreshRequired(
+                            "Workspace changed before asset indexing; retry query"
+                        )
                     );
                     ensure!(
                         branch_state
@@ -134,7 +136,9 @@ impl Jobs {
                             .and_then(|s| s.as_ref())
                             .map(|s| &s.prepared.revision)
                             == revision.as_ref(),
-                        "Repository changed before asset indexing; retry query"
+                        crate::diagnostics::RefreshRequired(
+                            "Repository changed before asset indexing; retry query"
+                        )
                     );
                     let store = code.store.clone();
                     let manifest = code.manifest.clone();
@@ -162,10 +166,14 @@ impl Jobs {
                         let state = branch
                             .state
                             .try_read()
-                            .context("Repository is refreshing; retry asset query")?;
+                            .map_err(|_| crate::diagnostics::RefreshRequired(
+                                "Repository is refreshing; retry asset query"
+                            ))?;
                         ensure!(
                             state.as_ref().map(|s| &s.prepared.revision) == revision.as_ref(),
-                            "Repository changed during asset indexing; retry query"
+                            crate::diagnostics::RefreshRequired(
+                                "Repository changed during asset indexing; retry query"
+                            )
                         );
                     }
                     tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = started.elapsed().as_millis(), "Unity asset index ready");
@@ -174,9 +182,9 @@ impl Jobs {
                 .await?
             }
             .await
-            .map_err(|error| format!("{error:#}"));
+            .map_err(Arc::new);
             if let Err(error) = &outcome {
-                tracing::warn!(workspace = %log_root.display(), %error, "Unity asset index failed");
+                tracing::warn!(workspace = %log_root.display(), error = %format_args!("{error:#}"), "Unity asset index failed");
             }
             sender.send_replace(Some(outcome));
         });
@@ -186,11 +194,32 @@ impl Jobs {
 pub async fn wait(mut ticket: Ticket) -> Result<Arc<Index>> {
     loop {
         if let Some(result) = ticket.borrow().clone() {
-            return result.map_err(anyhow::Error::msg);
+            return result.map_err(crate::diagnostics::shared_error);
         }
         ticket
             .changed()
             .await
             .context("Asset indexing worker stopped")?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn asset_wait_preserves_refresh_classification_and_can_read_a_ready_result() {
+        let failure = anyhow::Error::new(crate::diagnostics::RefreshRequired(
+            "Repository is refreshing; retry asset query",
+        ))
+        .context("asset publication");
+        let (sender, ticket) = watch::channel(Some(Err(Arc::new(failure))));
+        let error = wait(ticket.clone()).await.err().expect("refresh must fail");
+        let details = crate::diagnostics::details(&error, "asset-refresh");
+        assert_eq!(details["error_code"], "UNAVAILABLE");
+        assert_eq!(details["retryable"], true);
+
+        sender.send_replace(Some(Ok(Arc::new(Index::default()))));
+        assert!(wait(ticket).await.is_ok());
     }
 }
