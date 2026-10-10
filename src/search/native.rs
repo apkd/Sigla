@@ -6,7 +6,7 @@ use crate::{
     selection::Selection,
 };
 
-type ReferenceResults = Selection<(String, usize, Option<usize>), SearchResult>;
+type ReferenceResults = Selection<(String, usize, Option<usize>, String), SearchResult>;
 type HierarchyResults = Selection<(bool, String, usize), SearchResult>;
 
 impl Search<'_> {
@@ -299,6 +299,7 @@ impl Search<'_> {
                         display.clone(),
                         o.span.start,
                         containing.map(|d| d.name_span.start),
+                        o.name.clone(),
                     );
                     if !units.accepts(&rank) {
                         continue;

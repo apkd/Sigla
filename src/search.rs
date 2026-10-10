@@ -817,10 +817,10 @@ impl<'a> Search<'a> {
             if !narrowed.is_empty() {
                 candidates = narrowed;
                 known_receiver = true;
-            } else if known_receiver || !types.is_empty() {
-                return Ok(Vec::new());
             } else {
-                return Ok(candidates.into_iter().map(|h| (h, true)).collect());
+                // A shared member name is not evidence for an unresolved receiver.
+                // Outgoing searches retain this call site as an unresolved target.
+                return Ok(Vec::new());
             }
         } else {
             let own = context_name(&owner, m);
@@ -1227,19 +1227,14 @@ impl<'a> Search<'a> {
             None,
             |this, h| {
                 let file = &this.manifest.files[&h.file];
-                if (q.selector == "operator"
-                    && !file.language.native()
-                    && q.target.name != "*"
-                    && h.decl.name != q.target.name)
-                    || !this.filters(
-                        q,
-                        file,
-                        &h.membership,
-                        Some(&h.decl),
-                        h.decl.name_span.start,
-                        &inside,
-                    )
-                {
+                if !this.filters(
+                    q,
+                    file,
+                    &h.membership,
+                    Some(&h.decl),
+                    h.decl.name_span.start,
+                    &inside,
+                ) {
                     return Ok(());
                 }
                 let native_function = file.language.native()
@@ -1600,6 +1595,8 @@ impl<'a> Search<'a> {
                             display.to_string(),
                             o.span.start,
                             containing.as_ref().map(|d| d.name_span.start),
+                            // Implicit operations can share a source span.
+                            o.name.clone(),
                         );
                         if let Some(unit) = units.get_mut(&rank) {
                             let unit: &mut crate::render::SearchResult = unit;

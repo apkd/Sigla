@@ -339,3 +339,113 @@ class Usage { void Test(Target known, dynamic unknown) {
         resolved_only.query("calls:Target.Run path:Test.cs").await
     );
 }
+
+#[tokio::test]
+async fn foreach_operations_with_one_source_span_keep_separate_resolved_targets() {
+    let fixture = Fixture::new(
+        r#"
+class Enumerator { public int Current => 0; public bool MoveNext() => false; }
+class Items { public Enumerator GetEnumerator() => null; }
+class Usage { void Iterate(Items items) { foreach (var item in items) {} } }
+"#,
+    );
+    for targets in [
+        ["Enumerator.MoveNext", "Items.GetEnumerator"],
+        ["Items.GetEnumerator", "Enumerator.MoveNext"],
+    ] {
+        for target in targets {
+            let result = fixture.query(&format!("calls:{target}")).await;
+            assert!(result.contains("Usage.Iterate"), "{target}: {result}");
+            assert!(!result.contains("Possible"), "{result}");
+        }
+        let result = fixture.query("calls:* in:Usage.Iterate").await;
+        for target in [
+            "method:Items.GetEnumerator()",
+            "method:Enumerator.MoveNext()",
+        ] {
+            assert!(result.contains(&format!("→ {target}")), "{result}");
+        }
+        assert_eq!(result.matches("→ method:").count(), 2, "{result}");
+        assert!(!result.contains("Possible"), "{result}");
+        let result = fixture.query("uses:Enumerator.Current").await;
+        assert!(result.contains("Usage.Iterate"), "{result}");
+        assert!(!result.contains("Possible"), "{result}");
+    }
+    fixture.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn unresolved_foreach_operations_do_not_become_candidates_for_each_other() {
+    let fixture = Fixture::new(
+        "class Usage { void Iterate(Missing items) { foreach (var item in items) {} } }",
+    );
+    for _ in 0..2 {
+        let result = fixture.query("calls:* in:Usage.Iterate").await;
+        for target in ["unresolved:GetEnumerator", "unresolved:MoveNext"] {
+            assert!(result.contains(&format!("→ {target}")), "{result}");
+        }
+        assert_eq!(result.matches("→ unresolved:").count(), 2, "{result}");
+        assert!(!result.contains("Possible targets:"), "{result}");
+    }
+    fixture.app.shutdown().await;
+}
+
+const OPERATORS: &str = r#"
+namespace Demo {
+    struct Box {
+        public static bool operator ==(Box left, Box right) => true;
+        public static bool operator !=(Box left, Box right) => false;
+        public static Box operator +(Box value) => value;
+        public static Box operator +(Box left, Box right) => left;
+        public static explicit operator int(Box value) => 0;
+    }
+}
+namespace Other {
+    struct Box {
+        public static bool operator ==(Box left, Box right) => true;
+        public static bool operator !=(Box left, Box right) => false;
+    }
+}
+"#;
+
+#[tokio::test]
+async fn qualified_operator_ids_round_trip_with_signatures_and_wildcards() {
+    let fixture = Fixture::new(OPERATORS);
+    for operator in ["==", "!=", "+", "op_Explicit"] {
+        let unqualified = fixture
+            .query(&format!("operator:{operator} in:Demo.Box"))
+            .await;
+        let id = format!("Demo.Box.{operator}");
+        assert!(unqualified.contains(&id), "{unqualified}");
+        let qualified = fixture.query(&format!("operator:{id}")).await;
+        assert_eq!(qualified, unqualified, "{id}");
+    }
+    let partial = fixture.query("operator:Box.== in:Demo.Box").await;
+    assert!(partial.contains("Demo.Box.=="), "{partial}");
+    for parameters in ["Box", "Box,Box"] {
+        let expected = fixture
+            .query(&format!("operator:+({parameters}) in:Demo.Box"))
+            .await;
+        assert!(expected.contains("Demo.Box.+"), "{expected}");
+        assert_eq!(
+            fixture
+                .query(&format!("operator:Demo.Box.+({parameters})"))
+                .await,
+            expected,
+            "{parameters}",
+        );
+    }
+    let all = fixture.query("operator:Demo.Box.*").await;
+    for operator in ["==", "!=", "+", "op_Explicit"] {
+        assert!(all.contains(&format!("Demo.Box.{operator}")), "{all}");
+    }
+    assert!(!all.contains("Other.Box"), "{all}");
+    for query in [
+        "operator:Missing.Box.==",
+        "operator:Demo.Box.+(Box,Box,Box)",
+    ] {
+        let result = fixture.query(query).await;
+        assert!(result.starts_with("No matches."), "{query}: {result}");
+    }
+    fixture.app.shutdown().await;
+}

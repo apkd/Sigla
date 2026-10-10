@@ -204,3 +204,101 @@ ENDGLSL
         assert!(!calls.contains(other), "{calls}");
     }
 }
+
+#[tokio::test]
+async fn rust_unknown_receivers_keep_call_sites_without_unrelated_member_candidates() {
+    let source = r#"use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+pub struct Progress;
+impl Progress {
+    pub fn new() -> Self { Self }
+}
+pub struct OutputTransaction;
+impl OutputTransaction {
+    pub fn new(_: &Path) -> Self { Self }
+}
+pub struct Builder;
+impl Builder {
+    pub fn build(&self, _: bool) {}
+}
+pub struct ExtraArgument;
+impl ExtraArgument {
+    pub fn build(&self, _: bool, _: bool) {}
+}
+
+pub fn external_calls() {
+    let _ = Arc::new(
+        AtomicBool::new(false),
+    );
+}
+pub fn typed_calls(builder: Builder, path: &Path) {
+    let _ = Progress::new();
+    let _ = OutputTransaction::new(path);
+    builder.build(true);
+}
+pub fn unknown_receiver() {
+    let value = unavailable::factory();
+    value.build(true);
+}
+"#;
+    let fixture = Fixture::new("lib.rs", source);
+    std::fs::write(
+        fixture.root.path().join("Cargo.toml"),
+        "[package]\nname='receiver_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+    ).unwrap();
+    let app = &fixture.app;
+    let codebase = fixture.root.path().to_str().unwrap();
+    let external = app
+        .search(codebase, "calls:* in:receiver_fixture::external_calls")
+        .await
+        .unwrap();
+    assert!(
+        !external.contains("Progress::new") && !external.contains("OutputTransaction::new"),
+        "{external}"
+    );
+    // Keep the nested calls on different lines so relationship grouping cannot
+    // collapse the two source locations, even if dependency resolution improves.
+    let rows: Vec<_> = external
+        .lines()
+        .filter(|line| line.starts_with("`function:receiver_fixture::external_calls → "))
+        .collect();
+    assert_eq!(rows.len(), 2, "Both call sites must survive: {external}");
+    for source_line in ["    let _ = Arc::new(", "        AtomicBool::new(false),"] {
+        let line_number = source.lines().position(|line| line == source_line).unwrap() + 1;
+        let location = format!("lib.rs:{line_number}`");
+        assert!(
+            rows.iter().any(|row| row.ends_with(&location)),
+            "Missing call site on line {line_number}: {external}"
+        );
+    }
+
+    let typed = app
+        .search(codebase, "calls:* in:receiver_fixture::typed_calls")
+        .await
+        .unwrap();
+    for target in ["Progress::new", "OutputTransaction::new", "Builder::build"] {
+        assert!(typed.contains(target), "{typed}");
+    }
+    assert!(!typed.contains("unresolved:"), "{typed}");
+    assert!(!typed.contains("Possible"), "{typed}");
+
+    let unknown = app
+        .search(codebase, "calls:* in:receiver_fixture::unknown_receiver")
+        .await
+        .unwrap();
+    assert!(unknown.contains("value.build(true)"), "{unknown}");
+    assert!(unknown.contains("unresolved:build"), "{unknown}");
+    assert!(!unknown.contains("Builder::build"), "{unknown}");
+    assert!(!unknown.contains("ExtraArgument::build"), "{unknown}");
+
+    let incoming = app
+        .search(codebase, "calls:receiver_fixture::Builder::build")
+        .await
+        .unwrap();
+    assert!(incoming.contains("builder.build(true)"), "{incoming}");
+    assert!(!incoming.contains("value.build(true)"), "{incoming}");
+    assert!(!incoming.contains("Possible"), "{incoming}");
+    app.shutdown().await;
+}
