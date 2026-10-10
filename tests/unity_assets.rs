@@ -362,3 +362,156 @@ async fn scriptable_objects_stay_in_their_project_and_follow_asset_moves_and_del
     );
     app.shutdown().await;
 }
+
+fn app(root: &Path, cache: &Path) -> Arc<App> {
+    Arc::new(App::new(Policy::new(vec![root.into()]).unwrap(), cache.into(), 1).unwrap())
+}
+
+fn object_handles(result: &str) -> Vec<&str> {
+    result
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("unity@"))
+        .collect()
+}
+
+const LOD_PREFAB: &str = r#"--- !u!1 &1
+GameObject:
+  m_Name: Bolt
+  m_Component:
+  - component: {fileID: 2}
+  - component: {fileID: 3}
+  - component: {fileID: 4}
+  - component: {fileID: 5}
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Father: {fileID: 0}
+--- !u!23 &3
+MeshRenderer:
+  m_GameObject: {fileID: 1}
+--- !u!23 &4
+MeshRenderer:
+  m_GameObject: {fileID: 1}
+--- !u!205 &5
+LODGroup:
+  m_GameObject: {fileID: 1}
+  m_LODs:
+  - screenRelativeHeight: 0.6
+    renderers:
+    - renderer: {fileID: 3}
+  - screenRelativeHeight: 0.3
+    renderers:
+    - renderer: {fileID: 4}
+"#;
+
+#[tokio::test]
+async fn native_lod_group_instances_round_trip_and_keep_renderer_edges() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "ProjectSettings/ProjectVersion.txt",
+        "m_EditorVersion: 6000.0.1f1\n",
+    );
+    write(root.path(), "Assets/Bolt.prefab", LOD_PREFAB);
+    write(
+        root.path(),
+        "Assets/Bolt.prefab.meta",
+        "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    );
+    let app = app(root.path(), cache.path());
+    let codebase = root.path().to_str().unwrap();
+    let lod = app
+        .search(
+            codebase,
+            "instance:UnityEngine.LODGroup type-match:exact path:Assets/Bolt.prefab",
+        )
+        .await
+        .unwrap();
+    assert!(lod.contains("UnityEngine.LODGroup"), "{lod}");
+    assert!(!lod.contains("Coverage is incomplete"), "{lod}");
+    let handles = object_handles(&lod);
+    assert_eq!(handles.len(), 1, "{lod}");
+    assert!(handles[0].ends_with("#5"), "{lod}");
+
+    let components = app
+        .search(
+            codebase,
+            "instance:UnityEngine.Component path:Assets/Bolt.prefab",
+        )
+        .await
+        .unwrap();
+    assert_eq!(object_handles(&components).len(), 4, "{components}");
+    assert!(components.contains(handles[0]), "{components}");
+    let exact_base = app
+        .search(
+            codebase,
+            "instance:UnityEngine.Component type-match:exact path:Assets/Bolt.prefab",
+        )
+        .await
+        .unwrap();
+    assert!(object_handles(&exact_base).is_empty(), "{exact_base}");
+
+    let view = app.view(codebase, handles[0], "exact").await.unwrap();
+    assert!(view.contains("--- !u!205 &5"), "{view}");
+    assert!(view.contains("LODGroup:"), "{view}");
+    let dependencies = app
+        .search(codebase, &format!("dependencies:{} limit:10", handles[0]))
+        .await
+        .unwrap();
+    for field in [
+        "m_GameObject",
+        "m_LODs.Array.data[0].renderers.Array.data[0].renderer",
+        "m_LODs.Array.data[1].renderers.Array.data[0].renderer",
+    ] {
+        assert!(dependencies.contains(field), "{dependencies}");
+    }
+    assert!(!dependencies.contains("type unresolved"), "{dependencies}");
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn unresolved_native_types_report_incomplete_coverage_with_and_without_matches() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "ProjectSettings/ProjectVersion.txt",
+        "m_EditorVersion: 6000.0.1f1\n",
+    );
+    write(
+        root.path(),
+        "Assets/Unknown.prefab",
+        r#"--- !u!1 &1
+GameObject:
+  m_Name: UnresolvedTypes
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+--- !u!9876543 &3
+UnmappedNative:
+  m_GameObject: {fileID: 1}
+--- !u!114 &4
+MonoBehaviour:
+  m_GameObject: {fileID: 1}
+  m_Script: {fileID: 0}
+"#,
+    );
+    let app = app(root.path(), cache.path());
+    let codebase = root.path().to_str().unwrap();
+    for (ty, expected_matches) in [("UnityEngine.Component", 1), ("UnityEngine.LODGroup", 0)] {
+        let result = app
+            .search(
+                codebase,
+                &format!("instance:{ty} path:Assets/Unknown.prefab limit:1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(object_handles(&result).len(), expected_matches, "{result}");
+        assert!(result.contains("unresolved native types"), "{result}");
+        assert!(result.contains("unresolved script types"), "{result}");
+        assert!(result.contains("Coverage is incomplete"), "{result}");
+    }
+    app.shutdown().await;
+}

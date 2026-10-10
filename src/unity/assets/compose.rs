@@ -74,6 +74,7 @@ fn native(class: i32) -> Option<ScriptType> {
         208 => ("AI.NavMeshObstacle", "Behaviour"),
         198 => ("ParticleSystem", "Component"),
         199 => ("ParticleSystemRenderer", "Renderer"),
+        205 => ("LODGroup", "Component"),
         212 => ("SpriteRenderer", "Renderer"),
         213 => ("Sprite", "Object"),
         215 => ("ReflectionProbe", "Behaviour"),
