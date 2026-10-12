@@ -95,6 +95,9 @@ pub(crate) struct Analysis {
 }
 
 pub(crate) fn seed_repositories(cache: &Path, owners: &mut Catalog) -> Result<()> {
+    for (owner, _, used) in crate::repository::cache::history_owners(cache)? {
+        owners.seed(&owner, None, used);
+    }
     for (root, state) in crate::repository::retention::cached(cache)? {
         owners.seed(&root.join("source"), Some(&root), state.last_use);
     }
@@ -217,6 +220,10 @@ pub(crate) fn build(
     let now = super::now();
     let limits = overrides.apply(config.limits)?;
     let states = crate::repository::retention::cached(cache)?;
+    let history = crate::repository::cache::history_owners(cache)?;
+    for (owner, _, used) in &history {
+        owners.seed(owner, None, *used);
+    }
     for (root, state) in &states {
         owners.seed(&root.join("source"), Some(root), state.last_use);
     }
@@ -263,7 +270,13 @@ pub(crate) fn build(
                     .repository
                     .as_ref()
                     .and_then(|root| states.get(root))
-                    .map(|s| format!("{}#{}", s.repository, s.branch)),
+                    .map(|s| format!("{}#{}", s.repository, s.branch))
+                    .or_else(|| {
+                        history
+                            .iter()
+                            .find(|(entry, _, _)| entry == &candidate.owner.entry)
+                            .map(|(_, identity, _)| format!("{identity} (history objects)"))
+                    }),
                 attributed_bytes: candidate.bytes,
                 last_used_ms: candidate.owner.usage.last_use,
                 priority: candidate.owner.usage.priority(now, candidate.bytes),

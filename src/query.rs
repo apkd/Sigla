@@ -437,7 +437,7 @@ pub fn split_parameters(input: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-fn lex(input: &str) -> Result<Vec<String>> {
+pub(crate) fn lex(input: &str) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let mut token = String::new();
     let mut stack = Vec::new();

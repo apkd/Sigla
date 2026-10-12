@@ -231,6 +231,12 @@ fn rebuild(source: &Path, target: &Path, roots: &Retention) -> Result<()> {
         ensure!(kind == "blob", "Selected object is not a blob");
         objects.insert(blob);
     }
+    let history = kinds(source, &roots.history)?;
+    ensure!(
+        history.len() == roots.history.len(),
+        "Retained history coverage is incomplete"
+    );
+    objects.extend(history.keys().cloned());
     run(Command::new("git")
         .args(["init", "--bare", "--quiet", "--template="])
         .arg(format!("--object-format={format}"))
@@ -289,6 +295,7 @@ fn rebuild(source: &Path, target: &Path, roots: &Retention) -> Result<()> {
         File::open(target.join(name))?.sync_all()?;
     }
     File::open(target.join("objects"))?.sync_all()?;
+    super::cache::generation(target)?;
     let mut marker = File::create(target.join("sigla-complete"))?;
     marker.write_all(COMPLETE)?;
     marker.sync_all()?;

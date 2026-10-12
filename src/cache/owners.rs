@@ -121,6 +121,11 @@ impl Catalog {
             self.dirty = true;
         }
     }
+    pub(crate) fn record_history(&mut self, entry: &Path, now: u64) {
+        self.seed(entry, None, now);
+        self.entries.get_mut(entry).unwrap().usage.record(now);
+        self.dirty = true;
+    }
     pub fn flush(&mut self) -> Result<()> {
         if self.dirty {
             crate::repository::manager::write_json(&self.path, &self.entries)?;
@@ -139,6 +144,9 @@ impl Catalog {
     pub fn view_roots(&self, owner: &Owner) -> Vec<PathBuf> {
         let cache = self.path.parent().unwrap();
         let mut roots = BTreeSet::new();
+        if crate::repository::cache::history_owner(cache, &owner.entry) {
+            roots.insert(owner.entry.parent().unwrap().to_owned());
+        }
         for path in &owner.dependencies {
             for kind in VIEW_KINDS {
                 if let Ok(relative) = path.strip_prefix(cache.join(kind))

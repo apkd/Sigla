@@ -88,11 +88,22 @@ impl DeclarationScopes {
 }
 
 pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
+    let analysis = super::preprocess::active_source(source, defines)?;
+    extract_analysis(&analysis)
+}
+
+mod history;
+pub(crate) use history::conditions::Presence as HistoricalPresence;
+
+pub(super) fn historical(source: &str) -> Result<super::HistoricalFacts> {
+    history::extract(source)
+}
+
+fn extract_analysis(analysis: &str) -> Result<Facts> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
-    let analysis = super::preprocess::active_source(source, defines)?;
     let tree = parser
-        .parse(&analysis, None)
+        .parse(analysis, None)
         .ok_or_else(|| anyhow::anyhow!("C# parsing cancelled"))?;
     let mut facts = Facts {
         csharp: Some(crate::csharp::syntax::FileSyntax::default()),
@@ -132,7 +143,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
             .headers
             .push(crate::csharp::lower::header(
                 root,
-                &analysis,
+                analysis,
                 &facts.declarations,
                 None,
             ));
@@ -142,15 +153,15 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
     let mut parents = Vec::new();
     loop {
         let node = cursor.node();
-        declaration(node, &parents, &analysis, &mut facts, &mut scopes);
+        declaration(node, &parents, analysis, &mut facts, &mut scopes);
         if node.kind() == "using_directive" {
             facts
                 .csharp
                 .as_mut()
                 .unwrap()
                 .imports
-                .push(crate::csharp::lower::import(node, &analysis));
-            let written = text(node, &analysis).trim_end_matches(';').trim();
+                .push(crate::csharp::lower::import(node, analysis));
+            let written = text(node, analysis).trim_end_matches(';').trim();
             let global = written.starts_with("global ");
             let value = written
                 .trim_start_matches("global ")
@@ -161,7 +172,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                 .split_once('=')
                 .map_or(("", value), |(a, p)| (a.trim(), p.trim()));
             let scope = ancestor(&parents, &["namespace_declaration"])
-                .map_or(0..source.len(), |n| n.byte_range());
+                .map_or(0..analysis.len(), |n| n.byte_range());
             facts.imports.push(Import {
                 alias: normalize_name(alias),
                 path: path.trim_start_matches("global::").into(),
@@ -170,7 +181,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
             });
         }
         if node.kind() == "identifier" || node.kind() == "predefined_type" {
-            occurrence(node, &analysis, &mut facts);
+            occurrence(node, analysis, &mut facts);
         }
         if node.kind() == "element_access_expression"
             && let Some(arguments) = node.child_by_field_name("subscript")
@@ -189,7 +200,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                 } else {
                     crate::model::WriteKind::None
                 },
-                receiver: field(node, "expression", &analysis),
+                receiver: field(node, "expression", analysis),
                 arguments: Some(arguments.named_child_count()),
                 opaque: node.has_error(),
             });
@@ -213,7 +224,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                     .retain(|o| !names.contains(&(o.span.start, o.span.end)));
                 crate::csharp::lower::bodies(
                     tree.root_node(),
-                    &analysis,
+                    analysis,
                     facts.csharp.as_mut().unwrap(),
                 );
                 for expression in &facts.csharp.as_ref().unwrap().expressions {

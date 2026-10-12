@@ -2303,7 +2303,7 @@ fn normalized_type(s: &str) -> String {
     }
     out
 }
-fn signature_matches(a: &[String], b: &[String]) -> bool {
+pub(crate) fn signature_matches(a: &[String], b: &[String]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b)

@@ -37,6 +37,9 @@ impl Root {
 pub struct Retention {
     pub revisions: BTreeSet<String>,
     pub selected: BTreeSet<String>,
+    /// Validated history objects; unlike snapshot roots, no tree closure is implied.
+    #[serde(default)]
+    pub history: BTreeSet<String>,
 }
 impl Retention {
     pub fn add(&mut self, revision: &str, selected: impl IntoIterator<Item = String>) {
@@ -44,7 +47,7 @@ impl Retention {
         self.selected.extend(selected);
     }
     fn is_empty(&self) -> bool {
-        self.revisions.is_empty() && self.selected.is_empty()
+        self.revisions.is_empty() && self.selected.is_empty() && self.history.is_empty()
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -62,6 +65,7 @@ struct Pool {
     identity: Identity,
     operation: Mutex<u64>,
     pending: Mutex<Vec<Weak<Root>>>,
+    readers: Mutex<Vec<Weak<HistoryRoot>>>,
 }
 
 /// Hold this until parent-side publication completes or is abandoned.
@@ -181,6 +185,7 @@ impl Pool {
             identity: identity.clone(),
             operation: Mutex::new(0),
             pending: Mutex::new(Vec::new()),
+            readers: Mutex::new(Vec::new()),
         });
         pools.insert(root, Arc::downgrade(&pool));
         Ok(pool)
@@ -235,7 +240,7 @@ impl Pool {
         Ok(roots)
     }
     /// Root capture MUST upgrade pending pins before reading persistent selectors.
-    fn roots(&self, cache: &Path) -> Result<Retention> {
+    fn selector_roots(&self, cache: &Path) -> Result<Retention> {
         let mut roots = self.pending_roots()?;
         visit_selectors(cache, |state| {
             // Keep even expired-on-paper/repair states until retirement actually removes them.
@@ -247,6 +252,28 @@ impl Pool {
             }
         })?;
         Ok(roots)
+    }
+    fn roots(&self, cache: &Path) -> Result<Retention> {
+        let mut roots = self.selector_roots(cache)?;
+        self.retain_history(&mut roots)?;
+        Ok(roots)
+    }
+    fn retain_history(&self, roots: &mut Retention) -> Result<()> {
+        // Capture active pins before persisted coverage, as for snapshot publication.
+        let readers: Vec<_> = {
+            let mut readers = self.readers.lock().unwrap();
+            readers.retain(|reader| reader.strong_count() != 0);
+            readers.iter().filter_map(Weak::upgrade).collect()
+        };
+        for reader in readers {
+            roots
+                .history
+                .extend(reader.objects.lock().unwrap().iter().cloned());
+        }
+        if let Some(coverage) = self.history_coverage()? {
+            roots.history.extend(coverage.objects);
+        }
+        Ok(())
     }
     fn pin(self: &Arc<Self>, prepared: &Prepared) -> Result<Pin> {
         let root = Arc::new(Root::prepared(prepared));
@@ -342,13 +369,19 @@ impl Pool {
         if state.retained.as_ref() == Some(&retained) {
             return Ok(());
         }
+        let coverage = self.history_coverage()?;
         let result = (|| -> Result<()> {
             let stage = tempfile::Builder::new()
                 .prefix("rebuild-")
                 .tempdir_in(&self.root)?;
             let target = stage.path().join("git");
             super::rebuild::execute(&self.root.join("current"), &target, roots, cache)?;
-            self.replace(&target)
+            self.replace(&target)?;
+            if let Some(mut coverage) = coverage {
+                coverage.generation = generation(&self.root.join("current"))?;
+                super::manager::write_json(&self.root.join("history.json"), &coverage)?;
+            }
+            Ok(())
         })();
         match result {
             Ok(()) => {
@@ -435,7 +468,7 @@ fn maintain_pool(
     identity: &Identity,
     idle_lifetime: Duration,
     pressure: bool,
-    snapshot: Option<&Snapshot>,
+    snapshot: Option<Snapshot>,
 ) -> Result<()> {
     if !cache
         .join("git")
@@ -453,15 +486,31 @@ fn maintain_pool(
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
     let mut state = pool.state()?;
-    let fresh;
-    let roots = match snapshot.filter(|snapshot| snapshot.generation == *operation) {
-        Some(snapshot) => &snapshot.roots,
-        None => {
-            fresh = pool.roots(cache)?;
-            &fresh
-        }
+    let active = pool
+        .readers
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.strong_count() != 0);
+    // Pressure eviction is ranked by the global owner policy. Periodic idle
+    // maintenance also handles history-only pools, without preparing a selector.
+    if !active
+        && pool.root.join("history.json").is_file()
+        && !pressure
+        && now().saturating_sub(state.used)
+            >= idle_lifetime.as_millis().try_into().unwrap_or(u64::MAX)
+    {
+        fs::remove_file(pool.root.join("history.json"))?;
+    }
+    let mut roots = match snapshot.filter(|snapshot| snapshot.generation == *operation) {
+        Some(snapshot) => snapshot.roots,
+        None => pool.selector_roots(cache)?,
     };
-    if roots.is_empty()
+    // History can be published after the shared selector scan. Capture it under
+    // the pool lock, after idle coverage has been retired.
+    pool.retain_history(&mut roots)?;
+    if !active
+        && roots.is_empty()
         && (pressure
             || now().saturating_sub(state.used)
                 >= idle_lifetime.as_millis().try_into().unwrap_or(u64::MAX))
@@ -469,7 +518,7 @@ fn maintain_pool(
         fs::remove_dir_all(&pool.root)?;
         return Ok(());
     }
-    pool.maybe_rebuild(cache, &mut state, pressure, Some(roots))
+    pool.maybe_rebuild(cache, &mut state, pressure, Some(&roots))
 }
 
 #[cfg(test)]
@@ -549,14 +598,314 @@ fn maintain_pools(cache: &Path, idle_lifetime: Duration, pressure: bool) -> Resu
             );
         }
     })?;
-    for snapshot in snapshots.values() {
-        maintain_pool(
-            cache,
-            &snapshot.pool.identity,
-            idle_lifetime,
-            pressure,
-            Some(snapshot),
-        )?;
+    for snapshot in snapshots.into_values() {
+        let identity = snapshot.pool.identity.clone();
+        maintain_pool(cache, &identity, idle_lifetime, pressure, Some(snapshot))?;
     }
     Ok(())
+}
+
+/// Coverage is published only after objects have been indexed and validated.
+/// A generation mismatch invalidates claims, never triggers an implicit fetch.
+#[derive(Default, Serialize, Deserialize)]
+pub(super) struct HistoryCoverage {
+    version: u32,
+    generation: String,
+    pub objects: BTreeSet<String>,
+    #[serde(default)]
+    pub complete: BTreeSet<String>,
+    #[serde(default)]
+    pub boundaries: BTreeSet<String>,
+}
+struct HistoryRoot {
+    objects: Mutex<BTreeSet<String>>,
+}
+
+/// A Git control view over hardlinked immutable objects. Replacement can remove
+/// current/previous while this view keeps the exact acquired pack generation alive.
+/// Hardlinks are already deduplicated by the global inode-based disk accounting.
+pub(super) struct ObjectLease {
+    view: tempfile::TempDir,
+    root: Arc<HistoryRoot>,
+    pool: Arc<Pool>,
+}
+
+pub(super) fn generation(store: &Path) -> Result<String> {
+    let path = store.join("sigla-generation");
+    match fs::read_to_string(&path) {
+        Ok(bytes) => {
+            ensure!(
+                bytes.len() == 64 && bytes.bytes().all(|b| b.is_ascii_hexdigit()),
+                "Invalid Git pool generation"
+            );
+            return Ok(bytes);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    let unique = tempfile::NamedTempFile::new_in(store)?;
+    let id = blake3::hash(unique.path().as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string();
+    fs::write(&path, &id)?;
+    fs::File::open(&path)?.sync_all()?;
+    sync_dir(store)?;
+    Ok(id)
+}
+
+impl Pool {
+    fn history_coverage(&self) -> Result<Option<HistoryCoverage>> {
+        let path = self.root.join("history.json");
+        let coverage: HistoryCoverage = match read_json(&path, 256 * 1024 * 1024) {
+            Ok(coverage) => coverage,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let current = self.root.join("current");
+        if coverage.version != 1
+            || !current.is_dir()
+            || fs::read_to_string(current.join("sigla-generation"))
+                .ok()
+                .as_ref()
+                != Some(&coverage.generation)
+        {
+            return Ok(None);
+        }
+        Ok(Some(coverage))
+    }
+}
+
+/// Copy only control metadata; share compressed objects physically. No alternates
+/// point at a path that maintenance can replace, and no contents are decoded here.
+fn link_objects(source: &Path, target: &Path) -> Result<()> {
+    for entry in fs::read_dir(source.join("objects"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().context("Invalid Git object directory")?;
+        if name != "pack" && !(name.len() == 2 && name.bytes().all(|c| c.is_ascii_hexdigit())) {
+            continue;
+        }
+        ensure!(entry.file_type()?.is_dir(), "Invalid Git object directory");
+        let destination = target.join("objects").join(name);
+        fs::create_dir_all(&destination)?;
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            let filename = file.file_name();
+            let filename = filename.to_str().context("Invalid Git object filename")?;
+            let supported = if name == "pack" {
+                filename.starts_with("pack-")
+                    && [".pack", ".idx", ".promisor"]
+                        .iter()
+                        .any(|s| filename.ends_with(s))
+            } else {
+                matches!(filename.len(), 38 | 62) && filename.bytes().all(|c| c.is_ascii_hexdigit())
+            };
+            if !supported {
+                continue;
+            }
+            ensure!(file.file_type()?.is_file(), "Invalid Git object file");
+            let dest = destination.join(filename);
+            if !dest.try_exists()? {
+                fs::hard_link(file.path(), dest)?;
+            }
+        }
+        sync_dir(&destination)?;
+    }
+    sync_dir(&target.join("objects"))
+}
+
+pub(super) fn object_lease(cache: &Path, identity: &Identity, format: &str) -> Result<ObjectLease> {
+    let pool = Pool::open(cache, identity)?;
+    let operation = pool.operation.lock().unwrap();
+    private_dir(&pool.root)?;
+    pool.recover()?;
+    let mut state = pool.state()?;
+    let current = pool.root.join("current");
+    super::history::init(&current, format)?;
+    generation(&current)?;
+    // Orphan reader directories from a crashed process have no registry pins.
+    if pool
+        .readers
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.strong_count() == 0)
+    {
+        for entry in fs::read_dir(&pool.root)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("history-reader-")
+            {
+                ensure!(
+                    entry.file_type()?.is_dir(),
+                    "Invalid history reader directory"
+                );
+                fs::remove_dir_all(entry.path())?;
+            }
+        }
+    }
+    let view = tempfile::Builder::new()
+        .prefix("history-reader-")
+        .tempdir_in(&pool.root)?;
+    super::history::init(view.path(), format)?;
+    link_objects(&current, view.path())?;
+    if pool.history_coverage()?.is_none() {
+        let coverage = HistoryCoverage {
+            version: 1,
+            generation: generation(&pool.root.join("current"))?,
+            ..HistoryCoverage::default()
+        };
+        super::manager::write_json(&pool.root.join("history.json"), &coverage)?;
+    }
+    let root = Arc::new(HistoryRoot {
+        objects: Mutex::new(BTreeSet::new()),
+    });
+    pool.readers.lock().unwrap().push(Arc::downgrade(&root));
+    state.used = now();
+    pool.persist(&state)?;
+    drop(operation);
+    Ok(ObjectLease { view, root, pool })
+}
+
+impl ObjectLease {
+    pub fn path(&self) -> &Path {
+        self.view.path()
+    }
+    pub fn owner(&self) -> PathBuf {
+        self.pool.root.join("history.json")
+    }
+    pub fn retain(&self, id: &str) {
+        self.root.objects.lock().unwrap().insert(id.to_owned());
+    }
+
+    /// Serialize publication with replacement, but never hold the gate while matching.
+    pub fn acquire(&self, fetch: impl FnOnce(&Path, &Path) -> Result<u64>) -> Result<u64> {
+        let _operation = self.pool.operation.lock().unwrap();
+        self.pool.recover()?;
+        let bytes = fetch(&self.pool.root.join("current"), self.view.path())?;
+        link_objects(&self.pool.root.join("current"), self.view.path())?;
+        let mut state = self.pool.state()?;
+        state.used = now();
+        state.retained = None;
+        self.pool.persist(&state)?;
+        Ok(bytes)
+    }
+
+    pub fn publish(
+        &self,
+        complete: &BTreeSet<String>,
+        boundaries: &BTreeSet<String>,
+    ) -> Result<()> {
+        let _operation = self.pool.operation.lock().unwrap();
+        let current = self.pool.root.join("current");
+        // A replacement includes every object pinned before root capture. Readers
+        // can also keep older objects: link these back before extending coverage.
+        link_objects(self.view.path(), &current)?;
+        let mut coverage = self.pool.history_coverage()?.unwrap_or_default();
+        coverage.version = 1;
+        coverage.generation = generation(&current)?;
+        coverage
+            .objects
+            .extend(self.root.objects.lock().unwrap().iter().cloned());
+        coverage.complete.extend(complete.iter().cloned());
+        coverage.boundaries.extend(boundaries.iter().cloned());
+        coverage
+            .boundaries
+            .retain(|id| !coverage.complete.contains(id));
+        super::manager::write_json(&self.owner(), &coverage)?;
+        sync_dir(&self.pool.root)?;
+        let mut state = self.pool.state()?;
+        state.used = now();
+        state.retained = None;
+        self.pool.persist(&state)
+    }
+}
+
+pub(crate) fn history_owners(cache: &Path) -> Result<Vec<(PathBuf, Identity, u64)>> {
+    let mut result = Vec::new();
+    let entries = match fs::read_dir(cache.join("git")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().join("history.json").is_file() {
+            let state: State = read_json(&entry.path().join("pool.json"), 64 * 1024)?;
+            result.push((
+                entry.path().join("history.json"),
+                state.repository,
+                state.used,
+            ));
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn history_owner(cache: &Path, path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "history.json")
+        && path.parent().is_some_and(|p| {
+            p.parent() == Some(cache.join("git").as_path())
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+}
+
+pub(crate) fn active_history(cache: &Path) -> BTreeSet<PathBuf> {
+    let pools: Vec<_> = POOLS
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect();
+    pools
+        .into_iter()
+        .filter(|p| {
+            p.root.starts_with(cache.join("git"))
+                && p.readers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.strong_count() != 0)
+        })
+        .map(|p| p.root.join("history.json"))
+        .collect()
+}
+
+pub(crate) fn evict_history(owner: &Path) -> Result<bool> {
+    let root = owner.parent().context("Invalid history owner")?;
+    let cache = root
+        .parent()
+        .and_then(Path::parent)
+        .context("Invalid history owner")?;
+    ensure!(history_owner(cache, owner), "Invalid history owner");
+    let state: State = read_json(&root.join("pool.json"), 64 * 1024)?;
+    let pool = Pool::open(cache, &state.repository)?;
+    let _operation = pool.operation.lock().unwrap();
+    if pool
+        .readers
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.strong_count() != 0)
+    {
+        return Ok(false);
+    }
+    match fs::remove_file(owner) {
+        Ok(()) => {
+            sync_dir(root)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e.into()),
+    }
 }

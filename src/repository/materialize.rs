@@ -118,7 +118,7 @@ pub struct Prepared {
     pub directories: BTreeSet<String>,
 }
 
-fn git(store: &Path) -> Command {
+pub(super) fn git(store: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .args([
@@ -153,7 +153,7 @@ fn is_cached_commit_prefix(value: &str) -> bool {
     (7..64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn cached_commit(store: &Path, selector: &str) -> Result<gix_hash::ObjectId> {
+pub(super) fn cached_commit(store: &Path, selector: &str) -> Result<gix_hash::ObjectId> {
     let not_found = || {
         anyhow::anyhow!(
             "Cached commit prefix {selector:?} was not found; use a branch, tag, or full SHA."
@@ -213,6 +213,40 @@ fn receive(
     depth_one: bool,
     remaining: Option<u64>,
 ) -> Result<u64> {
+    receive_filtered(
+        session,
+        store,
+        store,
+        objects,
+        &super::transport::Fetch {
+            filter: super::transport::Filter::Trees,
+            depth: depth_one.then_some(1),
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+        },
+        remaining,
+    )
+}
+
+pub(super) fn receive_filtered(
+    session: &mut Session,
+    store: &Path,
+    control: &Path,
+    objects: Vec<gix_hash::ObjectId>,
+    options: &super::transport::Fetch<'_>,
+    remaining: Option<u64>,
+) -> Result<u64> {
+    receive_filtered_measured(session, store, control, objects, options, remaining)
+        .map(|transfer| transfer.bytes)
+}
+
+pub(super) fn receive_filtered_measured(
+    session: &mut Session,
+    store: &Path,
+    control: &Path,
+    objects: Vec<gix_hash::ObjectId>,
+    options: &super::transport::Fetch<'_>,
+    remaining: Option<u64>,
+) -> Result<Transfer> {
     let scratch = tempfile::tempdir_in(store.join("objects/pack"))?;
     let pack = scratch.path().join("incoming.pack");
     let mut output = LimitedWriter {
@@ -220,13 +254,22 @@ fn receive(
         remaining,
         exceeded: false,
     };
-    let received = session.pack(objects, store, depth_one, &mut output);
+    let mut transfer = Transfer::default();
+    let received = session.pack_filtered(
+        objects,
+        control,
+        options,
+        &mut MeasuredWriter {
+            output: &mut output,
+            transfer: &mut transfer,
+        },
+    );
     ensure!(
         !output.exceeded,
         "Repository transfer limit exceeded; use an exact repository allow entry to remove the cap"
     );
     received?;
-    let bytes = fs::metadata(&pack)?.len();
+    output.output.sync_all()?;
     let index = scratch.path().join("incoming.idx");
     let result = run(git(store)
         .args(["index-pack", "--index-version=2", "-o"])
@@ -236,10 +279,49 @@ fn receive(
     parse_id(&id)?;
     let destination = store.join("objects/pack").join(format!("pack-{id}"));
     // The marker precedes publication so local inspection never attempts to repair omitted blobs.
-    File::create(destination.with_extension("promisor"))?;
+    File::open(&index)?.sync_all()?;
+    File::create(destination.with_extension("promisor"))?.sync_all()?;
     fs::rename(index, destination.with_extension("idx"))?;
     fs::rename(pack, destination.with_extension("pack"))?;
-    Ok(bytes)
+    File::open(store.join("objects/pack"))?.sync_all()?;
+    Ok(transfer)
+}
+
+/// Timing of successful pack writes, without assuming that a one-buffer pack
+/// reveals throughput. Require at least a first-buffer's worth of subsequent
+/// bytes so a short tail does not turn write latency into a bandwidth estimate.
+#[derive(Default)]
+pub(super) struct Transfer {
+    pub bytes: u64,
+    first: Option<(std::time::Instant, u64)>,
+    last: Option<std::time::Instant>,
+}
+impl Transfer {
+    pub fn streaming(&self) -> Option<(u64, Duration)> {
+        let (first, first_bytes) = self.first?;
+        let elapsed = self.last?.duration_since(first);
+        let bytes = self.bytes.saturating_sub(first_bytes);
+        (bytes >= first_bytes && !elapsed.is_zero()).then_some((bytes, elapsed))
+    }
+}
+struct MeasuredWriter<'a, W> {
+    output: &'a mut W,
+    transfer: &'a mut Transfer,
+}
+impl<W: std::io::Write> std::io::Write for MeasuredWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let at = std::time::Instant::now();
+        let count = self.output.write(bytes)?;
+        if count > 0 {
+            self.transfer.first.get_or_insert((at, count as u64));
+            self.transfer.last = Some(at);
+            self.transfer.bytes += count as u64;
+        }
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
 }
 
 pub const TRANSFER_LIMIT: u64 = 128 * 1024 * 1024;
@@ -259,6 +341,37 @@ mod budget_tests {
         assert!(output.write_all(b"def").is_err());
         assert!(output.exceeded);
         assert_eq!(output.output, b"abc");
+    }
+    #[test]
+    fn transfer_timing_excludes_the_first_buffer_and_ignores_single_writes() {
+        let at = std::time::Instant::now();
+        let mut transfer = Transfer {
+            bytes: 10,
+            first: Some((at, 10)),
+            last: Some(at),
+        };
+        assert!(transfer.streaming().is_none());
+        transfer.bytes += 1;
+        transfer.last = Some(at + Duration::from_secs(1));
+        assert!(transfer.streaming().is_none());
+        transfer.bytes += 19;
+        transfer.last = Some(at + Duration::from_secs(2));
+        assert_eq!(transfer.streaming(), Some((20, Duration::from_secs(2))));
+        let mut output = LimitedWriter {
+            output: Vec::new(),
+            remaining: Some(3),
+            exceeded: false,
+        };
+        let mut transfer = Transfer::default();
+        let mut writer = MeasuredWriter {
+            output: &mut output,
+            transfer: &mut transfer,
+        };
+        writer.write_all(b"abc").unwrap();
+        assert!(writer.write_all(b"d").is_err());
+        assert_eq!(transfer.bytes, 3);
+        assert!(transfer.streaming().is_none());
+        assert!(output.exceeded);
     }
     #[test]
     fn exact_permissions_are_distinct_from_wildcard_permissions() {

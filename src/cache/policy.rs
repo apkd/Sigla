@@ -17,6 +17,7 @@ pub(crate) struct Candidate {
     pub protection: Option<String>,
     pub expired: bool,
     pub bytes: u64,
+    git: Option<PathBuf>,
 }
 
 pub(crate) fn candidates(
@@ -69,6 +70,11 @@ pub(crate) fn retention_candidates(
                 && now.saturating_sub(owner.usage.last_use) >= ttl.as_millis() as u64,
             protection,
             bytes: 0,
+            git: owner
+                .repository
+                .as_ref()
+                .and_then(|root| states.get(root))
+                .map(|state| cache.join("git").join(state.repository.storage_key())),
         });
     }
     Ok(result)
@@ -84,6 +90,7 @@ pub(crate) fn rank(
         .map(|candidate| {
             let mut views = owners.view_roots(&candidate.owner);
             views.extend(candidate.owner.repository.iter().cloned());
+            views.extend(candidate.git.iter().cloned());
             (candidate.owner.entry.clone(), views)
         })
         .collect();

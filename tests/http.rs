@@ -76,7 +76,7 @@ async fn http_contract_and_origin_validation() {
         .unwrap();
     let listed = body(response).await;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    for name in ["search", "browse", "view"] {
+    for name in ["search", "browse", "view", "history"] {
         assert!(tools.iter().any(|tool| tool["name"] == name));
     }
     let tool = tools.iter().find(|tool| tool["name"] == "search").unwrap();
