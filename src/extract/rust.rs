@@ -5,6 +5,11 @@ use ra_ap_syntax::{
 };
 use std::ops::Range;
 
+mod history;
+pub(super) fn historical(source: &str) -> anyhow::Result<super::HistoricalFacts> {
+    history::extract(source)
+}
+
 fn range(n: &SyntaxNode) -> Range<usize> {
     let r = n.text_range();
     usize::from(r.start())..usize::from(r.end())
@@ -85,6 +90,10 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
         _ => Edition::Edition2024,
     };
     let parsed = SourceFile::parse(source, edition);
+    Ok(extract_parsed(source, &parsed))
+}
+
+fn extract_parsed(source: &str, parsed: &ra_ap_syntax::Parse<SourceFile>) -> Facts {
     let root = parsed.tree().syntax().clone();
     let mut facts = Facts {
         modules: module_files(&root),
@@ -399,7 +408,7 @@ pub fn extract(source: &str, edition: &str) -> anyhow::Result<Facts> {
             declaration.qualified = format!("{}::{}", declaration.owner, declaration.name);
         }
     }
-    Ok(facts)
+    facts
 }
 
 fn imports(tree: ast::UseTree, prefix: &str, scope: Range<usize>, facts: &mut Facts) {

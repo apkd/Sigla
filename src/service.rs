@@ -8,6 +8,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
+mod history;
 mod indexes;
 mod inspection;
 mod preparation;
@@ -29,6 +30,7 @@ struct WorkspaceSlot {
 #[derive(Clone, Debug)]
 enum Request {
     Search(String),
+    History(String),
     Browse(String),
     View(String, crate::navigation::Mode),
 }
@@ -485,6 +487,12 @@ impl App {
         ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit");
         result_text(self.dispatch(path, Request::Search(query.into())).await?)
     }
+    pub async fn history(self: &Arc<Self>, codebase: &str, query: &str) -> Result<String> {
+        result_text(
+            self.dispatch(codebase, Request::History(query.into()))
+                .await?,
+        )
+    }
     pub async fn browse(self: &Arc<Self>, project: &str, path: &str) -> Result<String> {
         result_text(self.dispatch(project, Request::Browse(path.into())).await?)
     }
@@ -511,7 +519,7 @@ impl App {
             Request::Browse(path) | Request::View(path, _) => {
                 ensure!(path.len() <= 4096, "Path exceeds request size limit")
             }
-            Request::Search(query) => {
+            Request::Search(query) | Request::History(query) => {
                 ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit")
             }
         }
@@ -525,6 +533,10 @@ impl App {
                 project.push_str(selector);
             }
             let (name, args) = match request {
+                Request::History(query) => (
+                    "history",
+                    serde_json::json!({"codebase":project,"query":query}),
+                ),
                 Request::Search(query) => (
                     "search",
                     serde_json::json!({"codebase":project,"query":query}),
@@ -547,6 +559,9 @@ impl App {
     }
 
     async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
+        if let Request::History(query) = &request {
+            return self.history_request(path, query).await;
+        }
         let activity = Arc::new(
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -732,6 +747,7 @@ impl App {
             .transpose()?;
         let allow_absolute = self.remote.is_none();
         let asset_request = match &request {
+            Request::History(_) => unreachable!("history bypasses snapshot preparation"),
             Request::Search(_) => query.as_ref().is_some_and(|q| {
                 matches!(
                     q.selector.as_str(),
@@ -892,6 +908,7 @@ impl App {
                 drop(state);
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
                 let mut text = match request {
+                    Request::History(_) => unreachable!("history bypasses snapshot preparation"),
                     Request::Search(_) => {
                         let query = query.as_ref().unwrap();
                         if matches!(
@@ -1082,6 +1099,35 @@ file:src/**/*.cs"#,
     }
 
     #[tool(
+        name = "history",
+        description = r#"Read committed Git history without preparing, checking out, or building historical workspaces.
+The codebase revision anchors every selector; output at is a full commit ID. Dirty and staged files are ignored.
+
+log [selector] [skip:N] [limit:N]
+show COMMIT [selector] [parent:N] [offset:N]
+diff FROM..TO [selector] [offset:N]
+
+Selectors: file:src/Parser.cs, path:src/**, method:Parser.Parse(string), @src/Parser.cs:20:5, @docs/design.md:20-35.
+Omit the selector for repository history. path: narrows declaration lookup only at the anchor.
+Names, written signatures, kind aliases and quoting follow search. Relationships such as calls: and uses: are not history selectors.
+
+log follows actual parents, renames, moves, implementation transfers and copies. ~ marks inferred/ambiguous links.
+skip counts selected, finalized records after merge-rejection filtering; incomplete is not an introduction.
+show compares the actual parent (1-based; default 1), or the empty tree at a root. diff compares two snapshots, not a commit range.
+Offsets are UTF-8 byte positions in the canonical diff, not cursors. Continue with pinned codebase, endpoint IDs and the returned offset.
+Binary diffs, LFS payloads, historical builds, blame and working-tree changes are excluded."#,
+        annotations(read_only_hint = true)
+    )]
+    async fn history(
+        &self,
+        Parameters(args): Parameters<Arguments>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        self.execute(&args.codebase, Ok(Request::History(args.query)), context)
+            .await
+    }
+
+    #[tool(
         description = "Browse indexed files. Omit path for the repository root; pass a directory path to explore it.",
         annotations(read_only_hint = true)
     )]
@@ -1203,7 +1249,7 @@ mod tests {
                 .collect();
             let value = serde_json::Value::Object(arguments);
             match tool.name.as_ref() {
-                "search" => {
+                "search" | "history" => {
                     serde_json::from_value::<Arguments>(value).unwrap();
                 }
                 "browse" => {

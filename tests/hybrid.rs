@@ -300,6 +300,14 @@ async fn forwards_all_tools_and_preserves_results_and_cancellation() {
             serde_json::json!({"codebase":"https://github.com/owner/repo#refs%2Ftags%2Frelease%2520literal","query":"type:Example"}),
         ),
         (
+            "history",
+            serde_json::json!({"codebase":"https://github.com/owner/repo#refs%2Ftags%2Frelease%2520literal","query":"future:history syntax"}),
+        ),
+        (
+            "history",
+            serde_json::json!({"codebase":"owner/repo#feature/test","query":"fail"}),
+        ),
+        (
             "browse",
             serde_json::json!({"codebase":"git@github.com:owner/repo.git","path":"src"}),
         ),

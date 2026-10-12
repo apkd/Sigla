@@ -8,6 +8,7 @@ mod diagnostics;
 pub mod discovery;
 mod documents;
 pub mod extract;
+mod history;
 mod memory;
 pub mod metadata;
 pub mod metadata_archive;

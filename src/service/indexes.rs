@@ -31,6 +31,7 @@ pub(super) fn groups(
         groups.insert(Group::of(file.language).unwrap(), false);
     }
     let narrowed = match request {
+        Request::History(_) => unreachable!("history bypasses snapshot indexes"),
         Request::Search(_) => query.is_some_and(|q| {
             q.target.location.is_some()
                 || q.selector == "file" && q.target.name != "*"
@@ -60,6 +61,7 @@ pub(super) fn source_only(request: &Request, query: Option<&Query>) -> bool {
             || crate::documents::language(path).is_some()
     };
     match request {
+        Request::History(_) => unreachable!("history bypasses snapshot indexes"),
         Request::View(path, _) => {
             crate::navigation::location(path).is_ok_and(|(path, _)| source_path(path))
         }
@@ -123,6 +125,7 @@ fn selected(
         }
     }
     match request {
+        Request::History(_) => unreachable!("history bypasses snapshot indexes"),
         Request::Search(_) => true,
         Request::Browse(path) if path.is_empty() => true,
         Request::Browse(path) | Request::View(path, _) => {
@@ -150,6 +153,7 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 
 pub(super) fn wait_assets(request: &Request, query: Option<&Query>) -> bool {
     match request {
+        Request::History(_) => unreachable!("history bypasses snapshot indexes"),
         Request::View(..) => true,
         Request::Browse(path) => !path.is_empty(),
         Request::Search(_) => query.is_some_and(|q| {
@@ -171,6 +175,7 @@ pub(super) fn wait_assets(request: &Request, query: Option<&Query>) -> bool {
 /// Source navigation only needs selected paths and stable source bytes.
 pub(super) fn navigation(request: &Request, query: Option<&Query>) -> bool {
     match request {
+        Request::History(_) => unreachable!("history bypasses snapshot indexes"),
         Request::Browse(_) => true,
         Request::Search(_) => query.is_some_and(|q| {
             q.selector == "file" && !q.wait_complete && !wait_assets(request, Some(q))

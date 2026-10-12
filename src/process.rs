@@ -27,6 +27,76 @@ pub fn inherit_process_group() {
     OWNS_GROUP.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A persistent subprocess uses the same shutdown registry as one-shot jobs.
+/// Dropping it kills its group and reaps the child, including on read errors.
+pub(crate) struct Child {
+    process: std::process::Child,
+    group: bool,
+    stopped: bool,
+}
+impl std::ops::Deref for Child {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
+}
+impl std::ops::DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.process
+    }
+}
+impl Child {
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let pid = self.process.id() as i32;
+        unsafe {
+            libc::kill(if self.group { -pid } else { pid }, libc::SIGKILL);
+        }
+        let _ = self.process.wait();
+        if self.group {
+            CHILDREN.lock().unwrap().remove(&pid);
+        }
+        self.stopped = true;
+    }
+}
+impl Drop for Child {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+pub(crate) fn spawn(command: &mut Command) -> Result<Child> {
+    use std::os::unix::process::CommandExt;
+    ensure!(
+        !STOPPED.load(std::sync::atomic::Ordering::Acquire),
+        "Service is shutting down"
+    );
+    let group = OWNS_GROUP.load(std::sync::atomic::Ordering::Relaxed);
+    if group {
+        command.process_group(0);
+    }
+    let process = command.spawn().with_context(|| {
+        format!(
+            "Cannot start required subprocess `{}`",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+    let mut child = Child {
+        process,
+        group,
+        stopped: false,
+    };
+    if group {
+        CHILDREN.lock().unwrap().insert(child.id() as i32);
+        if STOPPED.load(std::sync::atomic::Ordering::Acquire) {
+            child.stop();
+        }
+    }
+    Ok(child)
+}
+
 fn read(mut stream: impl Read) -> std::io::Result<(Vec<u8>, bool)> {
     let mut output = Vec::new();
     let mut truncated = false;
@@ -64,11 +134,16 @@ pub fn capture(
     input: Option<Vec<u8>>,
     destination: Option<std::fs::File>,
 ) -> Result<Output> {
-    ensure!(
-        !STOPPED.load(std::sync::atomic::Ordering::Acquire),
-        "Service is shutting down"
-    );
-    use std::os::unix::process::CommandExt;
+    capture_cancellable(command, timeout, input, destination, None)
+}
+
+pub(crate) fn capture_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+    destination: Option<std::fs::File>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Output> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -77,26 +152,7 @@ pub fn capture(
         })
         .stdout(destination.map(Stdio::from).unwrap_or_else(Stdio::piped))
         .stderr(Stdio::piped());
-    let owns_group = OWNS_GROUP.load(std::sync::atomic::Ordering::Relaxed);
-    if owns_group {
-        command.process_group(0);
-    }
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "Cannot start required subprocess `{}`",
-            command.get_program().to_string_lossy()
-        )
-    })?;
-    let pid = child.id();
-    if owns_group {
-        let mut children = CHILDREN.lock().unwrap();
-        children.insert(pid as i32);
-        if STOPPED.load(std::sync::atomic::Ordering::Acquire) {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-    }
+    let mut child = spawn(command)?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take().unwrap();
@@ -107,6 +163,9 @@ pub fn capture(
     let err = thread::spawn(move || read(stderr));
     let started = Instant::now();
     let status = loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            break Err(anyhow::anyhow!("Subprocess cancelled"));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
@@ -118,22 +177,8 @@ pub fn capture(
             Err(error) => break Err(error.into()),
         }
     };
-    // Each job starts a private process group. Also stop descendants left by a
-    // successfully completed parent before importing generated files.
-    unsafe {
-        libc::kill(
-            if owns_group {
-                -(pid as i32)
-            } else {
-                pid as i32
-            },
-            libc::SIGKILL,
-        );
-    }
-    let _ = child.wait();
-    if owns_group {
-        CHILDREN.lock().unwrap().remove(&(pid as i32));
-    }
+    // Also stop descendants left by a successfully completed parent.
+    child.stop();
     let (stdout, out_overflow) = out
         .join()
         .map_err(|_| anyhow::anyhow!("Subprocess output reader failed"))??;

@@ -436,6 +436,9 @@ impl App {
 
     fn seed_owners(&self) -> Result<bool> {
         let mut known = true;
+        for (owner, _, used) in crate::repository::cache::history_owners(&self.cache)? {
+            self.owners.lock().unwrap().seed(&owner, None, used);
+        }
         if let Some(remote) = &self.remote {
             for (root, state) in remote.cached()? {
                 self.owners
@@ -499,6 +502,13 @@ impl App {
     fn evict_candidate(&self, candidate: &Candidate, pressure: bool) -> Result<bool> {
         if candidate.pinned {
             return Ok(false);
+        }
+        if crate::repository::cache::history_owner(&self.cache, &candidate.owner.entry) {
+            if !crate::repository::cache::evict_history(&candidate.owner.entry)? {
+                return Ok(false);
+            }
+            self.owners.lock().unwrap().remove(&candidate.owner.entry);
+            return Ok(true);
         }
         self.workspaces
             .lock()

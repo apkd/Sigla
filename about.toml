@@ -98,3 +98,7 @@ git = [{ path = "LICENSE", checksum = "f44d7107a33801260dc82624c91a71ebf5918b403
 [tree-sitter-hlsl.clarify]
 license = "MIT"
 git = [{ path = "LICENSE", checksum = "dec735ccc031754dd05e6556dd9e959915eb367cf01cf009c77a1a38786932b1" }]
+
+[tree-sitter-java.clarify]
+license = "MIT"
+git = [{ path = "LICENSE", checksum = "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7" }]
