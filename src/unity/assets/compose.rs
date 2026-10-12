@@ -20,6 +20,7 @@ pub struct Instance {
     pub object: Arc<Object>,
     pub name: String,
     pub ty: Option<Arc<ScriptType>>,
+    pub native_issue: Option<Arc<str>>,
     pub references: BTreeMap<String, Target>,
     pub evidence: Vec<(String, i64)>,
     pub alive: bool,
@@ -29,78 +30,6 @@ pub struct Composed {
     pub objects: Vec<Instance>,
     pub aliases: BTreeMap<i64, String>,
     pub incomplete: Vec<String>,
-}
-
-fn native(class: i32) -> Option<ScriptType> {
-    let (name, base) = match class {
-        1 => ("GameObject", "Object"),
-        4 => ("Transform", "Component"),
-        20 => ("Camera", "Behaviour"),
-        21 => ("Material", "Object"),
-        23 => ("MeshRenderer", "Renderer"),
-        25 => ("Renderer", "Component"),
-        33 => ("MeshFilter", "Component"),
-        43 => ("Mesh", "Object"),
-        48 => ("Shader", "Object"),
-        49 => ("TextAsset", "Object"),
-        50 => ("Rigidbody2D", "Component"),
-        54 => ("Rigidbody", "Component"),
-        56 => ("Collider", "Component"),
-        58 => ("CircleCollider2D", "Collider2D"),
-        60 => ("PolygonCollider2D", "Collider2D"),
-        61 => ("BoxCollider2D", "Collider2D"),
-        64 => ("MeshCollider", "Collider"),
-        65 => ("BoxCollider", "Collider"),
-        68 => ("EdgeCollider2D", "Collider2D"),
-        74 => ("AnimationClip", "Object"),
-        81 => ("AudioListener", "Behaviour"),
-        82 => ("AudioSource", "Behaviour"),
-        83 => ("AudioClip", "Object"),
-        89 => ("Cubemap", "Texture"),
-        91 => ("AnimatorController", "RuntimeAnimatorController"),
-        95 => ("Animator", "Behaviour"),
-        96 => ("TrailRenderer", "Renderer"),
-        108 => ("Light", "Behaviour"),
-        111 => ("Animation", "Behaviour"),
-        120 => ("LineRenderer", "Renderer"),
-        135 => ("SphereCollider", "Collider"),
-        136 => ("CapsuleCollider", "Collider"),
-        137 => ("SkinnedMeshRenderer", "Renderer"),
-        143 => ("CharacterController", "Collider"),
-        154 => ("TerrainCollider", "Collider"),
-        156 => ("TerrainData", "Object"),
-        157 => ("LightmapSettings", "Object"),
-        195 => ("AI.NavMeshAgent", "Behaviour"),
-        208 => ("AI.NavMeshObstacle", "Behaviour"),
-        198 => ("ParticleSystem", "Component"),
-        199 => ("ParticleSystemRenderer", "Renderer"),
-        212 => ("SpriteRenderer", "Renderer"),
-        213 => ("Sprite", "Object"),
-        215 => ("ReflectionProbe", "Behaviour"),
-        218 => ("Terrain", "Behaviour"),
-        221 => ("AnimatorOverrideController", "RuntimeAnimatorController"),
-        222 => ("CanvasRenderer", "Component"),
-        223 => ("Canvas", "Behaviour"),
-        224 => ("RectTransform", "Transform"),
-        225 => ("CanvasGroup", "Behaviour"),
-        320 => ("PlayableDirector", "Behaviour"),
-        _ => return None,
-    };
-    let mut ancestry = vec![format!("UnityEngine.{name}")];
-    let mut current = base;
-    loop {
-        ancestry.push(format!("UnityEngine.{current}"));
-        current = match current {
-            "Behaviour" | "Renderer" | "Collider" | "Collider2D" | "Transform" => "Component",
-            "Component" | "Texture" | "RuntimeAnimatorController" => "Object",
-            _ => break,
-        };
-    }
-    Some(ScriptType {
-        name: ancestry[0].clone(),
-        assembly: "UnityEngine".into(),
-        ancestry,
-    })
 }
 
 fn resolve(
@@ -184,6 +113,10 @@ fn compose(
         }
         let id = object.id.to_string();
         result.aliases.insert(object.id, id.clone());
+        let native = index
+            .native_types
+            .get(&asset.project)
+            .and_then(|types| types.get(&object.class));
         result.objects.push(Instance {
             id,
             definition: key.into(),
@@ -192,8 +125,9 @@ fn compose(
             ty: if object.class == 114 {
                 index.script(asset, object).cloned().map(Arc::new)
             } else {
-                native(object.class).map(Arc::new)
+                native.and_then(|resolved| resolved.ty.clone())
             },
+            native_issue: native.and_then(|resolved| resolved.issue.clone()),
             references: BTreeMap::new(),
             evidence: Vec::new(),
             alive: true,
@@ -330,7 +264,7 @@ fn compose(
                     property.clone(),
                     resolve(index, key, &result.aliases, &modification.reference),
                 );
-                if property == "m_Script" {
+                if property == "m_Script" && object.object.class == 114 {
                     object.ty = index
                         .resolve(&asset.project, &modification.reference.guid)
                         .and_then(|k| index.scripts.get(k))

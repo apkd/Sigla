@@ -162,6 +162,7 @@ impl Index {
         let mut lines = Vec::new();
         let mut incomplete = false;
         let mut unresolved_types = false;
+        let mut unresolved_native_types = false;
         let mut unavailable = 0;
         let target = matches!(q.selector.as_str(), "references" | "dependencies")
             .then(|| self.target(&q.target.name))
@@ -213,6 +214,9 @@ impl Index {
                     .objects
                     .iter()
                     .any(|o| o.alive && o.object.class == 114 && o.ty.is_none());
+                unresolved_native_types |= composition.objects.iter().any(|o| {
+                    o.alive && o.object.class != 114 && (o.ty.is_none() || o.native_issue.is_some())
+                });
                 if lines.len() > q.limit {
                     continue;
                 }
@@ -316,6 +320,9 @@ impl Index {
         if unresolved_types {
             reasons.push("unresolved script types".into());
         }
+        if unresolved_native_types {
+            reasons.push("unresolved native types".into());
+        }
         if incomplete {
             reasons.push("incomplete prefab composition".into());
         }
@@ -368,6 +375,9 @@ impl Index {
                 )));
             };
             let mut result = describe(self, &asset, object, &composition);
+            if let Some(issue) = &object.native_issue {
+                writeln!(result, "\n\nNative type coverage: {issue}")?;
+            }
             let definition = &self.assets[&object.definition];
             writeln!(
                 result,

@@ -1,6 +1,7 @@
 //! Unity object analysis is separate from source-code indexing.
 mod compose;
 pub mod jobs;
+mod native;
 mod parse;
 mod query;
 mod records;
@@ -42,6 +43,7 @@ pub struct Index {
     pub guids: BTreeMap<(String, String), Vec<String>>,
     pub scripts: BTreeMap<String, ScriptType>,
     pub instances: BTreeMap<String, std::sync::Arc<compose::Composed>>,
+    native_types: BTreeMap<String, BTreeMap<i32, native::Resolved>>,
     observed: BTreeMap<PathBuf, Stamp>,
 }
 impl Index {
@@ -296,6 +298,9 @@ pub fn build(
         } else {
             project_name
         };
+        // Rewriting this file need not change its parent directory's stamp.
+        let version_file = project.join("ProjectSettings/ProjectVersion.txt");
+        observed.insert(version_file.clone(), Stamp::read(&version_file)?);
         let mut scopes: BTreeSet<_> = [project.join("Assets"), project.join("ProjectSettings")]
             .into_iter()
             .filter(|p| !crate::discovery::linked_worktree(p))
@@ -438,6 +443,16 @@ pub fn build(
             asset.unavailable = record.unavailable;
             asset.content = record.content;
         }
+        let classes = index
+            .assets
+            .values()
+            .filter(|asset| asset.project == project_name)
+            .flat_map(|asset| asset.objects.iter().map(|object| object.class))
+            .collect();
+        index.native_types.insert(
+            project_name,
+            native::build(project, &classes, manifest, store, tx, cancel)?,
+        );
     }
     let mut missing: BTreeMap<_, _> = omitted.iter().collect();
     for asset in index.assets.values_mut() {
