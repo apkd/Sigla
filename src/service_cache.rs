@@ -6,6 +6,19 @@ use crate::cache::{
 };
 use std::fs;
 
+fn maintenance_stage<T>(name: &str, run: impl FnOnce() -> Result<T>) -> Result<T> {
+    let start = Instant::now();
+    tracing::info!(stage = name, "Disk cache maintenance stage started");
+    let result = run();
+    tracing::info!(
+        stage = name,
+        elapsed_ms = start.elapsed().as_millis(),
+        success = result.is_ok(),
+        "Disk cache maintenance stage finished"
+    );
+    result
+}
+
 impl App {
     pub(super) async fn maintain_disk(self: &Arc<Self>) -> Result<()> {
         if self
@@ -17,11 +30,26 @@ impl App {
         {
             return Ok(());
         }
-        let gate = self.activity.clone().write_owned().await;
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
+            // A queued writer blocks later readers, including navigation, while
+            // existing indexing jobs finish. Maintenance must wait for idle time.
+            let Ok(gate) = app.activity.clone().try_write_owned() else {
+                tracing::info!(
+                    "Disk cache maintenance deferred while queries or indexing are active"
+                );
+                return Ok(());
+            };
             let _gate = gate;
-            app.maintain_disk_exclusive()
+            let start = Instant::now();
+            tracing::info!("Disk cache maintenance started");
+            let result = app.maintain_disk_exclusive();
+            tracing::info!(
+                elapsed_ms = start.elapsed().as_millis(),
+                success = result.is_ok(),
+                "Disk cache maintenance finished"
+            );
+            result
         })
         .await?
     }
@@ -120,10 +148,12 @@ impl App {
     }
 
     fn collect_analysis(&self, pressure: bool) -> Result<()> {
-        self.maintain_analysis(true)?;
-        if self.cache.join("analysis").is_dir() {
+        // Ordinary passes resume the stored deletion/collection cursors. Only
+        // disk pressure justifies draining the entire analysis database.
+        self.maintain_analysis(pressure)?;
+        if pressure && self.cache.join("analysis").is_dir() {
             crate::store::Database::open(&self.cache.join("analysis"))?
-                .collect_unused(crate::cache::now(), pressure)?;
+                .collect_unused(crate::cache::now(), true)?;
         }
         Ok(())
     }
@@ -233,22 +263,33 @@ impl App {
     }
 
     fn maintain_disk_exclusive(&self) -> Result<()> {
-        self.migrate_views()?;
-        let known = self.seed_owners()?;
-        let before = blobs::allocated(&self.cache)?;
+        maintenance_stage("view migration", || self.migrate_views())?;
+        let known = maintenance_stage("ownership scan", || self.seed_owners())?;
+        let before = maintenance_stage("disk measurement", || blobs::allocated(&self.cache))?;
         let disk = Disk::read(&self.cache)?;
         let pressure = self.cache_limits.pressured(before, disk);
-        let mut candidates = self.candidates()?;
+        let mut candidates = maintenance_stage("eviction planning", || self.candidates())?;
         for candidate in candidates.iter().filter(|candidate| candidate.expired) {
             self.evict_candidate(candidate, false)?;
         }
-        self.collect_analysis(pressure)?;
-        self.collect_views(known)?;
+        maintenance_stage("analysis collection", || self.collect_analysis(pressure))?;
+        maintenance_stage("view collection", || self.collect_views(known))?;
         if pressure {
-            crate::repository::cache::reclaim(&self.cache)?;
+            maintenance_stage("Git reclamation", || {
+                crate::repository::cache::reclaim(&self.cache)
+            })?;
         }
-        self.blobs.collect_with_pressure(pressure)?;
-        self.compact_analysis()?;
+        maintenance_stage("blob collection", || {
+            self.blobs.collect_with_pressure(pressure)
+        })?;
+        // Freed LMDB pages are reusable. Rewriting the database and discarding
+        // loaded workspaces is only needed if other cleanup did not free enough.
+        if self
+            .cache_limits
+            .pressured(blobs::allocated(&self.cache)?, Disk::read(&self.cache)?)
+        {
+            maintenance_stage("analysis compaction", || self.compact_analysis())?;
+        }
         candidates.retain(|candidate| !candidate.expired && !candidate.pinned);
         let mut remaining = self
             .cache_limits
@@ -270,11 +311,15 @@ impl App {
             if !evicted {
                 break;
             }
-            self.collect_analysis(true)?;
-            self.collect_views(known)?;
-            crate::repository::cache::reclaim(&self.cache)?;
-            self.blobs.collect_with_pressure(true)?;
-            self.compact_analysis()?;
+            maintenance_stage("analysis collection", || self.collect_analysis(true))?;
+            maintenance_stage("view collection", || self.collect_views(known))?;
+            maintenance_stage("Git reclamation", || {
+                crate::repository::cache::reclaim(&self.cache)
+            })?;
+            maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
+            if allocated.saturating_sub(blobs::allocated(&self.cache)?) < remaining {
+                maintenance_stage("analysis compaction", || self.compact_analysis())?;
+            }
             remaining =
                 remaining.saturating_sub(allocated.saturating_sub(blobs::allocated(&self.cache)?));
         }
@@ -432,6 +477,126 @@ mod tests {
         };
         write_json(&root.join("state.json"), &state).unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn maintenance_yields_to_activity_and_retries_when_idle() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = Arc::new(app(
+            cache.path(),
+            vec![Rule::parse_private("https://github.com/example/*").unwrap()],
+        ));
+        let expired = seed(cache.path(), "expired", "trunk", "trunk", 1);
+        let active = app.activity.read().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.maintain_disk())
+            .await
+            .expect("Maintenance must not wait behind active work")
+            .unwrap();
+        assert!(expired.exists());
+        assert!(
+            app.activity.try_read().is_ok(),
+            "Maintenance must not queue ahead of new queries"
+        );
+        drop(active);
+        app.maintain_disk().await.unwrap();
+        assert!(
+            !expired.exists(),
+            "Deferred cleanup must run once the service is idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_report_maintenance_and_cancellation_then_recover() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), "Available after maintenance").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let gate = app.activity.write().await;
+        let path = root.path().to_str().unwrap();
+        let request = Request::View("README.md".into(), crate::navigation::Mode::Exact);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.request_cancellable(path, request.clone(), &cancel, None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let details = crate::diagnostics::details(&error, "maintenance");
+        assert_eq!(details["error_code"], "UNAVAILABLE");
+        assert_eq!(details["retryable"], true);
+        cancel.cancel();
+        let error = app
+            .request_cancellable(path, request, &cancel, None)
+            .await
+            .unwrap_err();
+        let details = crate::diagnostics::details(&error, "cancelled");
+        assert_eq!(details["error_code"], "CANCELLED");
+        assert_eq!(details["retryable"], false);
+        drop(gate);
+        assert!(
+            app.view(path, "README.md", "exact")
+                .await
+                .unwrap()
+                .contains("Available after maintenance")
+        );
+        app.shutdown().await;
+    }
+
+    #[test]
+    fn ordinary_collection_makes_progress_and_pressure_finishes_retirement() {
+        use crate::store::shared::{Database, Encoded, Names};
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = database.workspace([1; 32], root.path(), None).unwrap();
+        let object = [1; 32];
+        for i in 0..1024 {
+            scope
+                .install(
+                    &format!("file-{i}"),
+                    vec![1],
+                    object,
+                    1,
+                    || Ok(()),
+                    || {
+                        let mut records = Default::default();
+                        let names = crate::store::format::write(
+                            &[],
+                            None,
+                            true,
+                            &Names::default(),
+                            &mut records,
+                        )?;
+                        Ok(Encoded { names, records })
+                    },
+                )
+                .unwrap();
+        }
+        let bindings = || {
+            let tx = scope.read().unwrap();
+            database.binding_count(&tx, &object).unwrap().unwrap()
+        };
+        let before = bindings();
+        scope.mark_deleting().unwrap();
+        app.collect_analysis(false).unwrap();
+        let remaining = bindings();
+        assert!(remaining > 0 && remaining < before);
+        app.collect_analysis(false).unwrap();
+        assert!(
+            bindings() < remaining,
+            "Ordinary passes must resume deletion"
+        );
+        app.collect_analysis(true).unwrap();
+        assert!(database.workspaces().unwrap().is_empty());
     }
     #[test]
     fn pressure_protects_exact_default_but_not_other_versions() {

@@ -66,7 +66,7 @@ impl App {
     ) -> Result<CallToolResult> {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => anyhow::bail!("Query cancelled"),
+            _ = cancel.cancelled() => Err(crate::diagnostics::Cancelled.into()),
             result = self.dispatch_with_upstream(path, request, upstream) => result,
         }
     }
@@ -347,7 +347,7 @@ impl App {
         Ok(())
     }
 
-    fn maintain_analysis(&self, startup: bool) -> Result<()> {
+    fn maintain_analysis(&self, drain: bool) -> Result<()> {
         use crate::store::shared::Phase;
         let analysis = self.cache.join("analysis");
         if !analysis.try_exists()? {
@@ -383,7 +383,7 @@ impl App {
             // The registry lock prevents a request opening this scope during retirement.
             // Persisted deleting state rejects new opens until the next batch completes.
             loop {
-                if scope.delete_batch(now, 128)? || !startup {
+                if scope.delete_batch(now, 128)? || !drain {
                     break;
                 }
             }
@@ -459,7 +459,14 @@ impl App {
     }
 
     async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
-        let activity = Arc::new(self.activity.clone().read_owned().await);
+        let activity = Arc::new(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.activity.clone().read_owned(),
+            )
+            .await
+            .map_err(|_| crate::diagnostics::MaintenanceBusy)?,
+        );
         let query = match &request {
             Request::Search(query) => Some(
                 Query::parse(query)
@@ -1173,6 +1180,10 @@ mod tests {
             tokio::spawn(async move { app.search(&path, "type:Available").await })
         };
         app.preparation_started.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), app.maintain_disk())
+            .await
+            .expect("Maintenance must leave navigation available during indexing")
+            .unwrap();
         for (query, expected) in [
             ("file:*.rs", "child.rs"),
             ("file:*.cpp", "native.cpp"),

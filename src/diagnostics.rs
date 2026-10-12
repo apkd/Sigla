@@ -10,6 +10,15 @@ impl fmt::Display for RefreshRequired {
 }
 impl Error for RefreshRequired {}
 
+#[derive(Debug)]
+pub(crate) struct MaintenanceBusy;
+impl fmt::Display for MaintenanceBusy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Cache maintenance is in progress; retry this request shortly")
+    }
+}
+impl Error for MaintenanceBusy {}
+
 // Watch channels need cloneable outcomes. Keep the original error chain so a
 // background failure has the same classification as a direct request failure.
 #[derive(Debug)]
@@ -85,6 +94,12 @@ pub(crate) fn details(error: &anyhow::Error, request_id: &str) -> serde_json::Va
     if error.chain().any(|cause| cause.is::<Cancelled>()) {
         return serde_json::json!({
             "error_code": "CANCELLED", "request_id": request_id, "retryable": false
+        });
+    }
+    if error.chain().any(|cause| cause.is::<MaintenanceBusy>()) {
+        return serde_json::json!({
+            "error_code": "UNAVAILABLE", "request_id": request_id, "retryable": true,
+            "remediation": "Wait for cache maintenance to finish, then retry this request."
         });
     }
     if error.chain().any(|cause| cause.is::<RefreshRequired>()) {
