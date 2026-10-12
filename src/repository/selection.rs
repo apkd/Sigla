@@ -34,7 +34,7 @@ impl Selection {
         Ok(Self {
             includes: compile(includes)?,
             excludes: compile(excludes)?,
-            identity: blake3::hash(&serde_json::to_vec(&(6u32, includes, excludes))?)
+            identity: blake3::hash(&serde_json::to_vec(&(7u32, includes, excludes))?)
                 .to_hex()
                 .to_string(),
             patterns: (includes.to_vec(), excludes.to_vec()),
@@ -230,6 +230,14 @@ mod tests {
             "docs/Guide.MD",
             ".github/instructions/review.md",
             "docs/notes.txt",
+            "scripts/plugin.lua",
+            "scripts/PLUGIN.LUA",
+            "scripts/helper.py",
+            "queries/filter.jq",
+            "queries/metrics.logql",
+            "patches/change.patch",
+            "config/pins.json",
+            ".agents/skills/review/SKILL.md",
         ] {
             assert!(selection.selected(path), "{path}");
         }
@@ -237,7 +245,7 @@ mod tests {
             "game/Assets/Texture.png",
             "game/Assets/Plugin.dll",
             "rust/target/Generated.rs",
-            "data/arbitrary.json",
+            "data/arbitrary.bin",
         ] {
             assert!(!selection.selected(path), "{path}");
         }
@@ -251,6 +259,8 @@ mod tests {
         assert!(selection.selected("assets/notes/readme.txt"));
         assert!(selection.selected("game/Code.cs"));
         assert!(!selection.selected("assets/secret/readme.txt"));
+        assert!(!selection.selected("scripts/secret/plugin.lua"));
+        assert!(!selection.selected("config/secret/pins.json"));
         assert!(selection.require("assets/secret/readme.txt").is_err());
         assert!(selection.require("imports/custom.xml").is_ok());
         for path in [

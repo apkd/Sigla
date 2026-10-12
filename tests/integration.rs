@@ -2,6 +2,7 @@
 mod cache_inspection;
 mod csharp_binding;
 mod csharp_facts;
+mod format_coverage;
 mod http;
 mod hybrid;
 mod metadata;

@@ -1,4 +1,5 @@
 //! Text inputs useful for understanding a project, without symbol extraction.
+//! Scripts, queries and patches admitted here have file/text navigation only.
 use crate::model::Language;
 use std::path::Path;
 
@@ -16,9 +17,12 @@ pub fn language(path: &Path) -> Option<Language> {
         extension.as_str(),
         "txt"
             | "toml"
+            | "json"
             | "yaml"
             | "yml"
             | "xml"
+            | "svg"
+            | "tmtheme"
             | "ini"
             | "cfg"
             | "csproj"
@@ -32,6 +36,15 @@ pub fn language(path: &Path) -> Option<Language> {
             | "sh"
             | "bash"
             | "fish"
+            | "lua"
+            | "py"
+            | "go"
+            | "bt"
+            | "alloy"
+            | "rules"
+            | "jq"
+            | "logql"
+            | "patch"
             | "ps1"
             | "cmd"
             | "bat"
@@ -67,25 +80,12 @@ pub fn language(path: &Path) -> Option<Language> {
             | "LICENCE"
             | "COPYING"
             | "NOTICE"
-            | "package.json"
-            | "package-lock.json"
-            | "packages-lock.json"
-            | "packages.lock.json"
-            | "manifest.json"
-            | "global.json"
-            | "tsconfig.json"
-            | "jsconfig.json"
-            | "deno.json"
             | "deno.jsonc"
-            | "biome.json"
             | "biome.jsonc"
-            | "composer.json"
             | "composer.lock"
-            | "CMakePresets.json"
             | "flake.lock"
     ) || name.starts_with("Dockerfile.")
-        || name.ends_with(".config.json")
-        || name.starts_with("tsconfig.") && name.ends_with(".json")
+        || name.ends_with(".rules.in")
         || name.starts_with("Containerfile.")
         || name.eq_ignore_ascii_case("nuget.config")
         || name == "packages.config"

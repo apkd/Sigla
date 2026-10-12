@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/configuration_documents.rs"]
+mod configuration_documents;
+
 fn git(root: &Path, args: &[&str]) -> Result<()> {
     ensure!(
         Command::new("git")
@@ -321,6 +324,11 @@ fn lifecycle() -> Result<()> {
         upstream.join("README.md"),
         "# Remote fixture\n\nKeep  document spacing.\n",
     )?;
+    for &(path, source) in configuration_documents::FILES {
+        let path = upstream.join(path);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, source)?;
+    }
     fs::write(upstream.join("asset.bin"), vec![123; 1024 * 1024])?;
     git(&upstream, &["add", "."])?;
     git(&upstream, &["commit", "--quiet", "-m", "main"])?;
@@ -403,6 +411,33 @@ fn lifecycle() -> Result<()> {
         !error && document_match.contains("README.md"),
         "Remote text search missed document: {document_match}"
     );
+    for &(path, source) in configuration_documents::FILES {
+        let (error, found) = server.query(main, &format!("file:{path}"))?;
+        ensure!(
+            !error && found.contains(path),
+            "Remote document missing: {found}"
+        );
+        let (error, found) = server.query(main, &format!("text:\"CoverageMarker\" path:{path}"))?;
+        ensure!(
+            !error && found.contains(path),
+            "Remote document not indexed: {found}"
+        );
+        for mode in ["exact", "minified"] {
+            let (error, viewed) =
+                server.call("view", json!({"codebase":main,"path":path,"mode":mode}))?;
+            ensure!(
+                !error && viewed.contains(source),
+                "Remote document not delivered intact: {path}: {viewed}"
+            );
+        }
+    }
+    for query in ["function:coverage_lua", "uses:coverage_lua"] {
+        let (error, found) = server.query(main, query)?;
+        ensure!(
+            !error && found.starts_with("No matches."),
+            "Text-only source invented a semantic result: {found}"
+        );
+    }
     let (error, tree) = server.call("browse", json!({"codebase":main}))?;
     ensure!(
         !error && tree.contains("lib.rs") && !tree.contains("asset.bin"),

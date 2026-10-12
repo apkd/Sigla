@@ -77,7 +77,7 @@ impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         hash.update(&serde_json::to_vec(&(
-            10u32,
+            11u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -406,10 +406,9 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
                         .file_name()
                         .to_str()
                         .is_some_and(|n| !n.starts_with('.') && n.ends_with('~'))
-                    || entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|n| matches!(n, ".github" | ".gitlab" | ".cargo" | ".config")))
+                    || entry.file_name().to_str().is_some_and(|n| {
+                        matches!(n, ".github" | ".gitlab" | ".cargo" | ".config" | ".agents")
+                    }))
                     && !matches!(
                         entry.file_name().to_str(),
                         Some(
