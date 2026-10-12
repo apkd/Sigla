@@ -90,7 +90,7 @@ fn maintenance_snapshot_preserves_a_pin_released_before_collection() {
         &pool.identity,
         Duration::ZERO,
         true,
-        Some(&snapshot),
+        Some(snapshot),
     )
     .unwrap();
     assert!(pool.root.exists());
@@ -114,7 +114,7 @@ fn acquisition_after_snapshot_cannot_lose_its_pending_objects() {
         &pool.identity,
         Duration::ZERO,
         true,
-        Some(&snapshot),
+        Some(snapshot),
     )
     .unwrap();
     assert!(pool.root.exists());
@@ -141,7 +141,7 @@ fn acquisition_published_after_snapshot_survives_without_its_pin() {
         &pool.identity,
         Duration::ZERO,
         true,
-        Some(&snapshot),
+        Some(snapshot),
     )
     .unwrap();
     assert!(pool.root.exists());
@@ -321,5 +321,160 @@ fn retention_scan_benchmark() {
             .map(|snapshot| snapshot.roots.selected.len())
             .sum::<usize>(),
         expected
+    );
+}
+
+fn history_blob(store: &Path, value: &[u8]) -> String {
+    let output = crate::process::capture(
+        super::super::history::git(store).args(["hash-object", "-w", "--stdin"]),
+        Duration::from_secs(10),
+        Some(value.to_vec()),
+        None,
+    )
+    .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+fn read_history_blob(store: &Path, oid: &str) -> Vec<u8> {
+    crate::process::run(
+        super::super::history::git(store).args(["cat-file", "blob", oid]),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+}
+
+#[test]
+fn history_publication_and_eviction_after_selector_capture_refresh_retention() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let lease = object_lease(cache.path(), &id, "sha1").unwrap();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    let current = pool.root.join("current");
+    let oid = history_blob(&current, b"published after capture\n");
+    link_objects(&current, lease.path()).unwrap();
+    lease.retain(&oid);
+    lease.publish(&BTreeSet::new(), &BTreeSet::new()).unwrap();
+    let owner = lease.owner();
+    drop(lease);
+    maintain_pool(cache.path(), &id, Duration::ZERO, true, Some(snapshot)).unwrap();
+    assert_eq!(
+        read_history_blob(&current, &oid),
+        b"published after capture\n"
+    );
+    assert!(
+        pool.history_coverage()
+            .unwrap()
+            .unwrap()
+            .objects
+            .contains(&oid)
+    );
+
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    assert!(evict_history(&owner).unwrap());
+    maintain_pool(cache.path(), &id, Duration::ZERO, true, Some(snapshot)).unwrap();
+    assert!(!pool.root.exists());
+}
+
+#[test]
+fn history_reader_opened_after_selector_capture_keeps_its_pool() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    pool.state().unwrap();
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    let lease = object_lease(cache.path(), &id, "sha1").unwrap();
+    maintain_pool(cache.path(), &id, Duration::ZERO, true, Some(snapshot)).unwrap();
+    assert!(lease.path().is_dir());
+    drop(lease);
+    maintain_pool(cache.path(), &id, Duration::ZERO, false, None).unwrap();
+    assert!(!pool.root.exists());
+}
+
+#[test]
+fn history_reader_survives_replacement_and_can_republish_its_exact_objects() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let lease = object_lease(cache.path(), &id, "sha1").unwrap();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    let current = pool.root.join("current");
+    let oid = history_blob(&current, b"reader-owned bytes\n");
+    link_objects(&current, lease.path()).unwrap();
+    lease.retain(&oid);
+    let stage = tempfile::tempdir_in(&pool.root).unwrap();
+    let target = stage.path().join("git");
+    super::super::history::init(&target, "sha1").unwrap();
+    generation(&target).unwrap();
+    // Simulates replacement after a root capture preceding this read. Immutable
+    // hardlinks keep the old object accessible even after previous is deleted.
+    fs::write(
+        target.join("sigla-complete"),
+        b"sigla-selected-git-pool-1\n",
+    )
+    .unwrap();
+    {
+        let _gate = pool.operation.lock().unwrap();
+        pool.replace(&target).unwrap();
+    }
+    assert!(!pool.root.join("previous").exists());
+    assert_eq!(
+        read_history_blob(lease.path(), &oid),
+        b"reader-owned bytes\n"
+    );
+    lease.publish(&BTreeSet::new(), &BTreeSet::new()).unwrap();
+    assert_eq!(read_history_blob(&current, &oid), b"reader-owned bytes\n");
+    assert!(pool.roots(cache.path()).unwrap().history.contains(&oid));
+    let owner = lease.owner();
+    assert!(!evict_history(&owner).unwrap());
+    drop(lease);
+    assert!(evict_history(&owner).unwrap());
+    reclaim(cache.path()).unwrap();
+    assert!(!pool.root.exists());
+}
+#[test]
+fn generation_mismatch_invalidates_coverage_without_invalidating_live_reader() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let lease = object_lease(cache.path(), &id, "sha1").unwrap();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    let current = pool.root.join("current");
+    let oid = history_blob(&current, b"verified bytes\n");
+    link_objects(&current, lease.path()).unwrap();
+    lease.retain(&oid);
+    lease
+        .publish(&BTreeSet::from(["a".repeat(40)]), &BTreeSet::new())
+        .unwrap();
+    assert!(pool.history_coverage().unwrap().is_some());
+    fs::write(current.join("sigla-generation"), "f".repeat(64)).unwrap();
+    assert!(pool.history_coverage().unwrap().is_none());
+    assert!(pool.roots(cache.path()).unwrap().history.contains(&oid));
+    assert_eq!(read_history_blob(lease.path(), &oid), b"verified bytes\n");
+    drop(lease);
+    assert!(pool.roots(cache.path()).unwrap().history.is_empty());
+}
+
+#[test]
+fn abandoned_reader_views_are_collected_without_disturbing_live_readers() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let first = object_lease(cache.path(), &id, "sha1").unwrap();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    let oid = history_blob(&pool.root.join("current"), b"retained source\n");
+    link_objects(&pool.root.join("current"), first.path()).unwrap();
+    first.retain(&oid);
+    first.publish(&BTreeSet::new(), &BTreeSet::new()).unwrap();
+    let abandoned = pool.root.join("history-reader-abandoned");
+    super::super::history::init(&abandoned, "sha1").unwrap();
+    link_objects(first.path(), &abandoned).unwrap();
+    let second = object_lease(cache.path(), &id, "sha1").unwrap();
+    assert_eq!(read_history_blob(first.path(), &oid), b"retained source\n");
+    assert_eq!(read_history_blob(second.path(), &oid), b"retained source\n");
+    drop(first);
+    drop(second);
+    let recovered = object_lease(cache.path(), &id, "sha1").unwrap();
+    assert!(!abandoned.exists());
+    assert_eq!(
+        read_history_blob(recovered.path(), &oid),
+        b"retained source\n"
     );
 }

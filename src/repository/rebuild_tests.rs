@@ -90,6 +90,7 @@ impl Fixture {
     }
     fn roots(&self) -> Retention {
         Retention {
+            history: Default::default(),
             revisions: BTreeSet::from([self.first.clone(), self.last.clone()]),
             selected: BTreeSet::from([self.before.clone(), self.after.clone()]),
         }
@@ -123,6 +124,7 @@ fn absent_root_commit_does_not_discard_its_available_blob() {
     let f = Fixture::new("sha1");
     let target = f.target("missing-commit");
     let roots = Retention {
+        history: Default::default(),
         revisions: BTreeSet::from(["e".repeat(40)]),
         selected: BTreeSet::from([f.before.clone()]),
     };
@@ -195,4 +197,36 @@ fn empty_retention_creates_a_valid_empty_pool() {
         run(git(&target).args(["rev-parse", "--show-object-format"])).unwrap(),
         b"sha256\n"
     );
+}
+
+#[test]
+fn history_retention_is_an_explicit_object_set_not_snapshot_tree_closure() {
+    for format in ["sha1", "sha256"] {
+        let f = Fixture::new(format);
+        let target = f.target("history-retained");
+        let roots = Retention {
+            history: BTreeSet::from([
+                f.first.clone(),
+                f.middle.clone(),
+                f.last.clone(),
+                f.before.clone(),
+            ]),
+            ..Retention::default()
+        };
+        rebuild(&f.store, &target, &roots).unwrap();
+        let kept = kinds(&target, &roots.history).unwrap();
+        assert_eq!(kept.len(), roots.history.len());
+        assert_eq!(kept[&f.middle], "commit");
+        assert_eq!(kept[&f.before], "blob");
+        let missing = BTreeSet::from([f.after.clone(), f.excluded.clone()]);
+        assert!(kinds(&target, &missing).unwrap().is_empty());
+        let parent_bytes = run(git(&target).args(["cat-file", "commit", &f.last])).unwrap();
+        assert!(
+            String::from_utf8(parent_bytes)
+                .unwrap()
+                .contains(&format!("parent {}\n", f.middle))
+        );
+        // Snapshot shallow bookkeeping must not redefine actual history parents.
+        assert!(fs::read(target.join("shallow")).unwrap().is_empty());
+    }
 }

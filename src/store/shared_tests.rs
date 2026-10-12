@@ -663,7 +663,7 @@ fn current_v3_keeps_object_ids_and_rejects_unknown_formats() {
 }
 
 #[test]
-fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
+fn legacy_layout_objects_upgrade_on_use_and_retire_independently() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = Database::open(dir.path()).unwrap();

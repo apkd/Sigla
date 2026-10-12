@@ -6,6 +6,7 @@ use url::Url;
 pub mod cache;
 mod credentials;
 mod github;
+pub(crate) mod history;
 pub mod job;
 mod lfs;
 pub mod manager;

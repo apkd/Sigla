@@ -40,6 +40,7 @@ impl App {
         if let Some(remote) = &self.remote {
             active.extend(remote.active_entries());
         }
+        active.extend(crate::repository::cache::active_history(&self.cache));
         // Existing environments are safe to read alongside queries. An unopened
         // environment needs a writer gate so NO_LOCK inspection excludes openers.
         let read = self.activity.clone().read_owned().await;

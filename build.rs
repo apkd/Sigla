@@ -416,14 +416,23 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=src");
-    let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
+    let mut files: Vec<PathBuf> = [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/unity/assets/native/2022.3.json",
+        "src/unity/assets/native/6000.0.json",
+        "vendor/tree-sitter-c-sharp/Cargo.toml",
+        "vendor/tree-sitter-c-sharp/tree-sitter.json",
+        "vendor/tree-sitter-c-sharp/src/grammar.json",
+        "vendor/tree-sitter-c-sharp/src/scanner.c",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
     sources(Path::new("src"), &mut files);
-    files.extend(
-        [
-            "src/unity/assets/native/2022.3.json",
-            "src/unity/assets/native/6000.0.json",
-        ]
-        .map(PathBuf::from),
+    sources(
+        Path::new("vendor/tree-sitter-c-sharp/bindings/rust"),
+        &mut files,
     );
     files.sort();
     let mut analysis = Sha256::new();
@@ -459,6 +468,7 @@ fn main() {
                 .into_bytes();
         }
         let facts = name.starts_with("Cargo.")
+            || name.starts_with("vendor/tree-sitter-c-sharp/")
             || name.starts_with("src/extract/")
             || name.starts_with("src/native/") && !name.ends_with("jobs.rs")
             || matches!(

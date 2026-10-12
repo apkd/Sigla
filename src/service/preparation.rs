@@ -128,6 +128,7 @@ impl App {
                 (&inventory.prepared, inventory.source.as_ref().map(|s| s.path()))
             };
             let (path, mode) = match request {
+                super::Request::History(_) => unreachable!("history bypasses snapshot preparation"),
                 super::Request::Browse(path) => (path, None),
                 super::Request::View(path, mode) => (path, Some(mode)),
                 super::Request::Search(_) => unreachable!(),
@@ -174,6 +175,7 @@ impl App {
             let assets_pending =
                 !indexes::source_only(&request, query.as_ref()) && indexes::has_unity(manifest);
             let mut text = match request {
+                super::Request::History(_) => unreachable!("history bypasses snapshot preparation"),
                 super::Request::Search(_) => sources.files(query.as_ref().unwrap(), &root),
                 super::Request::Browse(path) => sources.browse(&root, &path, app.remote.is_none()),
                 super::Request::View(path, mode) => {

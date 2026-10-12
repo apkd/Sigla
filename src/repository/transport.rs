@@ -8,6 +8,27 @@ use gix_transport::IsSpuriousError;
 use gix_transport::client::blocking_io::{self, Transport};
 use std::{io::Write, path::Path, sync::atomic::AtomicBool, time::Duration};
 
+#[derive(Clone, Copy)]
+pub(super) enum Filter {
+    Commits,
+    Trees,
+}
+
+pub(super) struct Fetch<'a> {
+    pub filter: Filter,
+    pub depth: Option<u32>,
+    pub cancel: &'a AtomicBool,
+}
+
+#[derive(Debug)]
+pub(super) struct TreeFilterRejected;
+impl std::fmt::Display for TreeFilterRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Repository endpoint rejected the commit-only tree filter")
+    }
+}
+impl std::error::Error for TreeFilterRejected {}
+
 pub struct Session {
     transport: Box<dyn Transport + Send>,
     handshake: gix_protocol::Handshake,
@@ -246,24 +267,57 @@ impl Session {
         depth_one: bool,
         output: &mut impl Write,
     ) -> Result<()> {
+        self.pack_filtered(
+            objects,
+            store,
+            &Fetch {
+                filter: Filter::Trees,
+                depth: depth_one.then_some(1),
+                cancel: &AtomicBool::new(false),
+            },
+            output,
+        )
+    }
+
+    pub(super) fn pack_filtered(
+        &mut self,
+        objects: Vec<gix_hash::ObjectId>,
+        control: &Path,
+        options: &Fetch<'_>,
+        output: &mut impl Write,
+    ) -> Result<()> {
         ensure!(!objects.is_empty(), "Cannot request an empty Git pack");
         let mut wants = Wants {
             objects,
             unsupported: false,
+            filter: options.filter,
         };
-        let shallow = if depth_one {
-            fetch::Shallow::DepthAtRemote(1.try_into().unwrap())
-        } else {
-            fetch::Shallow::NoChange
+        let shallow = match options.depth {
+            Some(depth) => fetch::Shallow::DepthAtRemote(
+                depth
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Fetch depth must be positive"))?,
+            ),
+            None => fetch::Shallow::NoChange,
         };
         let result = gix_protocol::fetch(
             &mut wants,
             |reader, _, _| {
-                std::io::copy(reader, output)?;
+                let mut buffer = [0; 64 * 1024];
+                loop {
+                    if options.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(std::io::Error::other("Repository transfer cancelled"));
+                    }
+                    let count = std::io::Read::read(reader, &mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..count])?;
+                }
                 Ok::<_, std::io::Error>(true)
             },
             gix_features::progress::Discard,
-            &AtomicBool::new(false),
+            options.cancel,
             fetch::Context {
                 handshake: &mut self.handshake,
                 transport: &mut self.transport,
@@ -271,7 +325,7 @@ impl Session {
                 trace_packetlines: false,
             },
             fetch::Options {
-                shallow_file: store.join("shallow"),
+                shallow_file: control.join("shallow"),
                 shallow: &shallow,
                 tags: fetch::Tags::None,
                 reject_shallow_remote: false,
@@ -281,8 +335,33 @@ impl Session {
             !wants.unsupported,
             "Repository endpoint does not support filtered acquisition; no pack was requested"
         );
+        if matches!(options.filter, Filter::Commits)
+            && result
+                .as_ref()
+                .is_err_and(|error| tree_filter_rejected(error))
+        {
+            return Err(TreeFilterRejected.into());
+        }
         result.map_err(|_| anyhow::anyhow!("Filtered repository transfer failed"))?;
         Ok(())
+    }
+}
+
+fn tree_filter_rejected(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("filter")
+            && message.contains("tree")
+            && ["not supported", "unsupported", "not allowed", "disallowed"]
+                .iter()
+                .any(|s| message.contains(s))
+        {
+            return true;
+        }
+        let Some(source) = error.source() else {
+            return false;
+        };
+        error = source;
     }
 }
 
@@ -295,6 +374,7 @@ impl Drop for Session {
 struct Wants {
     objects: Vec<gix_hash::ObjectId>,
     unsupported: bool,
+    filter: Filter,
 }
 impl fetch::Negotiate for Wants {
     fn mark_complete_and_common_ref(&mut self) -> Result<negotiate::Action, negotiate::Error> {
@@ -308,7 +388,10 @@ impl fetch::Negotiate for Wants {
             self.unsupported = true;
             return false;
         }
-        arguments.filter("blob:none");
+        arguments.filter(match self.filter {
+            Filter::Commits => "tree:0",
+            Filter::Trees => "blob:none",
+        });
         for object in &self.objects {
             arguments.want(object);
         }
