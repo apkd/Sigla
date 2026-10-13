@@ -1,8 +1,16 @@
 use super::*;
-use reqwest::{Method, blocking::Client};
+use reqwest::{
+    Method, StatusCode,
+    blocking::{Client, RequestBuilder, Response},
+    header::HeaderMap,
+};
 use serde::Deserialize as JsonDeserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Clone, JsonDeserialize)]
 struct Asset {
@@ -18,6 +26,7 @@ struct Release {
 struct Github {
     client: Client,
     repo: String,
+    cooldown: Mutex<Instant>,
 }
 impl Github {
     fn new(repo: &str) -> Result<Self> {
@@ -41,19 +50,57 @@ impl Github {
         );
         Ok(Self {
             repo: repo.into(),
+            cooldown: Mutex::new(Instant::now()),
             client: Client::builder()
                 .default_headers(headers)
                 .timeout(std::time::Duration::from_secs(3600))
                 .build()?,
         })
     }
+    fn send(&self, request: impl Fn() -> Result<RequestBuilder>) -> Result<Response> {
+        for attempt in 0..=3 {
+            loop {
+                let delay = self
+                    .cooldown
+                    .lock()
+                    .unwrap()
+                    .saturating_duration_since(Instant::now());
+                if delay.is_zero() {
+                    break;
+                }
+                std::thread::sleep(delay);
+            }
+            let response = request()?.send()?;
+            let Err(error) = response.error_for_status_ref() else {
+                return Ok(response);
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text()?;
+            let Some(delay) = rate_limit_delay(status, &headers, &body, attempt) else {
+                return Err(error.into());
+            };
+            let mut cooldown = self.cooldown.lock().unwrap();
+            *cooldown = (*cooldown).max(Instant::now() + delay);
+            if attempt == 3 {
+                return Err(error.into());
+            }
+            tracing::warn!(
+                seconds = delay.as_secs(),
+                "GitHub rate limit; pausing publication requests"
+            );
+        }
+        unreachable!()
+    }
     fn api(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let url = format!("https://api.github.com/repos/{}/{}", self.repo, path);
-        let mut request = self.client.request(method, url);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send()?.error_for_status()?;
+        let response = self.send(|| {
+            let mut request = self.client.request(method.clone(), &url);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            Ok(request)
+        })?;
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             Ok(Value::Null)
         } else {
@@ -92,7 +139,7 @@ impl Github {
         if let Some(release) = self.releases()?.into_iter().find(|r| r.tag_name == tag) {
             return Ok(release);
         }
-        Ok(serde_json::from_value(self.api(Method::POST, "releases", Some(json!({"tag_name":tag,"name":"Unity metadata archive","body":"Current precomputed Unity analysis records.","make_latest":"false"})))?)?)
+        Ok(serde_json::from_value(self.api(Method::POST, "releases", Some(json!({"tag_name":tag,"name":"Metadata archive","body":"---","make_latest":"false"})))?)?)
     }
     fn assets(&self, release: &Release) -> Result<Vec<Asset>> {
         self.pages(&format!("releases/{}/assets", release.id))
@@ -114,21 +161,58 @@ impl Github {
         Ok(())
     }
     fn upload(&self, release: &Release, path: &Path, name: &str) -> Result<Asset> {
-        let file = fs::File::open(path)?;
         Ok(self
-            .client
-            .post(format!(
-                "https://uploads.github.com/repos/{}/releases/{}/assets",
-                self.repo, release.id
-            ))
-            .query(&[("name", name)])
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(reqwest::header::CONTENT_LENGTH, file.metadata()?.len())
-            .body(file)
-            .send()?
-            .error_for_status()?
+            .send(|| {
+                let file = fs::File::open(path)?;
+                Ok(self
+                    .client
+                    .post(format!(
+                        "https://uploads.github.com/repos/{}/releases/{}/assets",
+                        self.repo, release.id
+                    ))
+                    .query(&[("name", name)])
+                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(reqwest::header::CONTENT_LENGTH, file.metadata()?.len())
+                    .body(file))
+            })?
             .json()?)
     }
+}
+
+fn rate_limit_delay(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    attempt: u32,
+) -> Option<Duration> {
+    if status != StatusCode::FORBIDDEN && status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    if let Some(seconds) = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+    if headers
+        .get("x-ratelimit-remaining")
+        .is_some_and(|v| v == "0")
+    {
+        if let Some(reset) = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+        {
+            return Some(
+                (UNIX_EPOCH + Duration::from_secs(reset))
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default()
+                    + Duration::from_secs(1),
+            );
+        }
+        return Some(Duration::from_secs(60 << attempt));
+    }
+    (status == StatusCode::TOO_MANY_REQUESTS || body.contains("rate limit"))
+        .then(|| Duration::from_secs(60 << attempt))
 }
 
 pub(super) fn publish(
@@ -137,6 +221,7 @@ pub(super) fn publish(
     packages: registry::Plan,
     input: &Path,
 ) -> Result<()> {
+    let started = Instant::now();
     let fresh = producer::artifacts(input)?;
     let files = producer::files(input)?;
     let mut unavailable = packages.unavailable;
@@ -190,6 +275,8 @@ pub(super) fn publish(
         .collect::<Result<Vec<_>>>()?;
     let mut uploaded = Vec::new();
     let publication = (|| -> Result<()> {
+        let mut reused = 0;
+        let mut bytes = 0;
         for artifact in &mut selected {
             if let Some((release, existing)) = inventory.iter().find_map(|(r, assets)| {
                 assets
@@ -202,13 +289,18 @@ pub(super) fn publish(
                     "Existing release asset size differs"
                 );
                 artifact.release = release.tag_name.clone();
+                reused += 1;
                 continue;
             }
             let path = files
                 .iter()
                 .find(|p| p.file_name().is_some_and(|n| n == artifact.name.as_str()))
                 .context("New artifact has no local bundle")?;
-            bundle::verify(path, Some(artifact))?;
+            let started = Instant::now();
+            // The producer already validated these records. Check that the
+            // handoff contains the exact bytes it verified.
+            bundle::verify_digest(path, artifact)?;
+            let verified = started.elapsed();
             let bucket =
                 if let Some(index) = inventory.iter().position(|(_, assets)| assets.len() < 997) {
                     index
@@ -226,10 +318,24 @@ pub(super) fn publish(
                 };
             let (release, assets) = &mut inventory[bucket];
             let asset = github.upload(release, path, &artifact.name)?;
+            tracing::info!(
+                name = %artifact.name,
+                bytes = artifact.size,
+                hash_ms = verified.as_millis(),
+                upload_ms = (started.elapsed() - verified).as_millis(),
+                "Uploaded metadata bundle"
+            );
             artifact.release = release.tag_name.clone();
+            bytes += artifact.size;
             uploaded.push(asset.clone());
             assets.push(asset);
         }
+        tracing::info!(
+            reused,
+            uploads = uploaded.len(),
+            bytes,
+            "Published metadata bundles"
+        );
         selected.sort_by(|a, b| a.name.cmp(&b.name));
         let catalog = Catalog {
             artifacts: selected.clone(),
@@ -282,16 +388,19 @@ pub(super) fn publish(
         .map(|a| (a.release.clone(), a.name.clone()))
         .chain(std::iter::once((TAG.to_owned(), "catalog.bin".to_owned())))
         .collect();
+    let cleanup = Instant::now();
+    let mut removed = 0;
     for release in github.releases()? {
-        let mut retained = false;
-        for asset in github.assets(&release)? {
-            if keep.contains(&(release.tag_name.clone(), asset.name.clone())) {
-                retained = true;
-            } else {
-                github.delete(&asset)?;
-            }
+        let assets = github.assets(&release)?;
+        let obsolete: Vec<_> = assets
+            .iter()
+            .filter(|a| !keep.contains(&(release.tag_name.clone(), a.name.clone())))
+            .collect();
+        for asset in &obsolete {
+            github.delete(asset)?;
+            removed += 1;
         }
-        if !retained && release.tag_name != TAG {
+        if obsolete.len() == assets.len() && release.tag_name != TAG {
             github.api(Method::DELETE, &format!("releases/{}", release.id), None)?;
             github.api(
                 Method::DELETE,
@@ -302,6 +411,9 @@ pub(super) fn publish(
     }
     tracing::info!(
         artifacts = selected.len(),
+        removed,
+        cleanup_seconds = cleanup.elapsed().as_secs_f64(),
+        total_seconds = started.elapsed().as_secs_f64(),
         "Published metadata archive and removed obsolete assets"
     );
     Ok(())
@@ -328,6 +440,35 @@ fn switch_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limits_wait_but_permission_errors_do_not_retry() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            rate_limit_delay(StatusCode::FORBIDDEN, &headers, "Permission denied", 0).is_none()
+        );
+        let first = rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, &headers, "", 0).unwrap();
+        let second = rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, &headers, "", 1).unwrap();
+        assert!(!first.is_zero());
+        assert!(second > first);
+        assert!(
+            rate_limit_delay(StatusCode::FORBIDDEN, &headers, "secondary rate limit", 0).is_some()
+        );
+        let requested = Duration::from_secs(17);
+        headers.insert(
+            "retry-after",
+            requested.as_secs().to_string().parse().unwrap(),
+        );
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, &headers, "", 0),
+            Some(requested)
+        );
+        assert!(rate_limit_delay(StatusCode::BAD_REQUEST, &headers, "", 0).is_none());
+        headers.remove("retry-after");
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        assert!(rate_limit_delay(StatusCode::FORBIDDEN, &headers, "", 0).is_some());
+    }
+
     #[test]
     fn interrupted_catalog_switch_restores_the_current_pointer() {
         let old = Asset {

@@ -40,6 +40,10 @@ fn precomputed_sources_preserve_navigation_and_profile_selection() {
         Some(&artifact),
     )
     .unwrap();
+    assert_eq!(
+        bundle::verify(&output.path().join(&artifact.name), Some(&artifact)).unwrap(),
+        manifest
+    );
     assert_eq!(manifest.entries.len(), 4);
     let db = tempfile::tempdir().unwrap();
     let store = Store::open_workspace(db.path(), [1; 32], Path::new("fixture"), None).unwrap();
@@ -91,6 +95,45 @@ fn precomputed_sources_preserve_navigation_and_profile_selection() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn publication_rejects_changed_bundle_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = bundle::Builder::new(origin(), vec![vec![]]).unwrap();
+    builder
+        .add("LICENSE".into(), b"License text".to_vec(), "package")
+        .unwrap();
+    let artifact = builder.finish(dir.path()).unwrap();
+    let path = dir.path().join(&artifact.name);
+    bundle::verify_digest(&path, &artifact).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    assert!(bundle::verify_digest(&path, &artifact).is_err());
+    bytes.pop();
+    fs::write(&path, &bytes).unwrap();
+    assert!(bundle::verify_digest(&path, &artifact).is_err());
+}
+
+#[test]
+fn producer_rejects_invalid_analysis_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = bundle::Builder::new(origin(), vec![vec![]]).unwrap();
+    builder
+        .add("Broken.cs.analysis".into(), vec![0], "analysis")
+        .unwrap();
+    assert!(builder.finish(dir.path()).is_err());
+}
+
+#[test]
+fn verification_rejects_conflicting_file_and_directory_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = bundle::Builder::new(origin(), vec![vec![]]).unwrap();
+    for path in ["directory", "directory/file"] {
+        builder.add(path.into(), vec![1], "package").unwrap();
+    }
+    assert!(builder.finish(dir.path()).is_err());
 }
 
 #[test]

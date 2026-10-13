@@ -222,11 +222,16 @@ pub(super) fn unpack(
     destination: &Path,
     expected: Option<&Artifact>,
 ) -> Result<Manifest> {
+    inspect(path, Some(destination), expected)
+}
+
+fn inspect(
+    path: &Path,
+    destination: Option<&Path>,
+    expected: Option<&Artifact>,
+) -> Result<Manifest> {
     if let Some(expected) = expected {
-        ensure!(
-            fs::metadata(path)?.len() == expected.size && digest(path)? == expected.hash,
-            "Bundle digest or size mismatch"
-        );
+        verify_digest(path, expected)?;
     }
     let mut reader = zstd::stream::read::Decoder::new(fs::File::open(path)?)?;
     reader.window_log_max(27)?;
@@ -255,7 +260,7 @@ pub(super) fn unpack(
     for entry in &manifest.entries {
         safe(&entry.path)?;
         ensure!(
-            entry.size <= MAX_RECORD && paths.insert(&entry.path),
+            entry.size <= MAX_RECORD && paths.insert(entry.path.as_str()),
             "Invalid bundle inventory"
         );
         pending
@@ -263,7 +268,18 @@ pub(super) fn unpack(
             .or_default()
             .push(entry);
     }
-    fs::create_dir_all(destination)?;
+    for path in &paths {
+        ensure!(
+            !Path::new(path)
+                .ancestors()
+                .skip(1)
+                .any(|parent| paths.contains(parent.to_str().unwrap())),
+            "Bundle file is also used as a directory"
+        );
+    }
+    if let Some(destination) = destination {
+        fs::create_dir_all(destination)?;
+    }
     for item in entries {
         let mut item = item?;
         ensure!(
@@ -295,26 +311,37 @@ pub(super) fn unpack(
                     })?;
                 }
             }
-            let path = destination.join(&target.path);
-            fs::create_dir_all(path.parent().unwrap())?;
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)?
-                .write_all(&bytes)?;
+            if let Some(destination) = destination {
+                let path = destination.join(&target.path);
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?
+                    .write_all(&bytes)?;
+            }
         }
     }
     ensure!(pending.is_empty(), "Bundle is missing objects");
     std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
-    save(
-        &destination.join("manifest.bin"),
-        &binary::encode(&manifest)?,
-    )?;
+    if let Some(destination) = destination {
+        save(
+            &destination.join("manifest.bin"),
+            &binary::encode(&manifest)?,
+        )?;
+    }
     Ok(manifest)
 }
 pub(super) fn verify(path: &Path, expected: Option<&Artifact>) -> Result<Manifest> {
-    let temp = tempfile::tempdir()?;
-    unpack(path, temp.path(), expected)
+    inspect(path, None, expected)
+}
+
+pub(super) fn verify_digest(path: &Path, expected: &Artifact) -> Result<()> {
+    ensure!(
+        fs::metadata(path)?.len() == expected.size && digest(path)? == expected.hash,
+        "Bundle digest or size mismatch"
+    );
+    Ok(())
 }
 fn validate_analysis(analysis: &Analysis) -> Result<()> {
     records::validate_encoded(&analysis.encoded)
