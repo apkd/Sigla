@@ -11,6 +11,7 @@ use std::{
 
 const PENDING: &str = "data.mdb.compacting";
 const PREVIOUS: &str = "data.mdb.previous";
+const RETIRED: &str = "data.mdb.retired-";
 const TABLES: &[&str] = &[
     "control",
     "workspaces",
@@ -81,10 +82,10 @@ fn validate(path: &Path) -> Result<Vec<(String, u64)>> {
     result
 }
 
-fn remove(path: &Path) -> Result<()> {
+fn remove(path: &Path) -> Result<bool> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -97,30 +98,71 @@ pub fn recover(cache: &Path) -> Result<()> {
     }
     let current = root.join("data.mdb");
     let previous = root.join(PREVIOUS);
-    if previous.exists() {
-        if validate(&current).is_err() {
-            validate(&previous)?;
-            fs::rename(&previous, &current)?;
-            remove(&root.join("lock.mdb"))?;
-        } else {
-            remove(&previous)?;
-        }
+    if !previous.try_exists()? {
+        return Ok(());
     }
+    if validate(&current).is_err() {
+        validate(&previous)?;
+        fs::rename(&previous, &current)?;
+        remove(&root.join("lock.mdb"))?;
+    } else {
+        // Disarm the rollback marker durably, without unlinking a possibly huge
+        // obsolete environment on the startup path. Unique names survive retries.
+        let (file, retired) = tempfile::Builder::new()
+            .prefix(RETIRED)
+            .tempfile_in(&root)?
+            .keep()?;
+        drop(file);
+        fs::rename(&previous, retired)?;
+    }
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+/// Optional disposal after recovery. Hold cache ownership and at least a shared
+/// activity guard, excluding compaction/publication. Never remove PREVIOUS here:
+/// its presence means a publication still needs mandatory recovery.
+pub fn cleanup(cache: &Path) -> Result<()> {
+    let root = cache.join("analysis");
+    if !root.is_dir() {
+        return Ok(());
+    }
+    if root.join(PREVIOUS).try_exists()? {
+        return Ok(());
+    }
+    let mut changed = false;
     for name in [
         PENDING,
         "data.mdb.compacting-lock",
         "data.mdb.previous-lock",
         "data.mdb-lock",
     ] {
-        remove(&root.join(name))?;
+        changed |= remove(&root.join(name))?;
     }
-    File::open(root)?.sync_all()?;
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(RETIRED))
+        {
+            changed |= remove(&entry.path())?;
+        }
+    }
+    if changed {
+        File::open(root)?.sync_all()?;
+    }
     Ok(())
 }
 
 /// Consumes the last environment handle. Callers must exclude work for the full operation.
 pub fn run(env: Env, cache: &Path) -> Result<u64> {
     let root = cache.join("analysis");
+    ensure!(
+        !root.join(PREVIOUS).try_exists()?,
+        "Analysis compaction requires recovery"
+    );
+    cleanup(cache)?;
     let before = env.real_disk_size()?;
     let live = env.compacted_size()?;
     let available = super::policy::Disk::read(cache)?.available;
@@ -175,6 +217,7 @@ pub fn run(env: Env, cache: &Path) -> Result<u64> {
     }
     let after = fs::metadata(root.join("data.mdb"))?.len();
     recover(cache)?;
+    cleanup(cache)?;
     Ok(before.saturating_sub(after))
 }
 
@@ -254,6 +297,71 @@ mod tests {
         recover(cache.path()).unwrap();
         readable(cache.path());
     }
+    #[test]
+    fn recovery_disarms_rollback_without_disposing_of_retained_data() {
+        use std::os::unix::fs::MetadataExt;
+        let cache = tempfile::tempdir().unwrap();
+        drop(populated(cache.path()));
+        let root = cache.path().join("analysis");
+        let current = root.join("data.mdb");
+        let inode = fs::metadata(&current).unwrap().ino();
+        fs::hard_link(&current, root.join(PREVIOUS)).unwrap();
+        fs::write(root.join(PENDING), b"interrupted copy").unwrap();
+        recover(cache.path()).unwrap();
+        assert_eq!(fs::metadata(&current).unwrap().ino(), inode);
+        assert!(!root.join(PREVIOUS).exists());
+        assert!(root.join(PENDING).exists());
+        let retired = || {
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with(RETIRED)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(retired().len(), 1);
+        // A subsequent startup must neither re-promote nor unlink this garbage.
+        recover(cache.path()).unwrap();
+        assert_eq!(retired().len(), 1);
+        readable(cache.path());
+        cleanup(cache.path()).unwrap();
+        cleanup(cache.path()).unwrap();
+        assert!(retired().is_empty());
+        assert!(!root.join(PENDING).exists());
+        readable(cache.path());
+    }
+
+    #[test]
+    fn recovery_restores_a_missing_current_file() {
+        let cache = tempfile::tempdir().unwrap();
+        drop(populated(cache.path()));
+        let root = cache.path().join("analysis");
+        fs::rename(root.join("data.mdb"), root.join(PREVIOUS)).unwrap();
+        recover(cache.path()).unwrap();
+        readable(cache.path());
+    }
+
+    #[test]
+    fn failed_recovery_keeps_both_candidates_and_cleanup_never_removes_the_backup() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().join("analysis");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("data.mdb"), b"invalid current").unwrap();
+        fs::write(root.join(PREVIOUS), b"invalid backup").unwrap();
+        fs::write(root.join(PENDING), b"unpublished copy").unwrap();
+        assert!(recover(cache.path()).is_err());
+        cleanup(cache.path()).unwrap();
+        assert_eq!(fs::read(root.join("data.mdb")).unwrap(), b"invalid current");
+        assert_eq!(fs::read(root.join(PREVIOUS)).unwrap(), b"invalid backup");
+        assert_eq!(fs::read(root.join(PENDING)).unwrap(), b"unpublished copy");
+        assert!(recover(cache.path()).is_err());
+    }
+
     #[test]
     fn outstanding_database_handles_prevent_compaction() {
         let cache = tempfile::tempdir().unwrap();

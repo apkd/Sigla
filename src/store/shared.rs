@@ -1,5 +1,10 @@
 //! One LMDB transaction domain for immutable analysis and workspace-owned indexes.
 //! This module does not know about syntax or perform filesystem input extraction.
+#[path = "names.rs"]
+mod names;
+#[path = "publication.rs"]
+mod publication;
+
 use anyhow::{Context, Result, ensure};
 use heed::{
     Database as Table, DatabaseFlags, Env, EnvOpenOptions, RoTxn, RwTxn,
@@ -44,6 +49,7 @@ const PARTITION: u64 = 256;
 const POSTING_NAMES: &[u8] = b"posting-names";
 const INPUT_ALIAS: &[u8] = b"input:";
 
+#[derive(Clone)]
 pub(crate) struct PendingInstall {
     file: String,
     revision: Vec<u8>,
@@ -66,6 +72,13 @@ impl PendingInstall {
         self.input = input;
         self
     }
+}
+
+/// A read-only probe never decodes analysis or waits for parser admission.
+pub(crate) enum Reuse {
+    Current,
+    Pending(Box<PendingInstall>),
+    Missing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +237,9 @@ pub struct Database {
     pins: Mutex<HashMap<ObjectId, usize>>,
     writers: Mutex<(u64, u64)>,
     writer_changed: Condvar,
+    publications: Mutex<publication::Queue>,
+    publication_changed: Condvar,
+    dictionary_namespace: u64,
 }
 struct WriteTurn<'a>(&'a Database);
 impl Drop for WriteTurn<'_> {
@@ -268,7 +284,6 @@ struct Snapshot {
     database: Arc<Database>,
     bindings: BTreeMap<String, Binding>,
     members: BTreeMap<u64, Vec<String>>,
-    vocabulary: Option<Vec<u8>>,
 }
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -482,6 +497,9 @@ impl Database {
             pins: Mutex::new(HashMap::new()),
             writers: Mutex::new((0, 0)),
             writer_changed: Condvar::new(),
+            publications: Default::default(),
+            publication_changed: Condvar::new(),
+            dictionary_namespace: names::namespace(),
         });
         if needs_unused_index {
             while !db.index_unused_batch(PRESSURE_BATCH)? {}
@@ -643,6 +661,7 @@ impl Database {
     }
     fn postings(&self, tx: &mut RwTxn<'_>, ordinal: u64, names: &Names, add: bool) -> Result<()> {
         let partition = ordinal / PARTITION;
+        names::changed(self, tx, partition)?;
         let value = ordinal.to_be_bytes();
         for (table, names) in [
             (self.declarations, &names.declarations),
@@ -900,11 +919,6 @@ impl Scope {
             members.entry(live.ordinal).or_default().push(file.clone());
             bindings.insert(file, binding);
         }
-        let vocabulary = self
-            .database
-            .control
-            .get(&tx, &scope_key(self.id, b"vocabulary"))?
-            .map(<[u8]>::to_vec);
         for binding in bindings.values() {
             *pins.entry(binding.object).or_default() += 1;
         }
@@ -913,7 +927,6 @@ impl Scope {
                 database: self.database.clone(),
                 bindings,
                 members,
-                vocabulary,
             })),
             partitions: Default::default(),
             ..self.clone()
@@ -1017,6 +1030,57 @@ impl Scope {
         Ok(binding.revision == revision
             && (self.id >= self.database.legacy_until
                 || self.indexed(tx, file, &binding.object)?))
+    }
+    pub(crate) fn prepare_reuse(
+        &self,
+        file: &str,
+        revision: Vec<u8>,
+        input: Option<ObjectId>,
+        now: u64,
+    ) -> Result<Reuse> {
+        let tx = self.read()?;
+        if self.matches(&tx, file, &revision)? {
+            return Ok(Reuse::Current);
+        }
+        self.writable(&tx)?;
+        let object = if let Some(binding) = self.previous_binding(&tx, file, &revision)? {
+            Some(binding.object)
+        } else if let Some(input) = input {
+            self.database
+                .control
+                .get(&tx, &record_key(&input, b"input"))?
+                .map(|bytes| bytes.try_into())
+                .transpose()?
+        } else {
+            None
+        };
+        let Some(object) = object else {
+            return Ok(Reuse::Missing);
+        };
+        if self
+            .database
+            .live(&tx, &object)?
+            .is_none_or(|live| live.ordinal == UNINDEXED)
+        {
+            // Legacy index reconstruction and missing objects need admission.
+            return Ok(Reuse::Missing);
+        }
+        ensure!(
+            !file.is_empty()
+                && 8 + file.len() <= self.database.env.max_key_size()
+                && file.len() <= self.database.env.max_key_size(),
+            "File key exceeds LMDB limit"
+        );
+        Ok(Reuse::Pending(Box::new(PendingInstall {
+            file: file.to_owned(),
+            revision,
+            object,
+            now,
+            expected: self.binding(&tx, file)?,
+            encoded: None,
+            input,
+            index: None,
+        })))
     }
     pub fn binding(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<Binding>> {
         if let Some(snapshot) = &self.snapshot {
@@ -1204,38 +1268,10 @@ impl Scope {
         for index in 0..pending.len() {
             verify(index)?;
         }
-        let queued = std::time::Instant::now();
-        let mut tx = self.database.write()?;
-        let wait = queued.elapsed();
-        let applying = std::time::Instant::now();
-        let mut installed = Vec::with_capacity(pending.len());
-        for pending in pending {
-            let result = self.install_in(&mut tx, pending)?;
-            if result.is_some()
-                && let Some(input) = pending.input
-            {
-                let key = record_key(&input, b"input");
-                if self.database.control.get(&tx, &key)? != Some(pending.object.as_slice()) {
-                    self.database.control.put(&mut tx, &key, &pending.object)?;
-                    let mut key = record_key(&pending.object, INPUT_ALIAS);
-                    key.extend_from_slice(&input);
-                    self.database.records.put(&mut tx, &key, &[])?;
-                }
-            }
-            installed.push(result);
+        if pending.is_empty() {
+            return Ok(Vec::new());
         }
-        let apply = applying.elapsed();
-        let committing = std::time::Instant::now();
-        tx.commit()?;
-        tracing::debug!(
-            workspace = self.id,
-            files = pending.len(),
-            wait_ms = wait.as_millis(),
-            apply_ms = apply.as_millis(),
-            commit_ms = committing.elapsed().as_millis(),
-            "analysis batch published"
-        );
-        Ok(installed)
+        self.database.publish(self, pending.to_vec())
     }
 
     fn install_in(
@@ -1421,17 +1457,14 @@ impl Scope {
             self.database.declarations
         };
         let mut result = BTreeSet::new();
-        // Exact lookups use the small partition set directly. A large vocabulary
-        // may exceed its decoded cache budget; decoding it for every type lookup
-        // would repeatedly rebuild the entire workspace dictionary.
-        if !exact && let Some(vocabulary) = self.vocabulary(tx)? {
-            let terms = if occurrences {
-                &vocabulary.occurrences
-            } else {
-                &vocabulary.declarations
-            };
-            for (term, partitions) in terms.iter().filter(|(term, _)| matches(term)) {
-                for &partition in partitions {
+        let partitions = self.partitions(tx)?;
+        if !exact
+            && let Some(dictionary) =
+                names::dictionary(&self.database, tx, &partitions, occurrences)?
+        {
+            for (term, partitions) in dictionary.terms().filter(|(term, _)| matches(term)) {
+                for &index in partitions {
+                    let partition = dictionary.partition(index);
                     if let Some(rows) =
                         table.get_duplicates(tx, &scope_key(partition, term.as_bytes()))?
                     {
@@ -1443,7 +1476,9 @@ impl Scope {
             }
             return Ok(result);
         }
-        for &partition in self.partitions(tx)?.iter() {
+        // Exact lookup never builds a vocabulary. Oversized broad vocabularies
+        // stream distinct keys, not every (term, object) posting.
+        for &partition in partitions.iter() {
             if exact && name.len() <= 480 {
                 if let Some(rows) =
                     table.get_duplicates(tx, &scope_key(partition, name.as_bytes()))?
@@ -1453,10 +1488,17 @@ impl Scope {
                     }
                 }
             } else {
-                for row in table.prefix_iter(tx, &partition.to_be_bytes())? {
-                    let (key, ordinal) = row?;
-                    if matches(std::str::from_utf8(&key[8..])?) {
-                        self.member_files(tx, ordinal, &mut result)?;
+                for row in table
+                    .prefix_iter(tx, &partition.to_be_bytes())?
+                    .move_between_keys()
+                {
+                    let (key, _) = row?;
+                    if matches(std::str::from_utf8(&key[8..])?)
+                        && let Some(rows) = table.get_duplicates(tx, key)?
+                    {
+                        for row in rows {
+                            self.member_files(tx, row?.1, &mut result)?;
+                        }
                     }
                 }
             }
@@ -1478,18 +1520,7 @@ impl Scope {
         }
         Ok(files.into_iter().collect())
     }
-    fn vocabulary(&self, tx: &RoTxn<'_>) -> Result<Option<Arc<super::names::Vocabulary>>> {
-        let bytes = if let Some(snapshot) = &self.snapshot {
-            snapshot.vocabulary.as_deref()
-        } else if self.info(tx)?.phase == Phase::Clean {
-            self.database
-                .control
-                .get(tx, &scope_key(self.id, b"vocabulary"))?
-        } else {
-            None
-        };
-        bytes.map(super::names::decode).transpose()
-    }
+
     fn partitions(&self, tx: &RoTxn<'_>) -> Result<Arc<BTreeSet<u64>>> {
         let mut cached = self.partitions.lock().unwrap();
         if let Some((generation, partitions)) = cached.as_ref()
@@ -1592,7 +1623,7 @@ impl Scope {
         }
         // Validate outside the writer. The caller's publication gate excludes changes
         // to this scope; other workspaces and collection cannot remove its live bindings.
-        let vocabulary = {
+        {
             let tx = self.read()?;
             for file in keep {
                 ensure!(
@@ -1600,32 +1631,16 @@ impl Scope {
                     "Manifest file has no binding"
                 );
             }
-            let mut vocabulary = super::names::Vocabulary::default();
-            for row in self
-                .database
-                .members
-                .prefix_iter(&tx, &self.id.to_be_bytes())?
-                .move_between_keys()
-            {
-                let (key, file) = row?;
-                let ordinal = u64::from_be_bytes(key[8..].try_into()?);
-                let object = self.object(&tx, file)?.context("Missing member binding")?;
-                let names = self
-                    .database
-                    .record(&tx, &object, POSTING_NAMES)?
-                    .context("Missing posting names")?;
-                vocabulary.add(ordinal / PARTITION, decode(names)?);
-            }
-            vocabulary.encode()?
-        };
+        }
         let mut tx = self.database.write()?;
         let mut info = self.writable(&tx)?;
         self.database
             .control
             .put(&mut tx, &manifest_key(self.id), manifest)?;
+        // Remove an old workspace-owned dictionary on its next refresh.
         self.database
             .control
-            .put(&mut tx, &scope_key(self.id, b"vocabulary"), &vocabulary)?;
+            .delete(&mut tx, &scope_key(self.id, b"vocabulary"))?;
         if self.id < self.database.legacy_until {
             self.database
                 .control
@@ -1762,6 +1777,12 @@ impl Scope {
     }
 }
 
+#[cfg(test)]
+#[path = "storage_benchmark.rs"]
+mod storage_benchmark;
+#[cfg(test)]
+#[path = "storage_tests.rs"]
+mod storage_tests;
 #[cfg(test)]
 #[path = "shared_tests.rs"]
 mod tests;

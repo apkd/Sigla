@@ -610,20 +610,17 @@ fn parameters(list: Node<'_>, source: &str) -> Vec<Parameter> {
     result
 }
 
-pub fn header(node: Node<'_>, source: &str, declarations: &[Declaration]) -> Header {
+/// Lower the last appended declaration with the owner resolved by extraction.
+/// Qualification and header links must use the same declaration index.
+pub fn header(
+    node: Node<'_>,
+    source: &str,
+    declarations: &[Declaration],
+    owner: Option<u32>,
+) -> Header {
     let index = declarations.len() - 1;
     let declaration = &declarations[index];
-    let owner = declarations[..index]
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, d)| {
-            !d.local()
-                && d.kind != "namespace"
-                && d.span.start <= declaration.span.start
-                && d.span.end >= declaration.span.end
-        })
-        .map(|(i, _)| i as u32);
+    debug_assert!(owner.is_none_or(|owner| (owner as usize) < index));
     let type_node = node
         .child_by_field_name("type")
         .or_else(|| accessor_value_type(node))

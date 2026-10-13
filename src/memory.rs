@@ -83,6 +83,19 @@ pub struct Reservation<'a> {
     budget: &'a Budget,
     bytes: u64,
 }
+impl Reservation<'_> {
+    /// Release parser working space while retaining the publication estimate.
+    /// Never acquire more budget while holding another reservation.
+    pub fn shrink_to(&mut self, bytes: u64) {
+        let retained = bytes.min(self.bytes);
+        let released = self.bytes - retained;
+        if released != 0 {
+            self.bytes = retained;
+            *self.budget.available.lock().unwrap() += released;
+            self.budget.changed.notify_all();
+        }
+    }
+}
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         *self.budget.available.lock().unwrap() += self.bytes;
@@ -201,6 +214,35 @@ fn release_unused_pages() {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn shrinking_a_reservation_releases_capacity_before_publication_finishes() {
+        let budget = Budget::new(10);
+        let mut held = budget.reserve(10);
+        std::thread::scope(|threads| {
+            let (admitted, ready) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let worker_budget = &budget;
+            threads.spawn(move || {
+                let _next = worker_budget.reserve(6);
+                admitted.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            assert!(ready.try_recv().is_err());
+            held.shrink_to(4);
+            let result = ready.recv_timeout(std::time::Duration::from_secs(10));
+            held.shrink_to(8); // Shrinking must never acquire additional budget.
+            assert_eq!(held.bytes, 4);
+            drop(held);
+            release.send(()).unwrap();
+            assert!(
+                result.is_ok(),
+                "Released parser capacity did not wake the next worker"
+            );
+        });
+        assert_eq!(*budget.available.lock().unwrap(), budget.capacity);
+    }
+
     #[test]
     fn concurrent_reservations_bound_work_and_release_capacity() {
         let budget = Budget::new(12);

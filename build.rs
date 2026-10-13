@@ -415,6 +415,7 @@ fn main() {
             }
         }
     }
+    println!("cargo:rerun-if-changed=src");
     let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
     sources(Path::new("src"), &mut files);
     files.extend(
@@ -516,22 +517,41 @@ fn main() {
     ] {
         workspace.update(fs::read(file).unwrap());
     }
-    println!(
-        "cargo:rustc-env=SIGLA_ANALYSIS_FINGERPRINT={:x}",
-        analysis.finalize()
-    );
-    println!(
-        "cargo:rustc-env=SIGLA_WORKSPACE_FINGERPRINT={:x}",
-        workspace.finalize()
-    );
-    println!(
-        "cargo:rustc-env=SIGLA_ASSET_FINGERPRINT={:x}",
-        assets.finalize()
-    );
-    println!(
-        "cargo:rustc-env=SIGLA_ASSET_RECORD_FINGERPRINT={:x}",
-        asset_records.finalize()
-    );
+    // Each pair certifies equivalent output for one exact source snapshot.
+    // Unlisted source hashes keep their own identity and invalidate old caches.
+    // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
+    // prefix-scan oracle tests also cover recovery, top-level code and directives.
+    let analysis_aliases: &[(&str, &str)] = &[(
+        "e96765a745ee254ff3a52072cfef53d3ae37d4418b1060000c473f5ac2a1c214",
+        "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0",
+    )];
+    // Planning reuses stamps only within a pass and retains fresh input fences.
+    // Batched environment reads preserve the hash; archive changes retain valid
+    // inputs and only alter publication or reject conflicting bundle paths.
+    let workspace_aliases: &[(&str, &str)] = &[(
+        "c817019d8f730eef42bb3f4ba0f3e544d0aef8f294914a96695dc89638822525",
+        "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
+    )];
+    // Resolved-asset inputs changed only through the equivalent C# extraction.
+    // Asset parsing and composition are unchanged in this release.
+    let asset_aliases: &[(&str, &str)] = &[(
+        "21daf083db5802634df74c925bd21eae66fa116ae7308aa56092014bc6732de6",
+        "2bd548c115a34ba087131a20b944888147f6a6847f8334c13d29dabfe3595787",
+    )];
+    for (domain, hash, aliases) in [
+        ("ANALYSIS", analysis, analysis_aliases),
+        ("WORKSPACE", workspace, workspace_aliases),
+        ("ASSET", assets, asset_aliases),
+        ("ASSET_RECORD", asset_records, &[]),
+    ] {
+        let source = format!("{:x}", hash.finalize());
+        let version = aliases
+            .iter()
+            .find_map(|(raw, canonical)| (*raw == source.as_str()).then_some(*canonical))
+            .unwrap_or(source.as_str());
+        println!("cargo:rustc-env=SIGLA_{domain}_SOURCE_FINGERPRINT={source}");
+        println!("cargo:rustc-env=SIGLA_{domain}_FINGERPRINT={version}");
+    }
     for input in [
         "Cargo.toml",
         "Cargo.lock",

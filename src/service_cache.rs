@@ -4,7 +4,301 @@ use crate::cache::{
     blobs,
     policy::{Candidate, Disk},
 };
-use std::fs;
+use std::{collections::VecDeque, fs};
+
+/// One startup sweep, owned by the existing maintenance worker, not by requests.
+/// Only scheduling hints live here; retirement and collection progress live in LMDB.
+#[derive(Default)]
+pub(super) struct StartupMaintenance {
+    scopes: Option<VecDeque<([u8; 32], crate::store::shared::WorkspaceInfo)>>,
+    cleaned: bool,
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::store::shared::{Database, Encoded, Names, Phase, Scope};
+
+    fn install(scope: &Scope, file: &str, object: [u8; 32]) {
+        scope
+            .install(
+                file,
+                vec![1],
+                object,
+                1,
+                || Ok(()),
+                || {
+                    let mut records = std::collections::BTreeMap::from([(vec![1], vec![42])]);
+                    let names = crate::store::format::write(
+                        &[],
+                        None,
+                        true,
+                        &Names::default(),
+                        &mut records,
+                    )?;
+                    Ok(Encoded { names, records })
+                },
+            )
+            .unwrap();
+    }
+
+    fn make_app(root: &Path, cache: &Path) -> Arc<App> {
+        Arc::new(App::new(Policy::new(vec![root.into()]).unwrap(), cache.into(), 1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn startup_retirement_resumes_after_restart_and_preserves_shared_records() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let retiring = database.workspace([1; 32], root.path(), None).unwrap();
+        let live = database.workspace([2; 32], root.path(), None).unwrap();
+        let object = [9; 32];
+        for i in 0..1024 {
+            install(&retiring, &format!("retired-{i}"), object);
+        }
+        install(&live, "live", object);
+        retiring.mark_deleting().unwrap();
+        let small = database.workspace([4; 32], root.path(), None).unwrap();
+        small.mark_deleting().unwrap();
+        let unused = database.workspace([3; 32], root.path(), None).unwrap();
+        for i in 0u32..300 {
+            install(
+                &unused,
+                &format!("unused-{i}"),
+                *blake3::hash(&i.to_le_bytes()).as_bytes(),
+            );
+        }
+        unused.mark_deleting().unwrap();
+        while !unused.delete_batch(2, 256).unwrap() {}
+        let app = make_app(root.path(), cache.path());
+        let bindings = || {
+            database
+                .binding_count(&live.read().unwrap(), &object)
+                .unwrap()
+                .unwrap()
+        };
+        let before = bindings();
+        let mut pending = StartupMaintenance::default();
+        let active = app.activity.read().await;
+        assert!(!app.maintain_startup(&mut pending).await.unwrap());
+        assert_eq!(bindings(), before);
+        assert!(
+            app.activity.try_read().is_ok(),
+            "Maintenance queued a writer"
+        );
+        drop(active);
+        assert!(!app.maintain_startup(&mut pending).await.unwrap());
+        let remaining = bindings();
+        assert!(
+            remaining > 1 && remaining < before,
+            "Retirement was not incremental"
+        );
+        assert!(!app.maintain_startup(&mut pending).await.unwrap());
+        assert!(database.existing([4; 32]).unwrap().is_none());
+        assert!(database.existing([1; 32]).unwrap().is_some());
+        let retired_id = retiring.id;
+        app.shutdown().await;
+        drop(app);
+        drop(unused);
+        drop(small);
+        drop(retiring);
+        drop(live);
+        drop(database);
+
+        // Discard all scheduling hints and database handles. Committed progress,
+        // including unused-object collection, must survive reopening.
+        let app = make_app(root.path(), cache.path());
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let live = database.existing([2; 32]).unwrap().unwrap();
+        assert_eq!(
+            database
+                .binding_count(&live.read().unwrap(), &object)
+                .unwrap(),
+            Some(remaining)
+        );
+        let mut pending = StartupMaintenance::default();
+        let mut done = false;
+        for _ in 0..128 {
+            done = app.maintain_startup(&mut pending).await.unwrap();
+            if done {
+                break;
+            }
+        }
+        assert!(
+            done,
+            "Pending retirement or collection stopped making progress"
+        );
+        assert_eq!(database.workspaces().unwrap().len(), 1);
+        let tx = live.read().unwrap();
+        assert_eq!(database.binding_count(&tx, &object).unwrap(), Some(1));
+        assert_eq!(database.object_count(&tx).unwrap(), 1);
+        assert_eq!(live.record(&tx, "live", &[1]).unwrap(), Some(&[42][..]));
+        drop(tx);
+        let replacement = database.workspace([1; 32], root.path(), None).unwrap();
+        assert_ne!(replacement.id, retired_id);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_never_retires_a_reused_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let app = make_app(root.path(), cache.path());
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let old = database.workspace([1; 32], root.path(), None).unwrap();
+        old.mark_deleting().unwrap();
+        let mut pending = StartupMaintenance::default();
+        let active = app.activity.read().await;
+        app.maintain_startup(&mut pending).await.unwrap();
+        assert!(old.delete_batch(1, 128).unwrap());
+        let replacement = database.workspace([1; 32], root.path(), None).unwrap();
+        install(&replacement, "replacement", [2; 32]);
+        drop(active);
+        assert!(app.maintain_startup(&mut pending).await.unwrap());
+        let workspaces = database.workspaces().unwrap();
+        let info = &workspaces[0].1;
+        assert_eq!(info.id, replacement.id);
+        assert_ne!(info.phase, Phase::Deleting);
+        assert!(
+            replacement
+                .record(&replacement.read().unwrap(), "replacement", &[1])
+                .unwrap()
+                .is_some()
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn valid_search_does_not_wait_for_retirement_or_optional_disposal() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("lib.rs"), "pub struct Available;").unwrap();
+        let analysis = cache.path().join("analysis");
+        {
+            let database = Database::open(&analysis).unwrap();
+            database
+                .workspace([1; 32], &root.path().join("missing"), None)
+                .unwrap();
+        }
+        // Disposal failure is unrelated to the validity of the current database.
+        fs::create_dir(analysis.join("data.mdb.compacting")).unwrap();
+        let app = make_app(root.path(), cache.path());
+        // Drive maintenance explicitly in this test, independently of the timer.
+        let (_setup, complete) = tokio::sync::watch::channel(Some(Ok(())));
+        *app.startup.lock().unwrap() = Some(complete);
+        let active = app.activity.read().await;
+        let result = app
+            .search(root.path().to_str().unwrap(), "type:Available")
+            .await
+            .unwrap();
+        assert!(result.contains("Available"), "{result}");
+        assert!(
+            Database::open(&analysis)
+                .unwrap()
+                .existing([1; 32])
+                .unwrap()
+                .is_some()
+        );
+        assert!(analysis.join("data.mdb.compacting").is_dir());
+        drop(active);
+        // A disposal error must not prevent an independently valid retirement batch.
+        drop(app.activity.write().await);
+        assert!(
+            app.maintain_startup(&mut StartupMaintenance::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            Database::open(&analysis)
+                .unwrap()
+                .existing([1; 32])
+                .unwrap()
+                .is_none()
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_services_pending_retirement_before_periodic_disk_maintenance() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = database.workspace([1; 32], root.path(), None).unwrap();
+        scope.mark_deleting().unwrap();
+        let app = make_app(root.path(), cache.path());
+        assert!(database.existing([1; 32]).unwrap().is_some());
+        app.start_setup();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while database.existing([1; 32]).unwrap().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Setup left interrupted retirement waiting for periodic maintenance");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_is_singleton_and_shutdown_stops_maintenance() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let app = make_app(root.path(), cache.path());
+        app.start_setup();
+        let id = app.maintenance.lock().unwrap().as_ref().unwrap().id();
+        app.start_setup();
+        assert_eq!(app.maintenance.lock().unwrap().as_ref().unwrap().id(), id);
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.shutdown())
+            .await
+            .unwrap();
+        assert!(app.maintenance.lock().unwrap().is_none());
+        app.start_setup();
+        assert!(app.maintenance.lock().unwrap().is_none());
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = database.workspace([1; 32], root.path(), None).unwrap();
+        scope.mark_deleting().unwrap();
+        assert!(
+            app.maintain_startup(&mut StartupMaintenance::default())
+                .await
+                .unwrap()
+        );
+        assert!(database.existing([1; 32]).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_an_in_flight_blocking_maintenance_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let app = make_app(root.path(), cache.path());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = app.clone();
+        *app.maintenance.lock().unwrap() = Some(tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _activity = worker.activity.clone().try_write_owned().unwrap();
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+        let stopping = {
+            let app = app.clone();
+            tokio::spawn(async move { app.shutdown().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!stopping.is_finished());
+        assert!(app.activity.try_read().is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(app.maintenance.lock().unwrap().is_none());
+        assert!(app.activity.try_write().is_ok());
+    }
+}
 
 fn maintenance_stage<T>(name: &str, run: impl FnOnce() -> Result<T>) -> Result<T> {
     let start = Instant::now();
@@ -20,7 +314,90 @@ fn maintenance_stage<T>(name: &str, run: impl FnOnce() -> Result<T>) -> Result<T
 }
 
 impl App {
+    pub(super) async fn maintain_startup(
+        self: &Arc<Self>,
+        state: &mut StartupMaintenance,
+    ) -> Result<bool> {
+        let app = self.clone();
+        let mut pending = std::mem::take(state);
+        let (next, result) = tokio::task::spawn_blocking(move || {
+            let result = app.maintain_startup_step(&mut pending);
+            (pending, result)
+        })
+        .await?;
+        // Keep the queue on ordinary I/O errors, including a failed batch commit.
+        *state = next;
+        result
+    }
+
+    fn maintain_startup_step(&self, state: &mut StartupMaintenance) -> Result<bool> {
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(true);
+        }
+        let analysis = self.cache.join("analysis");
+        // Inventory and unlinking obsolete files do not replace the live database.
+        // Use a shared gate: an O(namespaces) scan must not exclude navigation.
+        let cleanup = {
+            let Ok(_activity) = self.activity.clone().try_read_owned() else {
+                return Ok(false);
+            };
+            let cleanup = if state.cleaned {
+                Ok(())
+            } else {
+                let result = crate::cache::compaction::cleanup(&self.cache);
+                state.cleaned = result.is_ok();
+                result
+            };
+            if state.scopes.is_none() {
+                let mut scopes = VecDeque::new();
+                if analysis.is_dir() {
+                    for (key, info) in crate::store::Database::open(&analysis)?.workspaces()? {
+                        if Self::retirement_candidate(&info) {
+                            scopes.push_back((key, info));
+                        }
+                    }
+                }
+                state.scopes = Some(scopes);
+            }
+            cleanup
+        };
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(true);
+        }
+        // Never queue an activity writer. One namespace batch and one GC batch
+        // per turn; a startup backlog must not become a full disk-pressure pass.
+        let Ok(_activity) = self.activity.clone().try_write_owned() else {
+            return cleanup.map(|()| false);
+        };
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(true);
+        }
+        if !analysis.is_dir() {
+            return cleanup.map(|()| true);
+        }
+        let database = crate::store::Database::open(&analysis)?;
+        let scopes = state.scopes.as_mut().unwrap();
+        let now = crate::cache::now();
+        if let Some((key, info)) = scopes.front() {
+            if self.retire_analysis_scope(&database, *key, info, now, false)? {
+                scopes.pop_front();
+            } else {
+                // Large or currently pinned namespaces cannot starve smaller ones.
+                scopes.rotate_left(1);
+            }
+        }
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(true);
+        }
+        let collected = database.collect(now, 128)?;
+        cleanup?;
+        Ok(scopes.is_empty() && collected.visited < 128)
+    }
+
     pub(super) async fn maintain_disk(self: &Arc<Self>) -> Result<()> {
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(());
+        }
         if self
             .startup
             .lock()
@@ -41,6 +418,9 @@ impl App {
                 return Ok(());
             };
             let _gate = gate;
+            if app.inspection_shutdown.is_cancelled() {
+                return Ok(());
+            }
             let start = Instant::now();
             tracing::info!("Disk cache maintenance started");
             let result = app.maintain_disk_exclusive();
@@ -280,6 +660,10 @@ impl App {
     }
 
     fn maintain_disk_exclusive(&self) -> Result<()> {
+        // Retry optional disposal independently of retirement and pressure relief.
+        if let Err(error) = crate::cache::compaction::cleanup(&self.cache) {
+            tracing::warn!(%error, "Cannot dispose of obsolete compaction files");
+        }
         maintenance_stage("view migration", || self.migrate_views())?;
         let known = maintenance_stage("ownership scan", || self.seed_owners())?;
         let before = maintenance_stage("disk measurement", || blobs::allocated(&self.cache))?;

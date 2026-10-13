@@ -2,7 +2,6 @@
 pub(crate) mod compatibility;
 mod data;
 pub(crate) mod format;
-mod names;
 pub(crate) mod payload;
 pub mod shared;
 
@@ -251,6 +250,15 @@ impl Store {
         self.scope
             .prepare_install(file, postcard::to_allocvec(revision)?, id, now(), build)
     }
+    pub(crate) fn prepare_reuse<R: Serialize>(
+        &self,
+        file: &str,
+        revision: &R,
+        input: Option<ObjectId>,
+    ) -> Result<shared::Reuse> {
+        self.scope
+            .prepare_reuse(file, postcard::to_allocvec(revision)?, input, now())
+    }
     pub fn modules(&self, file: &str) -> Result<Vec<ModuleFile>> {
         let tx = self.read()?;
         crate::binary::decode(
@@ -434,9 +442,12 @@ impl Store {
     }
     pub fn declaration_revision(&self, file: &str) -> Result<[u8; 32]> {
         let tx = self.read()?;
+        self.declaration_revision_in(&tx, file)
+    }
+    pub fn declaration_revision_in(&self, tx: &RoTxn<'_>, file: &str) -> Result<[u8; 32]> {
         Ok(self
             .scope
-            .record(&tx, file, payload::ENVIRONMENT)?
+            .record(tx, file, payload::ENVIRONMENT)?
             .context("Missing declaration fingerprint")?
             .try_into()?)
     }

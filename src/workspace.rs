@@ -69,6 +69,17 @@ impl Stamp {
     }
 }
 
+// A planning pass observes each physical input once. Publication and query
+// fences still read fresh stamps; this cache never escapes the plan.
+fn planning_stamp(stamps: &mut BTreeMap<PathBuf, Stamp>, path: &Path) -> Result<Stamp> {
+    if let Some(stamp) = stamps.get(path) {
+        return Ok(stamp.clone());
+    }
+    let stamp = Stamp::read(path)?;
+    stamps.insert(path.to_owned(), stamp.clone());
+    Ok(stamp)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Membership {
     pub project: usize,
@@ -405,6 +416,7 @@ impl Workspace {
             }
         }
         let mut visited = BTreeSet::new();
+        let mut stamps = BTreeMap::new();
         while let Some(input) = queue.pop_front() {
             if let Some(dir) = input.path.parent() {
                 directories.insert(dir.to_owned());
@@ -422,7 +434,7 @@ impl Workspace {
                 break;
             }
             let project = &manifest.projects[input.project];
-            let stamp = match Stamp::read(&input.path) {
+            let stamp = match planning_stamp(&mut stamps, &input.path) {
                 Ok(stamp) => stamp,
                 Err(error) => {
                     manifest
@@ -674,9 +686,12 @@ impl Workspace {
         // finish_refresh prunes obsolete bindings in batches.
         let mut environment = blake3::Hasher::new();
         environment.update(&postcard::to_allocvec(&manifest.projects)?);
-        for key in manifest.files.keys() {
-            environment.update(key.as_bytes());
-            environment.update(&self.store.declaration_revision(key)?);
+        {
+            let tx = self.store.read()?;
+            for key in manifest.files.keys() {
+                environment.update(key.as_bytes());
+                environment.update(&self.store.declaration_revision_in(&tx, key)?);
+            }
         }
         manifest.environment = *environment.finalize().as_bytes();
         self.store.save_manifest(&manifest)?;
@@ -726,6 +741,9 @@ impl Drop for Workspace {
     }
 }
 
+#[cfg(test)]
+#[path = "store/workspace_tests.rs"]
+mod storage_tests;
 #[cfg(test)]
 #[path = "workspace_validation.rs"]
 mod validation;
@@ -867,7 +885,6 @@ fn index_input(
     project: &Project,
     stamp: &Stamp,
 ) -> Result<Indexed> {
-    let _admission = crate::memory::admit_file(stamp.size, input.metadata);
     let started = std::time::Instant::now();
     let verify = || {
         ensure!(
@@ -886,6 +903,7 @@ fn index_input(
             storage: started.elapsed(),
         });
     }
+    let _admission = crate::memory::admit_file(stamp.size, input.metadata);
     let mut extraction = std::time::Duration::ZERO;
     let installed = (|| -> Result<_> {
         verify()?;
@@ -993,65 +1011,99 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
 }
 
 fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
+    use crate::store::shared::Reuse;
     let mut results = BTreeMap::new();
     let mut retry = Vec::new();
     {
-        // Reserve the whole batch at once: retaining individual reservations
-        // while acquiring the next one could deadlock the bounded parser budget.
+        // Resolve current bindings and immutable aliases without occupying a
+        // parser or worker slot. Each probe uses one short read transaction.
+        let probes: Vec<_> = jobs
+            .iter()
+            .map(|(key, (stamp, input, project))| {
+                let started = std::time::Instant::now();
+                let probe = (|| -> Result<_> {
+                    store.prepare_reuse(key, stamp, input_identity(input, project, stamp)?)
+                })();
+                (
+                    probe,
+                    Indexed {
+                        storage: started.elapsed(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
         let metadata = jobs[0].1.1.metadata;
         debug_assert!(
             jobs.iter()
                 .all(|(_, (_, input, _))| input.metadata == metadata)
         );
-        let _admission = crate::memory::admit_batch(
-            jobs.iter().map(|(_, (s, _, _))| s.size).sum(),
-            jobs.iter().map(|(_, (s, _, _))| s.size).max().unwrap(),
-            INDEX_BATCH_BYTES,
-            metadata,
-        );
+        let mut total = 0u64;
+        let mut largest = 0;
+        let mut needs_admission = false;
+        for ((_, (stamp, _, _)), (probe, _)) in jobs.iter().zip(&probes) {
+            if matches!(probe, Ok(Reuse::Missing)) {
+                needs_admission = true;
+                total = total.saturating_add(stamp.size);
+                largest = largest.max(stamp.size);
+            }
+        }
+        // Reserve unresolved work once, never while holding another parsing
+        // reservation. Cache-only batches need neither admission nor a worker.
+        let mut admission = needs_admission
+            .then(|| crate::memory::admit_batch(total, largest, INDEX_BATCH_BYTES, metadata));
+        let worker = needs_admission.then(crate::memory::admit_worker);
         let mut pending = Vec::new();
         let mut prepared = Vec::new();
-        let mut encoded_bytes = 0;
-        let worker = crate::memory::admit_worker();
-        for (key, (stamp, input, project)) in jobs {
-            let started = std::time::Instant::now();
-            let mut extraction = std::time::Duration::ZERO;
-            let stage = (|| -> Result<_> {
-                if store.matches(key, stamp)? {
+        let mut encoded_bytes = 0u64;
+        for ((key, (stamp, input, project)), (probe, mut timing)) in jobs.iter().zip(probes) {
+            let stage = match probe {
+                Err(error) => Err(error),
+                Ok(Reuse::Current) => (|| -> Result<_> {
+                    // A mixed batch may have waited for parser admission.
+                    // Validate current bindings after that wait, too.
                     ensure!(
                         Stamp::read(&input.path)? == *stamp,
                         "File changed during indexing; retry query"
                     );
-                    return Ok(None);
+                    Ok(None)
+                })(),
+                Ok(Reuse::Pending(value)) => Ok(Some(*value)),
+                Ok(Reuse::Missing) => {
+                    let started = std::time::Instant::now();
+                    let mut extraction = std::time::Duration::ZERO;
+                    let stage = (|| -> Result<_> {
+                        // Admission can wait. Recheck mutable inputs before
+                        // reading, after reading, and again before publication.
+                        ensure!(
+                            Stamp::read(&input.path)? == *stamp,
+                            "File changed before extraction; retry query"
+                        );
+                        let (id, identity, contents) =
+                            prepare_input(store, key, input, project, stamp)?;
+                        ensure!(
+                            Stamp::read(&input.path)? == *stamp,
+                            "File changed during indexing; retry query"
+                        );
+                        store
+                            .prepare_install(key, stamp, id, || {
+                                let started = std::time::Instant::now();
+                                let data = contents
+                                    .map_or_else(|| InputContents::read(input, project), Ok)?
+                                    .encode(&input.path, &id);
+                                extraction = started.elapsed();
+                                data
+                            })
+                            .map(|pending| Some(pending.input(identity)))
+                    })();
+                    timing.extraction = extraction;
+                    timing.storage += started.elapsed().saturating_sub(extraction);
+                    stage
                 }
-                ensure!(
-                    Stamp::read(&input.path)? == *stamp,
-                    "File changed before extraction; retry query"
-                );
-                let (id, identity, contents) = prepare_input(store, key, input, project, stamp)?;
-                ensure!(
-                    Stamp::read(&input.path)? == *stamp,
-                    "File changed during indexing; retry query"
-                );
-                store
-                    .prepare_install(key, stamp, id, || {
-                        let started = std::time::Instant::now();
-                        let data = contents
-                            .map_or_else(|| InputContents::read(input, project), Ok)?
-                            .encode(&input.path, &id);
-                        extraction = started.elapsed();
-                        data
-                    })
-                    .map(|pending| Some(pending.input(identity)))
-            })();
-            let timing = Indexed {
-                extraction,
-                storage: started.elapsed().saturating_sub(extraction),
-                ..Default::default()
             };
             match stage {
                 Ok(Some(value)) => {
-                    encoded_bytes += value.bytes();
+                    encoded_bytes = encoded_bytes.saturating_add(value.bytes());
                     pending.push(value);
                     prepared.push((key, stamp, input, project, timing));
                 }
@@ -1067,9 +1119,14 @@ fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
             }
         }
         drop(worker);
+        if let Some(admission) = &mut admission {
+            // Keep the existing conservative encoded/name expansion estimate,
+            // but release the largest parser's temporary working space.
+            admission.shrink_to(encoded_bytes.saturating_mul(8));
+        }
         if !pending.is_empty() {
             let started = std::time::Instant::now();
-            let installed = store.scope.install_batch(&pending, |index| {
+            let installed = store.scope.install_batch_resilient(&pending, |index| {
                 let (_, stamp, input, _, _) = &prepared[index];
                 ensure!(
                     Stamp::read(&input.path)? == **stamp,
@@ -1078,25 +1135,23 @@ fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                 Ok(())
             });
             let storage = started.elapsed() / pending.len() as u32;
-            match installed {
-                Ok(installed) => {
-                    for ((key, stamp, input, project, mut timing), installed) in
-                        prepared.into_iter().zip(installed)
-                    {
-                        if let Some(installed) = installed {
-                            timing.changed = installed.built;
-                            timing.reused = installed.reused;
-                            timing.encoded_bytes = installed.encoded_bytes;
-                            timing.storage += storage;
-                            results.insert(key.clone(), (stamp.clone(), Ok(timing)));
-                        } else {
-                            retry.push((key, stamp, input, project));
-                        }
+            for ((key, stamp, input, project, mut timing), installed) in
+                prepared.into_iter().zip(installed)
+            {
+                match installed {
+                    Ok(Some(installed)) => {
+                        timing.changed = installed.built;
+                        timing.reused = installed.reused;
+                        timing.encoded_bytes = installed.encoded_bytes;
+                        timing.storage += storage;
+                        results.insert(key.clone(), (stamp.clone(), Ok(timing)));
+                    }
+                    // Collection can still race an unpinned zero-reference hit.
+                    Ok(None) => retry.push((key, stamp, input, project)),
+                    Err(error) => {
+                        results.insert(key.clone(), (stamp.clone(), Err(error)));
                     }
                 }
-                // The transaction was aborted. Retry individually so one
-                // changed source does not exclude its unchanged neighbors.
-                Err(_) => retry.extend(prepared.into_iter().map(|(k, s, i, p, _)| (k, s, i, p))),
             }
         }
     }

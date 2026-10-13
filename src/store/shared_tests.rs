@@ -4,11 +4,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-fn scope(db: &Arc<Database>, n: u8) -> Scope {
+pub(super) fn scope(db: &Arc<Database>, n: u8) -> Scope {
     db.workspace([n; 32], Path::new(&format!("/workspace/{n}")), None)
         .unwrap()
 }
-fn object(name: &str, body: &[u8]) -> Encoded {
+pub(super) fn object(name: &str, body: &[u8]) -> Encoded {
     let mut records = BTreeMap::from([(vec![1], body.to_vec())]);
     let names = crate::store::format::write(
         &[],
@@ -24,7 +24,7 @@ fn object(name: &str, body: &[u8]) -> Encoded {
     .unwrap();
     Encoded { names, records }
 }
-fn put(scope: &Scope, file: &str, revision: u8, id: u8, name: &str) -> Installed {
+pub(super) fn put(scope: &Scope, file: &str, revision: u8, id: u8, name: &str) -> Installed {
     scope
         .install(
             file,
@@ -36,7 +36,7 @@ fn put(scope: &Scope, file: &str, revision: u8, id: u8, name: &str) -> Installed
         )
         .unwrap()
 }
-fn clean(scope: &Scope, files: &[&str]) {
+pub(super) fn clean(scope: &Scope, files: &[&str]) {
     scope
         .finish_refresh(
             b"test manifest",
@@ -592,6 +592,78 @@ fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn baseline_v3_keeps_object_ids_but_unknown_v3_is_rejected() {
+    let version = "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0";
+    let source = "class Kept {}";
+    let language = crate::model::Language::CSharp;
+    let id =
+        crate::store::payload::source_id_at_version(source, language, &[], "", version).unwrap();
+    assert_eq!(
+        crate::store::source_id(source, language, &[], "").unwrap(),
+        id
+    );
+    for (format, keep) in [
+        (format!("sigla-shared-3:{version}"), true),
+        (format!("sigla-shared-3:0{}", &version[1..]), false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::open(dir.path()).unwrap();
+            let old = scope(&db, 1);
+            old.install(
+                "file",
+                vec![1],
+                id,
+                100,
+                || Ok(()),
+                || Ok(object("Kept", b"body")),
+            )
+            .unwrap();
+            clean(&old, &["file"]);
+            let mut tx = db.env.write_txn().unwrap();
+            db.control
+                .put(&mut tx, b"format", format.as_bytes())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Database::open(dir.path()).unwrap();
+        let tx = db.env.read_txn().unwrap();
+        assert_eq!(db.control.get(&tx, b"format").unwrap(), Some(FORMAT));
+        assert!(db.control.get(&tx, b"legacy-until").unwrap().is_none());
+        assert_eq!(db.object_count(&tx).unwrap(), u64::from(keep));
+        assert_eq!(
+            db.record(&tx, &id, &[1]).unwrap(),
+            keep.then_some(b"body".as_slice())
+        );
+        drop(tx);
+        assert_eq!(db.existing([1; 32]).unwrap().is_some(), keep);
+        if keep {
+            let old = db.existing([1; 32]).unwrap().unwrap();
+            let tx = old.query_read().unwrap();
+            assert_eq!(old.binding(&tx, "file").unwrap().unwrap().object, id);
+            drop(tx);
+            let fresh = db
+                .workspace([2; 32], Path::new("/workspace/1"), None)
+                .unwrap();
+            let tx = fresh.read().unwrap();
+            assert!(fresh.previous_binding(&tx, "file", &[1]).unwrap().is_none());
+            assert!(
+                fresh
+                    .candidates(&tx, "Kept", false, true, |_| false)
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(tx);
+            let pending = fresh
+                .prepare_install("file", vec![1], id, 100, || unreachable!())
+                .unwrap();
+            let results = fresh.install_batch(&[pending], |_| Ok(())).unwrap();
+            assert!(results[0].unwrap().reused);
+        }
+    }
 }
 
 #[test]

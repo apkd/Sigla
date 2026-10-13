@@ -48,6 +48,7 @@ pub struct App {
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
+    maintenance: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stateless_summaries: crate::summary::Stateless,
     activity: Arc<tokio::sync::RwLock<()>>,
     blobs: Arc<crate::cache::blobs::Store>,
@@ -161,14 +162,15 @@ impl App {
             remote: None,
             upstream: None,
             startup: Mutex::new(None),
+            maintenance: Mutex::new(None),
             stateless_summaries: Default::default(),
             #[cfg(test)]
             preparation_started: tokio::sync::Notify::new(),
             #[cfg(test)]
             indexing_pause: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        app.maintain_analysis(true)?;
-        app.compact_analysis()?;
+        // Recovery above is mandatory. Retirement and space reclamation are
+        // scheduled by start_setup, never part of synchronous construction.
         Ok(app)
     }
     pub fn with_cache_limits(mut self, limits: crate::cache::policy::Limits) -> Self {
@@ -185,7 +187,6 @@ impl App {
         let mut app = Self::new(policy, cache.clone(), workers)?;
         let manager = crate::repository::manager::Manager::new(app.cache.clone(), options)?;
         app.remote = Some(manager);
-        app.maintain_analysis(true)?;
         Ok(app)
     }
 
@@ -216,6 +217,16 @@ impl App {
         }
         self.assets.shutdown();
         self.sources.shutdown();
+        // Do not abort a spawn_blocking maintenance batch: join it while its
+        // activity guard and cache ownership still protect the environment.
+        let maintenance = {
+            // Pair with start_setup's registration order, including a racing setup.
+            let _startup = self.startup.lock().unwrap();
+            self.maintenance.lock().unwrap().take()
+        };
+        if let Some(maintenance) = maintenance {
+            let _ = maintenance.await;
+        }
         let _idle = self.activity.write().await;
         if let Err(error) = self.owners.lock().unwrap().flush() {
             tracing::warn!(%error, "Cannot persist cache usage during shutdown");
@@ -227,7 +238,7 @@ impl App {
 
     pub fn start_setup(self: &Arc<Self>) {
         let mut startup = self.startup.lock().unwrap();
-        if startup.is_some() {
+        if startup.is_some() || self.inspection_shutdown.is_cancelled() {
             return;
         }
         if let Err(error) = self.save_cache_configuration() {
@@ -246,11 +257,48 @@ impl App {
             let interval = self.remote.as_ref().map_or(collection_interval, |remote| {
                 remote.options.maintenance_interval()
             });
-            tokio::spawn(async move {
+            let shutdown = self.inspection_shutdown.clone();
+            let maintenance = tokio::spawn(async move {
                 let mut last_collection = Instant::now();
+                let mut regular = tokio::time::Instant::now() + interval;
+                let retry = std::time::Duration::from_secs(1);
+                let mut next_startup = tokio::time::Instant::now() + retry;
+                let mut pending = Some(disk::StartupMaintenance::default());
                 loop {
-                    tokio::time::sleep(interval).await;
+                    let deadline = if pending.is_some() {
+                        regular.min(next_startup)
+                    } else {
+                        regular
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep_until(deadline) => (),
+                    }
                     let Some(app) = weak.upgrade() else { return };
+                    if tokio::time::Instant::now() >= next_startup
+                        && let Some(state) = pending.as_mut()
+                    {
+                        let delay = match app.maintain_startup(state).await {
+                            Ok(done) => {
+                                if done {
+                                    pending = None;
+                                }
+                                retry
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "Startup cache maintenance deferred");
+                                std::time::Duration::from_secs(30)
+                            }
+                        };
+                        next_startup = tokio::time::Instant::now() + delay;
+                    }
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+                    if tokio::time::Instant::now() < regular {
+                        continue;
+                    }
                     let collect = last_collection.elapsed() >= collection_interval;
                     if let Some(remote) = &app.remote {
                         // Fetch failures stay on the branch preparation state, never on valid query results.
@@ -266,14 +314,22 @@ impl App {
                             }
                         }
                     }
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
                     if !collect {
+                        regular = tokio::time::Instant::now() + interval;
                         continue;
                     }
                     last_collection = Instant::now();
                     if let Err(error) = app.maintain_disk().await {
                         tracing::error!(%error, "Cannot maintain disk cache");
                     }
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
                     {
+                        // Keep ownership and the worker alive until this blocking job ends.
                         let cache = app.cache.clone();
                         let ttl = app
                             .remote
@@ -290,8 +346,10 @@ impl App {
                             tracing::error!(%error, "Cannot maintain Git pools");
                         }
                     }
+                    regular = tokio::time::Instant::now() + interval;
                 }
             });
+            *self.maintenance.lock().unwrap() = Some(maintenance);
         }
         let cache = self.cache.clone();
         tokio::spawn(async move {
@@ -358,56 +416,69 @@ impl App {
     }
 
     fn maintain_analysis(&self, drain: bool) -> Result<()> {
-        use crate::store::shared::Phase;
         let analysis = self.cache.join("analysis");
         if !analysis.try_exists()? {
             return Ok(());
         }
         let database = crate::store::Database::open(&analysis)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as u64;
+        let now = crate::cache::now();
         for (key, info) in database.workspaces()? {
-            let mut registry = self.workspaces.lock().unwrap();
-            if registry
-                .get(&info.entry)
-                .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
-            {
-                continue;
-            }
-            let missing =
-                match std::fs::symlink_metadata(info.owner.as_deref().unwrap_or(&info.entry)) {
-                    Ok(_) => false,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(_) => false,
-                };
-            if info.phase != Phase::Deleting && !missing {
-                continue;
-            }
-            registry.remove(&info.entry);
-            self.sources.forget(&info.entry);
-            let Some(scope) = database.existing(key)? else {
-                continue;
-            };
-            scope.mark_deleting()?;
-            // The registry lock prevents a request opening this scope during retirement.
-            // Persisted deleting state rejects new opens until the next batch completes.
-            loop {
-                let limit = if drain {
-                    crate::store::shared::PRESSURE_BATCH
-                } else {
-                    128
-                };
-                if scope.delete_batch(now, limit)? || !drain {
-                    break;
-                }
-            }
-            drop(registry);
+            self.retire_analysis_scope(&database, key, &info, now, drain)?;
         }
         if !drain {
             database.collect(now, 128)?;
         }
         Ok(())
+    }
+
+    fn retirement_candidate(info: &crate::store::shared::WorkspaceInfo) -> bool {
+        info.phase == crate::store::shared::Phase::Deleting
+            || std::fs::symlink_metadata(info.owner.as_deref().unwrap_or(&info.entry))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    fn retire_analysis_scope(
+        &self,
+        database: &Arc<crate::store::Database>,
+        key: [u8; 32],
+        info: &crate::store::shared::WorkspaceInfo,
+        now: u64,
+        drain: bool,
+    ) -> Result<bool> {
+        let mut registry = self.workspaces.lock().unwrap();
+        if registry
+            .get(&info.entry)
+            .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
+        {
+            return Ok(false);
+        }
+        if !Self::retirement_candidate(info) {
+            return Ok(true);
+        }
+        let Some(scope) = database.existing(key)? else {
+            return Ok(true);
+        };
+        // The startup sweep is a snapshot. A retired fingerprint may have been
+        // recreated since it was queued; never delete the replacement namespace.
+        if scope.id != info.id {
+            return Ok(true);
+        }
+        registry.remove(&info.entry);
+        self.sources.forget(&info.entry);
+        scope.mark_deleting()?;
+        // Preserve activity -> registry -> storage ordering and exclude opens
+        // until this transaction commits. Deleting remains durable between turns.
+        loop {
+            let limit = if drain {
+                crate::store::shared::PRESSURE_BATCH
+            } else {
+                128
+            };
+            let done = scope.delete_batch(now, limit)?;
+            if done || !drain {
+                return Ok(done);
+            }
+        }
     }
 
     pub async fn search(self: &Arc<Self>, path: &str, query: &str) -> Result<String> {
@@ -1633,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_finishes_interrupted_namespace_retirement() {
+    fn startup_defers_interrupted_namespace_retirement() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
@@ -1647,13 +1718,11 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(
-            crate::store::Database::open(&app.cache.join("analysis"))
-                .unwrap()
-                .workspaces()
-                .unwrap()
-                .is_empty()
-        );
+        let database = crate::store::Database::open(&app.cache.join("analysis")).unwrap();
+        let workspaces = database.workspaces().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].1.phase, crate::store::shared::Phase::Deleting);
+        assert!(database.workspace([1; 32], root.path(), None).is_err());
     }
 
     #[tokio::test]

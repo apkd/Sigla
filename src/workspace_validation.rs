@@ -135,7 +135,10 @@ fn source_indexing_benchmark() {
 
 fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("sigla=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "sigla=info,sigla::store::shared::publication=debug".into()),
+        )
         .with_writer(std::io::stderr)
         .try_init();
     let started = std::time::Instant::now();

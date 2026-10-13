@@ -1,6 +1,6 @@
 //! Audited transition from the whole-program fingerprint to scoped versions.
-//! These releases use identical extraction and record formats. Future changes
-//! to those inputs automatically disable this compatibility window.
+//! BASELINE and WORKSPACE are canonical identities, not latest source hashes.
+//! Source changes keep these gates open only via exact audited aliases in build.rs.
 const BASELINE: &str = "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0";
 const WORKSPACE: &str = "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a";
 const LEGACY: &[&str] = &[
@@ -12,11 +12,52 @@ const LEGACY: &[&str] = &[
 ];
 
 pub(crate) fn accepts(version: &[u8]) -> bool {
-    version == super::ANALYSIS_VERSION.as_bytes()
-        || super::ANALYSIS_VERSION == BASELINE
-            && LEGACY.iter().any(|known| version == known.as_bytes())
+    accepts_at(super::ANALYSIS_VERSION, version)
+}
+
+fn accepts_at(current: &str, version: &[u8]) -> bool {
+    version == current.as_bytes()
+        || current == BASELINE && LEGACY.iter().any(|known| version == known.as_bytes())
 }
 
 pub(crate) fn legacy_workspace() -> bool {
-    super::ANALYSIS_VERSION == BASELINE && env!("SIGLA_WORKSPACE_FINGERPRINT") == WORKSPACE
+    legacy_workspace_at(super::ANALYSIS_VERSION, env!("SIGLA_WORKSPACE_FINGERPRINT"))
+}
+
+fn legacy_workspace_at(analysis: &str, workspace: &str) -> bool {
+    analysis == BASELINE && workspace == WORKSPACE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analysis_gate_is_exact_and_baseline_scoped() {
+        let prefixed = format!("sigla-shared-3:{BASELINE}");
+        for current in [BASELINE, "unreviewed-analysis"] {
+            assert!(accepts_at(current, current.as_bytes()));
+            assert_eq!(
+                accepts_at(current, BASELINE.as_bytes()),
+                current == BASELINE
+            );
+            for version in LEGACY {
+                assert_eq!(accepts_at(current, version.as_bytes()), current == BASELINE);
+            }
+            for version in ["", WORKSPACE, &BASELINE[..63], prefixed.as_str()] {
+                assert!(!accepts_at(current, version.as_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_workspace_requires_both_canonical_identities() {
+        assert!(legacy_workspace_at(BASELINE, WORKSPACE));
+        assert!(!legacy_workspace_at(BASELINE, "unreviewed-workspace"));
+        assert!(!legacy_workspace_at("unreviewed-analysis", WORKSPACE));
+        assert!(!legacy_workspace_at(
+            "unreviewed-analysis",
+            "unreviewed-workspace"
+        ));
+    }
 }

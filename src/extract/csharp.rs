@@ -1,5 +1,6 @@
 use crate::{model::*, query::normalize_name};
 use anyhow::Result;
+use std::ops::Range;
 use tree_sitter::Node;
 
 fn text<'a>(n: Node<'_>, source: &'a str) -> &'a str {
@@ -29,6 +30,63 @@ fn modifiers(n: Node<'_>, s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Declaration spans arrive in tree preorder: ordinary spans nest or are disjoint.
+/// Keep only enclosing declarations, so each index is pushed and popped once.
+/// These indices are extraction state, not additional persisted relationships.
+#[derive(Default)]
+struct DeclarationScopes {
+    owners: Vec<usize>,
+    namespaces: Vec<usize>,
+    file_namespace: Option<usize>,
+    // Inserted before traversal, but may start after earlier types/namespaces and
+    // end before later ones. It must not be popped like an ordinary declaration.
+    top_level: Option<usize>,
+}
+
+impl DeclarationScopes {
+    fn enclosing(
+        &mut self,
+        span: &Range<usize>,
+        declarations: &[Declaration],
+    ) -> (Option<usize>, Option<usize>) {
+        let contains = |index: &usize| {
+            let parent = &declarations[*index].span;
+            parent.start <= span.start && parent.end >= span.end
+        };
+        while self.owners.last().is_some_and(|i| !contains(i)) {
+            self.owners.pop();
+        }
+        while self.namespaces.last().is_some_and(|i| !contains(i)) {
+            self.namespaces.pop();
+        }
+        (
+            self.owners
+                .last()
+                .copied()
+                .or_else(|| self.top_level.filter(contains)),
+            self.namespaces.last().copied().or(self.file_namespace),
+        )
+    }
+
+    fn push(&mut self, index: usize, declaration: &Declaration, source: &str) {
+        if declaration.kind == "namespace" {
+            self.namespaces.push(index);
+            if self.file_namespace.is_none() {
+                // Preserve the existing first-braceless-namespace fallback,
+                // including its treatment of comments and recovered syntax.
+                let written = &source[declaration.span.clone()];
+                if written.trim_start().starts_with("namespace ") && !written.contains('{') {
+                    self.file_namespace = Some(index);
+                }
+            }
+        } else if !declaration.local() {
+            // Local functions are method declarations and own declarations;
+            // Header::local is deliberately not the eligibility predicate.
+            self.owners.push(index);
+        }
+    }
+}
+
 pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
@@ -41,6 +99,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
         errors: tree.root_node().has_error(),
         ..Facts::default()
     };
+    let mut scopes = DeclarationScopes::default();
     let root = tree.root_node();
     let globals: Vec<_> = root
         .named_children(&mut root.walk())
@@ -75,18 +134,15 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                 root,
                 &analysis,
                 &facts.declarations,
+                None,
             ));
+        scopes.top_level = Some(facts.declarations.len() - 1);
     }
     let mut cursor = tree.walk();
     let mut parents = Vec::new();
     loop {
         let node = cursor.node();
-        let before = facts.declarations.len();
-        declaration(node, &parents, &analysis, &mut facts);
-        if facts.declarations.len() != before {
-            let header = crate::csharp::lower::header(node, &analysis, &facts.declarations);
-            facts.csharp.as_mut().unwrap().headers.push(header);
-        }
+        declaration(node, &parents, &analysis, &mut facts, &mut scopes);
         if node.kind() == "using_directive" {
             facts
                 .csharp
@@ -186,7 +242,13 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
     }
 }
 
-fn declaration<'a>(n: Node<'a>, parents: &[Node<'a>], s: &str, facts: &mut Facts) {
+fn declaration<'a>(
+    n: Node<'a>,
+    parents: &[Node<'a>],
+    s: &str,
+    facts: &mut Facts,
+    scopes: &mut DeclarationScopes,
+) {
     let implicit_value_type = crate::csharp::lower::accessor_value_type(n);
     let kind = match n.kind() {
         "accessor_declaration" if implicit_value_type.is_some() => "parameter",
@@ -263,21 +325,11 @@ fn declaration<'a>(n: Node<'a>, parents: &[Node<'a>], s: &str, facts: &mut Facts
         return;
     }
     let span = n.byte_range();
-    let owner = facts.declarations.iter().rev().find(|d| {
-        !d.local() && d.span.start <= span.start && d.span.end >= span.end && d.kind != "namespace"
-    });
-    let file_ns = facts.declarations.iter().find(|d| {
-        d.kind == "namespace"
-            && s[d.span.clone()].trim_start().starts_with("namespace ")
-            && !s[d.span.clone()].contains('{')
-    });
-    let ns = facts
-        .declarations
-        .iter()
-        .rev()
-        .find(|d| d.kind == "namespace" && d.span.start <= span.start && d.span.end >= span.end)
-        .or(file_ns);
-    let namespace = ns.map(|d| d.qualified.clone()).unwrap_or_default();
+    let (owner_index, namespace_index) = scopes.enclosing(&span, &facts.declarations);
+    let owner = owner_index.map(|i| &facts.declarations[i]);
+    let namespace = namespace_index
+        .map(|i| facts.declarations[i].qualified.clone())
+        .unwrap_or_default();
     let owner_name = owner
         .map(|d| d.qualified.clone())
         .unwrap_or_else(|| namespace.clone());
@@ -391,6 +443,11 @@ fn declaration<'a>(n: Node<'a>, parents: &[Node<'a>], s: &str, facts: &mut Facts
         modifiers: mods,
         bases,
     });
+    let header =
+        crate::csharp::lower::header(n, s, &facts.declarations, owner_index.map(|i| i as u32));
+    facts.csharp.as_mut().unwrap().headers.push(header);
+    let index = facts.declarations.len() - 1;
+    scopes.push(index, &facts.declarations[index], s);
 }
 
 fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
@@ -535,5 +592,370 @@ mod tests {
                 .iter()
                 .any(|o| f.declarations.iter().any(|d| d.name_span == o.span))
         );
+    }
+
+    // Independent oracle for the base's prefix scans. Build expected names from
+    // earlier expected names, so a wrong namespace cannot validate itself.
+    fn assert_prefix_owners(source: &str, facts: &Facts) {
+        let syntax = facts.csharp.as_ref().unwrap();
+        assert_eq!(facts.declarations.len(), syntax.headers.len());
+        let mut names: Vec<String> = Vec::new();
+        for (index, (declaration, header)) in
+            facts.declarations.iter().zip(&syntax.headers).enumerate()
+        {
+            let previous = &facts.declarations[..index];
+            let contains = |d: &Declaration| {
+                d.span.start <= declaration.span.start && d.span.end >= declaration.span.end
+            };
+            let owner = previous
+                .iter()
+                .rposition(|d| !d.local() && d.kind != "namespace" && contains(d));
+            let namespace = previous
+                .iter()
+                .rposition(|d| d.kind == "namespace" && contains(d))
+                .or_else(|| {
+                    previous.iter().position(|d| {
+                        d.kind == "namespace"
+                            && source[d.span.clone()]
+                                .trim_start()
+                                .starts_with("namespace ")
+                            && !source[d.span.clone()].contains('{')
+                    })
+                });
+            let namespace = namespace.map_or("", |i| names[i].as_str());
+            let owner_name = owner.map_or(namespace, |i| names[i].as_str());
+            let qualified = if owner_name.is_empty() {
+                declaration.name.clone()
+            } else {
+                format!("{owner_name}.{}", declaration.name)
+            };
+            assert_eq!(header.declaration, index as u32, "{qualified}");
+            assert_eq!(header.owner, owner.map(|i| i as u32), "{qualified}");
+            assert_eq!(declaration.namespace, namespace, "{qualified}");
+            assert_eq!(declaration.owner, owner_name, "{qualified}");
+            assert_eq!(declaration.qualified, qualified, "declaration {index}");
+            let explicit_access = declaration
+                .modifiers
+                .iter()
+                .filter(|m| matches!(m.as_str(), "public" | "private" | "protected" | "internal"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let access = if !explicit_access.is_empty() {
+                explicit_access.as_str()
+            } else if declaration.kind == "namespace"
+                || owner.is_some_and(|i| previous[i].kind == "interface")
+            {
+                "public"
+            } else if owner.is_some() {
+                "private"
+            } else {
+                "internal"
+            };
+            assert_eq!(declaration.access, access, "{qualified}");
+            names.push(qualified);
+        }
+    }
+
+    fn owner_facts(source: &str) -> Facts {
+        let facts = extract(source, &[]).unwrap();
+        assert_prefix_owners(source, &facts);
+        facts
+    }
+
+    fn assert_owner(facts: &Facts, qualified: &str, owner: Option<&str>, local: bool) {
+        let mut found = false;
+        for (declaration, header) in facts
+            .declarations
+            .iter()
+            .zip(&facts.csharp.as_ref().unwrap().headers)
+            .filter(|(d, _)| d.qualified == qualified)
+        {
+            found = true;
+            assert_eq!(
+                header
+                    .owner
+                    .map(|i| facts.declarations[i as usize].qualified.as_str()),
+                owner,
+                "{}",
+                declaration.qualified
+            );
+            assert_eq!(header.local, local, "{qualified}");
+        }
+        assert!(found, "missing declaration {qualified}");
+    }
+
+    #[test]
+    fn owner_links_follow_nested_types_members_and_namespaces() {
+        let source = r#"
+namespace Outer {
+    interface I {
+        int P { get; set; }
+        void M(int argument);
+        class Nested { int field; }
+    }
+    class C {
+        const int A = 1, B = 2;
+        event System.Action E, F;
+        enum Kind { First, Second }
+        delegate void Callback(int item);
+        record R(int primary) { int field; }
+        struct S { int field; }
+        class Inner { int x, y; }
+        int tail;
+    }
+    namespace Inner { class C { int field; } }
+}
+namespace Next { class C { int field; } }
+"#;
+        let facts = owner_facts(source);
+        assert!(!facts.errors);
+        for name in [
+            "Outer",
+            "Outer.I",
+            "Outer.C",
+            "Outer.Inner",
+            "Outer.Inner.C",
+            "Next.C",
+        ] {
+            assert_owner(&facts, name, None, false);
+        }
+        for (name, owner) in [
+            ("Outer.I.P", "Outer.I"),
+            ("Outer.I.Nested", "Outer.I"),
+            ("Outer.I.Nested.field", "Outer.I.Nested"),
+            ("Outer.C.A", "Outer.C"),
+            ("Outer.C.B", "Outer.C"),
+            ("Outer.C.E", "Outer.C"),
+            ("Outer.C.F", "Outer.C"),
+            ("Outer.C.Kind.First", "Outer.C.Kind"),
+            ("Outer.C.Kind.Second", "Outer.C.Kind"),
+            ("Outer.C.Callback", "Outer.C"),
+            ("Outer.C.R.field", "Outer.C.R"),
+            ("Outer.C.S.field", "Outer.C.S"),
+            ("Outer.C.Inner.x", "Outer.C.Inner"),
+            ("Outer.C.Inner.y", "Outer.C.Inner"),
+            ("Outer.C.tail", "Outer.C"),
+            ("Outer.Inner.C.field", "Outer.Inner.C"),
+            ("Next.C.field", "Next.C"),
+        ] {
+            assert_owner(&facts, name, Some(owner), false);
+        }
+        for (name, owner) in [
+            ("Outer.I.P.value", "Outer.I.P"),
+            ("Outer.I.M.argument", "Outer.I.M"),
+            ("Outer.C.Callback.item", "Outer.C.Callback"),
+            ("Outer.C.R.primary", "Outer.C.R"),
+        ] {
+            assert_owner(&facts, name, Some(owner), true);
+        }
+    }
+
+    #[test]
+    fn owner_links_distinguish_local_functions_parameters_and_accessors() {
+        let source = r#"
+namespace N;
+class C {
+    System.Func<int, int> first = (int fieldArg) => fieldArg,
+                          second = (int siblingFieldArg) => siblingFieldArg;
+    C(int ctor) {}
+    public static implicit operator int(C converted) => 0;
+    public int this[int index] {
+        get { int got = 0; return got; }
+        set { int setLocal = value; void InSet(int setArg) {} }
+    }
+    public int P { init { int initLocal = value; } }
+    event System.Action E {
+        add { System.Action addLocal = value; }
+        remove { System.Action removeLocal = value; }
+    }
+    void M(int argument) {
+        int a = 0, b = 1;
+        System.Func<int, int> lambda = (int lambdaArg) => lambdaArg;
+        System.Func<int, int> anonymous = delegate(int anonymousArg) {
+            int anonymousLocal = 0; return anonymousArg;
+        };
+        void Local<T>(T localArg) {
+            int inner = 0;
+            void Nested(int nestedArg) {}
+        }
+        void Sibling(int siblingArg) {}
+        if (argument is int pattern) {}
+        int.TryParse("", out int output);
+        int after = 0;
+    }
+}
+"#;
+        let facts = owner_facts(source);
+        assert!(!facts.errors);
+        for (name, owner) in [
+            ("N.C.first.fieldArg", "N.C.first"),
+            ("N.C.second.siblingFieldArg", "N.C.second"),
+            ("N.C.C.ctor", "N.C.C"),
+            ("N.C.op_Implicit.converted", "N.C.op_Implicit"),
+            ("N.C.Item.index", "N.C.Item"),
+            ("N.C.Item.value", "N.C.Item"),
+            ("N.C.Item.got", "N.C.Item"),
+            ("N.C.Item.setLocal", "N.C.Item"),
+            ("N.C.Item.InSet", "N.C.Item"),
+            ("N.C.Item.InSet.setArg", "N.C.Item.InSet"),
+            ("N.C.P.value", "N.C.P"),
+            ("N.C.P.initLocal", "N.C.P"),
+            ("N.C.E.value", "N.C.E"),
+            ("N.C.E.addLocal", "N.C.E"),
+            ("N.C.E.removeLocal", "N.C.E"),
+            ("N.C.M.lambdaArg", "N.C.M"),
+            ("N.C.M.anonymousArg", "N.C.M"),
+            ("N.C.M.anonymousLocal", "N.C.M"),
+            ("N.C.M.Local", "N.C.M"),
+            ("N.C.M.Local.localArg", "N.C.M.Local"),
+            ("N.C.M.Local.inner", "N.C.M.Local"),
+            ("N.C.M.Local.Nested", "N.C.M.Local"),
+            ("N.C.M.Local.Nested.nestedArg", "N.C.M.Local.Nested"),
+            ("N.C.M.Sibling", "N.C.M"),
+            ("N.C.M.Sibling.siblingArg", "N.C.M.Sibling"),
+            ("N.C.M.pattern", "N.C.M"),
+            ("N.C.M.output", "N.C.M"),
+            ("N.C.M.after", "N.C.M"),
+        ] {
+            assert_owner(&facts, name, Some(owner), true);
+        }
+        // A setter's synthetic value declaration owns nothing; lexical locals
+        // still have the same scopes as expression lowering, not owner spans.
+        let syntax = facts.csharp.as_ref().unwrap();
+        for declaration in facts.declarations.iter().filter(|d| d.kind == "local") {
+            let local = syntax
+                .locals
+                .iter()
+                .find(|l| l.span == declaration.name_span)
+                .unwrap();
+            assert_eq!(declaration.scope, local.scope, "{}", declaration.qualified);
+        }
+        let values: Vec<_> = facts
+            .declarations
+            .iter()
+            .filter(|d| d.qualified == "N.C.E.value")
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert!(values[0].scope.end <= values[1].scope.start);
+    }
+
+    #[test]
+    fn owner_links_limit_the_synthetic_top_level_range() {
+        let source = "int first = 0; void Top(int arg) { int local = arg; void Inner(int nested) {} } int last = first; class After { int field; }";
+        let facts = owner_facts(source);
+        assert!(!facts.errors);
+        assert_owner(&facts, "", None, false);
+        for name in ["first", "Top", "last"] {
+            assert_owner(&facts, name, Some(""), true);
+        }
+        assert_owner(&facts, "Top.arg", Some("Top"), true);
+        assert_owner(&facts, "Top.local", Some("Top"), true);
+        assert_owner(&facts, "Top.Inner", Some("Top"), true);
+        assert_owner(&facts, "Top.Inner.nested", Some("Top.Inner"), true);
+        assert_owner(&facts, "After", None, false);
+        assert_owner(&facts, "After.field", Some("After"), false);
+
+        // Recovery can interleave types and global statements. Earlier types
+        // must not evict the synthetic owner before its range is reached.
+        let source = "class Before { int field; } int first = 0; class Between { int field; } int last = 0; class After { int field; }";
+        let facts = owner_facts(source);
+        assert_owner(&facts, "Before", None, false);
+        assert_owner(&facts, "first", Some(""), true);
+        assert_owner(&facts, "Between", Some(""), false);
+        assert_owner(&facts, "last", Some(""), true);
+        assert_owner(&facts, "After", None, false);
+        for name in ["Before", "Between", "After"] {
+            assert_owner(&facts, &format!("{name}.field"), Some(name), false);
+        }
+    }
+
+    #[test]
+    fn owner_links_match_prefix_scans_after_recovery_and_preprocessing() {
+        for source in [
+            "",
+            "namespace N;",
+            "namespace /*{*/ N; class C { int field; }",
+            "namespace N; namespace M; class C { int field; }",
+            "namespace N { class C { void M( { int x = ; } }",
+            "namespace N { class C {} } int x = 0;",
+        ] {
+            owner_facts(source);
+        }
+        let source = "namespace Ω { class C { int a, b; int P { get; set { int x = value; } } void M(int p) { void L(int q) {} int z = p; } } }";
+        for (offset, character) in source.char_indices() {
+            owner_facts(&source[..offset]);
+            let mut damaged = source.to_owned();
+            damaged.replace_range(offset..offset + character.len_utf8(), "");
+            owner_facts(&damaged);
+        }
+        let source =
+            "#if LEFT\nnamespace Left;\n#else\nnamespace Right;\n#endif\nclass C { int field; }";
+        for (defines, namespace) in [(vec![], "Right"), (vec!["LEFT".into()], "Left")] {
+            let analysis = crate::extract::preprocess::active_source(source, &defines).unwrap();
+            let facts = extract(source, &defines).unwrap();
+            assert!(!facts.errors);
+            assert_prefix_owners(&analysis, &facts);
+            assert_owner(&facts, &format!("{namespace}.C"), None, false);
+            assert_owner(
+                &facts,
+                &format!("{namespace}.C.field"),
+                Some(&format!("{namespace}.C")),
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn owner_links_do_not_leak_across_many_sibling_declarations() {
+        use std::fmt::Write;
+        let mut source = String::from("namespace N; class Wide {");
+        for i in 0..256 {
+            write!(source, "int f{i}, g{i}; void M{i}(int p) {{ int x = p; }}").unwrap();
+        }
+        source.push('}');
+        let facts = owner_facts(&source);
+        assert!(!facts.errors);
+        assert_eq!(facts.declarations.len(), 2 + 5 * 256);
+        for i in 0..256 {
+            for field in [format!("N.Wide.f{i}"), format!("N.Wide.g{i}")] {
+                assert_owner(&facts, &field, Some("N.Wide"), false);
+            }
+            let method = format!("N.Wide.M{i}");
+            assert_owner(&facts, &method, Some("N.Wide"), false);
+            for name in ["p", "x"] {
+                assert_owner(&facts, &format!("{method}.{name}"), Some(&method), true);
+            }
+        }
+    }
+
+    #[test]
+    fn owner_links_survive_an_owned_declaration_payload_roundtrip() {
+        use crate::csharp::syntax::{DeclarationFile, FileSyntax};
+        let source =
+            "int x = 0; void F(int p) { void G(int q) {} } class C { int P { get; set; } }";
+        let facts = owner_facts(source);
+        let syntax = facts.csharp.unwrap();
+        let payload = DeclarationFile {
+            declarations: facts.declarations,
+            headers: syntax.headers,
+            imports: syntax.imports,
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        let decoded: DeclarationFile = postcard::from_bytes(&bytes).unwrap();
+        let recovered = Facts {
+            declarations: decoded.declarations,
+            csharp: Some(FileSyntax {
+                headers: decoded.headers,
+                imports: decoded.imports,
+                ..FileSyntax::default()
+            }),
+            ..Facts::default()
+        };
+        assert_prefix_owners(source, &recovered);
+        assert_owner(&recovered, "F.G.q", Some("F.G"), true);
+        assert_owner(&recovered, "C.P.value", Some("C.P"), true);
+        assert_owner(&recovered, "x", Some(""), true);
+        assert_owner(&recovered, "C", None, false);
     }
 }
