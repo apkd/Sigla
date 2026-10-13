@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-const ADAPTER_VERSION: u32 = 5;
+const ADAPTER_VERSION: u32 = 6;
 const MEMORY: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,6 +336,9 @@ pub(super) fn compatible(a: &str, b: &str) -> bool {
 pub(super) fn selectable(declaration: &Declaration) -> bool {
     !declaration.local() && !matches!(declaration.kind.as_str(), "scope" | "impl" | "lambda")
 }
+pub(super) fn matches_kind(kind: &str, declaration: &Declaration) -> bool {
+    kind == "symbol" || (kind == "type" && declaration.named_type()) || kind == declaration.kind
+}
 pub(super) fn selected(query: &crate::query::Query, declaration: &Declaration, path: &str) -> bool {
     if !selectable(declaration)
         // History-only callables are reachable by position, not new named queries.
@@ -348,8 +351,7 @@ pub(super) fn selected(query: &crate::query::Query, declaration: &Declaration, p
         return false;
     }
     let kind = query.selector.as_str();
-    if kind != "symbol" && !(kind == "type" && declaration.named_type()) && kind != declaration.kind
-    {
+    if !matches_kind(kind, declaration) {
         return false;
     }
     let name = if kind == "constructor" {

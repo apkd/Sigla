@@ -323,7 +323,11 @@ impl Tracker {
                             let mut declarations: Vec<_> = source
                                 .declarations
                                 .iter()
-                                .filter(|d| regions::selectable(d) && d.span.contains(&offset))
+                                .filter(|d| {
+                                    regions::selectable(d)
+                                        && regions::matches_kind(&query.selector, d)
+                                        && d.span.contains(&offset)
+                                })
                                 .collect();
                             declarations.sort_by_key(|d| d.span.len());
                             // Innermost in each feasible environment, not the

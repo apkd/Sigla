@@ -935,7 +935,7 @@ mod tests {
             "commit",
             "--quiet",
             "-m",
-            "fixture",
+            "Create fixture sources\n\nCreate source and asset snapshots for repository tests.",
         ]))
         .unwrap();
         if filter {
@@ -1076,7 +1076,12 @@ mod tests {
         execute(&["tag", "-a", "annotated", "-m", "release"]);
         execute(&["tag", "-a", "nested", "annotated", "-m", "nested release"]);
         fs::write(upstream_path.join("Code.cs"), "class Updated {}\n").unwrap();
-        execute(&["commit", "--quiet", "-am", "update"]);
+        execute(&[
+            "commit",
+            "--quiet",
+            "-am",
+            "Update fixture source\n\nReplace the source snapshot for selector tests.",
+        ]);
         execute(&["branch", "release"]);
         execute(&["branch", "face1234"]);
         execute(&["branch", "abc123"]);
@@ -1148,7 +1153,12 @@ mod tests {
             .trim()
             .to_owned();
         fs::write(upstream_path.join("Code.cs"), "class Updated {}\n").unwrap();
-        execute(&["commit", "--quiet", "-am", "update"]);
+        execute(&[
+            "commit",
+            "--quiet",
+            "-am",
+            "Update fixture source\n\nReplace the source snapshot for selector tests.",
+        ]);
         let current = String::from_utf8(execute(&["rev-parse", "HEAD"]))
             .unwrap()
             .trim()
@@ -1251,7 +1261,7 @@ mod tests {
             "commit",
             "--quiet",
             "-m",
-            "asset",
+            "Add fixture asset\n\nCover deferred acquisition of oversized source objects.",
         ]))
         .unwrap();
         let revision = String::from_utf8(
