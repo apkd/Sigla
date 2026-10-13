@@ -222,14 +222,52 @@ impl Request {
     }
 }
 
-pub(super) fn matches(pattern: &str, path: &str) -> bool {
-    let directory = pattern.trim_end_matches('/');
-    if path == directory
-        || path
-            .strip_prefix(directory)
-            .is_some_and(|s| s.starts_with('/'))
-    {
-        return true;
+pub(super) struct PathPattern<'a> {
+    directory: &'a str,
+    glob: Option<globset::GlobMatcher>,
+}
+impl<'a> PathPattern<'a> {
+    pub fn new(pattern: &'a str) -> Self {
+        Self {
+            directory: pattern.trim_end_matches('/'),
+            // Rebased patterns retain literal-prefix matching even if their glob is invalid.
+            glob: globset::Glob::new(pattern)
+                .ok()
+                .map(|glob| glob.compile_matcher()),
+        }
     }
-    globset::Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(path))
+    pub fn matches(&self, path: &str) -> bool {
+        path == self.directory
+            || path
+                .strip_prefix(self.directory)
+                .is_some_and(|s| s.starts_with('/'))
+            || self.glob.as_ref().is_some_and(|glob| glob.is_match(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiled_paths_preserve_prefix_and_glob_semantics() {
+        for (pattern, accepted, rejected) in [
+            ("src", "src/nested/a.rs", "src-other/a.rs"),
+            ("src/", "src", "src-other"),
+            ("src///", "src/a.rs", "src-other/a.rs"),
+            ("src/a.rs", "src/a.rs", "src/b.rs"),
+            ("src/*", "src/a.rs", "other/a.rs"),
+            ("src/**", "src/nested/a.rs", "other/a.rs"),
+            ("**/*.rs", "src/nested/a.rs", "src/a.cs"),
+            ("src/{a,b}.rs", "src/b.rs", "src/c.rs"),
+            ("src/[ab]?.rs", "src/a1.rs", "src/c1.rs"),
+            (r"src/\*.rs", "src/*.rs", "src/a.rs"),
+            ("src/λ", "src/λ/a.rs", "src/λ-other/a.rs"),
+            ("src/[", "src/[/a.rs", "src/a.rs"),
+        ] {
+            let compiled = PathPattern::new(pattern);
+            assert!(compiled.matches(accepted), "{pattern:?}: {accepted:?}");
+            assert!(!compiled.matches(rejected), "{pattern:?}: {rejected:?}");
+        }
+    }
 }

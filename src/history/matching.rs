@@ -264,7 +264,7 @@ impl Tracker {
             Selector::Repository => return Ok(state),
             Selector::Paths(patterns) => {
                 state.paths = patterns.clone();
-                state.regions = members(&tree, state.selection());
+                state.regions = members(&tree, state.selection().compile(&self.store.cancel)?);
                 // Deleted-before-anchor members remain discoverable through the path scope.
             }
             Selector::File(path) | Selector::Text { path, .. } => {
@@ -289,15 +289,20 @@ impl Tracker {
             }
             Selector::Declaration(query) => {
                 let mut incomplete = None;
+                let filters = query
+                    .filters
+                    .iter()
+                    .map(|f| {
+                        check(&self.store.cancel)?;
+                        Ok((query::PathPattern::new(&f.value), f.negate))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let candidates: Vec<_> = tree
                     .iter()
                     .filter(|(path, entry)| {
                         matches!(entry.mode, 0o100644 | 0o100755)
                             && regions::language(path).is_some_and(|l| !l.document())
-                            && query
-                                .filters
-                                .iter()
-                                .all(|f| query::matches(&f.value, path) != f.negate)
+                            && filters.iter().all(|(p, negate)| p.matches(path) != *negate)
                             && query
                                 .target
                                 .location
@@ -306,6 +311,7 @@ impl Tracker {
                     })
                     .map(|(path, entry)| (path.clone(), entry.id.clone()))
                     .collect();
+                drop(filters);
                 for chunk in candidates.chunks(16) {
                     self.store.prefetch(
                         &chunk.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
@@ -355,7 +361,7 @@ impl Tracker {
                             }
                         } else {
                             for declaration in &source.declarations {
-                                if regions::selected(query, declaration, path) {
+                                if regions::selected(query, declaration) {
                                     state.regions.push(Region::declaration(
                                         path,
                                         blob,
@@ -463,7 +469,8 @@ impl Tracker {
             let selection = paths::Selection {
                 patterns: &result.state.paths,
                 exclusions: &result.state.scope_exclusions,
-            };
+            }
+            .compile(&self.store.cancel)?;
             result.links.retain(|l| !selection.excluded(&l.to.path));
             result
                 .state
@@ -1334,7 +1341,7 @@ pub(super) fn directory_prefix(pattern: &str) -> &str {
         prefix.rsplit_once('/').map_or("", |(p, _)| p)
     }
 }
-pub(super) fn members(tree: &Tree, selection: paths::Selection<'_>) -> Vec<Region> {
+pub(super) fn members(tree: &Tree, selection: paths::CompiledSelection<'_>) -> Vec<Region> {
     tree.iter()
         .filter(|(path, entry)| {
             matches!(entry.mode, 0o100644 | 0o100755)

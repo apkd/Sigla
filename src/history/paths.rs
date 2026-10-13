@@ -46,7 +46,7 @@ impl Exclusion {
     pub fn heap_bytes(&self) -> usize {
         self.root.capacity() + self.original.capacity() + self.pattern.capacity()
     }
-    fn matches(&self, path: &str) -> bool {
+    fn matches(&self, path: &str, pattern: &query::PathPattern<'_>) -> bool {
         let relative = if path == self.root {
             ""
         } else if let Some(relative) = suffix(path, &self.root) {
@@ -54,7 +54,7 @@ impl Exclusion {
         } else {
             return false;
         };
-        query::matches(&self.pattern, &format!("{}{relative}", self.original))
+        pattern.matches(&format!("{}{relative}", self.original))
     }
     fn rebase(&self, from: &str, to: &str) -> Option<Self> {
         let (root, original) = if self.root == from {
@@ -79,21 +79,45 @@ pub(super) struct Selection<'a> {
     pub patterns: &'a [String],
     pub exclusions: &'a [Exclusion],
 }
-impl Selection<'_> {
-    pub fn excluded(self, path: &str) -> bool {
-        self.patterns
-            .iter()
-            .filter_map(|p| p.strip_prefix("-path:"))
-            .any(|p| query::matches(p, path))
-            || self.exclusions.iter().any(|e| e.matches(path))
+impl<'a> Selection<'a> {
+    pub fn compile(self, cancel: &AtomicBool) -> Result<CompiledSelection<'a>> {
+        check(cancel)?;
+        let mut compiled = CompiledSelection {
+            positive: Vec::new(),
+            negative: Vec::new(),
+            exclusions: Vec::new(),
+        };
+        for raw in self.patterns {
+            check(cancel)?;
+            if let Some(pattern) = raw.strip_prefix("path:") {
+                compiled.positive.push(query::PathPattern::new(pattern));
+            } else if let Some(pattern) = raw.strip_prefix("-path:") {
+                compiled.negative.push(query::PathPattern::new(pattern));
+            }
+        }
+        for exclusion in self.exclusions {
+            check(cancel)?;
+            compiled
+                .exclusions
+                .push((exclusion, query::PathPattern::new(&exclusion.pattern)));
+        }
+        Ok(compiled)
     }
-    pub fn matches(self, path: &str) -> bool {
-        !self.excluded(path)
-            && self
-                .patterns
-                .iter()
-                .filter_map(|p| p.strip_prefix("path:"))
-                .any(|p| query::matches(p, path))
+}
+
+// Scan-local only: retained states keep strings for equality and memory accounting.
+pub(super) struct CompiledSelection<'a> {
+    positive: Vec<query::PathPattern<'a>>,
+    negative: Vec<query::PathPattern<'a>>,
+    exclusions: Vec<(&'a Exclusion, query::PathPattern<'a>)>,
+}
+impl CompiledSelection<'_> {
+    pub fn excluded(&self, path: &str) -> bool {
+        self.negative.iter().any(|p| p.matches(path))
+            || self.exclusions.iter().any(|(e, p)| e.matches(path, p))
+    }
+    pub fn matches(&self, path: &str) -> bool {
+        !self.excluded(path) && self.positive.iter().any(|p| p.matches(path))
     }
 }
 
@@ -115,7 +139,7 @@ fn consistent(
     to: &Tree,
     prefix: &str,
     destination: &str,
-    selection: Selection<'_>,
+    selection: &CompiledSelection<'_>,
     links: &BTreeMap<&str, Option<&Link>>,
     work: &mut Work<'_>,
 ) -> Result<bool> {
@@ -173,7 +197,7 @@ pub(super) fn map(
     links: &[Link],
     cancel: &AtomicBool,
 ) -> Result<Mapping> {
-    check(cancel)?;
+    let selected = selection.compile(cancel)?;
     let mut work = Work {
         cancel,
         remaining: SCOPE_WORK,
@@ -256,7 +280,7 @@ pub(super) fn map(
         let mut established = None;
         for destination in candidates {
             let supported = to[destination].id == entry.id
-                || consistent(from, to, prefix, destination, selection, &unique, &mut work)?;
+                || consistent(from, to, prefix, destination, &selected, &unique, &mut work)?;
             if supported && established.replace(destination).is_some() {
                 established = None;
                 mapped.unresolved = true;
@@ -304,6 +328,7 @@ pub(super) fn map(
             mapped.exclusions.extend(exclusions);
         }
     }
+    drop(selected);
     mapped.patterns.sort();
     mapped.patterns.dedup();
     mapped.exclusions.sort();
@@ -312,7 +337,8 @@ pub(super) fn map(
     let selection = Selection {
         patterns: &mapped.patterns,
         exclusions: &mapped.exclusions,
-    };
+    }
+    .compile(cancel)?;
     for link in movements {
         if !work.step()? {
             mapped.unresolved = true;
@@ -324,6 +350,7 @@ pub(super) fn map(
         mapped.unresolved |=
             !selection.excluded(&link.to.path) && !selection.matches(&link.to.path);
     }
+    drop(selection);
     Ok(mapped)
 }
 
@@ -369,6 +396,38 @@ mod tests {
     }
 
     #[test]
+    fn compiled_selection_keeps_positive_union_and_negative_precedence() {
+        let patterns = [
+            "path:src/",
+            "path:tests/**",
+            "-path:src/private",
+            "-path:**/skip.rs",
+        ]
+        .map(String::from);
+        let cancel = AtomicBool::new(false);
+        let compiled = selection(&patterns).compile(&cancel).unwrap();
+        for (path, matches, excluded) in [
+            ("src", true, false),
+            ("src/lib.rs", true, false),
+            ("tests/a.rs", true, false),
+            ("src/private", false, true),
+            ("src/private/a.rs", false, true),
+            ("tests/skip.rs", false, true),
+            ("src/private-other/a.rs", true, false),
+            ("other/a.rs", false, false),
+        ] {
+            assert_eq!(compiled.matches(path), matches, "{path}");
+            assert_eq!(compiled.excluded(path), excluded, "{path}");
+        }
+        assert!(
+            !selection(&[])
+                .compile(&cancel)
+                .unwrap()
+                .matches("src/lib.rs")
+        );
+    }
+
+    #[test]
     fn edited_scopes_and_exclusions_are_direction_independent() {
         for (from, to) in [("new", "old"), ("old", "new")] {
             let a = tree(
@@ -404,7 +463,9 @@ mod tests {
                 let selected = Selection {
                     patterns: &mapped.patterns,
                     exclusions: &mapped.exclusions,
-                };
+                }
+                .compile(&AtomicBool::new(false))
+                .unwrap();
                 assert!(selected.matches(&format!("{to}/a.rs")));
                 assert!(selected.excluded(&format!("{to}/private/deleted.rs")));
             }
@@ -499,12 +560,14 @@ mod tests {
             pattern: "new*/sub/private/**".into(),
         };
         let parent = excluded.rebase("old", "older").unwrap();
-        assert!(parent.matches("older/sub/private/deleted.rs"));
-        assert!(!parent.matches("older/sub/public.rs"));
+        let pattern = query::PathPattern::new(&parent.pattern);
+        assert!(parent.matches("older/sub/private/deleted.rs", &pattern));
+        assert!(!parent.matches("older/sub/public.rs", &pattern));
         assert!(excluded.rebase("oldish", "elsewhere").is_none());
         let child = parent.rebase("older/sub/private", "archive").unwrap();
-        assert!(child.matches("archive/deleted.rs"));
-        assert!(!child.matches("archive-other/deleted.rs"));
+        let pattern = query::PathPattern::new(&child.pattern);
+        assert!(child.matches("archive/deleted.rs", &pattern));
+        assert!(!child.matches("archive-other/deleted.rs", &pattern));
         assert!(
             child.heap_bytes() >= child.root.len() + child.original.len() + child.pattern.len()
         );
@@ -551,5 +614,7 @@ mod tests {
         assert!(mapped.unresolved);
         cancel.store(true, Ordering::Release);
         assert!(map(&a, &b, selection(&patterns), &links, &cancel).is_err());
+        assert!(selection(&patterns).compile(&cancel).is_err());
+        assert!(selection(&[]).compile(&cancel).is_err());
     }
 }
