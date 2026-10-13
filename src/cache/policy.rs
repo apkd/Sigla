@@ -25,17 +25,25 @@ pub(crate) fn candidates(
     policy: Option<&crate::repository::retention::Policy>,
     now: u64,
 ) -> Result<Vec<Candidate>> {
+    let mut result = retention_candidates(cache, owners, policy, now)?;
+    rank(owners, &mut result, now)?;
+    Ok(result)
+}
+
+pub(crate) fn retention_candidates(
+    cache: &Path,
+    owners: &super::owners::Catalog,
+    policy: Option<&crate::repository::retention::Policy>,
+    now: u64,
+) -> Result<Vec<Candidate>> {
     let states = crate::repository::retention::cached(cache)?;
     let mut result = Vec::new();
-    let mut roots = Vec::new();
     for owner in owners.entries.values() {
-        let mut views = owners.view_roots(owner);
         let (protection, ttl) = match (&owner.repository, policy) {
             (Some(root), Some(policy)) => {
                 let Some(state) = states.get(root) else {
                     continue;
                 };
-                views.push(root.clone());
                 policy.decision(cache, state, |identity, branch| {
                     Ok(states.values().any(|s| {
                         &s.repository == identity
@@ -45,19 +53,15 @@ pub(crate) fn candidates(
                     }))
                 })?
             }
-            (Some(root), None) => {
-                views.push(root.clone());
-                (
-                    Some("repository is outside the current maintenance configuration".into()),
-                    crate::config::DEFAULT_REPO_TTL,
-                )
-            }
+            (Some(_), None) => (
+                Some("repository is outside the current maintenance configuration".into()),
+                crate::config::DEFAULT_REPO_TTL,
+            ),
             (None, _) => (
                 None,
                 policy.map_or(crate::config::DEFAULT_REPO_TTL, |p| p.repo_ttl),
             ),
         };
-        roots.push((owner.entry.clone(), views));
         result.push(Candidate {
             owner: owner.clone(),
             pinned: protection.is_some(),
@@ -67,18 +71,34 @@ pub(crate) fn candidates(
             bytes: 0,
         });
     }
+    Ok(result)
+}
+
+pub(crate) fn rank(
+    owners: &super::owners::Catalog,
+    candidates: &mut [Candidate],
+    now: u64,
+) -> Result<()> {
+    let roots: Vec<_> = candidates
+        .iter()
+        .map(|candidate| {
+            let mut views = owners.view_roots(&candidate.owner);
+            views.extend(candidate.owner.repository.iter().cloned());
+            (candidate.owner.entry.clone(), views)
+        })
+        .collect();
     let costs = attributed(&roots)?;
-    for candidate in &mut result {
+    for candidate in candidates.iter_mut() {
         candidate.bytes = costs[&candidate.owner.entry];
     }
-    result.sort_by(|a, b| {
+    candidates.sort_by(|a, b| {
         a.owner
             .usage
             .priority(now, a.bytes)
             .total_cmp(&b.owner.usage.priority(now, b.bytes))
             .then_with(|| a.owner.usage.last_use.cmp(&b.owner.usage.last_use))
     });
-    Ok(result)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -168,7 +188,8 @@ impl Limits {
 pub fn attributed(owners: &[(PathBuf, Vec<PathBuf>)]) -> Result<BTreeMap<PathBuf, u64>> {
     fn scan(
         path: &Path,
-        owner: usize,
+        inherited: &BTreeSet<usize>,
+        roots: &BTreeMap<PathBuf, BTreeSet<usize>>,
         files: &mut BTreeMap<(u64, u64), (u64, BTreeSet<usize>)>,
     ) -> Result<()> {
         let metadata = match fs::symlink_metadata(path) {
@@ -176,11 +197,20 @@ pub fn attributed(owners: &[(PathBuf, Vec<PathBuf>)]) -> Result<BTreeMap<PathBuf
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
+        let owners = match roots.get(path) {
+            Some(additional) => std::borrow::Cow::Owned(
+                inherited
+                    .union(additional)
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+            ),
+            None => std::borrow::Cow::Borrowed(inherited),
+        };
         files
             .entry((metadata.dev(), metadata.ino()))
             .or_insert_with(|| (metadata.blocks() * 512, BTreeSet::new()))
             .1
-            .insert(owner);
+            .extend(owners.iter().copied());
         if metadata.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
@@ -194,16 +224,26 @@ pub fn attributed(owners: &[(PathBuf, Vec<PathBuf>)]) -> Result<BTreeMap<PathBuf
                 Err(error) => return Err(error.into()),
             };
             for entry in entries {
-                scan(&entry?.path(), owner, files)?;
+                scan(&entry?.path(), &owners, roots, files)?;
             }
         }
         Ok(())
     }
     let mut files = BTreeMap::new();
     let mut result: BTreeMap<_, _> = owners.iter().map(|(owner, _)| (owner.clone(), 0)).collect();
+    let mut root_owners: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
     for (owner, (_, roots)) in owners.iter().enumerate() {
         for root in roots {
-            scan(root, owner, &mut files)?;
+            root_owners.entry(root.clone()).or_default().insert(owner);
+        }
+    }
+    for root in root_owners.keys() {
+        if !root
+            .ancestors()
+            .skip(1)
+            .any(|parent| root_owners.contains_key(parent))
+        {
+            scan(root, &BTreeSet::new(), &root_owners, &mut files)?;
         }
     }
     for (bytes, indices) in files.values() {
@@ -277,5 +317,27 @@ mod tests {
             costs.values().sum::<u64>(),
             fs::metadata(first).unwrap().blocks() * 512
         );
+    }
+
+    #[test]
+    fn nested_and_shared_roots_count_each_inode_once() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let data = nested.join("data");
+        fs::write(&data, vec![42; 8192]).unwrap();
+        fs::hard_link(&data, root.path().join("alias")).unwrap();
+        let costs = attributed(&[
+            (
+                PathBuf::from("a"),
+                vec![root.path().to_owned(), nested.clone()],
+            ),
+            (PathBuf::from("b"), vec![nested]),
+        ])
+        .unwrap();
+        let total = crate::cache::blobs::allocated(root.path()).unwrap();
+        let parent = fs::metadata(root.path()).unwrap().blocks() * 512;
+        assert_eq!(costs.values().sum::<u64>(), total);
+        assert_eq!(costs[Path::new("a")] - parent, costs[Path::new("b")]);
     }
 }

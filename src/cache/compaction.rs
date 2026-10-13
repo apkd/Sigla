@@ -17,6 +17,11 @@ pub struct Stats {
     pub live: u64,
 }
 impl Stats {
+    pub fn temporary_bytes(self) -> u64 {
+        self.live
+            .saturating_add(self.live / 10)
+            .saturating_add(64 * 1024 * 1024)
+    }
     pub fn reclaimable(self) -> u64 {
         self.allocated.saturating_sub(self.live)
     }
@@ -109,13 +114,15 @@ pub fn recover(cache: &Path) -> Result<()> {
 pub fn run(env: Env, cache: &Path) -> Result<u64> {
     let root = cache.join("analysis");
     let before = env.real_disk_size()?;
-    let live = env.non_free_pages_size()?;
+    let live = env.compacted_size()?;
     let available = super::policy::Disk::read(cache)?.available;
     ensure!(
         available
-            >= live
-                .saturating_add(live / 10)
-                .saturating_add(64 * 1024 * 1024),
+            >= Stats {
+                allocated: before,
+                live
+            }
+            .temporary_bytes(),
         "Insufficient temporary space for analysis compaction"
     );
     let pending = root.join(PENDING);
@@ -222,7 +229,16 @@ mod tests {
     fn compact_copy_reclaims_space_and_preserves_live_records() {
         let cache = tempfile::tempdir().unwrap();
         let database = populated(cache.path());
-        assert!(database.compact(cache.path()).unwrap() > 0);
+        let expected = database.disk_stats().unwrap();
+        let reclaimed = database.compact(cache.path()).unwrap();
+        assert!(reclaimed > 0);
+        assert_eq!(reclaimed, expected.reclaimable());
+        assert_eq!(
+            fs::metadata(cache.path().join("analysis/data.mdb"))
+                .unwrap()
+                .len(),
+            expected.live
+        );
         readable(cache.path());
     }
     #[test]

@@ -27,6 +27,29 @@ fn candidate(path: &Path, complete: bool, sentinel: &str) {
     }
 }
 
+fn publish_selector(cache: &Path, pool: &Pool, root: &Root) {
+    let selected: std::collections::BTreeMap<_, _> = root
+        .selected
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (format!("file-{i}"), id))
+        .collect();
+    super::super::manager::write_json(
+        &cache
+            .join("repositories")
+            .join(pool.identity.storage_key())
+            .join("state.json"),
+        &serde_json::json!({
+            "schema": 4, "repository": pool.identity,
+            "transport": "https://github.com/example/sharing-fixture", "branch": "main",
+            "last_use": 0, "refreshed": 0, "policy": "", "indexed_revision": null, "repair": false,
+            "prepared": { "branch": "main", "revision": root.revision, "selected": selected,
+                "tracked": {}, "directories": [] }
+        }),
+    )
+    .unwrap();
+}
+
 #[test]
 fn pin_keeps_the_registry_operation_owner_alive() {
     let cache = tempfile::tempdir().unwrap();
@@ -52,6 +75,116 @@ fn captured_pending_roots_survive_the_pin_being_released() {
     assert!(pool.roots(cache.path()).unwrap().is_empty());
     assert_eq!(captured.revisions, BTreeSet::from(["a".repeat(40)]));
     assert_eq!(captured.selected, BTreeSet::from(["b".repeat(40)]));
+}
+
+#[test]
+fn maintenance_snapshot_preserves_a_pin_released_before_collection() {
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Pool::open(cache.path(), &identity()).unwrap();
+    pool.state().unwrap();
+    let pending = pin(&pool);
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    drop(pending);
+    maintain_pool(
+        cache.path(),
+        &pool.identity,
+        Duration::ZERO,
+        true,
+        Some(&snapshot),
+    )
+    .unwrap();
+    assert!(pool.root.exists());
+    reclaim(cache.path()).unwrap();
+    assert!(!pool.root.exists());
+}
+
+#[test]
+fn acquisition_after_snapshot_cannot_lose_its_pending_objects() {
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Pool::open(cache.path(), &identity()).unwrap();
+    pool.state().unwrap();
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    let pending = {
+        let mut operation = pool.operation.lock().unwrap();
+        *operation += 1;
+        pin(&pool)
+    };
+    maintain_pool(
+        cache.path(),
+        &pool.identity,
+        Duration::ZERO,
+        true,
+        Some(&snapshot),
+    )
+    .unwrap();
+    assert!(pool.root.exists());
+    drop(pending);
+    reclaim(cache.path()).unwrap();
+    assert!(!pool.root.exists());
+}
+
+#[test]
+fn acquisition_published_after_snapshot_survives_without_its_pin() {
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Pool::open(cache.path(), &identity()).unwrap();
+    pool.state().unwrap();
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    let pending = {
+        let mut operation = pool.operation.lock().unwrap();
+        *operation += 1;
+        pin(&pool)
+    };
+    publish_selector(cache.path(), &pool, &pending._root);
+    drop(pending);
+    maintain_pool(
+        cache.path(),
+        &pool.identity,
+        Duration::ZERO,
+        true,
+        Some(&snapshot),
+    )
+    .unwrap();
+    assert!(pool.root.exists());
+}
+
+#[test]
+fn shared_selector_scan_assigns_roots_to_their_pool() {
+    let cache = tempfile::tempdir().unwrap();
+    let kept = Pool::open(cache.path(), &identity()).unwrap();
+    kept.state().unwrap();
+    let orphan_id = Repository::parse("https://github.com/example/orphan")
+        .unwrap()
+        .unwrap()
+        .identity;
+    let orphan = Pool::open(cache.path(), &orphan_id).unwrap();
+    orphan.state().unwrap();
+    let pending = pin(&kept);
+    publish_selector(cache.path(), &kept, &pending._root);
+    drop(pending);
+    reclaim(cache.path()).unwrap();
+    assert!(kept.root.exists());
+    assert!(!orphan.root.exists());
+}
+
+#[test]
+fn ordinary_maintenance_skips_a_pool_with_unchanged_roots() {
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Pool::open(cache.path(), &identity()).unwrap();
+    let mut state = pool.state().unwrap();
+    let pending = pin(&pool);
+    let roots = pool.roots(cache.path()).unwrap();
+    state.replaced = 0;
+    state.retained = Some(
+        blake3::hash(&serde_json::to_vec(&roots).unwrap())
+            .to_hex()
+            .to_string(),
+    );
+    // A rebuild of this deliberately incomplete pool would fail and set a retry deadline.
+    candidate(&pool.root.join("current"), true, "retained");
+    pool.maybe_rebuild(cache.path(), &mut state, false, Some(&roots))
+        .unwrap();
+    assert_eq!(state.retry_after, 0);
+    drop(pending);
 }
 
 #[test]
@@ -127,4 +260,66 @@ fn retention_deduplicates_identical_objects_across_selectors() {
     roots.add(&"b".repeat(40), ["c".repeat(40)]);
     assert_eq!(roots.revisions.len(), 2);
     assert_eq!(roots.selected.len(), 2);
+}
+
+#[test]
+#[ignore = "manual comparison of per-pool and shared selector scans"]
+fn retention_scan_benchmark() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut pools = Vec::new();
+    for n in 0..32 {
+        let identity = Repository::parse(&format!("https://github.com/example/repo-{n}"))
+            .unwrap()
+            .unwrap()
+            .identity;
+        let pool = Pool::open(cache.path(), &identity).unwrap();
+        pool.state().unwrap();
+        let root = Root {
+            revision: "a".repeat(40),
+            selected: (0..2048)
+                .map(|i| {
+                    blake3::hash(format!("{n}/{i}").as_bytes())
+                        .to_hex()
+                        .to_string()
+                })
+                .collect(),
+        };
+        publish_selector(cache.path(), &pool, &root);
+        pools.push(pool);
+    }
+    let start = std::time::Instant::now();
+    let expected: usize = pools
+        .iter()
+        .map(|pool| pool.roots(cache.path()).unwrap().selected.len())
+        .sum();
+    eprintln!("per-pool selector scans: {:?}", start.elapsed());
+    let start = std::time::Instant::now();
+    let mut snapshots: HashMap<_, _> = pools
+        .iter()
+        .map(|pool| {
+            (
+                pool.identity.storage_key(),
+                Snapshot::capture(pool.clone()).unwrap().unwrap(),
+            )
+        })
+        .collect();
+    visit_selectors(cache.path(), |state| {
+        snapshots
+            .get_mut(&state.repository.storage_key())
+            .unwrap()
+            .roots
+            .add(
+                &state.prepared.revision,
+                state.prepared.selected.into_values(),
+            );
+    })
+    .unwrap();
+    eprintln!("shared selector scan: {:?}", start.elapsed());
+    assert_eq!(
+        snapshots
+            .values()
+            .map(|snapshot| snapshot.roots.selected.len())
+            .sum::<usize>(),
+        expected
+    );
 }

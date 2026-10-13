@@ -20,7 +20,7 @@ gix-protocol = { version = "0.65.1", features = ["blocking-client", "sha1", "sha
 gix-transport = { version = "0.59.2", features = ["blocking-client", "http-client-reqwest-rust-tls"] }
 gix-features = { version = "0.49.1", features = ["progress"] }
 gix-hash = { version = "0.26.2", features = ["sha1", "sha256"] }
-heed = "0.22"
+heed = { git = "https://github.com/apkd/heed", rev = "1db589f0f859dfb7a92edcd3bba2b94661efb9f2" }
 inotify = "0.11"
 libc = "0.2"
 lru = "0.16"

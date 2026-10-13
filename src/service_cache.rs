@@ -105,7 +105,7 @@ impl App {
     }
 
     fn candidates(&self) -> Result<Vec<Candidate>> {
-        crate::cache::policy::candidates(
+        crate::cache::policy::retention_candidates(
             &self.cache,
             &self.owners.lock().unwrap(),
             self.remote
@@ -148,14 +148,28 @@ impl App {
     }
 
     fn collect_analysis(&self, pressure: bool) -> Result<()> {
-        // Ordinary passes resume the stored deletion/collection cursors. Only
-        // disk pressure justifies draining the entire analysis database.
+        // Ordinary passes retire and collect bounded batches. Disk pressure
+        // drains all retired workspaces and unused objects.
         self.maintain_analysis(pressure)?;
         if pressure && self.cache.join("analysis").is_dir() {
             crate::store::Database::open(&self.cache.join("analysis"))?
                 .collect_unused(crate::cache::now(), true)?;
         }
         Ok(())
+    }
+
+    fn analysis_savings(&self, disk: Disk) -> Result<u64> {
+        if !self.cache.join("analysis").is_dir() {
+            return Ok(0);
+        }
+        let stats = crate::store::Database::open(&self.cache.join("analysis"))?.disk_stats()?;
+        Ok(
+            if stats.eligible() && disk.available >= stats.temporary_bytes() {
+                stats.reclaimable()
+            } else {
+                0
+            },
+        )
     }
 
     pub(super) fn compact_analysis(&self) -> Result<u64> {
@@ -274,26 +288,32 @@ impl App {
         }
         maintenance_stage("analysis collection", || self.collect_analysis(pressure))?;
         maintenance_stage("view collection", || self.collect_views(known))?;
-        if pressure {
-            maintenance_stage("Git reclamation", || {
-                crate::repository::cache::reclaim(&self.cache)
-            })?;
-        }
         maintenance_stage("blob collection", || {
             self.blobs.collect_with_pressure(pressure)
         })?;
         let mut after = blobs::allocated(&self.cache)?;
-        // Freed LMDB pages are reusable. Rewriting the database and discarding
-        // loaded workspaces is only needed if other cleanup did not free enough.
-        if self.cache_limits.pressured(after, Disk::read(&self.cache)?)
-            && maintenance_stage("analysis compaction", || self.compact_analysis())? > 0
-        {
-            after = blobs::allocated(&self.cache)?;
-        }
-        candidates.retain(|candidate| !candidate.expired && !candidate.pinned);
+        candidates.retain(|candidate| !candidate.expired);
         let mut remaining = self.cache_limits.reclaim(after, Disk::read(&self.cache)?);
+        let mut savings = if remaining > 0 {
+            self.analysis_savings(Disk::read(&self.cache)?)?
+        } else {
+            0
+        };
+        if remaining > savings {
+            maintenance_stage("eviction ranking", || {
+                crate::cache::policy::rank(
+                    &self.owners.lock().unwrap(),
+                    &mut candidates,
+                    crate::cache::now(),
+                )
+            })?;
+        }
+        candidates.retain(|candidate| !candidate.pinned);
         let mut candidates = candidates.into_iter();
-        while remaining > 0 {
+        while remaining > savings {
+            // Credit an affordable compact copy, but postpone the copy until all
+            // victims are retired. Git packing savings are deliberately not assumed.
+            let needed = remaining - savings;
             let allocated = after;
             let mut estimated = 0;
             let mut evicted = false;
@@ -302,7 +322,7 @@ impl App {
                     evicted = true;
                     estimated += candidate.bytes;
                 }
-                if estimated >= remaining {
+                if estimated >= needed {
                     break;
                 }
             }
@@ -311,17 +331,25 @@ impl App {
             }
             maintenance_stage("analysis collection", || self.collect_analysis(true))?;
             maintenance_stage("view collection", || self.collect_views(known))?;
+            maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
+            after = blobs::allocated(&self.cache)?;
+            remaining = remaining.saturating_add(after).saturating_sub(allocated);
+            savings = self.analysis_savings(Disk::read(&self.cache)?)?;
+        }
+        // Avoid repacking Git when the known compact-copy savings already meet
+        // the target. Repacking is the fallback after idle victims are exhausted.
+        if remaining > savings {
+            let allocated = after;
             maintenance_stage("Git reclamation", || {
                 crate::repository::cache::reclaim(&self.cache)
             })?;
-            maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
             after = blobs::allocated(&self.cache)?;
-            if allocated.saturating_sub(after) < remaining
-                && maintenance_stage("analysis compaction", || self.compact_analysis())? > 0
-            {
-                after = blobs::allocated(&self.cache)?;
-            }
-            remaining = remaining.saturating_sub(allocated.saturating_sub(after));
+            remaining = remaining.saturating_add(after).saturating_sub(allocated);
+        }
+        if remaining > 0
+            && maintenance_stage("analysis compaction", || self.compact_analysis())? > 0
+        {
+            after = blobs::allocated(&self.cache)?;
         }
         self.owners.lock().unwrap().flush()?;
         let disk = Disk::read(&self.cache)?;
@@ -621,6 +649,116 @@ mod tests {
         assert!(kept.join("source/File.cs").is_file());
         assert!(!other.exists());
         assert!(!wildcard.exists());
+    }
+
+    #[test]
+    #[ignore = "manual disk-pressure replay with existing free pages and live workspaces"]
+    fn pressure_cleanup_benchmark() {
+        use crate::store::{
+            Store,
+            shared::{Encoded, Names, PRESSURE_BATCH},
+        };
+        use crate::workspace::{FileEntry, Manifest, Stamp};
+        use std::collections::BTreeMap;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let cache = tempfile::tempdir().unwrap();
+        let mut app = app(
+            cache.path(),
+            vec![
+                Rule::parse("https://github.com/example/*").unwrap(),
+                Rule::parse_private("https://github.com/example/keep").unwrap(),
+            ],
+        );
+        for (name, count) in [
+            ("keep", 16),
+            ("cold-a", 384),
+            ("cold-b", 384),
+            ("unused", 1024),
+        ] {
+            let root = seed(cache.path(), name, "main", "main", crate::cache::now());
+            let entry = root.join("source");
+            let store = Store::open_workspace(
+                &cache.path().join("analysis"),
+                *blake3::hash(name.as_bytes()).as_bytes(),
+                &entry,
+                Some(&root),
+            )
+            .unwrap();
+            let mut manifest = Manifest {
+                root: entry.clone(),
+                ..Default::default()
+            };
+            for start in (0..count).step_by(16) {
+                let pending: Vec<_> = (start..(start + 16).min(count))
+                    .map(|i| {
+                        let file = format!("file-{i}");
+                        manifest.files.insert(
+                            file.clone(),
+                            FileEntry {
+                                path: entry.join("File.cs"),
+                                display: file.clone(),
+                                stamp: Stamp::read(&entry.join("File.cs")).unwrap(),
+                                language: crate::model::Language::CSharp,
+                                memberships: vec![],
+                                modules: vec![],
+                                metadata: false,
+                            },
+                        );
+                        store
+                            .scope
+                            .prepare_install(
+                                &file,
+                                vec![1],
+                                *blake3::hash(format!("{name}/{i}").as_bytes()).as_bytes(),
+                                100,
+                                || {
+                                    let mut records =
+                                        BTreeMap::from([(vec![1], vec![42; 512 * 1024])]);
+                                    let names = crate::store::format::write(
+                                        &[],
+                                        None,
+                                        true,
+                                        &Names::default(),
+                                        &mut records,
+                                    )?;
+                                    Ok(Encoded { names, records })
+                                },
+                            )
+                            .unwrap()
+                    })
+                    .collect();
+                store.scope.install_batch(&pending, |_| Ok(())).unwrap();
+            }
+            store.save_manifest(&manifest).unwrap();
+            if name == "unused" {
+                store.scope.mark_deleting().unwrap();
+                while !store.scope.delete_batch(100, PRESSURE_BATCH).unwrap() {}
+                store.scope.database.collect_unused(100, true).unwrap();
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+        app.cache_limits.max_bytes = 256 * 1024 * 1024;
+        let before = blobs::allocated(cache.path()).unwrap();
+        let start = Instant::now();
+        app.maintain_disk_exclusive().unwrap();
+        let elapsed = start.elapsed();
+        let after = blobs::allocated(cache.path()).unwrap();
+        assert!(
+            !app.cache_limits
+                .pressured(after, Disk::read(cache.path()).unwrap())
+        );
+        let db = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = db
+            .existing(*blake3::hash(b"keep").as_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(scope.manifest().unwrap().is_some());
+        eprintln!("pressure cleanup: {elapsed:?}; allocation {before} -> {after}");
+        drop(scope);
+        drop(db);
+        let start = Instant::now();
+        app.maintain_disk_exclusive().unwrap();
+        eprintln!("ordinary cleanup: {:?}", start.elapsed());
     }
     #[test]
     fn disk_pressure_evicts_the_less_frequently_used_workspace_first() {

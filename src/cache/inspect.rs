@@ -220,7 +220,7 @@ pub(crate) fn build(
     for (root, state) in &states {
         owners.seed(&root.join("source"), Some(root), state.last_use);
     }
-    let mut notes = vec!["Eviction uses the maintenance policy's age limits and frequency/recency ranking. Byte estimates are approximate: maintenance collects shared objects and rebuilds Git pools, then remeasures before evicting more.".into()];
+    let mut notes = vec!["Eviction uses the maintenance policy's age limits and frequency/recency ranking. Byte estimates are approximate: shared data can remain after a workspace is removed. Cleanup chooses evictions before rewriting retained data, so it can remove more idle workspaces to finish faster.".into()];
     if let Some(analysis) = &analysis {
         for entry in &analysis.unknown {
             notes.push(format!(
@@ -239,13 +239,7 @@ pub(crate) fn build(
     let reclaim_target_bytes = limits.reclaim(footprint.allocated_bytes, disk);
     let cleanup = footprint.unreferenced_blob_bytes
         + analysis
-            .filter(|s| {
-                s.eligible()
-                    && disk.available
-                        >= s.live
-                            .saturating_add(s.live / 10)
-                            .saturating_add(64 * 1024 * 1024)
-            })
+            .filter(|s| s.eligible() && disk.available >= s.temporary_bytes())
             .map_or(0, |s| s.reclaimable());
     let mut workspaces: Vec<_> = candidates
         .iter()

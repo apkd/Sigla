@@ -381,13 +381,20 @@ impl App {
             // The registry lock prevents a request opening this scope during retirement.
             // Persisted deleting state rejects new opens until the next batch completes.
             loop {
-                if scope.delete_batch(now, 128)? || !drain {
+                let limit = if drain {
+                    crate::store::shared::PRESSURE_BATCH
+                } else {
+                    128
+                };
+                if scope.delete_batch(now, limit)? || !drain {
                     break;
                 }
             }
             drop(registry);
         }
-        database.collect(now, 128)?;
+        if !drain {
+            database.collect(now, 128)?;
+        }
         Ok(())
     }
 

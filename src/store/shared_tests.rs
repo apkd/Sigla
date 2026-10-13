@@ -584,7 +584,135 @@ fn long_names_remain_indexable_and_oversize_keys_are_rejected() {
 }
 
 #[test]
-fn gc_grace_and_cursor_survive_reopening() {
+#[cfg(target_os = "linux")]
+#[ignore = "manual comparison of full-scan and indexed collection"]
+fn collection_benchmark() {
+    fn io() -> (u64, u64) {
+        let text = std::fs::read_to_string("/proc/self/io").unwrap();
+        let value = |key| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        };
+        (value("read_bytes:"), value("write_bytes:"))
+    }
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::open(dir.path()).unwrap();
+            for (owner, count) in [(1, 16_384), (2, 256)] {
+                let space = scope(&db, owner);
+                for start in (0..count).step_by(128) {
+                    let pending: Vec<_> = (start..(start + 128).min(count))
+                        .map(|i| {
+                            space
+                                .prepare_install(
+                                    &format!("file-{i}"),
+                                    vec![1],
+                                    *blake3::hash(format!("{owner}/{i}").as_bytes()).as_bytes(),
+                                    100,
+                                    || Ok(object("Shared", &[42; 2048])),
+                                )
+                                .unwrap()
+                        })
+                        .collect();
+                    space.install_batch(&pending, |_| Ok(())).unwrap();
+                }
+                if owner == 2 {
+                    space.mark_deleting().unwrap();
+                    while !space.delete_batch(100, PRESSURE_BATCH).unwrap() {}
+                }
+            }
+        }
+        let db = Database::open(dir.path()).unwrap();
+        let before = io();
+        let transaction = db.env.info().last_txn_id;
+        let start = std::time::Instant::now();
+        let mut visited = 0;
+        if indexed {
+            loop {
+                let result = db.collect_with_retention(100, PRESSURE_BATCH, 0).unwrap();
+                visited += result.visited;
+                if result.visited < PRESSURE_BATCH {
+                    break;
+                }
+            }
+        } else {
+            // The former collector scanned live objects and committed a cursor every batch.
+            let mut cursor: Option<ObjectId> = None;
+            loop {
+                let mut tx = db.env.write_txn().unwrap();
+                let bound = cursor
+                    .as_ref()
+                    .map_or(Unbounded, |id| Excluded(id.as_slice()));
+                let ids: Vec<ObjectId> = db
+                    .objects
+                    .range(&tx, &(bound, Unbounded))
+                    .unwrap()
+                    .take(1024)
+                    .map(|row| row.unwrap().0.try_into().unwrap())
+                    .collect();
+                visited += ids.len();
+                for id in &ids {
+                    let live = db.live(&tx, id).unwrap().unwrap();
+                    if live.bindings != 0 {
+                        continue;
+                    }
+                    let keys: Vec<_> = db
+                        .records
+                        .prefix_iter(&tx, id)
+                        .unwrap()
+                        .map(|row| row.unwrap().0.to_vec())
+                        .collect();
+                    for key in keys {
+                        db.records.delete(&mut tx, &key).unwrap();
+                    }
+                    db.objects.delete(&mut tx, id).unwrap();
+                    db.control
+                        .delete(&mut tx, &unused_key(id, live.unused_since.unwrap()))
+                        .unwrap();
+                }
+                let done = ids.len() < 1024;
+                cursor = ids.last().copied();
+                if let Some(id) = cursor.filter(|_| !done) {
+                    db.control.put(&mut tx, b"gc-cursor", &id).unwrap();
+                } else {
+                    db.control.delete(&mut tx, b"gc-cursor").unwrap();
+                }
+                tx.commit().unwrap();
+                if done {
+                    break;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        let after = io();
+        eprintln!(
+            "indexed={indexed} elapsed={elapsed:?} visited={visited} commits={} read_bytes={} write_bytes={}",
+            db.env.info().last_txn_id - transaction,
+            after.0 - before.0,
+            after.1 - before.1
+        );
+        assert_eq!(
+            db.object_count(&db.env.read_txn().unwrap()).unwrap(),
+            16_384
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(
+            db.collect_with_retention(100, PRESSURE_BATCH, 0)
+                .unwrap()
+                .visited,
+            0
+        );
+        eprintln!("empty indexed collection: {:?}", start.elapsed());
+    }
+}
+
+#[test]
+fn gc_grace_and_progress_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = Database::open(dir.path()).unwrap();
@@ -598,13 +726,69 @@ fn gc_grace_and_cursor_survive_reopening() {
     }
     let db = Database::open(dir.path()).unwrap();
     let a = scope(&db, 1);
-    assert_eq!(db.collect(100 + RETENTION_MS, 1).unwrap().objects, 1); // resumes at object 2
+    assert_eq!(db.collect(100 + RETENTION_MS, 1).unwrap().objects, 1);
     for _ in 0..4 {
         db.collect(100 + RETENTION_MS, 1).unwrap();
     }
     let tx = a.read().unwrap();
     assert_eq!(db.object_count(&tx).unwrap(), 1);
     assert_eq!(db.binding_count(&tx, &[3; 32]).unwrap(), Some(1));
+}
+
+#[test]
+fn collection_visits_only_expired_unused_objects_and_preserves_resurrection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let a = scope(&db, 1);
+    for id in 1..=100 {
+        put(&a, &format!("f{id}"), 1, id, "Name");
+    }
+    a.detach("f1", 100).unwrap();
+    a.detach("f2", 200).unwrap();
+    a.detach("f3", 100).unwrap();
+    put(&a, "resurrected", 1, 3, "Name");
+    let collected = db.collect(100 + RETENTION_MS, 1000).unwrap();
+    assert_eq!((collected.visited, collected.objects), (1, 1));
+    assert_eq!(db.collect(100 + RETENTION_MS, 1000).unwrap().visited, 0);
+    assert_eq!(db.collect(200 + RETENTION_MS, 1000).unwrap().objects, 1);
+    let tx = a.read().unwrap();
+    assert_eq!(db.object_count(&tx).unwrap(), 98);
+    assert_eq!(
+        a.record(&tx, "resurrected", &[1]).unwrap(),
+        Some([3].as_slice())
+    );
+}
+
+#[test]
+fn unused_index_upgrade_resumes_after_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        let a = scope(&db, 1);
+        for id in 1..=4 {
+            put(&a, &format!("f{id}"), 1, id, "Name");
+            if id != 3 {
+                a.detach(&format!("f{id}"), 100).unwrap();
+            }
+        }
+        // Model the old database format, then interrupt its upgrade after one batch.
+        let mut tx = db.env.write_txn().unwrap();
+        {
+            let mut unused = db.control.prefix_iter_mut(&mut tx, UNUSED).unwrap();
+            while unused.next().transpose().unwrap().is_some() {
+                unsafe { unused.del_current().unwrap() };
+            }
+        }
+        db.control.delete(&mut tx, b"unused-index-ready").unwrap();
+        tx.commit().unwrap();
+        assert!(!db.index_unused_batch(2).unwrap());
+    }
+    let db = Database::open(dir.path()).unwrap();
+    db.collect_unused(100, true).unwrap();
+    let a = scope(&db, 1);
+    let tx = a.read().unwrap();
+    assert_eq!(db.object_count(&tx).unwrap(), 1);
+    assert_eq!(a.record(&tx, "f3", &[1]).unwrap(), Some([3].as_slice()));
 }
 
 #[test]

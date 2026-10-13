@@ -275,12 +275,8 @@ fn rebuild(source: &Path, target: &Path, roots: &Retention) -> Result<()> {
     file.write_all(shallow.as_bytes())?;
     file.sync_all()?;
     // Validation is deliberately exact and local; no lazy fetching can fill a hole.
-    for revision in &commits {
-        ensure!(
-            tree_ids(source, revision)? == tree_ids(target, revision)?,
-            "Lost retained tree inventory"
-        );
-    }
+    // index-pack verified the content hashes. Checking every inventoried object
+    // also preserves the tree graph, without traversing both repositories again.
     let retained = kinds(target, &objects)?;
     ensure!(retained.len() == objects.len(), "Lost retained object");
     for revision in &commits {

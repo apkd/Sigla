@@ -17,6 +17,8 @@ pub type ObjectId = [u8; 32];
 const FORMAT: &[u8] = super::ANALYSIS_VERSION.as_bytes();
 pub const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const BATCH: usize = 128;
+pub(crate) const PRESSURE_BATCH: usize = 4096;
+const UNUSED: &[u8] = b"unused:";
 static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Database>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -90,7 +92,7 @@ fn inspect_env(
 ) -> Result<crate::cache::compaction::Stats> {
     let stats = crate::cache::compaction::Stats {
         allocated: env.real_disk_size()?,
-        live: env.non_free_pages_size()?,
+        live: env.compacted_size()?,
     };
     let tx = env.read_txn()?;
     let control = env
@@ -202,6 +204,14 @@ fn manifest_key(scope: u64) -> Vec<u8> {
     key
 }
 
+fn unused_key(id: &ObjectId, at: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(UNUSED.len() + 8 + id.len());
+    key.extend_from_slice(UNUSED);
+    key.extend_from_slice(&at.to_be_bytes());
+    key.extend_from_slice(id);
+    key
+}
+
 impl Database {
     pub(crate) fn opened(path: &Path) -> Option<Arc<Self>> {
         OPEN.lock().unwrap().get(path).and_then(Weak::upgrade)
@@ -293,7 +303,9 @@ impl Database {
             occurrences.clear(&mut tx)?;
             globals.clear(&mut tx)?;
             control.put(&mut tx, b"format", FORMAT)?;
+            control.put(&mut tx, b"unused-index-ready", b"1")?;
         }
+        let needs_unused_index = control.get(&tx, b"unused-index-ready")?.is_none();
         tx.commit()?;
         let db = Arc::new(Self {
             env,
@@ -307,6 +319,9 @@ impl Database {
             globals,
             builds: Mutex::new(HashMap::new()),
         });
+        if needs_unused_index {
+            while !db.index_unused_batch(PRESSURE_BATCH)? {}
+        }
         opened.insert(path, Arc::downgrade(&db));
         Ok(db)
     }
@@ -417,6 +432,9 @@ impl Database {
             .live(tx, id)?
             .context("Binding points to missing object")?;
         if add {
+            if let Some(at) = live.unused_since {
+                self.control.delete(tx, &unused_key(id, at))?;
+            }
             live.bindings = live
                 .bindings
                 .checked_add(1)
@@ -429,13 +447,52 @@ impl Database {
                 .context("Object binding count underflow")?;
             if live.bindings == 0 {
                 live.unused_since = Some(now);
+                self.control.put(tx, &unused_key(id, now), &[])?;
             }
         }
         self.objects.put(tx, id, &encode(&live)?)?;
         Ok(())
     }
 
-    /// Bounded scan; the cursor persists across closing/reopening the environment.
+    /// Upgrade an existing database in bounded, restartable transactions.
+    fn index_unused_batch(&self, limit: usize) -> Result<bool> {
+        let mut tx = self.env.write_txn()?;
+        if self.control.get(&tx, b"unused-index-ready")?.is_some() {
+            return Ok(true);
+        }
+        let cursor = self.control.get(&tx, b"unused-index-cursor")?;
+        let start = cursor.map_or(Unbounded, Excluded);
+        let rows: Vec<(ObjectId, Liveness)> = self
+            .objects
+            .range(&tx, &(start, Unbounded))?
+            .take(limit)
+            .map(|row| {
+                let (id, live) = row?;
+                Ok((id.try_into()?, decode(live)?))
+            })
+            .collect::<Result<_>>()?;
+        for (id, live) in &rows {
+            if live.bindings == 0 {
+                let at = live
+                    .unused_since
+                    .context("Unused object has no retirement time")?;
+                self.control.put(&mut tx, &unused_key(id, at), &[])?;
+            }
+        }
+        let done = rows.len() < limit;
+        if done {
+            self.control.put(&mut tx, b"unused-index-ready", b"1")?;
+            self.control.delete(&mut tx, b"unused-index-cursor")?;
+            self.control.delete(&mut tx, b"gc-cursor")?;
+        } else {
+            self.control
+                .put(&mut tx, b"unused-index-cursor", &rows.last().unwrap().0)?;
+        }
+        tx.commit()?;
+        Ok(done)
+    }
+
+    /// Visit only expired unused objects; removing their index entries records progress.
     /// Old readers remain valid through LMDB's own MVCC, including after collection.
     pub fn collect(&self, now: u64, limit: usize) -> Result<Collected> {
         self.collect_with_retention(now, limit, RETENTION_MS)
@@ -447,49 +504,45 @@ impl Database {
         retention: u64,
     ) -> Result<Collected> {
         ensure!(limit > 0, "Collection batch must be nonzero");
+        let Some(cutoff) = now.checked_sub(retention) else {
+            return Ok(Collected::default());
+        };
         let mut tx = self.env.write_txn()?;
-        let cursor = self.control.get(&tx, b"gc-cursor")?.map(<[u8]>::to_vec);
-        let start = cursor.as_deref().map_or(Unbounded, Excluded);
-        let ids: Vec<ObjectId> = self
-            .objects
-            .range(&tx, &(start, Unbounded))?
+        let end = unused_key(&[u8::MAX; 32], cutoff);
+        let mut unused: Vec<(Vec<u8>, ObjectId)> = self
+            .control
+            .range(&tx, &(Included(UNUSED), Included(end.as_slice())))?
             .take(limit)
-            .map(|row| Ok(row?.0.try_into()?))
+            .map(|row| {
+                let key = row?.0;
+                Ok((key.to_vec(), key[UNUSED.len() + 8..].try_into()?))
+            })
             .collect::<Result<_>>()?;
+        // Object records are ordered by ID, independently of retirement time.
+        unused.sort_unstable_by_key(|(_, id)| *id);
         let mut result = Collected {
-            visited: ids.len(),
+            visited: unused.len(),
             ..Default::default()
         };
-        for id in &ids {
+        for (key, id) in &unused {
             let live = self
                 .live(&tx, id)?
                 .context("Object disappeared inside transaction")?;
-            if live.bindings != 0
-                || !live
-                    .unused_since
-                    .is_some_and(|at| now >= at && now - at >= retention)
             {
-                continue;
-            }
-            let keys: Vec<Vec<u8>> = self
-                .records
-                .prefix_iter(&tx, id)?
-                .map(|row| Ok(row?.0.to_vec()))
-                .collect::<Result<_>>()?;
-            for key in keys {
-                self.records.delete(&mut tx, &key)?;
+                let mut records = self.records.prefix_iter_mut(&mut tx, id)?;
+                while records.next().transpose()?.is_some() {
+                    // No borrowed key or value survives the cursor update.
+                    unsafe { records.del_current()? };
+                }
             }
             self.objects.delete(&mut tx, id)?;
+            self.control.delete(&mut tx, key)?;
             result.objects += 1;
             result.encoded_bytes += live.encoded_bytes;
         }
-        if ids.len() == limit {
-            self.control
-                .put(&mut tx, b"gc-cursor", ids.last().unwrap())?;
-        } else {
-            self.control.delete(&mut tx, b"gc-cursor")?;
+        if !unused.is_empty() {
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(result)
     }
 
@@ -497,11 +550,12 @@ impl Database {
         Ok(self.objects.len(tx)?)
     }
     pub fn collect_unused(&self, now: u64, pressure: bool) -> Result<()> {
-        let mut tx = self.env.write_txn()?;
-        self.control.delete(&mut tx, b"gc-cursor")?;
-        tx.commit()?;
         let retention = if pressure { 0 } else { RETENTION_MS };
-        while self.collect_with_retention(now, 1024, retention)?.visited == 1024 {}
+        while self
+            .collect_with_retention(now, PRESSURE_BATCH, retention)?
+            .visited
+            == PRESSURE_BATCH
+        {}
         Ok(())
     }
     pub fn binding_count(&self, tx: &RoTxn<'_>, id: &ObjectId) -> Result<Option<u64>> {
@@ -513,7 +567,7 @@ impl Database {
     pub fn disk_stats(&self) -> Result<crate::cache::compaction::Stats> {
         Ok(crate::cache::compaction::Stats {
             allocated: self.env.real_disk_size()?,
-            live: self.env.non_free_pages_size()?,
+            live: self.env.compacted_size()?,
         })
     }
     pub fn compact(self: Arc<Self>, cache: &Path) -> Result<u64> {
@@ -992,6 +1046,9 @@ impl Scope {
     pub fn mark_deleting(&self) -> Result<()> {
         let mut tx = self.database.env.write_txn()?;
         let mut info = self.info(&tx)?;
+        if info.phase == Phase::Deleting {
+            return Ok(());
+        }
         info.phase = Phase::Deleting;
         self.database
             .spaces

@@ -60,7 +60,7 @@ struct State {
 struct Pool {
     root: PathBuf,
     identity: Identity,
-    operation: Mutex<()>,
+    operation: Mutex<u64>,
     pending: Mutex<Vec<Weak<Root>>>,
 }
 
@@ -109,6 +109,60 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn visit_selectors(cache: &Path, mut visit: impl FnMut(super::manager::State)) -> Result<()> {
+    let directories = match fs::read_dir(cache.join("repositories")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in directories {
+        let entry = entry?;
+        ensure!(
+            entry.file_type()?.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_hexdigit())),
+            "Invalid selector cache directory"
+        );
+        let state = match read_json(&entry.path().join("state.json"), 256 * 1024 * 1024) {
+            Ok(state) => state,
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.context("Cannot establish Git retention roots")),
+        };
+        visit(state);
+    }
+    Ok(())
+}
+
+struct Snapshot {
+    pool: Arc<Pool>,
+    generation: u64,
+    roots: Retention,
+}
+impl Snapshot {
+    fn capture(pool: Arc<Pool>) -> Result<Option<Self>> {
+        let operation = match pool.operation.try_lock() {
+            Ok(operation) => operation,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(error) => return Err(anyhow::anyhow!("Git pool operation interrupted: {error}")),
+        };
+        let generation = *operation;
+        let roots = pool.pending_roots()?;
+        drop(operation);
+        Ok(Some(Self {
+            pool,
+            generation,
+            roots,
+        }))
+    }
+}
+
 impl Pool {
     fn open(cache: &Path, identity: &Identity) -> Result<Arc<Self>> {
         private_dir(&cache.join("git"))?;
@@ -125,7 +179,7 @@ impl Pool {
         let pool = Arc::new(Self {
             root: root.clone(),
             identity: identity.clone(),
-            operation: Mutex::new(()),
+            operation: Mutex::new(0),
             pending: Mutex::new(Vec::new()),
         });
         pools.insert(root, Arc::downgrade(&pool));
@@ -164,8 +218,7 @@ impl Pool {
         super::manager::write_json(&self.root.join("pool.json"), state)?;
         sync_dir(&self.root)
     }
-    /// Root capture MUST upgrade pending pins before reading persistent selectors.
-    fn roots(&self, cache: &Path) -> Result<Retention> {
+    fn pending_roots(&self) -> Result<Retention> {
         let pending: Vec<Arc<Root>> = {
             let mut pending = self
                 .pending
@@ -179,32 +232,12 @@ impl Pool {
         for root in &pending {
             roots.add(&root.revision, root.selected.iter().cloned());
         }
-        let directories = match fs::read_dir(cache.join("repositories")) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in directories {
-            let entry = entry?;
-            ensure!(
-                entry.file_type()?.is_dir()
-                    && entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_hexdigit())),
-                "Invalid selector cache directory"
-            );
-            let state_path = entry.path().join("state.json");
-            let state: super::manager::State = match read_json(&state_path, 256 * 1024 * 1024) {
-                Ok(state) => state,
-                Err(e)
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    continue;
-                }
-                Err(e) => return Err(e.context("Cannot establish Git retention roots")),
-            };
+        Ok(roots)
+    }
+    /// Root capture MUST upgrade pending pins before reading persistent selectors.
+    fn roots(&self, cache: &Path) -> Result<Retention> {
+        let mut roots = self.pending_roots()?;
+        visit_selectors(cache, |state| {
             // Keep even expired-on-paper/repair states until retirement actually removes them.
             if state.repository == self.identity {
                 roots.add(
@@ -212,7 +245,7 @@ impl Pool {
                     state.prepared.selected.values().cloned(),
                 );
             }
-        }
+        })?;
         Ok(roots)
     }
     fn pin(self: &Arc<Self>, prepared: &Prepared) -> Result<Pin> {
@@ -281,7 +314,13 @@ impl Pool {
         }
         Ok(())
     }
-    fn maybe_rebuild(&self, cache: &Path, state: &mut State, force: bool) -> Result<()> {
+    fn maybe_rebuild(
+        &self,
+        cache: &Path,
+        state: &mut State,
+        force: bool,
+        captured: Option<&Retention>,
+    ) -> Result<()> {
         let time = now();
         if !force && time.saturating_sub(state.replaced) < REBUILD_MS
             || time < state.retry_after
@@ -289,11 +328,18 @@ impl Pool {
         {
             return Ok(());
         }
-        let roots = self.roots(cache)?;
-        let retained = blake3::hash(&serde_json::to_vec(&roots)?)
+        let fresh;
+        let roots = match captured {
+            Some(roots) => roots,
+            None => {
+                fresh = self.roots(cache)?;
+                &fresh
+            }
+        };
+        let retained = blake3::hash(&serde_json::to_vec(roots)?)
             .to_hex()
             .to_string();
-        if force && state.retained.as_ref() == Some(&retained) {
+        if state.retained.as_ref() == Some(&retained) {
             return Ok(());
         }
         let result = (|| -> Result<()> {
@@ -301,7 +347,7 @@ impl Pool {
                 .prefix("rebuild-")
                 .tempdir_in(&self.root)?;
             let target = stage.path().join("git");
-            super::rebuild::execute(&self.root.join("current"), &target, &roots, cache)?;
+            super::rebuild::execute(&self.root.join("current"), &target, roots, cache)?;
             self.replace(&target)
         })();
         match result {
@@ -339,14 +385,18 @@ pub(super) fn acquire_git(request: &Request, cache: &Path) -> Result<(Prepared, 
     let repository =
         Repository::parse(&request.repository)?.context("Expected repository identity")?;
     let pool = Pool::open(cache, &repository.identity)?;
-    let _operation = pool
+    let mut operation = pool
         .operation
         .lock()
         .map_err(|_| anyhow::anyhow!("Git pool operation interrupted"))?;
+    // Even a failed acquisition can change the pool. Invalidate earlier root snapshots.
+    *operation = operation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("Git acquisition generation exhausted"))?;
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
     let mut state = pool.state()?;
-    pool.maybe_rebuild(cache, &mut state, false)?;
+    pool.maybe_rebuild(cache, &mut state, false, None)?;
     let mut request = request.clone();
     request.store = pool.root.join("current");
     // execute() is synchronous and does not return until its bounded child is stopped.
@@ -355,7 +405,7 @@ pub(super) fn acquire_git(request: &Request, cache: &Path) -> Result<(Prepared, 
     state.retained = None;
     pool.persist(&state)?;
     let pin = pool.pin(&prepared)?; // Still under operation lock: no unprotected handoff.
-    drop(_operation);
+    drop(operation);
     Ok((prepared, pin))
 }
 
@@ -377,7 +427,7 @@ pub(super) fn complete(request: &Request, cache: &Path, prepared: Prepared) -> R
 /// Invoke separately from selector expiration, on a blocking worker, without any
 /// branch/workspace state lock. Retained state files and pending pins protect roots.
 pub fn maintain(cache: &Path, identity: &Identity, idle_lifetime: Duration) -> Result<()> {
-    maintain_pool(cache, identity, idle_lifetime, false)
+    maintain_pool(cache, identity, idle_lifetime, false, None)
 }
 
 fn maintain_pool(
@@ -385,6 +435,7 @@ fn maintain_pool(
     identity: &Identity,
     idle_lifetime: Duration,
     pressure: bool,
+    snapshot: Option<&Snapshot>,
 ) -> Result<()> {
     if !cache
         .join("git")
@@ -394,7 +445,7 @@ fn maintain_pool(
         return Ok(());
     }
     let pool = Pool::open(cache, identity)?;
-    let _operation = match pool.operation.try_lock() {
+    let operation = match pool.operation.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
         Err(error) => return Err(anyhow::anyhow!("Git pool operation interrupted: {error}")),
@@ -402,7 +453,15 @@ fn maintain_pool(
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
     let mut state = pool.state()?;
-    if pool.roots(cache)?.is_empty()
+    let fresh;
+    let roots = match snapshot.filter(|snapshot| snapshot.generation == *operation) {
+        Some(snapshot) => &snapshot.roots,
+        None => {
+            fresh = pool.roots(cache)?;
+            &fresh
+        }
+    };
+    if roots.is_empty()
         && (pressure
             || now().saturating_sub(state.used)
                 >= idle_lifetime.as_millis().try_into().unwrap_or(u64::MAX))
@@ -410,7 +469,7 @@ fn maintain_pool(
         fs::remove_dir_all(&pool.root)?;
         return Ok(());
     }
-    pool.maybe_rebuild(cache, &mut state, pressure)
+    pool.maybe_rebuild(cache, &mut state, pressure, Some(roots))
 }
 
 #[cfg(test)]
@@ -432,6 +491,7 @@ fn maintain_pools(cache: &Path, idle_lifetime: Duration, pressure: bool) -> Resu
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    let mut snapshots = HashMap::new();
     for entry in entries {
         let entry = entry?;
         ensure!(entry.file_type()?.is_dir(), "Invalid Git pool directory");
@@ -472,7 +532,31 @@ fn maintain_pools(cache: &Path, idle_lifetime: Duration, pressure: bool) -> Resu
             entry.file_name().to_str() == Some(state.repository.storage_key().as_str()),
             "Git pool directory identity mismatch"
         );
-        maintain_pool(cache, &state.repository, idle_lifetime, pressure)?;
+        if let Some(snapshot) = Snapshot::capture(Pool::open(cache, &state.repository)?)? {
+            snapshots.insert(state.repository.storage_key(), snapshot);
+        }
+    }
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    // Capture every pending pin before reading any persistent selector. Acquisitions
+    // after capture change the generation and force a fresh per-pool snapshot.
+    visit_selectors(cache, |state| {
+        if let Some(snapshot) = snapshots.get_mut(&state.repository.storage_key()) {
+            snapshot.roots.add(
+                &state.prepared.revision,
+                state.prepared.selected.into_values(),
+            );
+        }
+    })?;
+    for snapshot in snapshots.values() {
+        maintain_pool(
+            cache,
+            &snapshot.pool.identity,
+            idle_lifetime,
+            pressure,
+            Some(snapshot),
+        )?;
     }
     Ok(())
 }
