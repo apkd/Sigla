@@ -307,6 +307,7 @@ async fn runtime_integer_span_parser_keeps_its_explicit_interface_origin() {
 #[tokio::test]
 async fn runtime_memmove_keeps_the_old_owner_and_path() {
     let fixture = Fixture::new();
+    let after = include_str!("fixtures/csharp-bytememops-after.cs");
     let parent = fixture.commit(
         &[(BUFFER, include_str!("fixtures/csharp-buffer-before.cs"))],
         &[],
@@ -315,15 +316,16 @@ async fn runtime_memmove_keeps_the_old_owner_and_path() {
     let child = fixture.commit(
         &[
             (BUFFER, include_str!("fixtures/csharp-buffer-after.cs")),
-            (
-                BYTE_MEM_OPS,
-                include_str!("fixtures/csharp-bytememops-after.cs"),
-            ),
+            (BYTE_MEM_OPS, after),
         ],
         &[&parent],
         "move byte operations",
     );
-    let selected = format!("method:SpanHelpers.Memmove path:{BYTE_MEM_OPS}");
+    // The NATIVEAOT attribute identifies one written header alternative.
+    let prefix = &after[..after.find("[System.Runtime.RuntimeExport(").unwrap()];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
+    let selected = format!("method:@{BYTE_MEM_OPS}:{line}:{column}");
     let shown = fixture
         .history(&child, &format!("show {child} {selected}"))
         .await;

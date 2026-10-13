@@ -1742,9 +1742,13 @@ async fn a_positional_anchor_does_not_discard_a_longer_conditional_header() {
     let f = Fixture::new();
     let source = "class Worker {\n#if FEATURE\n[Marker]\n#endif\nint Target() { return 1; }\n}\n";
     let root = f.commit(&[("Worker.cs", source)], &[], "conditional attribute");
-    let error = f.error(&root, "log @Worker.cs:5:6").await;
-    assert!(error.contains("Ambiguous anchor"), "{error}");
-    assert!(error.contains("2 declarations"), "{error}");
+    for selector in ["@Worker.cs:5:6", "method:@Worker.cs:5:6", "@Worker.cs:3:2"] {
+        let error = f.error(&root, &format!("log {selector}")).await;
+        assert!(error.contains("Ambiguous anchor"), "{error}");
+        assert!(error.contains("2 declarations"), "{error}");
+    }
+    let history = f.history(&root, "log method:@Worker.cs:3:2").await;
+    assert_eq!(ids(&history), [root.as_str()], "{history}");
 }
 
 #[tokio::test]

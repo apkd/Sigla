@@ -197,6 +197,104 @@ fn malformed_directives_and_unfinished_headers_remain_explicit() {
 }
 
 #[test]
+fn unsafe_expression_trees_keep_the_written_operands() {
+    let source = r#"unsafe class Worker {
+    static void Target(byte* pointer, ref int value) {
+        *pointer++ = 1;
+        Unsafe.AsRef(in value) = 2;
+        (Unsafe.AsRef(in value)) = 3;
+        Sink(ref *(byte*)pointer);
+        var sum = *pointer + 1;
+        *(pointer + 1) = 4;
+    }
+}"#;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    assert!(!tree.root_node().has_error());
+    let node = |text: &str| {
+        let start = source.find(text).unwrap();
+        let range = start..start + text.len();
+        let node = tree
+            .root_node()
+            .descendant_for_byte_range(range.start, range.end)
+            .unwrap();
+        assert_eq!(node.byte_range(), range);
+        node
+    };
+
+    let pointer = node("*pointer++");
+    assert_eq!(pointer.kind(), "prefix_unary_expression");
+    assert_eq!(
+        pointer.named_child(0).unwrap().kind(),
+        "postfix_unary_expression"
+    );
+    assert_eq!(pointer.named_child(0).unwrap(), node("pointer++"));
+
+    let assignment = node("Unsafe.AsRef(in value) = 2");
+    assert_eq!(assignment.kind(), "assignment_expression");
+    assert_eq!(
+        assignment.child_by_field_name("left").unwrap(),
+        node("Unsafe.AsRef(in value)")
+    );
+    assert_eq!(
+        assignment.child_by_field_name("left").unwrap().kind(),
+        "invocation_expression"
+    );
+    let parenthesized = node("(Unsafe.AsRef(in value)) = 3");
+    assert_eq!(
+        parenthesized.child_by_field_name("left").unwrap().kind(),
+        "parenthesized_expression"
+    );
+
+    let argument = node("ref *(byte*)pointer");
+    assert_eq!(argument.kind(), "argument");
+    let dereference = argument.named_child(0).unwrap();
+    assert_eq!(dereference, node("*(byte*)pointer"));
+    assert_eq!(dereference.kind(), "prefix_unary_expression");
+    let cast = dereference.named_child(0).unwrap();
+    assert_eq!(cast.kind(), "cast_expression");
+    let cast_type = cast.child_by_field_name("type").unwrap();
+    assert_eq!(cast_type.kind(), "pointer_type");
+    assert_eq!(&source[cast_type.byte_range()], "byte*");
+
+    let addition = node("*pointer + 1");
+    assert_eq!(addition.kind(), "binary_expression");
+    assert_eq!(
+        addition.child_by_field_name("left").unwrap().kind(),
+        "prefix_unary_expression"
+    );
+    let arithmetic = node("*(pointer + 1)");
+    assert_eq!(arithmetic.kind(), "prefix_unary_expression");
+    assert_eq!(
+        arithmetic.named_child(0).unwrap().kind(),
+        "parenthesized_expression"
+    );
+}
+
+#[test]
+fn unfinished_unsafe_expressions_still_report_parse_errors() {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .unwrap();
+    for body in ["return +;", "*pointer++ = ;", "Sink(ref *(byte*) );"] {
+        let source = format!("unsafe class Worker {{ void Target(byte* pointer) {{ {body} }} }}");
+        assert!(parser.parse(&source, None).unwrap().root_node().has_error());
+        let facts = extract(&source).unwrap();
+        assert!(facts.incomplete.is_some());
+        assert!(
+            facts
+                .declarations
+                .iter()
+                .all(|declaration| declaration.uncertain)
+        );
+    }
+}
+
+#[test]
 fn legal_unsafe_expressions_keep_historical_member_boundaries() {
     let source = r#"unsafe class Worker {
     static void Target(byte* pointer, ref int value) {
