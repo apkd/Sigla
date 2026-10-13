@@ -218,12 +218,18 @@ jobs:
       - name: Build release binary
         env:
           VERSION: ${{ needs.plan-release.outputs.version }}
+          CARGO_PROFILE_RELEASE_DEBUG: '2'
+          CARGO_PROFILE_RELEASE_STRIP: none
         run: |
           sed -i '/^\[package\]$/,/^\[dependencies\]$/s/^version = ".*"$/version = "'"$VERSION"'"/' Cargo.toml
           sed -i '/^name = "sigla"$/,/^\[\[package\]\]$/s/^version = ".*"$/version = "'"$VERSION"'"/' Cargo.lock
           cargo build --locked --release --bin sigla
           mkdir -p release-assets
           cp "target/$CARGO_BUILD_TARGET/release/sigla" release-assets/sigla-linux-${{ matrix.arch }}
+          executable="release-assets/sigla-linux-${{ matrix.arch }}"
+          objcopy --only-keep-debug --compress-debug-sections=zlib-gabi "$executable" "$executable.debug"
+          strip --strip-all "$executable"
+          objcopy --add-gnu-debuglink="$executable.debug" "$executable"
       - name: Smoke-test the release binary
         env:
           VERSION: ${{ needs.plan-release.outputs.version }}
@@ -276,7 +282,9 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: sigla-linux-${{ matrix.arch }}
-          path: release-assets/sigla-linux-${{ matrix.arch }}
+          path: |
+            release-assets/sigla-linux-${{ matrix.arch }}
+            release-assets/sigla-linux-${{ matrix.arch }}.debug
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -383,17 +391,15 @@ jobs:
             gh api --paginate --slurp "$api/releases/$archive_id/assets?per_page=100" > "$work/assets.json" || return
             jq -c --arg name "$name" '.[][] | select(.name == $name)' "$work/assets.json"
           }
-          jq -n --arg version "$VERSION" '{version: $version, platforms: {}}' > "$work/release.json"
-          for arch in x64 arm64; do
-            binary="release-assets/sigla-linux-$arch"
-            name="sigla-$VERSION-linux-$arch"
-            test -s "$binary" || fail "Missing or empty binary: $binary"
-            digest="sha256:$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          archive_asset() {
+            local file="$1" name="$2" digest asset recorded_digest asset_id
+            test -s "$file" || fail "Missing or empty asset: $file"
+            digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
             asset="$(find_asset)"
             if [[ -z "$asset" ]]; then
               [[ "$(jq '[.[][]] | length' "$work/assets.json")" -lt 1000 ]] \
                 || fail "The archive has reached GitHub's 1,000-asset limit. Create a new archive before publishing."
-              cp "$binary" "$work/$name"
+              cp "$file" "$work/$name"
               # upload once; an existing version is never replaced.
               gh release upload build-archive "$work/$name" --repo "$GITHUB_REPOSITORY"
               asset="$(find_asset)"
@@ -407,6 +413,13 @@ jobs:
               recorded_digest="sha256:$(sha256sum "$work/download" | cut -d ' ' -f 1)"
             fi
             [[ "$recorded_digest" == "$digest" ]] || fail "Archived bytes differ: $name. Nothing will be overwritten."
+          }
+          jq -n --arg version "$VERSION" '{version: $version, platforms: {}}' > "$work/release.json"
+          for arch in x64 arm64; do
+            binary="release-assets/sigla-linux-$arch"
+            name="sigla-$VERSION-linux-$arch"
+            archive_asset "$binary" "$name"
+            archive_asset "$binary.debug" "$name.debug"
 
             case "$arch" in
               x64) system=x86_64-linux ;;
@@ -562,7 +575,8 @@ jobs:
       - name: Create or update rolling release
         if: steps.verify.outputs.changed == 'false'
         run: |
-          files=(release-assets/sigla-linux-x64 release-assets/sigla-linux-arm64)
+          files=(release-assets/sigla-linux-x64 release-assets/sigla-linux-x64.debug
+                 release-assets/sigla-linux-arm64 release-assets/sigla-linux-arm64.debug)
           for file in "${files[@]}"; do test -s "$file"; done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -579,7 +593,7 @@ jobs:
           mapfile -t published < <(jq -r '.assets[].name' <<< "$assets")
           for asset in "${published[@]}"; do
             case "$asset" in
-              sigla-linux-x64|sigla-linux-arm64) ;;
+              sigla-linux-x64|sigla-linux-x64.debug|sigla-linux-arm64|sigla-linux-arm64.debug) ;;
               *) gh release delete-asset release "$asset" --yes ;;
             esac
           done
