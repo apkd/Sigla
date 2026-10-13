@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     ops::Range,
     path::Path,
@@ -400,6 +400,51 @@ pub(super) fn same_tokens(a: &str, b: &str) -> bool {
         .map(|m| m.as_str())
         .eq(TOKENS.find_iter(b).map(|m| m.as_str()))
 }
+/// Corroborate a whole edited body with 80% ordered token coverage and four
+/// disjoint 16-token anchors unique in both bodies. Repetition and overlapping
+/// windows cannot inflate the independent source evidence.
+pub(super) fn ordered_body_anchors(a: &str, b: &str) -> bool {
+    const WIDTH: usize = 16;
+    const REQUIRED: usize = 4;
+    let at = tokens(a);
+    let bt = tokens(b);
+    if at.len().min(bt.len()) < WIDTH * REQUIRED {
+        return false;
+    }
+    let aw = words(a, &at);
+    let bw = words(b, &bt);
+    let pairs = sequence::matches(&aw, &bw);
+    if pairs.len() * 100 < aw.len().max(bw.len()) * 80 {
+        return false;
+    }
+    let mut counts = BTreeMap::<&[&str], (usize, usize)>::new();
+    for window in aw.windows(WIDTH) {
+        counts.entry(window).or_default().0 += 1;
+    }
+    for window in bw.windows(WIDTH) {
+        if let Some(count) = counts.get_mut(window) {
+            count.1 += 1;
+        }
+    }
+    let (mut end, mut count) = (0, 0);
+    for run in pairs.windows(WIDTH) {
+        let (i, j) = run[0];
+        // Alignment is strictly increasing on both sides: these endpoints
+        // require consecutive tokens, and disjoint runs stay disjoint in both.
+        if i < end || run[WIDTH - 1] != (i + WIDTH - 1, j + WIDTH - 1) {
+            continue;
+        }
+        if counts.get(&aw[i..i + WIDTH]) == Some(&(1, 1)) {
+            count += 1;
+            if count == REQUIRED {
+                return true;
+            }
+            end = i + WIDTH;
+        }
+    }
+    false
+}
+
 pub(super) fn similarity(a: &str, b: &str) -> usize {
     let at = tokens(a);
     let bt = tokens(b);
@@ -461,6 +506,44 @@ pub(super) fn line_range(text: &str, start: usize, end: usize) -> Result<Range<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edited_body_anchors_require_whole_ordered_nonrepeating_source() {
+        let check = |a: &str, b: &str, expected: bool| {
+            assert_eq!(ordered_body_anchors(a, b), expected);
+            assert_eq!(ordered_body_anchors(b, a), expected);
+        };
+        let tokens: Vec<_> = (0..128).map(|i| format!("token{i}")).collect();
+        let original = tokens.join(" ");
+        let edited = original.replace("token64", "changed");
+        check(&original, &edited, true);
+        check(&original, &edited.replace(' ', "\r\n"), true);
+
+        let reordered = tokens
+            .chunks(32)
+            .rev()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        check(&original, &reordered, false);
+        check(
+            &original,
+            &format!("{edited} {}", "unrelated ".repeat(128)),
+            false,
+        );
+
+        let template = "var adjusted = value + 10; var scaled = adjusted * 3; return scaled ^ 127;";
+        check(template, &template.replace("127", "255"), false);
+        let repeated = template.repeat(20);
+        let changed = repeated.replacen("127", "255", 1);
+        check(&repeated, &changed, false);
+
+        // Many unique windows in one short prefix are still overlapping evidence.
+        let prefix = tokens[..20].join(" ");
+        let padded = format!("{prefix} {}", "repeat ".repeat(256));
+        check(&format!("{padded} old"), &format!("{padded} new"), false);
+    }
 
     #[test]
     fn exact_body_evidence_requires_tokens_not_just_equal_trigram_sets() {

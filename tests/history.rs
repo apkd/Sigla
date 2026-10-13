@@ -3590,3 +3590,77 @@ async fn history_selects_native_and_document_files_supported_by_sigla() {
         assert!(body(&shown).contains(path), "{shown}");
     }
 }
+
+#[tokio::test]
+async fn edited_body_anchors_preserve_whole_origins_and_competition() {
+    let member = r#"    int Original(int value) {
+        var adjusted = value + 10;
+        var scaled = adjusted * 3;
+        var rotated = (scaled << 5) | (scaled >> 27);
+        var combined = rotated + value;
+        var spread = combined ^ (combined >> 16);
+        var avalanche = spread * 668265263;
+        var folded = avalanche ^ (avalanche >> 13);
+        return folded & 65535;
+    }
+"#;
+    let before = format!("class Before {{\n{member}}}\n");
+    let rival = before.replace("class Before", "class Rival");
+    // Both owner and member names change; there are no sibling witnesses.
+    let after = before
+        .replace("class Before", "class After")
+        .replace("Original(", "Relocated(")
+        .replace("+ 10", "+ 11");
+    for case in ["move", "tie", "copy"] {
+        let f = Fixture::new();
+        let mut old_files = vec![("before.cs", before.as_str())];
+        let mut new_files = vec![("after.cs", after.as_str())];
+        if case == "tie" {
+            old_files.push(("rival.cs", &rival));
+        }
+        if case == "copy" {
+            new_files.push(("before.cs", &before));
+        } else {
+            // Direct continuations must settle without fetching unchanged origins.
+            old_files.push(("unrelated.cs", "\0"));
+            new_files.push(("unrelated.cs", "\0"));
+        }
+        let root = f.commit(&old_files, &[], "initial implementations");
+        let tip = f.commit(&new_files, &[&root], "revised implementation");
+        let selected = "method:After.Relocated(int) path:after.cs";
+        let history = f.history(&tip, &format!("log {selected}")).await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+        if case == "copy" {
+            assert!(history.contains("~copy before.cs→after.cs"), "{history}");
+            assert!(!history.contains("move"), "{history}");
+        } else {
+            assert!(history.contains("~move before.cs→after.cs"), "{history}");
+            assert!(!history.contains("copy"), "{history}");
+        }
+        if case == "tie" {
+            assert!(history.contains("~move rival.cs→after.cs"), "{history}");
+            assert!(history.contains("competing predecessors"), "{history}");
+        }
+        let predecessor = f.history(&tip, &format!("show {root} {selected}")).await;
+        let expected = format!("+{}", member.trim().replace('\n', "\n+"));
+        assert!(body(&predecessor).contains(&expected), "{predecessor}");
+        assert!(!body(&predecessor).contains("# fragment "), "{predecessor}");
+        assert_eq!(
+            body(&predecessor).matches("diff --git ").count(),
+            if case == "tie" { 2 } else { 1 },
+            "{predecessor}"
+        );
+        if case == "move" {
+            let shown = f
+                .history(
+                    &root,
+                    &format!("diff {root}..{tip} method:Before.Original(int) path:before.cs"),
+                )
+                .await;
+            assert!(body(&shown).contains("--- a/before.cs"), "{shown}");
+            assert!(body(&shown).contains("+++ b/after.cs"), "{shown}");
+            assert!(body(&shown).contains("Relocated("), "{shown}");
+            assert!(!body(&shown).contains("/dev/null"), "{shown}");
+        }
+    }
+}

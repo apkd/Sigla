@@ -988,6 +988,19 @@ impl Tracker {
                 // A reused header must not beat a distinctive unchanged body.
                 // Trigram similarity alone can be 100 for non-identical token streams.
                 let exact = !small && sim == 100 && regions::same_tokens(a, b);
+                // A substantial edited body can establish a member relocation
+                // without establishing an owner move. Share the corroboration
+                // band with sibling evidence, preserving the exact-local bound.
+                let implementation = !same_owner
+                    && !group
+                    && !exact
+                    && !region.fragment
+                    && matches!(
+                        region.kind.as_str(),
+                        "method" | "function" | "constructor" | "operator"
+                    )
+                    && sim >= 70
+                    && regions::ordered_body_anchors(a, b);
                 let mut score = sim / 2
                     + usize::from(exact) * 24
                     + usize::from(same_path) * 8
@@ -995,12 +1008,14 @@ impl Tracker {
                     + usize::from(same_name || header) * 12
                     + usize::from(signature) * 10
                     + usize::from(overlap) * 18
-                    + usize::from(group) * 12
+                    + usize::from(group || implementation) * 12
                     + usize::from(callers) * 24;
                 let mut reason = if callers {
                     "caller replacement+owner+range"
                 } else if header {
                     "header+body+owner+range"
+                } else if implementation {
+                    "body+ordered source anchors"
                 } else {
                     "body+owner+range"
                 };
