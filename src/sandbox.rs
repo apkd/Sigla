@@ -52,7 +52,7 @@ pub fn local_command(
     }
     command
         .args([
-            // .NET named mutexes use this fixed path, ignoring TMPDIR.
+            // Older .NET runtimes use this fixed path, ignoring TMPDIR.
             "--tmpfs",
             "/tmp/.dotnet",
             // Precreate both roots: .NET otherwise initializes them by renaming
@@ -91,6 +91,9 @@ pub fn local_command(
         .arg("--")
         .arg(host)
         .env("TMPDIR", cache.join("tmp"))
+        // Newer .NET runtimes place named mutexes under XDG_RUNTIME_DIR.
+        // The job directory is private, writable, and removed after discovery.
+        .env("XDG_RUNTIME_DIR", job)
         .env("DOTNET_CLI_HOME", cache.join("home"))
         .env("NUGET_PACKAGES", packages.path())
         .env("NUGET_HTTP_CACHE_PATH", cache.join("http-cache"))
@@ -550,6 +553,7 @@ mod tests {
                     done
                     : > /tmp/.dotnet/shm/mutex
                     : > /tmp/.dotnet/lockfiles/lock
+                    : > "$XDG_RUNTIME_DIR/runtime-file"
                     : > "$TMPDIR/scratch"
                     : > "$NUGET_PACKAGES/package"
                     : > "$1/result"

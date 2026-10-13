@@ -186,6 +186,34 @@ fn remote_discovery_confines_generated_files_and_hides_host_files() {
 }
 
 #[test]
+fn restore_with_fresh_home_and_inaccessible_host_runtime_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "msbuild::sdk_membership_generated_inputs_and_unbuilt_references",
+            "--nocapture",
+        ])
+        .env("HOME", home.path())
+        .env("DOTNET_CLI_HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = output.unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn sdk_membership_generated_inputs_and_unbuilt_references() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
