@@ -357,7 +357,7 @@ fn deleting_namespace_resumes_and_never_reuses_numeric_id() {
             .is_err()
     );
     let old = db.existing([1; 32]).unwrap().unwrap();
-    assert!(old.delete_batch(100, 1).unwrap());
+    while !old.delete_batch(100, 1).unwrap() {}
     let new = scope(&db, 1);
     assert_ne!(old_id, new.id);
     assert!(
@@ -373,6 +373,187 @@ fn deleting_namespace_resumes_and_never_reuses_numeric_id() {
     );
     let tx = new.read().unwrap();
     assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(0));
+}
+
+#[test]
+fn retirement_preserves_shared_objects_and_other_workspace_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let retiring_id;
+    {
+        let db = Database::open(dir.path()).unwrap();
+        let retiring = scope(&db, 1);
+        let retained = scope(&db, 2);
+        retiring_id = retiring.id;
+        put(&retiring, "one", 1, 7, "Shared");
+        put(&retiring, "two", 1, 7, "Shared");
+        put(&retiring, "unique", 1, 8, "Unique");
+        put(&retained, "keep", 1, 7, "Shared");
+        clean(&retiring, &["one", "two", "unique"]);
+        clean(&retained, &["keep"]);
+        retiring.mark_deleting().unwrap();
+        assert!(!retiring.delete_batch(100, 1).unwrap());
+    }
+    // Reopen between every batch, including the transition to binding removal.
+    loop {
+        let db = Database::open(dir.path()).unwrap();
+        let retiring = db.existing([1; 32]).unwrap().unwrap();
+        if retiring.delete_batch(100, 1).unwrap() {
+            break;
+        }
+    }
+    let db = Database::open(dir.path()).unwrap();
+    db.collect_unused(100, true).unwrap();
+    let retained = scope(&db, 2);
+    assert!(db.existing([1; 32]).unwrap().is_none());
+    let tx = retained.query_read().unwrap();
+    assert!(
+        db.control
+            .get(&tx, &manifest_key(retiring_id))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
+    assert_eq!(db.binding_count(&tx, &[8; 32]).unwrap(), None);
+    for table in [db.declarations, db.occurrences, db.globals] {
+        assert!(
+            table
+                .prefix_iter(&tx, &retiring_id.to_be_bytes())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(
+            table
+                .prefix_iter(&tx, &retained.id.to_be_bytes())
+                .unwrap()
+                .next()
+                .is_some()
+        );
+    }
+    assert_eq!(
+        retained
+            .candidates(&tx, "Shared", false, true, |_| false)
+            .unwrap(),
+        BTreeSet::from(["keep".into()])
+    );
+    assert_eq!(
+        retained
+            .candidates(&tx, "Use", true, true, |_| false)
+            .unwrap(),
+        BTreeSet::from(["keep".into()])
+    );
+    assert!(db.record(&tx, &[7; 32], &[]).unwrap().is_some());
+}
+
+#[test]
+fn retirement_does_not_decode_analysis_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let retiring = scope(&db, 1);
+    put(&retiring, "file", 1, 7, "Name");
+    retiring.mark_deleting().unwrap();
+    let mut tx = db.env.write_txn().unwrap();
+    db.records
+        .put(&mut tx, &record_key(&[7; 32], &[]), &[255])
+        .unwrap();
+    tx.commit().unwrap();
+    while !retiring.delete_batch(100, 1).unwrap() {}
+    db.collect_unused(100, true).unwrap();
+    assert!(db.workspaces().unwrap().is_empty());
+    assert_eq!(db.object_count(&db.env.read_txn().unwrap()).unwrap(), 0);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "manual comparison with the former per-file retirement algorithm"]
+fn retirement_benchmark() {
+    fn io() -> (u64, u64) {
+        let text = std::fs::read_to_string("/proc/self/io").unwrap();
+        let value = |key| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        };
+        (value("read_bytes:"), value("write_bytes:"))
+    }
+    for per_file in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::open(dir.path()).unwrap();
+            let retiring = scope(&db, 1);
+            for i in 0..512 {
+                let id = (i % 4) as u8;
+                retiring
+                    .install(
+                        &format!("file-{i}"),
+                        vec![1],
+                        [id; 32],
+                        100,
+                        || Ok(()),
+                        || {
+                            let mut records = BTreeMap::new();
+                            let declarations: BTreeSet<_> = (0..512)
+                                .map(|n| format!("Shared{n}"))
+                                .chain((0..16).map(|n| format!("Object{id}Name{n}")))
+                                .collect();
+                            let names = crate::store::format::write(
+                                &[],
+                                None,
+                                true,
+                                &Names {
+                                    occurrences: declarations.clone(),
+                                    declarations,
+                                    global_imports: true,
+                                },
+                                &mut records,
+                            )?;
+                            Ok(Encoded { names, records })
+                        },
+                    )
+                    .unwrap();
+            }
+            retiring.mark_deleting().unwrap();
+        }
+        let db = Database::open(dir.path()).unwrap();
+        let retiring = db.existing([1; 32]).unwrap().unwrap();
+        let before = io();
+        let start = std::time::Instant::now();
+        if per_file {
+            loop {
+                let mut tx = db.env.write_txn().unwrap();
+                for file in retiring.files_after(&tx, None, 128).unwrap() {
+                    retiring.detach_in(&mut tx, &file, 100).unwrap();
+                }
+                let done = retiring.files_after(&tx, None, 1).unwrap().is_empty();
+                if done {
+                    db.control
+                        .delete(&mut tx, &manifest_key(retiring.id))
+                        .unwrap();
+                    db.spaces.delete(&mut tx, &retiring.fingerprint).unwrap();
+                }
+                tx.commit().unwrap();
+                if done {
+                    break;
+                }
+            }
+        } else {
+            while !retiring.delete_batch(100, 128).unwrap() {}
+        }
+        let elapsed = start.elapsed();
+        let after = io();
+        eprintln!(
+            "per_file={per_file} elapsed={elapsed:?} read_bytes={} write_bytes={}",
+            after.0 - before.0,
+            after.1 - before.1
+        );
+        assert!(db.workspaces().unwrap().is_empty());
+        for table in [db.declarations, db.occurrences, db.globals] {
+            assert!(table.is_empty(&db.env.read_txn().unwrap()).unwrap());
+        }
+    }
 }
 
 #[test]

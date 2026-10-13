@@ -1007,9 +1007,38 @@ impl Scope {
             self.info(&tx)?.phase == Phase::Deleting,
             "Namespace is not retiring"
         );
-        let files = self.files_after(&tx, None, limit)?;
+        // Retire whole posting lists without decoding each file's analysis.
+        // Remaining rows are the resume cursor; commit indexes before bindings.
+        let mut remaining = limit;
+        for table in [
+            self.database.declarations,
+            self.database.occurrences,
+            self.database.globals,
+        ] {
+            let keys: Vec<_> = table
+                .prefix_iter(&tx, &self.id.to_be_bytes())?
+                .move_between_keys()
+                .take(remaining)
+                .map(|row| Ok(row?.0.to_vec()))
+                .collect::<Result<_>>()?;
+            for key in &keys {
+                table.delete(&mut tx, key)?;
+            }
+            remaining -= keys.len();
+            if remaining == 0 {
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
+        let files = self.files_after(&tx, None, remaining)?;
         for file in files {
-            self.detach_in(&mut tx, &file, now)?;
+            let binding = self
+                .binding(&tx, &file)?
+                .context("Binding disappeared inside transaction")?;
+            self.database
+                .bindings
+                .delete(&mut tx, &scope_key(self.id, file.as_bytes()))?;
+            self.database.adjust(&mut tx, &binding.object, false, now)?;
         }
         let done = self.files_after(&tx, None, 1)?.is_empty();
         if done {

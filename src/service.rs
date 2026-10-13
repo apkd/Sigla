@@ -230,18 +230,16 @@ impl App {
         *startup = Some(receive);
         {
             let weak = Arc::downgrade(self);
-            let interval = self
-                .remote
-                .as_ref()
-                .map_or(std::time::Duration::from_secs(60), |remote| {
-                    remote.options.maintenance_interval()
-                });
+            let collection_interval = std::time::Duration::from_secs(15 * 60);
+            let interval = self.remote.as_ref().map_or(collection_interval, |remote| {
+                remote.options.maintenance_interval()
+            });
             tokio::spawn(async move {
                 let mut last_collection = Instant::now();
                 loop {
                     tokio::time::sleep(interval).await;
                     let Some(app) = weak.upgrade() else { return };
-                    let collect = last_collection.elapsed() >= std::time::Duration::from_secs(60);
+                    let collect = last_collection.elapsed() >= collection_interval;
                     if let Some(remote) = &app.remote {
                         // Fetch failures stay on the branch preparation state, never on valid query results.
                         match remote.maintain(collect).await {

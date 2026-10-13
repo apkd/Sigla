@@ -282,21 +282,19 @@ impl App {
         maintenance_stage("blob collection", || {
             self.blobs.collect_with_pressure(pressure)
         })?;
+        let mut after = blobs::allocated(&self.cache)?;
         // Freed LMDB pages are reusable. Rewriting the database and discarding
         // loaded workspaces is only needed if other cleanup did not free enough.
-        if self
-            .cache_limits
-            .pressured(blobs::allocated(&self.cache)?, Disk::read(&self.cache)?)
+        if self.cache_limits.pressured(after, Disk::read(&self.cache)?)
+            && maintenance_stage("analysis compaction", || self.compact_analysis())? > 0
         {
-            maintenance_stage("analysis compaction", || self.compact_analysis())?;
+            after = blobs::allocated(&self.cache)?;
         }
         candidates.retain(|candidate| !candidate.expired && !candidate.pinned);
-        let mut remaining = self
-            .cache_limits
-            .reclaim(blobs::allocated(&self.cache)?, Disk::read(&self.cache)?);
+        let mut remaining = self.cache_limits.reclaim(after, Disk::read(&self.cache)?);
         let mut candidates = candidates.into_iter();
         while remaining > 0 {
-            let allocated = blobs::allocated(&self.cache)?;
+            let allocated = after;
             let mut estimated = 0;
             let mut evicted = false;
             for candidate in candidates.by_ref() {
@@ -317,14 +315,15 @@ impl App {
                 crate::repository::cache::reclaim(&self.cache)
             })?;
             maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
-            if allocated.saturating_sub(blobs::allocated(&self.cache)?) < remaining {
-                maintenance_stage("analysis compaction", || self.compact_analysis())?;
+            after = blobs::allocated(&self.cache)?;
+            if allocated.saturating_sub(after) < remaining
+                && maintenance_stage("analysis compaction", || self.compact_analysis())? > 0
+            {
+                after = blobs::allocated(&self.cache)?;
             }
-            remaining =
-                remaining.saturating_sub(allocated.saturating_sub(blobs::allocated(&self.cache)?));
+            remaining = remaining.saturating_sub(allocated.saturating_sub(after));
         }
         self.owners.lock().unwrap().flush()?;
-        let after = blobs::allocated(&self.cache)?;
         let disk = Disk::read(&self.cache)?;
         tracing::info!(
             allocated = after,
