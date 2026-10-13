@@ -257,9 +257,10 @@ async fn runtime_guid_generalization_keeps_the_written_predecessor() {
 
 #[tokio::test]
 async fn runtime_guid_byte_overload_keeps_the_character_implementation_origin() {
-    let (fixture, _, child) = source_pair(
+    let before = include_str!("fixtures/csharp-guid-utf8-before.cs");
+    let (fixture, parent, child) = source_pair(
         GUID,
-        include_str!("fixtures/csharp-guid-utf8-before.cs"),
+        before,
         include_str!("fixtures/csharp-guid-utf8-after.cs"),
     );
     let selected = format!("method:Guid.Parse(ReadOnlySpan<byte>) path:{GUID}");
@@ -279,6 +280,22 @@ async fn runtime_guid_byte_overload_keeps_the_character_implementation_origin() 
         .history(&child, &format!("log {selected} limit:1"))
         .await;
     assert!(log.contains("copy"), "{log}");
+    whole_predecessor(
+        &fixture,
+        &child,
+        &parent,
+        &selected,
+        before,
+        "public static Guid Parse(ReadOnlySpan<char>",
+    )
+    .await;
+    let retained = fixture
+        .history(
+            &child,
+            &format!("log method:Guid.Parse(ReadOnlySpan<char>) path:{GUID}"),
+        )
+        .await;
+    assert_eq!(ids(&retained), [parent.as_str()], "{retained}");
 }
 
 #[tokio::test]
@@ -307,12 +324,9 @@ async fn runtime_integer_span_parser_keeps_its_explicit_interface_origin() {
 #[tokio::test]
 async fn runtime_memmove_keeps_the_old_owner_and_path() {
     let fixture = Fixture::new();
+    let before = include_str!("fixtures/csharp-buffer-before.cs");
     let after = include_str!("fixtures/csharp-bytememops-after.cs");
-    let parent = fixture.commit(
-        &[(BUFFER, include_str!("fixtures/csharp-buffer-before.cs"))],
-        &[],
-        "before move",
-    );
+    let parent = fixture.commit(&[(BUFFER, before)], &[], "before move");
     let child = fixture.commit(
         &[
             (BUFFER, include_str!("fixtures/csharp-buffer-after.cs")),
@@ -321,6 +335,13 @@ async fn runtime_memmove_keeps_the_old_owner_and_path() {
         &[&parent],
         "move byte operations",
     );
+    let ambiguous = fixture
+        .error(
+            &child,
+            &format!("show {child} method:Memmove path:{BYTE_MEM_OPS}"),
+        )
+        .await;
+    assert!(ambiguous.contains("Ambiguous anchor"), "{ambiguous}");
     // The NATIVEAOT attribute identifies one written header alternative.
     let prefix = &after[..after.find("[System.Runtime.RuntimeExport(").unwrap()];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
@@ -333,4 +354,15 @@ async fn runtime_memmove_keeps_the_old_owner_and_path() {
     assert!(shown.contains(&format!("b/{BYTE_MEM_OPS}")), "{shown}");
     assert!(shown.contains("# move "), "{shown}");
     assert!(!shown.contains("/dev/null"), "{shown}");
+    assert!(shown.contains("# rename System.Buffer.Memmove("), "{shown}");
+    assert!(!shown.contains("# fragment"), "{shown}");
+    whole_predecessor(
+        &fixture,
+        &child,
+        &parent,
+        &selected,
+        before,
+        "internal static unsafe void Memmove(",
+    )
+    .await;
 }

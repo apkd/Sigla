@@ -2653,6 +2653,108 @@ async fn a_changed_file_copy_origin_does_not_hide_an_unchanged_origin() {
     }
 }
 
+fn fragment_competition_members() -> (String, String, String) {
+    let original = continuation_member("Worker.cs", "Read");
+    let copied = original
+        .replace("int value", "short input")
+        .replace("= value +", "= input +");
+    let container = continuation_member("Worker.cs", "Container").replace(
+        "        var adjusted",
+        "        Audit(\"one\"); Audit(\"two\"); Audit(\"three\"); Audit(\"four\"); Audit(\"five\");\n        var adjusted",
+    );
+    (original, copied, container)
+}
+
+#[tokio::test]
+async fn whole_copy_origin_outranks_boilerplate_fragments() {
+    let path = "Worker.cs";
+    let (original, copied, container) = fragment_competition_members();
+    let before = continuation_source(path, &format!("{original}{container}"));
+    let after = continuation_source(path, &format!("{original}{copied}{container}"));
+    let f = Fixture::new();
+    let root = f.commit(&[(path, &before)], &[], "initial implementations");
+    let tip = f.commit(&[(path, &after)], &[&root], "additional member");
+    let selected = "method:Worker.Read(short)";
+    let history = f.history(&tip, &format!("log {selected}")).await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    assert!(history.contains("copy"), "{history}");
+    let retained = f.history(&tip, "log method:Worker.Read(int)").await;
+    assert_eq!(ids(&retained), [root.as_str()], "{retained}");
+    let shown = f.history(&tip, &format!("show {tip} {selected}")).await;
+    assert!(!body(&shown).contains("# fragment "), "{shown}");
+    assert!(!body(&shown).contains("/dev/null"), "{shown}");
+    let predecessor = f.history(&tip, &format!("show {root} {selected}")).await;
+    let expected = format!("+{}", original.trim().replace('\n', "\n+"));
+    assert!(body(&predecessor).contains(&expected), "{predecessor}");
+    assert_eq!(body(&predecessor).matches("diff --git ").count(), 1);
+}
+
+#[tokio::test]
+async fn whole_copy_origin_ties_survive_higher_scoring_local_fragments() {
+    let path = "Worker.cs";
+    let (original, copied, container) = fragment_competition_members();
+    let second = original.replace("Read(int", "Read(byte");
+    let left = continuation_source(path, &original);
+    let right = continuation_source(path, &second);
+    let before = continuation_source(path, &container);
+    let after = continuation_source(path, &format!("{copied}{container}"));
+    let f = Fixture::new();
+    let root = f.commit(
+        &[("a.cs", &left), ("z.cs", &right), (path, &before)],
+        &[],
+        "initial implementations",
+    );
+    let tip = f.commit(
+        &[("a.cs", &left), ("z.cs", &right), (path, &after)],
+        &[&root],
+        "additional member",
+    );
+    let selected = "method:Worker.Read(short) path:Worker.cs";
+    let history = f.history(&tip, &format!("log {selected}")).await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    for origin in ["a.cs", "z.cs"] {
+        assert!(
+            history.contains(&format!("~copy {origin}→{path}")),
+            "{history}"
+        );
+    }
+    assert!(history.contains("competing predecessors"), "{history}");
+    let predecessor = f.history(&tip, &format!("show {root} {selected}")).await;
+    assert!(!body(&predecessor).contains("# fragment "), "{predecessor}");
+    assert_eq!(body(&predecessor).matches("diff --git ").count(), 2);
+    for member in [&original, &second] {
+        let expected = format!("+{}", member.trim().replace('\n', "\n+"));
+        assert!(body(&predecessor).contains(&expected), "{predecessor}");
+    }
+}
+
+#[tokio::test]
+async fn rejected_whole_candidates_leave_fragment_ancestry_available() {
+    let path = "Worker.cs";
+    let (_, copied, container) = fragment_competition_members();
+    let selected = copied.replace("Read(short", "Read(int");
+    let original = selected.replace(
+        "        var scaled = adjusted * 3;\n        return scaled ^ 127;",
+        "        return ChooseFallback(adjusted);",
+    );
+    let retained = original.replace("Read(", "Retained(");
+    let before = continuation_source(path, &format!("{original}{container}"));
+    let after = continuation_source(path, &format!("{retained}{selected}{container}"));
+    let f = Fixture::new();
+    let root = f.commit(&[(path, &before)], &[], "initial implementations");
+    let tip = f.commit(&[(path, &after)], &[&root], "new occurrence");
+    let history = f.history(&tip, "log method:Worker.Read(int)").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    assert!(history.contains("extract"), "{history}");
+    let shown = f
+        .history(&tip, &format!("show {tip} method:Worker.Read(int)"))
+        .await;
+    assert!(body(&shown).contains("# fragment "), "{shown}");
+    assert!(body(&shown).contains("scaled ^ 127"), "{shown}");
+    assert!(!body(&shown).contains("ChooseFallback"), "{shown}");
+    assert!(!body(&shown).contains("Audit("), "{shown}");
+}
+
 fn rust_owner_source(owner: &str, sibling: &str) -> String {
     format!(
         "impl<T, F> {owner}<T, F> {{\n    fn new(init: F) -> Self {{\n        {owner} {{ cell: OnceCell::new(), init: Cell::new(Some(init)) }}\n    }}\n}}\nimpl<T, F> {owner}<T, F> {{\n{sibling}}}\n"

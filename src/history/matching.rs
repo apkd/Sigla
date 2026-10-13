@@ -599,6 +599,7 @@ impl Tracker {
         let mut selected = Vec::new();
         let mut direct = None;
         let mut origin = None;
+        let mut fragment = None;
         let mut weak = false;
         for candidate in &search.scored {
             if direct.is_some_and(|score| candidate.score + SCORE_MARGIN < score) {
@@ -661,12 +662,12 @@ impl Tracker {
             }
             // Origins do not win the direct-continuation score band. A claimed
             // implementation must not hide an available predecessor below it.
-            let best = if old.fragment
-                || region.fragment
-                || matches!(
-                    relation,
-                    Relation::Copy | Relation::Extract | Relation::Wrapper
-                ) {
+            let best = if old.fragment || region.fragment {
+                &mut fragment
+            } else if matches!(
+                relation,
+                Relation::Copy | Relation::Extract | Relation::Wrapper
+            ) {
                 &mut origin
             } else {
                 &mut direct
@@ -676,6 +677,12 @@ impl Tracker {
             }
             best.get_or_insert(candidate.score);
             selected.push((candidate, relation, competition));
+        }
+        // Use fragment containment when no whole candidate was accepted.
+        // Only accepted declarations can suppress it; rejected claims must
+        // leave partial ancestry available, and whole ties remain alternatives.
+        if selected.iter().any(|(c, _, _)| !c.region.fragment) {
+            selected.retain(|(c, _, _)| !c.region.fragment);
         }
         let alternatives = selected.len() > 1
             && !selected.iter().all(|(c, _, _)| {
