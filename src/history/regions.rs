@@ -1,6 +1,6 @@
 mod java;
 
-use super::{query, sequence};
+use super::sequence;
 use crate::{
     extract::{HistoricalDeclaration, HistoricalPresence},
     model::{Declaration, Language},
@@ -339,14 +339,11 @@ pub(super) fn selectable(declaration: &Declaration) -> bool {
 pub(super) fn matches_kind(kind: &str, declaration: &Declaration) -> bool {
     kind == "symbol" || (kind == "type" && declaration.named_type()) || kind == declaration.kind
 }
-pub(super) fn selected(query: &crate::query::Query, declaration: &Declaration, path: &str) -> bool {
+// The anchor scan applies path filters before loading declarations.
+pub(super) fn selected(query: &crate::query::Query, declaration: &Declaration) -> bool {
     if !selectable(declaration)
         // History-only callables are reachable by position, not new named queries.
         || matches!(declaration.kind.as_str(), "closure" | "accessor")
-        || !query
-            .filters
-            .iter()
-            .all(|f| query::matches(&f.value, path) != f.negate)
     {
         return false;
     }
@@ -565,7 +562,7 @@ mod tests {
         for declaration in &facts.declarations {
             assert!(selectable(declaration));
             assert_eq!(
-                selected(&query, declaration, "Worker.cs"),
+                selected(&query, declaration),
                 !matches!(declaration.kind.as_str(), "closure" | "accessor")
             );
         }
