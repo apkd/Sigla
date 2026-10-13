@@ -21,15 +21,37 @@ pub fn local_command(
         fs::create_dir_all(cache.join(child))?;
     }
     let mut command = Command::new("bwrap");
+    command.args([
+        "--die-with-parent",
+        "--unshare-pid",
+        "--cap-drop",
+        "ALL",
+        "--ro-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/tmp",
+    ]);
+    // Preserve temporary source trees and mounts without requiring a host
+    // /tmp/.dotnet directory. The private parent lets bwrap create that mountpoint.
+    for entry in fs::read_dir("/tmp")? {
+        let entry = entry?;
+        if entry.file_name() == ".dotnet" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_symlink() {
+            match fs::read_link(&path) {
+                Ok(target) => command.arg("--symlink").arg(target).arg(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+        } else {
+            command.arg("--ro-bind-try").arg(&path).arg(&path);
+        }
+    }
     command
         .args([
-            "--die-with-parent",
-            "--unshare-pid",
-            "--cap-drop",
-            "ALL",
-            "--ro-bind",
-            "/",
-            "/",
             // .NET named mutexes use this fixed path, ignoring TMPDIR.
             "--tmpfs",
             "/tmp/.dotnet",
@@ -39,6 +61,8 @@ pub fn local_command(
             "/tmp/.dotnet/shm",
             "--dir",
             "/tmp/.dotnet/lockfiles",
+            "--remount-ro",
+            "/tmp",
         ])
         .arg("--bind")
         .arg(&cache)
@@ -498,6 +522,66 @@ pub fn read_job_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_discovery_with_a_fresh_tmp_preserves_inputs_and_confines_writes() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = root.path().join("source");
+        let cache = root.path().join("cache");
+        let job = root.path().join("job");
+        for path in [&source, &cache.join("dotnet"), &job] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source.join("input"), "source").unwrap();
+        std::os::unix::fs::symlink("input", source.join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", source.join("dangling")).unwrap();
+        let packages = crate::cache::packages::View::local(&cache, &source).unwrap();
+        let mut command =
+            local_command(Path::new("/bin/sh"), &source, &cache, &job, &packages).unwrap();
+        command
+            .args([
+                "-ec",
+                r#"
+                    test "$(cat input)" = source
+                    test "$(cat link)" = source
+                    test -L dangling
+                    for path in input new-source /tmp/outside-cache; do
+                        if (: > "$path") 2>/dev/null; then exit 1; fi
+                    done
+                    : > /tmp/.dotnet/shm/mutex
+                    : > /tmp/.dotnet/lockfiles/lock
+                    : > "$TMPDIR/scratch"
+                    : > "$NUGET_PACKAGES/package"
+                    : > "$1/result"
+                "#,
+                "sandbox-test",
+            ])
+            .arg(&job);
+        // Hide the host's .NET leftovers while retaining a source tree under /tmp.
+        // Root CI needs mount capabilities until the inner launcher drops them.
+        let mut outer = Command::new("bwrap");
+        if unsafe { libc::geteuid() } == 0 {
+            outer.args(["--cap-add", "ALL"]);
+        }
+        let output = outer
+            .args(["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind"])
+            .arg(root.path())
+            .arg(root.path())
+            .args(["--proc", "/proc", "--dev", "/dev", "--"])
+            .arg(command.get_program())
+            .args(command.get_args())
+            .envs(command.get_envs().map(|(key, value)| (key, value.unwrap())))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(source.join("input")).unwrap(), "source");
+        assert!(cache.join("dotnet/tmp/scratch").is_file());
+        assert!(job.join("result").is_file());
+    }
 
     #[test]
     fn expired_outputs_remove_private_overlay_work() {
