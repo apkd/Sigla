@@ -90,7 +90,7 @@ fn maintenance_snapshot_preserves_a_pin_released_before_collection() {
         &pool.identity,
         Duration::ZERO,
         true,
-        Some(&snapshot),
+        Some(snapshot),
     )
     .unwrap();
     assert!(pool.root.exists());
@@ -114,7 +114,7 @@ fn acquisition_after_snapshot_cannot_lose_its_pending_objects() {
         &pool.identity,
         Duration::ZERO,
         true,
-        Some(&snapshot),
+        Some(snapshot),
     )
     .unwrap();
     assert!(pool.root.exists());
@@ -141,7 +141,7 @@ fn acquisition_published_after_snapshot_survives_without_its_pin() {
         &pool.identity,
         Duration::ZERO,
         true,
-        Some(&snapshot),
+        Some(snapshot),
     )
     .unwrap();
     assert!(pool.root.exists());
@@ -342,6 +342,55 @@ fn read_history_blob(store: &Path, oid: &str) -> Vec<u8> {
     )
     .unwrap()
 }
+
+#[test]
+fn history_publication_and_eviction_after_selector_capture_refresh_retention() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let lease = object_lease(cache.path(), &id, "sha1").unwrap();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    let current = pool.root.join("current");
+    let oid = history_blob(&current, b"published after capture\n");
+    link_objects(&current, lease.path()).unwrap();
+    lease.retain(&oid);
+    lease.publish(&BTreeSet::new(), &BTreeSet::new()).unwrap();
+    let owner = lease.owner();
+    drop(lease);
+    maintain_pool(cache.path(), &id, Duration::ZERO, true, Some(snapshot)).unwrap();
+    assert_eq!(
+        read_history_blob(&current, &oid),
+        b"published after capture\n"
+    );
+    assert!(
+        pool.history_coverage()
+            .unwrap()
+            .unwrap()
+            .objects
+            .contains(&oid)
+    );
+
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    assert!(evict_history(&owner).unwrap());
+    maintain_pool(cache.path(), &id, Duration::ZERO, true, Some(snapshot)).unwrap();
+    assert!(!pool.root.exists());
+}
+
+#[test]
+fn history_reader_opened_after_selector_capture_keeps_its_pool() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = identity();
+    let pool = Pool::open(cache.path(), &id).unwrap();
+    pool.state().unwrap();
+    let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
+    let lease = object_lease(cache.path(), &id, "sha1").unwrap();
+    maintain_pool(cache.path(), &id, Duration::ZERO, true, Some(snapshot)).unwrap();
+    assert!(lease.path().is_dir());
+    drop(lease);
+    maintain_pool(cache.path(), &id, Duration::ZERO, false, None).unwrap();
+    assert!(!pool.root.exists());
+}
+
 #[test]
 fn history_reader_survives_replacement_and_can_republish_its_exact_objects() {
     let cache = tempfile::tempdir().unwrap();

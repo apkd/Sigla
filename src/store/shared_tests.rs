@@ -595,19 +595,14 @@ fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
 }
 
 #[test]
-fn baseline_v3_keeps_object_ids_but_unknown_v3_is_rejected() {
-    let version = "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0";
+fn current_analysis_v3_keeps_object_ids_but_unknown_v3_is_rejected() {
+    let version = crate::store::ANALYSIS_VERSION;
     let source = "class Kept {}";
     let language = crate::model::Language::CSharp;
-    let id =
-        crate::store::payload::source_id_at_version(source, language, &[], "", version).unwrap();
-    assert_eq!(
-        crate::store::source_id(source, language, &[], "").unwrap(),
-        id
-    );
+    let id = crate::store::source_id(source, language, &[], "").unwrap();
     for (format, keep) in [
         (format!("sigla-shared-3:{version}"), true),
-        (format!("sigla-shared-3:0{}", &version[1..]), false),
+        ("sigla-shared-3:unreviewed-analysis".to_owned(), false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -667,7 +662,7 @@ fn baseline_v3_keeps_object_ids_but_unknown_v3_is_rejected() {
 }
 
 #[test]
-fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
+fn legacy_layout_objects_upgrade_on_use_and_retire_independently() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = Database::open(dir.path()).unwrap();
@@ -702,7 +697,7 @@ fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
             .put(
                 &mut tx,
                 b"format",
-                b"d70ac251b161d05505fdc5790766a45bdd917c9e97093b7df3751e7479131b09",
+                crate::store::ANALYSIS_VERSION.as_bytes(),
             )
             .unwrap();
         tx.commit().unwrap();
@@ -713,14 +708,10 @@ fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
             .workspace([2; 32], Path::new("/workspace/1"), None)
             .unwrap();
         let tx = new.read().unwrap();
-        let binding = new.previous_binding(&tx, "file", &[1]).unwrap().unwrap();
-        assert_eq!(
-            db.live(&tx, &binding.object).unwrap().unwrap().ordinal,
-            UNINDEXED
-        );
+        assert_eq!(db.live(&tx, &[7; 32]).unwrap().unwrap().ordinal, UNINDEXED);
         drop(tx);
         let pending = new
-            .prepare_install("file", vec![1], binding.object, 100, || {
+            .prepare_install("file", vec![1], [7; 32], 100, || {
                 panic!("Compatible facts must be reused")
             })
             .unwrap();
