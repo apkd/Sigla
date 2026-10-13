@@ -454,9 +454,11 @@ fn declaration<'a>(
         modifiers: mods,
         bases,
     });
-    let header =
-        crate::csharp::lower::header(n, s, &facts.declarations, owner_index.map(|i| i as u32));
-    facts.csharp.as_mut().unwrap().headers.push(header);
+    if let Some(syntax) = facts.csharp.as_mut() {
+        let header =
+            crate::csharp::lower::header(n, s, &facts.declarations, owner_index.map(|i| i as u32));
+        syntax.headers.push(header);
+    }
     let index = facts.declarations.len() - 1;
     scopes.push(index, &facts.declarations[index], s);
 }

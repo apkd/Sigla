@@ -9,7 +9,7 @@ mod contexts;
 mod document;
 mod lexical;
 
-use super::{declaration, occurrence};
+use super::{DeclarationScopes, declaration, occurrence};
 use crate::{
     extract::{HistoricalDeclaration, HistoricalFacts},
     model::Facts,
@@ -198,17 +198,23 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFa
     let mut tokens = Vec::new();
     let mut field_headers = HashMap::new();
     let mut cursor = tree.walk();
+    let mut parents = Vec::new();
+    let mut scopes = DeclarationScopes::default();
     'walk: loop {
         let node = cursor.node();
         let field_header = callables::field_header(node);
         // A local inside a field-initializer lambda is not itself a field.
         if node.kind() != "variable_declarator" || field_header.is_some() {
-            declaration(node, analysis, &mut facts);
+            declaration(node, &parents, analysis, &mut facts, &mut scopes);
         }
         if let Some(header) = field_header {
             field_headers.insert(node.start_byte(), header);
         }
+        let before = facts.declarations.len();
         callables::declaration(node, analysis, &mut facts);
+        if facts.declarations.len() != before {
+            scopes.push(before, &facts.declarations[before], analysis);
+        }
         if node.kind() == "identifier" || node.kind() == "predefined_type" {
             occurrence(node, analysis, &mut facts);
             if facts
@@ -223,6 +229,7 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFa
             tokens.push(node.byte_range());
         }
         if node.kind() != "comment" && cursor.goto_first_child() {
+            parents.push(node);
             continue;
         }
         loop {
@@ -232,6 +239,7 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFa
             if !cursor.goto_parent() {
                 break 'walk;
             }
+            parents.pop();
         }
     }
     let mut owners = HashMap::<String, String>::new();
