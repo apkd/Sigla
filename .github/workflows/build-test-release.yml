@@ -331,11 +331,18 @@ jobs:
               packages = builtins.getAttr (builtins.getEnv "SIGLA_SYSTEM") flake.packages;
             in packages.sigla.overrideAttrs (_: {
               src = builtins.path { path = builtins.getEnv "SIGLA_ARTIFACT"; name = "sigla"; };
+              debugSrc = builtins.path { path = builtins.getEnv "SIGLA_ARTIFACT" + ".debug"; name = "sigla.debug"; };
               version = builtins.getEnv "SIGLA_VERSION";
             })'
           executable="$RUNNER_TEMP/sigla-nix/bin/sigla"
           [[ "$("$executable" --version)" == "sigla $SIGLA_VERSION" ]]
           cmp "$SIGLA_ARTIFACT" "$RUNNER_TEMP/sigla-nix/bin/.sigla-wrapped"
+          nix shell --inputs-from . nixpkgs#gdb --command gdb --batch --nx \
+            -ex 'set debuginfod enabled off' \
+            -ex 'set auto-load off' \
+            -ex "file $RUNNER_TEMP/sigla-nix/bin/.sigla-wrapped" \
+            -ex 'info line sigla::main' | tee "$RUNNER_TEMP/debug-link.txt"
+          grep -q ' starts at address ' "$RUNNER_TEMP/debug-link.txt"
           "$executable" licenses > "$RUNNER_TEMP/licenses.txt"
           test -s "$RUNNER_TEMP/licenses.txt"
           work="$RUNNER_TEMP/nix-smoke"
@@ -426,9 +433,11 @@ jobs:
               arm64) system=aarch64-linux ;;
             esac
             hash="sha256-$(openssl dgst -sha256 -binary "$binary" | base64 -w0)"
+            debug_hash="sha256-$(openssl dgst -sha256 -binary "$binary.debug" | base64 -w0)"
             jq --arg system "$system" --arg hash "$hash" \
+              --arg debug_hash "$debug_hash" \
               --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/build-archive/$name" \
-              '.platforms[$system] = {url: $url, hash: $hash}' "$work/release.json" > "$work/release-next.json"
+              '.platforms[$system] = {url: $url, hash: $hash, debug: {url: ($url + ".debug"), hash: $debug_hash}}' "$work/release.json" > "$work/release-next.json"
             mv "$work/release-next.json" "$work/release.json"
           done
           cp "$work/release.json" nix/release.json
