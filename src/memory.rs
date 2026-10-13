@@ -2,6 +2,51 @@
 use std::io;
 use std::sync::{Condvar, Mutex, OnceLock};
 
+/// Budget cached heap independently of mapped database pages and active jobs.
+pub fn cache_budget() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mut limit = 2 * 1024 * 1024 * 1024u64;
+        if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup")
+            && let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::"))
+        {
+            let root = std::path::Path::new("/sys/fs/cgroup");
+            let mut directory = root.join(group.trim_start_matches('/'));
+            while directory.starts_with(root) {
+                for name in ["memory.high", "memory.max"] {
+                    if let Ok(value) = std::fs::read_to_string(directory.join(name))
+                        && let Ok(bytes) = value.trim().parse::<u64>()
+                    {
+                        limit = limit.min(bytes);
+                    }
+                }
+                if !directory.pop() {
+                    break;
+                }
+            }
+        }
+        (limit / 4).clamp(32 * 1024 * 1024, 512 * 1024 * 1024) as usize
+    })
+}
+
+/// Count serialized data without allocating a second copy. Call once when a
+/// cache entry is published; containers also retain allocation overhead.
+pub fn encoded_size(value: &impl serde::Serialize) -> usize {
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    postcard::to_io(value, Counter(0))
+        .expect("serializable cache entry")
+        .0
+}
+
 // leave room for two active jobs and temporary parser allocations.
 pub const IDLE_CACHE_HIGH_WATER: u64 = 640 * 1024 * 1024;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -45,18 +90,51 @@ impl Drop for Reservation<'_> {
     }
 }
 
-pub fn admit_file(bytes: u64, assembly: bool) -> Reservation<'static> {
+fn admit_parsing(bytes: u64) -> Reservation<'static> {
     static PARSING: OnceLock<Budget> = OnceLock::new();
     let budget = PARSING.get_or_init(|| Budget::new(256 * 1024 * 1024));
+    budget.reserve(bytes)
+}
+
+pub fn admit_file(bytes: u64, assembly: bool) -> Reservation<'static> {
     // account for syntax nodes, owned facts, compression, and publication buffers.
     // these are admission estimates, not a bound on an arbitrary parser's heap.
-    budget.reserve(bytes.saturating_mul(if assembly { 8 } else { 32 }))
+    admit_parsing(bytes.saturating_mul(if assembly { 8 } else { 32 }))
 }
 
-pub fn resident_bytes() -> io::Result<u64> {
-    resident("VmRSS:")
+pub fn admit_batch(
+    total: u64,
+    largest: u64,
+    encoded_limit: u64,
+    assembly: bool,
+) -> Reservation<'static> {
+    let expansion = if assembly { 8 } else { 32 };
+    // A worker parses one file at a time, retaining bounded encodings and posting
+    // names for publication. Reserving syntax trees for every file serializes
+    // large batches even when their actual live memory fits several workers.
+    admit_parsing(
+        total.saturating_mul(expansion).min(
+            largest
+                .saturating_mul(expansion)
+                .saturating_add(encoded_limit.saturating_mul(8)),
+        ),
+    )
 }
 
+pub fn admit_worker() -> Reservation<'static> {
+    static WORKERS: OnceLock<Budget> = OnceLock::new();
+    WORKERS
+        .get_or_init(|| {
+            Budget::new(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(4) as u64,
+            )
+        })
+        .reserve(1)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn resident(field: &str) -> io::Result<u64> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let kib = status

@@ -23,6 +23,7 @@ mod disk;
 struct WorkspaceSlot {
     state: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     preparing: Option<preparation::Ticket>,
+    materialized: Option<u64>,
     used: Instant,
 }
 #[derive(Clone, Debug)]
@@ -37,6 +38,8 @@ pub struct App {
     cache: PathBuf,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceSlot>>,
     workers: Arc<tokio::sync::Semaphore>,
+    preparation_workers: Arc<tokio::sync::Semaphore>,
+    indexing_workers: Arc<tokio::sync::Semaphore>,
     navigation_workers: Arc<tokio::sync::Semaphore>,
     inspection_shutdown: tokio_util::sync::CancellationToken,
     assets: crate::unity::assets::jobs::Jobs,
@@ -48,6 +51,7 @@ pub struct App {
     stateless_summaries: crate::summary::Stateless,
     activity: Arc<tokio::sync::RwLock<()>>,
     blobs: Arc<crate::cache::blobs::Store>,
+    asset_records: Arc<crate::cache::artifacts::Store>,
     cache_limits: crate::cache::policy::Limits,
     owners: Mutex<crate::cache::owners::Catalog>,
     #[cfg(test)]
@@ -72,20 +76,25 @@ impl App {
     }
     fn trim_idle(&self) {
         crate::memory::reclaim();
+        let budget = crate::memory::cache_budget();
+        self.assets.trim_to(budget / 2);
+        self.sources.trim_to(budget / 4);
         loop {
-            match crate::memory::resident_bytes() {
-                Ok(bytes) if bytes > crate::memory::IDLE_CACHE_HIGH_WATER => {
-                    self.assets.trim_completed();
-                    self.sources.trim_completed();
-                }
-                Ok(_) => return,
-                Err(error) => {
-                    tracing::warn!(%error, "Cannot measure resident cache memory");
-                    return;
-                }
-            }
             let retired = {
                 let mut registry = self.workspaces.lock().unwrap();
+                let bytes: usize = registry
+                    .values()
+                    .filter_map(|slot| {
+                        slot.state.try_lock().ok().map(|state| {
+                            state
+                                .as_ref()
+                                .map_or(0, |workspace| workspace.retained_bytes)
+                        })
+                    })
+                    .sum();
+                if bytes <= budget / 4 {
+                    return;
+                }
                 let oldest = registry
                     .iter()
                     .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
@@ -96,7 +105,7 @@ impl App {
             if retired.is_none() {
                 return;
             }
-            // release the LMDB mapping outside the registry lock before measuring again.
+            // Drop cached heap outside the registry lock.
             drop(retired);
             crate::memory::reclaim();
         }
@@ -134,6 +143,7 @@ impl App {
         let app = Self {
             activity: Arc::new(tokio::sync::RwLock::new(())),
             blobs: crate::cache::blobs::Store::open(&cache)?,
+            asset_records: Arc::new(crate::cache::artifacts::Store::open(&cache)?),
             cache_limits: Default::default(),
             owners: Mutex::new(crate::cache::owners::Catalog::open(&cache)?),
             _ownership: Ownership(ownership),
@@ -141,6 +151,8 @@ impl App {
             cache,
             workspaces: Mutex::new(HashMap::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            preparation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            indexing_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             navigation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             inspection_shutdown: tokio_util::sync::CancellationToken::new(),
             assets: Default::default(),
@@ -551,14 +563,20 @@ impl App {
                     .or_insert_with(|| WorkspaceSlot {
                         state: Arc::new(tokio::sync::Mutex::new(None)),
                         preparing: None,
+                        materialized: None,
                         used: Instant::now(),
                     });
                 slot.used = Instant::now();
-                if slot
-                    .preparing
+                let generation = branch
                     .as_ref()
-                    .is_none_or(|ticket| !ticket.running())
+                    .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
+                if slot.materialized != generation
+                    || slot
+                        .preparing
+                        .as_ref()
+                        .is_none_or(|ticket| ticket.needs_refresh())
                 {
+                    slot.materialized = generation;
                     slot.preparing = Some(preparation::start(
                         self.clone(),
                         preparation::Request {
@@ -573,7 +591,7 @@ impl App {
                 }
                 let state = slot.state.clone();
                 let ticket = slot.preparing.as_ref().unwrap().clone();
-                while registry.len() > 8 {
+                while registry.len() > 256 {
                     let oldest = registry
                         .iter()
                         .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
@@ -1338,6 +1356,22 @@ mod tests {
                 && !current.contains("native_ready"),
             "{current}"
         );
+        let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
+        let fingerprint = database.workspaces().unwrap()[0].0;
+        let scope = database.existing(fingerprint).unwrap().unwrap();
+        let before = scope.read().unwrap().id();
+        app.sources.trim_completed();
+        app.workspaces.lock().unwrap().clear();
+        let reopened = app
+            .search(path, "function:* lang:cpp wait:complete")
+            .await
+            .unwrap();
+        assert!(reopened.contains("newest") && !reopened.contains("intermediate"));
+        assert_eq!(
+            scope.read().unwrap().id(),
+            before,
+            "Reopening completed groups must not write analysis"
+        );
         app.shutdown().await;
     }
 
@@ -1454,6 +1488,7 @@ mod tests {
             WorkspaceSlot {
                 state: workspace.clone(),
                 preparing: None,
+                materialized: None,
                 used: Instant::now(),
             },
         );

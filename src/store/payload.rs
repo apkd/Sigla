@@ -74,6 +74,16 @@ pub fn source_id(
     defines: &[String],
     edition: &str,
 ) -> Result<ObjectId> {
+    source_id_at_version(source, language, defines, edition, ANALYSIS_VERSION)
+}
+
+pub(crate) fn source_id_at_version(
+    source: &str,
+    language: Language,
+    defines: &[String],
+    edition: &str,
+    version: &str,
+) -> Result<ObjectId> {
     let profile = match language {
         Language::CSharp => {
             let active = if source.contains('#') {
@@ -89,7 +99,7 @@ pub fn source_id(
     };
     Ok(*blake3::hash(&postcard::to_allocvec(&(
         "sigla-source-analysis",
-        ANALYSIS_VERSION,
+        version,
         language,
         profile,
         blake3::hash(source.as_bytes()).as_bytes(),

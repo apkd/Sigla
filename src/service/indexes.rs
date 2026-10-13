@@ -226,6 +226,7 @@ impl super::App {
             branch,
             root: manifest.root.clone(),
             cache,
+            records: self.asset_records.clone(),
             expected: crate::unity::assets::jobs::generation(manifest)?,
             revision,
             refresh,

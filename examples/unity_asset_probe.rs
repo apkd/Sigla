@@ -10,24 +10,44 @@ fn main() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let store =
         sigla::store::Store::open_workspace(&temp.path().join("analysis"), [0; 32], &root, None)?;
-    let tx = store.read()?;
     let manifest = sigla::workspace::Manifest {
         root: root.clone(),
         ..Default::default()
     };
+    store.save_manifest(&manifest)?;
+    let build = || {
+        sigla::unity::assets::build(
+            &root,
+            &temp.path().join("assets"),
+            &manifest,
+            &store,
+            sigla::unity::assets::BuildOptions {
+                previous: None,
+                records: None,
+                remote: false,
+                omitted: &Default::default(),
+                cancel: &tokio_util::sync::CancellationToken::new(),
+            },
+        )
+    };
     let started = std::time::Instant::now();
-    let index = sigla::unity::assets::build(
-        &root,
-        &temp.path().join("assets"),
-        &manifest,
-        &store,
-        &tx,
-        sigla::unity::assets::BuildOptions {
-            remote: false,
-            omitted: &Default::default(),
-            cancel: &tokio_util::sync::CancellationToken::new(),
-        },
-    )?;
+    let index = build()?;
+    let cold = started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
+    let cached = build()?;
+    let warm = started.elapsed().as_secs_f64();
+    anyhow::ensure!(
+        index.assets.keys().eq(cached.assets.keys()),
+        "Cached asset inventory changed"
+    );
+    anyhow::ensure!(
+        index
+            .assets
+            .values()
+            .map(|a| a.objects.len())
+            .eq(cached.assets.values().map(|a| a.objects.len())),
+        "Cached assets lost objects"
+    );
     let failures: Vec<_> = index
         .assets
         .values()
@@ -51,7 +71,7 @@ fn main() -> Result<()> {
         .sum();
     println!(
         "{}",
-        serde_json::json!({"seconds": started.elapsed().as_secs_f64(), "assets": index.assets.len(), "parsed": parsed, "objects": objects, "cache_bytes": cache_bytes, "unsupported": failures})
+        serde_json::json!({"cold_seconds": cold, "cached_seconds": warm, "assets": index.assets.len(), "parsed": parsed, "objects": objects, "cache_bytes": cache_bytes, "unsupported": failures})
     );
     Ok(())
 }

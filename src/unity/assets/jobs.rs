@@ -22,6 +22,7 @@ pub struct Request {
     pub branch: Option<Arc<Branch>>,
     pub root: PathBuf,
     pub cache: PathBuf,
+    pub records: std::sync::Arc<crate::cache::artifacts::Store>,
     pub expected: [u8; 32],
     pub revision: Option<String>,
     pub refresh: bool,
@@ -30,6 +31,7 @@ struct Job {
     generation: [u8; 32],
     ticket: Ticket,
     cancel: tokio_util::sync::CancellationToken,
+    used: std::time::Instant,
 }
 pub struct Jobs {
     running: Mutex<HashMap<PathBuf, Job>>,
@@ -46,14 +48,47 @@ impl Default for Jobs {
     }
 }
 pub fn generation(manifest: &Manifest) -> Result<[u8; 32]> {
-    Ok(*blake3::hash(&postcard::to_allocvec(manifest)?).as_bytes())
+    Ok(*blake3::hash(&postcard::to_allocvec(&(
+        env!("SIGLA_ASSET_FINGERPRINT"),
+        manifest,
+    ))?)
+    .as_bytes())
 }
 impl Jobs {
     pub fn trim_completed(&self) {
-        self.running
-            .lock()
-            .unwrap()
-            .retain(|_, job| job.ticket.borrow().is_none());
+        self.trim_to(0);
+    }
+    pub fn trim_to(&self, limit: usize) {
+        let mut jobs = self.running.lock().unwrap();
+        let mut completed: Vec<_> = jobs
+            .iter()
+            .filter_map(|(key, job)| {
+                job.ticket.borrow().as_ref().map(|result| {
+                    (
+                        key.clone(),
+                        job.used,
+                        result
+                            .as_ref()
+                            .map_or(256, |index| index.retained_bytes + 256),
+                        result
+                            .as_ref()
+                            .map_or(true, |index| Arc::strong_count(index) == 1),
+                    )
+                })
+            })
+            .collect();
+        completed.sort_by_key(|(_, used, _, _)| *used);
+        let mut bytes: usize = completed.iter().map(|(_, _, size, _)| size).sum();
+        for (key, _, size, idle) in completed {
+            if bytes <= limit {
+                break;
+            }
+            if !idle {
+                continue;
+            }
+            jobs.remove(&key);
+            bytes -= size;
+        }
     }
     pub fn shutdown(&self) {
         self.shutdown.cancel();
@@ -69,6 +104,7 @@ impl Jobs {
             branch,
             root,
             cache,
+            records,
             expected,
             revision,
             refresh,
@@ -78,25 +114,20 @@ impl Jobs {
         )
         .as_bytes();
         let mut jobs = self.running.lock().unwrap();
-        let mut previous = None;
-        if let Some(job) = jobs.get(&root) {
+        let (same_generation, previous) = if let Some(job) = jobs.get_mut(&root) {
             let outcome = job.ticket.borrow();
             if job.generation == generation
-                && (outcome.is_none()
-                    || outcome
-                        .as_ref()
-                        .is_some_and(|r| r.as_ref().is_ok_and(|index| !refresh || index.current())))
+                && (outcome.is_none() || outcome.as_ref().is_some_and(|r| r.is_ok() && !refresh))
             {
+                job.used = std::time::Instant::now();
                 return job.ticket.clone();
             }
-            if job.generation == generation {
-                previous = outcome.as_ref().and_then(|r| r.as_ref().ok()).cloned();
-            }
+            let previous = outcome.as_ref().and_then(|r| r.as_ref().ok()).cloned();
             job.cancel.cancel();
-        }
-        if jobs.len() >= 8 {
-            jobs.retain(|_, job| job.ticket.borrow().is_none());
-        }
+            (job.generation == generation, previous)
+        } else {
+            (false, None)
+        };
         let (sender, ticket) = watch::channel(None);
         let cancel = self.shutdown.child_token();
         jobs.insert(
@@ -105,6 +136,7 @@ impl Jobs {
                 generation,
                 ticket: ticket.clone(),
                 cancel: cancel.clone(),
+                used: std::time::Instant::now(),
             },
         );
         let workers = self.workers.clone();
@@ -140,9 +172,8 @@ impl Jobs {
                             "Repository changed before asset indexing; retry query"
                         )
                     );
-                    let store = code.store.clone();
+                    let store = code.store.snapshot()?;
                     let manifest = code.manifest.clone();
-                    let tx = store.query_read()?;
                     let omitted = branch_state
                         .as_ref()
                         .and_then(|s| s.as_ref())
@@ -150,18 +181,20 @@ impl Jobs {
                         .unwrap_or_default();
                     drop(branch_state);
                     drop(state);
-                    if let Some(previous) = previous.filter(|index| branch.is_none() && index.current()) {
-                        return Ok(previous);
-                    }
                     let started = std::time::Instant::now();
-                    let index = super::build(
-                        &root,
-                        &cache,
-                        &manifest,
-                        &store,
-                        &tx,
-                        super::BuildOptions { remote: branch.is_some(), omitted: &omitted, cancel: &cancel },
-                    )?;
+                    let (index, built) = if let Some(previous) = previous.as_ref().filter(|index| same_generation && branch.is_none() && index.current()) {
+                        (previous.clone(), false)
+                    } else if let Some(index) = super::snapshot::load(&cache, generation) {
+                        (Arc::new(index), false)
+                    } else {
+                        (Arc::new(super::build(
+                            &root,
+                            &cache,
+                            &manifest,
+                            &store,
+                            super::BuildOptions { previous: previous.as_deref(), records: Some(&records), remote: branch.is_some(), omitted: &omitted, cancel: &cancel },
+                        )?), true)
+                    };
                     if let Some(branch) = &branch {
                         let state = branch
                             .state
@@ -176,8 +209,12 @@ impl Jobs {
                             )
                         );
                     }
-                    tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = started.elapsed().as_millis(), "Unity asset index ready");
-                    Ok(Arc::new(index))
+                    ensure!(!cancel.is_cancelled(), "Asset indexing superseded");
+                    if built {
+                        super::snapshot::save(&cache, generation, &index)?;
+                        tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = started.elapsed().as_millis(), "Unity asset index ready");
+                    }
+                    Ok(index)
                 })
                 .await?
             }

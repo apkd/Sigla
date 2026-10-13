@@ -151,9 +151,12 @@ impl App {
         // Ordinary passes retire and collect bounded batches. Disk pressure
         // drains all retired workspaces and unused objects.
         self.maintain_analysis(pressure)?;
-        if pressure && self.cache.join("analysis").is_dir() {
-            crate::store::Database::open(&self.cache.join("analysis"))?
-                .collect_unused(crate::cache::now(), true)?;
+        if self.cache.join("analysis").is_dir() {
+            let database = crate::store::Database::open(&self.cache.join("analysis"))?;
+            if pressure {
+                database.collect_unused(crate::cache::now(), true)?;
+            }
+            database.checkpoint()?;
         }
         Ok(())
     }
@@ -291,6 +294,9 @@ impl App {
         maintenance_stage("blob collection", || {
             self.blobs.collect_with_pressure(pressure)
         })?;
+        maintenance_stage("asset record collection", || {
+            self.asset_records.collect(pressure)
+        })?;
         let mut after = blobs::allocated(&self.cache)?;
         candidates.retain(|candidate| !candidate.expired);
         let mut remaining = self.cache_limits.reclaim(after, Disk::read(&self.cache)?);
@@ -332,6 +338,9 @@ impl App {
             maintenance_stage("analysis collection", || self.collect_analysis(true))?;
             maintenance_stage("view collection", || self.collect_views(known))?;
             maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
+            maintenance_stage("asset record collection", || {
+                self.asset_records.collect(true)
+            })?;
             after = blobs::allocated(&self.cache)?;
             remaining = remaining.saturating_add(after).saturating_sub(allocated);
             savings = self.analysis_savings(Disk::read(&self.cache)?)?;

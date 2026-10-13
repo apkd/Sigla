@@ -26,6 +26,12 @@ enum Revision {
     Immutable(crate::cache::blobs::Id),
 }
 impl Stamp {
+    pub(crate) fn immutable(&self) -> Option<&crate::cache::blobs::Id> {
+        match &self.revision {
+            Revision::Immutable(id) => Some(id),
+            Revision::File { .. } => None,
+        }
+    }
     pub fn read(path: &Path) -> Result<Self> {
         let m = std::fs::metadata(path)?;
         if let Some(id) = crate::cache::blobs::identity(path, &m)? {
@@ -160,6 +166,7 @@ pub struct Workspace {
     pub entry: PathBuf,
     pub store: Arc<Store>,
     pub manifest: Arc<Manifest>,
+    pub(crate) retained_bytes: usize,
     policy: Policy,
     cache: PathBuf,
     pub builds: usize,
@@ -201,7 +208,7 @@ impl Workspace {
         monitor: Arc<crate::watch::Monitor>,
     ) -> Result<Self> {
         let key = *blake3::hash(&postcard::to_allocvec(&(
-            crate::store::ANALYSIS_VERSION,
+            env!("SIGLA_WORKSPACE_FINGERPRINT"),
             &entry,
             policy.unity_platform,
             policy.remote.is_some(),
@@ -209,6 +216,7 @@ impl Workspace {
         .as_bytes();
         let store = Store::open_workspace(analysis, key, &entry, owner)?;
         let manifest = store.get_manifest()?.unwrap_or_default();
+        let retained_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3);
         Ok(Self {
             _files: crate::cache::blobs::Store::open(
                 analysis.parent().context("Analysis has no cache root")?,
@@ -216,6 +224,7 @@ impl Workspace {
             entry,
             store,
             manifest: Arc::new(manifest),
+            retained_bytes,
             policy,
             cache: cache.to_owned(),
             builds: 0,
@@ -282,12 +291,10 @@ impl Workspace {
             .chain(self.manifest.deferred.values())
             .find(|f| Stamp::read(&f.path).as_ref().ok() != Some(&f.stamp))
             .map(|file| &file.path);
-        let metadata_changed = !cache_current
-            || !policy_current
-            || self.manifest.projects.is_empty()
-            || changed_metadata.is_some();
+        let metadata_changed =
+            !policy_current || self.manifest.projects.is_empty() || changed_metadata.is_some();
         let sources_changed = changed_source.is_some();
-        if !metadata_changed && !sources_changed {
+        if cache_current && !metadata_changed && !sources_changed {
             self.fence = fence;
             self.initialized = true;
             tracing::debug!(workspace = %self.entry.display(), elapsed_ms = start.elapsed().as_millis(), "workspace cache validated");
@@ -450,6 +457,12 @@ impl Workspace {
                 let modules = self.store.current(&key, &stamp).and_then(|cached| {
                     cached.map_or_else(
                         || {
+                            if let Some(identity) = input_identity(&input, project, &stamp)?
+                                && let Some(object) = self.store.scope.input(&identity)?
+                                && let Some(modules) = self.store.object_modules(&object)?
+                            {
+                                return Ok(modules);
+                            }
                             Ok(crate::extract::rust_modules(
                                 &read_stable(&input.path, input.language)?,
                                 &project.edition,
@@ -583,7 +596,9 @@ impl Workspace {
 
     pub(crate) fn apply_plan(&mut self, plan: IndexPlan) -> Result<()> {
         self.initialized = false;
+        let indexing_started = std::time::Instant::now();
         self.store.begin_refresh()?;
+        let begin_refresh_time = indexing_started.elapsed();
         let IndexPlan {
             manifest,
             directories,
@@ -600,7 +615,6 @@ impl Workspace {
         let mut reused_object_bytes = 0u64;
         let mut extraction_time = std::time::Duration::ZERO;
         let mut storage_time = std::time::Duration::ZERO;
-        let indexing_started = std::time::Instant::now();
         let inputs: VecDeque<_> = manifest
             .files
             .values()
@@ -657,14 +671,7 @@ impl Workspace {
                 reused_object_bytes += encoded_bytes;
             }
         }
-        for key in self
-            .manifest
-            .files
-            .keys()
-            .filter(|k| !manifest.files.contains_key(*k))
-        {
-            self.store.remove(key)?;
-        }
+        // finish_refresh prunes obsolete bindings in batches.
         let mut environment = blake3::Hasher::new();
         environment.update(&postcard::to_allocvec(&manifest.projects)?);
         for key in manifest.files.keys() {
@@ -682,6 +689,7 @@ impl Workspace {
                 tracing::warn!("{diagnostic}");
             }
         }
+        self.retained_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3);
         self.manifest = Arc::new(manifest);
         self.fence = fence;
         self.initialized = true;
@@ -700,6 +708,7 @@ impl Workspace {
             validation_ms = validation.as_millis(),
             discovery_ms = discovery_time.as_millis(),
             indexing_ms = indexing_started.elapsed().as_millis(),
+            begin_refresh_ms = begin_refresh_time.as_millis(),
             extraction_worker_ms = extraction_time.as_millis(),
             storage_worker_ms = storage_time.as_millis(),
             elapsed_ms = start.elapsed().as_millis(),
@@ -814,8 +823,17 @@ impl InputContents {
         if let Self::Archived(analysis) = self {
             return Ok(analysis.encoded);
         }
-        if matches!(self, Self::Source { .. })
-            && let Some(encoded) = crate::metadata_archive::source_analysis(path, id)?
+        if let Self::Source {
+            source,
+            language,
+            defines,
+            edition,
+        } = &self
+            && let Some(encoded) = crate::metadata_archive::source_analysis(path, id, |version| {
+                crate::store::payload::source_id_at_version(
+                    source, *language, defines, edition, version,
+                )
+            })?
         {
             return Ok(encoded);
         }
@@ -858,7 +876,7 @@ fn index_input(
         );
         Ok(())
     };
-    if store.current(key, stamp)?.is_some() {
+    if store.matches(key, stamp)? {
         verify()?;
         return Ok(Indexed {
             changed: false,
@@ -871,12 +889,13 @@ fn index_input(
     let mut extraction = std::time::Duration::ZERO;
     let installed = (|| -> Result<_> {
         verify()?;
-        let contents = InputContents::read(input, project)?;
+        let (id, _, contents) = prepare_input(store, key, input, project, stamp)?;
         verify()?;
-        let id = contents.identity()?;
         store.install_encoded(key, stamp, id, verify, || {
             let start = std::time::Instant::now();
-            let data = contents.encode(&input.path, &id);
+            let data = contents
+                .map_or_else(|| InputContents::read(input, project), Ok)?
+                .encode(&input.path, &id);
             extraction = start.elapsed();
             data
         })
@@ -899,10 +918,81 @@ fn index_input(
 }
 
 type IndexedSources = BTreeMap<String, (Stamp, Result<Indexed>)>;
+const INDEX_BATCH_FILES: usize = 1024;
+const INDEX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 type SourceJob<'a> = (String, (Stamp, &'a SourceInput, &'a Project));
 
+fn prepare_input(
+    store: &Store,
+    key: &str,
+    input: &SourceInput,
+    project: &Project,
+    stamp: &Stamp,
+) -> Result<(
+    crate::store::ObjectId,
+    Option<crate::store::ObjectId>,
+    Option<InputContents>,
+)> {
+    let identity = input_identity(input, project, stamp)?;
+    {
+        let tx = store.read()?;
+        if let Some(binding) =
+            store
+                .scope
+                .previous_binding(&tx, key, &postcard::to_allocvec(stamp)?)?
+        {
+            return Ok((binding.object, identity, None));
+        }
+    }
+    if let Some(identity) = identity
+        && let Some(object) = store.scope.input(&identity)?
+    {
+        return Ok((object, Some(identity), None));
+    }
+    let contents = InputContents::read(input, project)?;
+    Ok((contents.identity()?, identity, Some(contents)))
+}
+
+fn input_identity(
+    input: &SourceInput,
+    project: &Project,
+    stamp: &Stamp,
+) -> Result<Option<crate::store::ObjectId>> {
+    stamp
+        .immutable()
+        .map(|blob| -> Result<_> {
+            Ok(*blake3::hash(&postcard::to_allocvec(&(
+                crate::store::ANALYSIS_VERSION,
+                blob,
+                input.language,
+                input.metadata,
+                if !input.metadata && input.language == Language::CSharp {
+                    crate::store::canonical_defines(&project.defines)
+                } else {
+                    Vec::new()
+                },
+                if !input.metadata && input.language == Language::Rust {
+                    project.edition.as_str()
+                } else {
+                    ""
+                },
+                input.metadata.then(|| input.path.file_stem()),
+            ))?)
+            .as_bytes())
+        })
+        .transpose()
+}
+
 fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
+    let mut results = BTreeMap::new();
+    while results.len() < jobs.len() {
+        results.extend(index_source_chunk(store, &jobs[results.len()..]));
+    }
+    results
+}
+
+fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
     let mut results = BTreeMap::new();
     let mut retry = Vec::new();
     {
@@ -913,15 +1003,21 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
             jobs.iter()
                 .all(|(_, (_, input, _))| input.metadata == metadata)
         );
-        let _admission =
-            crate::memory::admit_file(jobs.iter().map(|(_, (s, _, _))| s.size).sum(), metadata);
+        let _admission = crate::memory::admit_batch(
+            jobs.iter().map(|(_, (s, _, _))| s.size).sum(),
+            jobs.iter().map(|(_, (s, _, _))| s.size).max().unwrap(),
+            INDEX_BATCH_BYTES,
+            metadata,
+        );
         let mut pending = Vec::new();
         let mut prepared = Vec::new();
+        let mut encoded_bytes = 0;
+        let worker = crate::memory::admit_worker();
         for (key, (stamp, input, project)) in jobs {
             let started = std::time::Instant::now();
             let mut extraction = std::time::Duration::ZERO;
             let stage = (|| -> Result<_> {
-                if store.current(key, stamp)?.is_some() {
+                if store.matches(key, stamp)? {
                     ensure!(
                         Stamp::read(&input.path)? == *stamp,
                         "File changed during indexing; retry query"
@@ -932,20 +1028,21 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                     Stamp::read(&input.path)? == *stamp,
                     "File changed before extraction; retry query"
                 );
-                let contents = InputContents::read(input, project)?;
+                let (id, identity, contents) = prepare_input(store, key, input, project, stamp)?;
                 ensure!(
                     Stamp::read(&input.path)? == *stamp,
                     "File changed during indexing; retry query"
                 );
-                let id = contents.identity()?;
                 store
                     .prepare_install(key, stamp, id, || {
                         let started = std::time::Instant::now();
-                        let data = contents.encode(&input.path, &id);
+                        let data = contents
+                            .map_or_else(|| InputContents::read(input, project), Ok)?
+                            .encode(&input.path, &id);
                         extraction = started.elapsed();
                         data
                     })
-                    .map(Some)
+                    .map(|pending| Some(pending.input(identity)))
             })();
             let timing = Indexed {
                 extraction,
@@ -954,6 +1051,7 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
             };
             match stage {
                 Ok(Some(value)) => {
+                    encoded_bytes += value.bytes();
                     pending.push(value);
                     prepared.push((key, stamp, input, project, timing));
                 }
@@ -964,7 +1062,11 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                     results.insert(key.clone(), (stamp.clone(), Err(error)));
                 }
             }
+            if encoded_bytes >= INDEX_BATCH_BYTES {
+                break;
+            }
         }
+        drop(worker);
         if !pending.is_empty() {
             let started = std::time::Instant::now();
             let installed = store.scope.install_batch(&pending, |index| {
@@ -1010,31 +1112,62 @@ fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
     results
 }
 
-pub(crate) fn index_native(
+pub(crate) fn native_batches(
+    files: &BTreeMap<String, FileEntry>,
+) -> Vec<BTreeMap<String, FileEntry>> {
+    let mut batches = Vec::new();
+    let mut batch = BTreeMap::new();
+    let mut bytes = 0;
+    for (key, file) in files {
+        if !batch.is_empty()
+            && (batch.len() >= INDEX_BATCH_FILES || bytes + file.stamp.size > INDEX_BATCH_BYTES)
+        {
+            batches.push(std::mem::take(&mut batch));
+            bytes = 0;
+        }
+        bytes += file.stamp.size;
+        batch.insert(key.clone(), file.clone());
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+pub(crate) fn index_native_batch(
     store: &Store,
-    key: &str,
-    file: &FileEntry,
+    files: &BTreeMap<String, FileEntry>,
     projects: &[Project],
-) -> Result<()> {
-    let started = std::time::Instant::now();
-    tracing::debug!(path = %file.path.display(), "indexing native source");
-    let membership = &file.memberships[0];
-    let input = SourceInput {
-        path: file.path.clone(),
-        project: membership.project,
-        module: String::new(),
-        language: file.language,
-        metadata: false,
-    };
-    index_input(
-        store,
-        key,
-        &input,
-        &projects[membership.project],
-        &file.stamp,
-    )?;
-    tracing::debug!(path = %file.path.display(), elapsed_ms = started.elapsed().as_millis(), "native source indexed");
-    Ok(())
+) -> BTreeMap<String, Result<()>> {
+    let inputs: Vec<_> = files
+        .iter()
+        .map(|(key, file)| {
+            (
+                key,
+                file,
+                SourceInput {
+                    path: file.path.clone(),
+                    project: file.memberships[0].project,
+                    module: String::new(),
+                    language: file.language,
+                    metadata: false,
+                },
+            )
+        })
+        .collect();
+    let jobs: Vec<_> = inputs
+        .iter()
+        .map(|(key, file, input)| {
+            (
+                (*key).clone(),
+                (file.stamp.clone(), input, &projects[input.project]),
+            )
+        })
+        .collect();
+    index_source_batch(store, &jobs)
+        .into_iter()
+        .map(|(key, (_, result))| (key, result.map(|_| ())))
+        .collect()
 }
 
 /// Extract independent source and metadata inputs concurrently, then assemble
@@ -1046,11 +1179,7 @@ fn index_sources(
 ) -> Result<IndexedSources> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let mut jobs = BTreeMap::new();
-    for input in inputs
-        .iter()
-        .filter(|i| i.metadata || i.language == Language::CSharp)
-        .take(1_000_000)
-    {
+    for input in inputs.iter().take(1_000_000) {
         let Ok(stamp) = Stamp::read(&input.path) else {
             continue;
         };
@@ -1070,8 +1199,8 @@ fn index_sources(
     let mut bytes = 0;
     for (index, (_, (stamp, input, _))) in jobs.iter().enumerate() {
         if index > start
-            && (index - start >= 128
-                || bytes + stamp.size > 1024 * 1024
+            && (index - start >= INDEX_BATCH_FILES
+                || bytes + stamp.size > INDEX_BATCH_BYTES
                 || input.metadata != jobs[start].1.1.metadata)
         {
             batches.push(&jobs[start..index]);

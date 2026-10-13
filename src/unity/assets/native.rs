@@ -123,7 +123,7 @@ fn compatibility() -> &'static Snapshot {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub(super) struct Resolved {
     pub ty: Option<Arc<ScriptType>>,
     pub issue: Option<Arc<str>>,

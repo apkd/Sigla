@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub asset: String,
     pub object: Option<String>,
@@ -336,7 +336,7 @@ fn compose(
 }
 
 pub fn build(index: &mut Index) -> Result<()> {
-    let mut memo = BTreeMap::new();
+    let mut memo = std::mem::take(&mut index.instances);
     for key in index.assets.keys() {
         if index.assets[key].path.ends_with(".prefab") {
             compose(index, key, &mut BTreeSet::new(), &mut memo)?;
@@ -344,6 +344,86 @@ pub fn build(index: &mut Index) -> Result<()> {
     }
     index.instances = memo;
     Ok(())
+}
+
+pub(super) fn reuse(index: &mut Index, previous: &Index) {
+    // Retained compositions point at these definitions. Share them with the
+    // new inventory rather than retaining two decoded copies of each object.
+    for (key, asset) in &mut index.assets {
+        if asset.content.is_some()
+            && let Some(old) = previous.assets.get(key)
+            && old.content == asset.content
+            && old.unavailable == asset.unavailable
+        {
+            asset.objects.clone_from(&old.objects);
+        }
+    }
+    if index.guids != previous.guids
+        || index.scripts != previous.scripts
+        || index.native_types != previous.native_types
+    {
+        return;
+    }
+    let mut changed: BTreeSet<_> = index
+        .assets
+        .iter()
+        .filter(|(key, asset)| {
+            previous.assets.get(*key).is_none_or(|old| {
+                old.content != asset.content || old.unavailable != asset.unavailable
+            })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    changed.extend(
+        previous
+            .assets
+            .keys()
+            .filter(|key| !index.assets.contains_key(*key))
+            .cloned(),
+    );
+    let dependencies: BTreeMap<_, BTreeSet<_>> = index
+        .assets
+        .iter()
+        .map(|(key, asset)| {
+            let dependencies = asset
+                .objects
+                .iter()
+                .flat_map(|object| {
+                    object
+                        .references
+                        .values()
+                        .map(|r| &r.target)
+                        .chain(object.prefab.iter().map(|p| &p.source))
+                })
+                .filter_map(|pointer| {
+                    index
+                        .resolve(&asset.project, &pointer.guid)
+                        .map(str::to_owned)
+                })
+                .collect();
+            (key.clone(), dependencies)
+        })
+        .collect();
+    loop {
+        let next: Vec<_> = dependencies
+            .iter()
+            .filter(|(key, dependencies)| {
+                !changed.contains(*key) && !dependencies.is_disjoint(&changed)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        changed.extend(next);
+    }
+    index.instances.extend(
+        previous
+            .instances
+            .iter()
+            .filter(|(key, _)| !changed.contains(*key))
+            .map(|(key, instance)| (key.clone(), instance.clone())),
+    );
 }
 
 impl Index {
@@ -379,10 +459,99 @@ mod tests {
             .insert((".".into(), guid.into()), vec![name.into()]);
     }
     const PREFAB: &str = "--- !u!1 &1\nGameObject:\n  m_Name: Enemy\n--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n  m_Father: {fileID: 0}\n--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n  nested:\n    target: {fileID: 1, guid: sword, type: 2}\n";
+    #[test]
+    fn completed_snapshots_restore_shared_definitions_and_invalidate_dependent_prefabs() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut index = Index::default();
+        asset(&mut index, "Base.prefab", "base", PREFAB);
+        asset(
+            &mut index,
+            "Variant.prefab",
+            "variant",
+            &placement(10, "base", "", ""),
+        );
+        asset(&mut index, "Independent.prefab", "independent", PREFAB);
+        build(&mut index).unwrap();
+        super::super::snapshot::save(cache.path(), [1; 32], &index).unwrap();
+        let saved = super::super::snapshot::load(cache.path(), [1; 32]).unwrap();
+        assert!(super::super::snapshot::load(cache.path(), [2; 32]).is_none());
+        for (key, expected) in &index.instances {
+            let actual = &saved.instances[key];
+            assert_eq!(actual.aliases, expected.aliases);
+            assert_eq!(actual.objects.len(), expected.objects.len());
+            for (actual, expected) in actual.objects.iter().zip(&expected.objects) {
+                assert_eq!(actual.references, expected.references);
+                assert_eq!(actual.name, expected.name);
+                let definition = saved.assets[&actual.definition]
+                    .objects
+                    .iter()
+                    .find(|o| o.id == actual.object.id)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&actual.object, definition));
+            }
+        }
+        let mut changed = Index {
+            assets: saved.assets.clone(),
+            guids: saved.guids.clone(),
+            ..Default::default()
+        };
+        asset(
+            &mut changed,
+            "Base.prefab",
+            "base",
+            &PREFAB.replace("Enemy", "Changed"),
+        );
+        changed.assets.get_mut("Base.prefab").unwrap().content = Some("changed-record".into());
+        reuse(&mut changed, &saved);
+        assert!(changed.instances.contains_key("Independent.prefab"));
+        assert!(!changed.instances.contains_key("Variant.prefab"));
+        build(&mut changed).unwrap();
+        assert!(Arc::ptr_eq(
+            &changed.instances["Independent.prefab"],
+            &saved.instances["Independent.prefab"]
+        ));
+        assert!(
+            changed.instances["Variant.prefab"]
+                .objects
+                .iter()
+                .any(|o| o.name == "Changed")
+        );
+        index.assets.get_mut("Base.prefab").unwrap().content =
+            Some(cache.path().join("missing.text.zst"));
+        super::super::snapshot::save(cache.path(), [1; 32], &index).unwrap();
+        assert!(super::super::snapshot::load(cache.path(), [1; 32]).is_none());
+    }
     fn placement(id: i64, guid: &str, changes: &str, removed: &str) -> String {
         format!(
             "--- !u!1001 &{id}\nPrefabInstance:\n  m_SourcePrefab: {{fileID: 100100000, guid: {guid}, type: 3}}\n  m_Modification:\n    m_Modifications: {changes}\n    m_RemovedComponents: {removed}\n"
         )
+    }
+
+    #[test]
+    fn reused_compositions_share_inventory_definitions() {
+        let prepare = || {
+            let mut index = Index::default();
+            asset(&mut index, "Stable.prefab", "stable", PREFAB);
+            index.assets.get_mut("Stable.prefab").unwrap().content = Some("content-record".into());
+            index
+        };
+        let mut before = prepare();
+        build(&mut before).unwrap();
+        let mut after = prepare();
+        reuse(&mut after, &before);
+        build(&mut after).unwrap();
+        assert!(Arc::ptr_eq(
+            &before.instances["Stable.prefab"],
+            &after.instances["Stable.prefab"]
+        ));
+        for instance in &after.instances["Stable.prefab"].objects {
+            let definition = after.assets[&instance.definition]
+                .objects
+                .iter()
+                .find(|object| object.id == instance.object.id)
+                .unwrap();
+            assert!(Arc::ptr_eq(&instance.object, definition));
+        }
     }
     #[test]
     fn placements_apply_reference_overrides_and_component_removals() {

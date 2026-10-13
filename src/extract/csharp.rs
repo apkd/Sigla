@@ -14,14 +14,12 @@ fn field(n: Node<'_>, name: &str, source: &str) -> String {
         .map(|n| text(n, source).to_owned())
         .unwrap_or_default()
 }
-fn ancestor<'a>(mut n: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    while let Some(p) = n.parent() {
-        if kinds.contains(&p.kind()) {
-            return Some(p);
-        }
-        n = p;
-    }
-    None
+fn ancestor<'a>(parents: &[Node<'a>], kinds: &[&str]) -> Option<Node<'a>> {
+    parents
+        .iter()
+        .rev()
+        .copied()
+        .find(|p| kinds.contains(&p.kind()))
 }
 fn modifiers(n: Node<'_>, s: &str) -> Vec<String> {
     let mut c = n.walk();
@@ -80,10 +78,11 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
             ));
     }
     let mut cursor = tree.walk();
+    let mut parents = Vec::new();
     loop {
         let node = cursor.node();
         let before = facts.declarations.len();
-        declaration(node, &analysis, &mut facts);
+        declaration(node, &parents, &analysis, &mut facts);
         if facts.declarations.len() != before {
             let header = crate::csharp::lower::header(node, &analysis, &facts.declarations);
             facts.csharp.as_mut().unwrap().headers.push(header);
@@ -105,7 +104,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
             let (alias, path) = value
                 .split_once('=')
                 .map_or(("", value), |(a, p)| (a.trim(), p.trim()));
-            let scope = ancestor(node, &["namespace_declaration"])
+            let scope = ancestor(&parents, &["namespace_declaration"])
                 .map_or(0..source.len(), |n| n.byte_range());
             facts.imports.push(Import {
                 alias: normalize_name(alias),
@@ -140,6 +139,7 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
             });
         }
         if cursor.goto_first_child() {
+            parents.push(node);
             continue;
         }
         loop {
@@ -181,11 +181,12 @@ pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
                 }
                 return Ok(facts);
             }
+            parents.pop();
         }
     }
 }
 
-fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
+fn declaration<'a>(n: Node<'a>, parents: &[Node<'a>], s: &str, facts: &mut Facts) {
     let implicit_value_type = crate::csharp::lower::accessor_value_type(n);
     let kind = match n.kind() {
         "accessor_declaration" if implicit_value_type.is_some() => "parameter",
@@ -205,10 +206,10 @@ fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
         "parameter" | "implicit_parameter" => "parameter",
         "declaration_expression" | "declaration_pattern" => "local",
         "variable_declarator" => {
-            if ancestor(n, &["event_field_declaration"]).is_some() {
+            if ancestor(parents, &["event_field_declaration"]).is_some() {
                 "event"
-            } else if ancestor(n, &["field_declaration"]).is_some() {
-                if ancestor(n, &["field_declaration"])
+            } else if ancestor(parents, &["field_declaration"]).is_some() {
+                if ancestor(parents, &["field_declaration"])
                     .is_some_and(|p| modifiers(p, s).iter().any(|m| m == "const"))
                 {
                     "const"
@@ -287,7 +288,7 @@ fn declaration(n: Node<'_>, s: &str, facts: &mut Facts) {
     };
     let outer = if matches!(kind, "field" | "event" | "const") && n.kind() == "variable_declarator"
     {
-        ancestor(n, &["field_declaration", "event_field_declaration"]).unwrap_or(n)
+        ancestor(parents, &["field_declaration", "event_field_declaration"]).unwrap_or(n)
     } else {
         n
     };
@@ -482,6 +483,32 @@ fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sibling_scopes_keep_their_own_ancestors() {
+        let source = "namespace Outer { using System; class A { const int X = 1; event Action E; void M() { int local = 0; } } namespace Inner { using Other; class B { int field; } } } namespace Next { class C { int value; } }";
+        let facts = extract(source, &[]).unwrap();
+        for (name, kind) in [
+            ("X", "const"),
+            ("E", "event"),
+            ("local", "local"),
+            ("field", "field"),
+            ("value", "field"),
+        ] {
+            assert!(
+                facts
+                    .declarations
+                    .iter()
+                    .any(|d| d.name == name && d.kind == kind)
+            );
+        }
+        let outer = facts.imports.iter().find(|i| i.path == "System").unwrap();
+        let inner = facts.imports.iter().find(|i| i.path == "Other").unwrap();
+        assert!(outer.scope.contains(&source.find("class A").unwrap()));
+        assert!(!inner.scope.contains(&source.find("class A").unwrap()));
+        assert!(inner.scope.contains(&source.find("class B").unwrap()));
+        assert!(!outer.scope.contains(&source.find("class C").unwrap()));
+    }
+
     #[test]
     fn declarations_and_explicit_roles() {
         let s = "namespace Game; class Parser { int a,b; public int Parse(int x) { a++; b = x; return Parse(x); } }";

@@ -5,6 +5,7 @@ mod native;
 mod parse;
 mod query;
 mod records;
+mod snapshot;
 mod yaml;
 
 use crate::{
@@ -28,7 +29,7 @@ pub struct ScriptType {
     pub assembly: String,
     pub ancestry: Vec<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Asset {
     pub project: String,
     pub path: String,
@@ -45,12 +46,52 @@ pub struct Index {
     pub instances: BTreeMap<String, std::sync::Arc<compose::Composed>>,
     native_types: BTreeMap<String, BTreeMap<i32, native::Resolved>>,
     observed: BTreeMap<PathBuf, Stamp>,
+    retained_bytes: usize,
 }
 impl Index {
     fn current(&self) -> bool {
         self.observed
             .iter()
             .all(|(path, stamp)| Stamp::read(path).as_ref().ok() == Some(stamp))
+    }
+    fn measure(&mut self) {
+        // Count shared object/type allocations once across prefab instances.
+        let mut objects = std::collections::HashSet::new();
+        let mut bytes = crate::memory::encoded_size(&(
+            &self.guids,
+            &self.scripts,
+            &self.native_types,
+            &self.observed,
+        )) * 3;
+        for (key, asset) in &self.assets {
+            bytes += 256 + key.len() + asset.project.len() + asset.path.len() + asset.guid.len();
+            for object in &asset.objects {
+                if objects.insert(std::sync::Arc::as_ptr(object)) {
+                    bytes += crate::memory::encoded_size(object) * 3;
+                }
+            }
+        }
+        for (key, composed) in &self.instances {
+            bytes += 128
+                + key.len()
+                + crate::memory::encoded_size(&(&composed.aliases, &composed.incomplete)) * 3;
+            for instance in &composed.objects {
+                bytes += 256
+                    + crate::memory::encoded_size(&(
+                        &instance.id,
+                        &instance.definition,
+                        &instance.name,
+                        &instance.ty,
+                        &instance.native_issue,
+                        &instance.references,
+                        &instance.evidence,
+                    )) * 3;
+                if objects.insert(std::sync::Arc::as_ptr(&instance.object)) {
+                    bytes += crate::memory::encoded_size(&instance.object) * 3;
+                }
+            }
+        }
+        self.retained_bytes = bytes;
     }
 }
 
@@ -179,42 +220,56 @@ impl Index {
 }
 
 pub struct BuildOptions<'a> {
+    pub previous: Option<&'a Index>,
+    pub records: Option<&'a crate::cache::artifacts::Store>,
     pub remote: bool,
     pub omitted: &'a BTreeMap<String, String>,
     pub cancel: &'a tokio_util::sync::CancellationToken,
 }
 
+type ScriptTypes = BTreeMap<(PathBuf, PathBuf), Vec<ScriptType>>;
 fn script_types(
     root: &Path,
+    cache: &Path,
     projects: &[PathBuf],
     manifest: &Manifest,
     store: &Store,
-    tx: &heed::RoTxn<'_>,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<BTreeMap<(PathBuf, PathBuf), Vec<ScriptType>>> {
+) -> Result<ScriptTypes> {
+    let files: Vec<_> = manifest
+        .files
+        .iter()
+        .filter(|(_, entry)| {
+            if entry.language != Language::CSharp || entry.metadata {
+                return false;
+            }
+            let mut meta = entry.path.as_os_str().to_os_string();
+            meta.push(".meta");
+            Path::new(&meta).is_file()
+        })
+        .collect();
+    let key = *blake3::hash(&postcard::to_allocvec(&(
+        env!("SIGLA_ASSET_FINGERPRINT"),
+        manifest.environment,
+        projects,
+        files.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+    ))?)
+    .as_bytes();
+    let path = cache.join("script-types.zst");
+    if let Ok(file) = std::fs::File::open(&path)
+        && let Ok(bytes) = zstd::stream::decode_all(file)
+        && let Ok((saved, types)) = postcard::from_bytes::<([u8; 32], ScriptTypes)>(&bytes)
+        && saved == key
+    {
+        return Ok(types);
+    }
     let mut type_files = BTreeMap::<(PathBuf, PathBuf), Vec<ScriptType>>::new();
-    let view = crate::csharp::catalog::View {
-        store,
-        tx,
-        manifest,
-        cancel,
-    };
     let types_started = std::time::Instant::now();
-    for (file, entry) in &manifest.files {
+    for (file, entry) in files {
         ensure!(
             !cancel.is_cancelled(),
             "Asset indexing cancelled or superseded"
         );
-        if entry.language != Language::CSharp || entry.metadata {
-            continue;
-        }
-        // Only a script's .meta entry can publish its type in index.scripts.
-        // Avoid binding package/generated sources that have no such asset entry.
-        let mut meta = entry.path.as_os_str().to_os_string();
-        meta.push(".meta");
-        if !Path::new(&meta).is_file() {
-            continue;
-        }
         // Each source file is an independent binding query with its own budget.
         let mut binder = crate::csharp::bind::Binder::default();
         let stem = entry
@@ -222,7 +277,18 @@ fn script_types(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        for declaration in store.declarations_in(tx, file)? {
+        let tx = store.read()?;
+        let view = crate::csharp::catalog::View {
+            store,
+            tx: &tx,
+            manifest,
+            cancel,
+        };
+        for id in store.csharp_lookup(&tx, file, stem, crate::store::DeclarationLookup::Type)? {
+            let facts = store
+                .csharp_declaration(&tx, file, id)?
+                .context("Missing script declaration")?;
+            let declaration = &facts.declarations[0];
             if declaration.kind != "class" || declaration.name != stem {
                 continue;
             }
@@ -232,7 +298,7 @@ fn script_types(
                     &crate::csharp::catalog::Site {
                         file,
                         project: membership.project,
-                        declaration: &declaration,
+                        declaration,
                     },
                 )?;
                 if ancestry
@@ -264,6 +330,7 @@ fn script_types(
         }
     }
     tracing::info!(workspace = %root.display(), scripts = type_files.len(), elapsed_ms = types_started.elapsed().as_millis(), "Unity script types resolved");
+    records::save(&path, &(key, &type_files))?;
     Ok(type_files)
 }
 
@@ -272,14 +339,17 @@ pub fn build(
     cache: &Path,
     manifest: &Manifest,
     store: &Store,
-    tx: &heed::RoTxn<'_>,
     options: BuildOptions<'_>,
 ) -> Result<Index> {
     let BuildOptions {
+        previous,
+        records: shared_records,
         remote,
         omitted,
         cancel,
     } = options;
+    let snapshot = store.snapshot()?;
+    let store = &*snapshot;
     ensure!(
         !cancel.is_cancelled(),
         "Asset indexing cancelled or superseded"
@@ -289,7 +359,7 @@ pub fn build(
     let mut observed = BTreeMap::new();
     roots(root, &mut projects, &mut observed, 0)?;
     let mut index = Index::default();
-    let type_files = script_types(root, &projects, manifest, store, tx, cancel)?;
+    let type_files = script_types(root, cache, &projects, manifest, store, cancel)?;
     let assets_started = std::time::Instant::now();
     for project in &projects {
         let project_name = project.strip_prefix(root)?.to_string_lossy().to_string();
@@ -361,7 +431,7 @@ pub fn build(
             .filter(|file| observed[*file].size <= limit)
             .map(|file| (file.clone(), observed[file].clone()))
             .collect();
-        let mut records = records::load_all(cache, &inputs, cancel)?;
+        let mut records = records::load_all(cache, shared_records, &inputs, cancel)?;
         for file in files {
             ensure!(
                 !cancel.is_cancelled(),
@@ -449,9 +519,10 @@ pub fn build(
             .filter(|asset| asset.project == project_name)
             .flat_map(|asset| asset.objects.iter().map(|object| object.class))
             .collect();
+        let native_tx = store.read()?;
         index.native_types.insert(
             project_name,
-            native::build(project, &classes, manifest, store, tx, cancel)?,
+            native::build(project, &classes, manifest, store, &native_tx, cancel)?,
         );
     }
     let mut missing: BTreeMap<_, _> = omitted.iter().collect();
@@ -493,6 +564,9 @@ pub fn build(
     }
     index.observed = observed;
     tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = assets_started.elapsed().as_millis(), "Unity asset records ready");
+    if let Some(previous) = previous {
+        compose::reuse(&mut index, previous);
+    }
     compose::build(&mut index)?;
     ensure!(
         !cancel.is_cancelled(),
@@ -502,6 +576,7 @@ pub fn build(
         index.current(),
         "Unity inputs changed during indexing; retry query"
     );
+    index.measure();
     Ok(index)
 }
 
@@ -559,15 +634,16 @@ mod tests {
         );
         let store =
             Store::open_workspace(&cache.path().join("store"), [0; 32], &root, None).unwrap();
-        let tx = store.read().unwrap();
+        store.save_manifest(&Manifest::default()).unwrap();
         let build_at = |path: &Path| {
             build(
                 path,
                 &cache.path().join("assets"),
                 &Manifest::default(),
                 &store,
-                &tx,
                 BuildOptions {
+                    previous: None,
+                    records: None,
                     remote: false,
                     omitted: &Default::default(),
                     cancel: &tokio_util::sync::CancellationToken::new(),
@@ -627,14 +703,15 @@ mod tests {
         ]);
         let store =
             Store::open_workspace(&cache.path().join("store"), [0; 32], root.path(), None).unwrap();
-        let tx = store.read().unwrap();
+        store.save_manifest(&Manifest::default()).unwrap();
         let index = build(
             root.path(),
             &cache.path().join("assets"),
             &Manifest::default(),
             &store,
-            &tx,
             BuildOptions {
+                previous: None,
+                records: None,
                 remote: false,
                 omitted: &omitted,
                 cancel: &tokio_util::sync::CancellationToken::new(),

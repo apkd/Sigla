@@ -11,6 +11,20 @@ use std::{
 
 const PENDING: &str = "data.mdb.compacting";
 const PREVIOUS: &str = "data.mdb.previous";
+const TABLES: &[&str] = &[
+    "control",
+    "workspaces",
+    "bindings",
+    "objects",
+    "records",
+    "declarations",
+    "occurrences",
+    "global-import-files",
+    "members",
+    "shared-declarations",
+    "shared-occurrences",
+    "shared-global-imports",
+];
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub allocated: u64,
@@ -38,7 +52,7 @@ fn validate(path: &Path) -> Result<Vec<(String, u64)>> {
     // The cache ownership lock and the service activity gate exclude other openers.
     let env = unsafe {
         EnvOpenOptions::new()
-            .max_dbs(8)
+            .max_dbs(12)
             .flags(EnvFlags::READ_ONLY | EnvFlags::NO_SUB_DIR)
             .open(path)
     }?;
@@ -47,24 +61,18 @@ fn validate(path: &Path) -> Result<Vec<(String, u64)>> {
         let control = env
             .open_database::<Bytes, Bytes>(&tx, Some("control"))?
             .ok_or_else(|| anyhow::anyhow!("Missing analysis control database"))?;
+        let format = control.get(&tx, b"format")?;
+        let legacy = format.is_some_and(crate::store::compatibility::accepts);
         ensure!(
-            control.get(&tx, b"format")? == Some(crate::store::ANALYSIS_VERSION.as_bytes()),
+            format == Some(crate::store::shared::FORMAT) || legacy,
             "Unknown analysis format"
         );
         let mut counts = Vec::new();
-        for name in [
-            "control",
-            "workspaces",
-            "bindings",
-            "objects",
-            "records",
-            "declarations",
-            "occurrences",
-            "global-import-files",
-        ] {
-            let table = env
-                .open_database::<Bytes, Bytes>(&tx, Some(name))?
-                .ok_or_else(|| anyhow::anyhow!("Missing analysis table"))?;
+        for &name in TABLES {
+            let Some(table) = env.open_database::<Bytes, Bytes>(&tx, Some(name))? else {
+                ensure!(legacy, "Missing analysis table");
+                continue;
+            };
             counts.push((name.to_owned(), table.len(&tx)?));
         }
         Ok(counts)
@@ -132,18 +140,12 @@ pub fn run(env: Env, cache: &Path) -> Result<u64> {
     let expected = {
         let tx = env.read_txn()?;
         let mut counts = Vec::new();
-        for name in [
-            "control",
-            "workspaces",
-            "bindings",
-            "objects",
-            "records",
-            "declarations",
-            "occurrences",
-            "global-import-files",
-        ] {
+        for &name in TABLES {
             // Re-open raw bytes only in the isolated validator; heed tracks typed handles here.
-            let count = if matches!(name, "declarations" | "occurrences" | "global-import-files") {
+            let count = if matches!(
+                name,
+                "members" | "declarations" | "occurrences" | "global-import-files"
+            ) {
                 env.open_database::<Bytes, Str>(&tx, Some(name))?
                     .unwrap()
                     .len(&tx)?

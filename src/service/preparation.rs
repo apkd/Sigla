@@ -35,6 +35,13 @@ impl Ticket {
     pub fn running(&self) -> bool {
         matches!(*self.0.borrow(), Progress::Pending | Progress::Files(_))
     }
+    pub fn needs_refresh(&self) -> bool {
+        match &*self.0.borrow() {
+            Progress::Ready(inventory) => inventory.watch.changed(),
+            Progress::Failed(..) => true,
+            Progress::Pending | Progress::Files(_) => false,
+        }
+    }
     pub fn retained_inventory(&self) -> bool {
         matches!(*self.0.borrow(), Progress::Failed(_, Some(_)))
     }
@@ -251,7 +258,9 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 let generation = preparing_branch
                     .as_ref()
                     .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
+                let permit = preparing_app.preparation_workers.clone().acquire_owned().await?;
                 let (next, result) = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let _permit = permit;
                     if state.is_none() {
                         *state = Some(Workspace::open(
                             entry,
@@ -332,7 +341,9 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     ),
                     watch: prepared.watch.clone(),
                 })));
-                let permit = preparing_app.workers.clone().acquire_owned().await?;
+                let queued = std::time::Instant::now();
+                let permit = preparing_app.indexing_workers.clone().acquire_owned().await?;
+                tracing::debug!(workspace = %entry.display(), wait_ms = queued.elapsed().as_millis(), "indexing worker admitted");
                 #[cfg(test)]
                 let _pause = preparing_app.indexing_pause.clone().acquire_owned().await?;
                 state = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -369,7 +380,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 {
                     metadata.indexed_revision = Some(metadata.prepared.revision.clone());
                     metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
-                    branch.persist(metadata)?;
+                    let branch = branch.clone();
+                    tokio::task::spawn_blocking(move || {
+                        branch.persist(gate.as_ref().unwrap())
+                    }).await??;
                 }
             }
             preparing_app.start_assets(

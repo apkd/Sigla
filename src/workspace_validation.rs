@@ -8,6 +8,11 @@ fn source_indexing_benchmark() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let path = |name| PathBuf::from(std::env::var_os(name).expect(name));
     let root = path("SIGLA_BENCH_ROOT");
+    let _blobs = std::env::var_os("SIGLA_BENCH_BLOBS").map(|cache| {
+        let cache = PathBuf::from(cache);
+        assert!(cache.join("blobs").is_dir(), "Use an existing blob store");
+        crate::cache::blobs::Store::open(&cache).unwrap()
+    });
     let parent = std::env::var_os("SIGLA_BENCH_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -222,11 +227,12 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
         let asset_jobs = crate::unity::assets::jobs::Jobs::default();
         let asset_started = std::time::Instant::now();
         let ticket = asset_jobs.start(crate::unity::assets::jobs::Request {
-            activity,
+            records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
+            activity: activity.clone(),
             workspace: workspace.clone(),
             branch: None,
             root: root.clone(),
-            cache: asset_cache,
+            cache: asset_cache.clone(),
             expected: crate::unity::assets::jobs::generation(&manifest).unwrap(),
             revision: None,
             refresh: false,
@@ -253,6 +259,26 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
             );
         }
         assets.await.unwrap();
+        drop(asset_jobs);
+        let cached_started = std::time::Instant::now();
+        let cached_jobs = crate::unity::assets::jobs::Jobs::default();
+        let cached = cached_jobs.start(crate::unity::assets::jobs::Request {
+            records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
+            activity,
+            workspace,
+            branch: None,
+            root,
+            cache: asset_cache,
+            expected: crate::unity::assets::jobs::generation(&manifest).unwrap(),
+            revision: None,
+            refresh: false,
+        });
+        let cached = crate::unity::assets::jobs::wait(cached).await.unwrap();
+        eprintln!(
+            "persisted_assets: files={} elapsed_ms={}",
+            cached.assets.len(),
+            cached_started.elapsed().as_millis()
+        );
     });
     eprintln!("all_indexes: elapsed_ms={}", started.elapsed().as_millis());
 }

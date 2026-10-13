@@ -417,17 +417,120 @@ fn main() {
     }
     let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
     sources(Path::new("src"), &mut files);
+    files.extend(
+        [
+            "src/unity/assets/native/2022.3.json",
+            "src/unity/assets/native/6000.0.json",
+        ]
+        .map(PathBuf::from),
+    );
     files.sort();
-    let mut fingerprint = Sha256::new();
+    let mut analysis = Sha256::new();
+    let mut workspace = Sha256::new();
+    let mut assets = Sha256::new();
+    let mut asset_records = Sha256::new();
     for file in files {
         println!("cargo:rerun-if-changed={}", file.display());
-        fingerprint.update(file.to_string_lossy().as_bytes());
-        fingerprint.update([0]);
-        fingerprint.update(fs::read(file).unwrap());
+        let name = file.to_string_lossy();
+        let mut bytes = fs::read(&file).unwrap();
+        // Release numbers and build profiles do not change extracted facts.
+        if name == "Cargo.lock" {
+            let text = String::from_utf8(bytes).unwrap();
+            bytes = text
+                .split("[[package]]")
+                .filter(|block| !block.starts_with("\nname = \"sigla\"\n"))
+                .collect::<Vec<_>>()
+                .join("[[package]]")
+                .into_bytes();
+        } else if name == "Cargo.toml" {
+            let text = String::from_utf8(bytes).unwrap();
+            let mut include = false;
+            bytes = text
+                .lines()
+                .filter(|line| {
+                    if line.starts_with('[') {
+                        include = line.contains("dependencies") || *line == "[features]";
+                    }
+                    include
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes();
+        }
+        let facts = name.starts_with("Cargo.")
+            || name.starts_with("src/extract/")
+            || name.starts_with("src/native/") && !name.ends_with("jobs.rs")
+            || matches!(
+                name.as_ref(),
+                "src/binary.rs"
+                    | "src/model.rs"
+                    | "src/metadata.rs"
+                    | "src/query.rs"
+                    | "src/minify.rs"
+                    | "src/csharp/syntax.rs"
+                    | "src/csharp/lower.rs"
+                    | "src/csharp/types.rs"
+                    | "src/store/data.rs"
+                    | "src/store/format.rs"
+                    | "src/store/payload.rs"
+            );
+        let graph = facts
+            || name.starts_with("src/discovery")
+            || name.starts_with("src/unity/") && !name.starts_with("src/unity/assets/")
+            || name.starts_with("src/metadata_archive")
+            || matches!(
+                name.as_ref(),
+                "src/workspace.rs"
+                    | "src/msbuild.rs"
+                    | "src/selection.rs"
+                    | "src/documents.rs"
+                    | "src/cache/packages.rs"
+                    | "src/repository/selection.rs"
+            );
+        let objects = facts || name.starts_with("src/csharp/") || name.starts_with("src/unity/");
+        let records = name.starts_with("Cargo.")
+            || matches!(
+                name.as_ref(),
+                "src/unity/assets/parse.rs"
+                    | "src/unity/assets/yaml.rs"
+                    | "src/unity/assets/records.rs"
+            );
+        for (hash, include) in [
+            (&mut analysis, facts),
+            (&mut workspace, graph),
+            (&mut assets, objects),
+            (&mut asset_records, records),
+        ] {
+            if include {
+                hash.update(name.as_bytes());
+                hash.update([0]);
+                hash.update(&bytes);
+            }
+        }
+    }
+    for file in [
+        "managed/Program.cs",
+        "managed/TrackedFileSystem.cs",
+        "managed/PackageSnapshot.cs",
+        "managed/Sigla.Discovery.csproj",
+    ] {
+        workspace.update(fs::read(file).unwrap());
     }
     println!(
         "cargo:rustc-env=SIGLA_ANALYSIS_FINGERPRINT={:x}",
-        fingerprint.finalize()
+        analysis.finalize()
+    );
+    println!(
+        "cargo:rustc-env=SIGLA_WORKSPACE_FINGERPRINT={:x}",
+        workspace.finalize()
+    );
+    println!(
+        "cargo:rustc-env=SIGLA_ASSET_FINGERPRINT={:x}",
+        assets.finalize()
+    );
+    println!(
+        "cargo:rustc-env=SIGLA_ASSET_RECORD_FINGERPRINT={:x}",
+        asset_records.finalize()
     );
     for input in [
         "Cargo.toml",

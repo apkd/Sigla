@@ -59,12 +59,14 @@ struct Progress {
     started: Instant,
     completed: AtomicU64,
     total: u64,
+    retained: AtomicU64,
 }
 struct Job {
     generation: [u8; 32],
     ticket: Ticket,
     cancel: CancellationToken,
     writer: Arc<tokio::sync::Mutex<()>>,
+    used: Instant,
 }
 pub struct Jobs {
     running: Mutex<HashMap<(PathBuf, Group), Job>>,
@@ -127,10 +129,37 @@ impl Jobs {
         });
     }
     pub fn trim_completed(&self) {
-        self.running
-            .lock()
-            .unwrap()
-            .retain(|_, job| job.ticket.ready().is_none());
+        self.trim_to(0);
+    }
+    pub fn trim_to(&self, limit: usize) {
+        let mut jobs = self.running.lock().unwrap();
+        let mut completed: Vec<_> = jobs
+            .iter()
+            .filter_map(|(key, job)| {
+                let outcome = job.ticket.outcome.borrow();
+                let result = outcome.as_ref()?;
+                Some((
+                    key.clone(),
+                    job.used,
+                    (job.ticket.progress.retained.load(Ordering::Relaxed) as usize).max(256),
+                    result
+                        .as_ref()
+                        .map_or(true, |snapshot| Arc::strong_count(snapshot) == 1),
+                ))
+            })
+            .collect();
+        completed.sort_by_key(|(_, used, _, _)| *used);
+        let mut bytes: usize = completed.iter().map(|(_, _, bytes, _)| bytes).sum();
+        for (key, _, size, idle) in completed {
+            if bytes <= limit {
+                break;
+            }
+            if !idle {
+                continue;
+            }
+            jobs.remove(&key);
+            bytes -= size;
+        }
     }
     #[cfg(test)]
     pub async fn pause(&self, group: Group) -> tokio::sync::OwnedSemaphorePermit {
@@ -154,10 +183,11 @@ impl Jobs {
         let generation = generation(&manifest, group)?;
         let mut jobs = self.running.lock().unwrap();
         let key = (entry.clone(), group);
-        if let Some(job) = jobs.get(&key)
+        if let Some(job) = jobs.get_mut(&key)
             && job.generation == generation
             && job.ticket.ready().is_none_or(|r| r.is_ok())
         {
+            job.used = Instant::now();
             return Ok(job.ticket.clone());
         }
         let writer = if let Some(previous) = jobs.get(&key) {
@@ -166,13 +196,11 @@ impl Jobs {
         } else {
             Arc::new(tokio::sync::Mutex::new(()))
         };
-        if jobs.len() >= 16 {
-            jobs.retain(|_, job| job.ticket.ready().is_none());
-        }
         let (send, outcome) = watch::channel(None);
         let progress = Arc::new(Progress {
             started: Instant::now(),
             completed: AtomicU64::new(0),
+            retained: AtomicU64::new(0),
             total: manifest
                 .deferred
                 .values()
@@ -192,6 +220,7 @@ impl Jobs {
                 ticket: ticket.clone(),
                 cancel: cancel.clone(),
                 writer: writer.clone(),
+                used: Instant::now(),
             },
         );
         let workers = self.workers.clone();
@@ -211,9 +240,6 @@ impl Jobs {
                     "source-group", crate::store::ANALYSIS_VERSION, &entry, group,
                     manifest.discovery_policy,
                 ))?).as_bytes();
-                let owner = branch.as_ref().map(|b| b.root.as_path());
-                let store = Store::open_workspace(&analysis, fingerprint, &entry, owner)?;
-                store.begin_refresh()?;
                 let mut snapshot = Manifest {
                     source_group: Some(group),
                     root: manifest.root.clone(),
@@ -224,12 +250,34 @@ impl Jobs {
                         .map(|(k, f)| (k.clone(), f.clone())).collect(),
                     ..Default::default()
                 };
-                let mut pending = snapshot.files.clone().into_iter();
+                if snapshot.files.is_empty() {
+                    let state = workspace.lock().await;
+                    let code = state.as_ref().context("Code workspace unavailable")?;
+                    ensure!(self::generation(&code.manifest, group)? == generation, "Source indexing superseded");
+                    let snapshot = Arc::new(Snapshot { store: code.store.clone(), manifest: snapshot });
+                    progress.retained.store(crate::memory::encoded_size(&snapshot.manifest) as u64 * 3 + 256, Ordering::Relaxed);
+                    send.send_replace(Some(Ok(snapshot.clone())));
+                    return Ok(snapshot);
+                }
+                let owner = branch.as_ref().map(|b| b.root.clone());
+                let expected = postcard::to_allocvec(&(&snapshot.files, &snapshot.projects, snapshot.discovery_policy))?;
+                let (store, cached) = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let store = Store::open_workspace(&analysis, fingerprint, &entry, owner.as_deref())?;
+                    let cached = store.get_manifest::<Manifest>()?.filter(|saved| {
+                        postcard::to_allocvec(&(&saved.files, &saved.projects, saved.discovery_policy)).ok().as_ref() == Some(&expected)
+                            && saved.sources_current()
+                    });
+                    Ok((store, cached))
+                }).await??;
+                let reused = cached.is_some();
+                if let Some(cached) = cached { snapshot = cached; }
+                let batches = if reused { Vec::new() } else { crate::workspace::native_batches(&snapshot.files) };
+                let mut pending = batches.into_iter();
                 let mut tasks = tokio::task::JoinSet::new();
                 let mut failure = None;
                 loop {
                     while tasks.len() < 4 && !cancel.is_cancelled() {
-                        let Some((key, file)) = pending.next() else { break; };
+                        let Some(files) = pending.next() else { break; };
                         let store = store.clone();
                         let manifest = manifest.clone();
                         let workers = workers.clone();
@@ -241,15 +289,14 @@ impl Jobs {
                             };
                             tokio::task::spawn_blocking(move || {
                                 let _permit = permit;
-                                let result = crate::workspace::index_native(
-                                    &store, &key, &file, &manifest.projects,
-                                );
-                                (key, file.stamp.size.max(1), result)
+                                let bytes = files.values().map(|file| file.stamp.size.max(1)).sum::<u64>();
+                                let results = crate::workspace::index_native_batch(&store, &files, &manifest.projects);
+                                (bytes, results)
                             }).await.context("Source extraction worker stopped")
                         });
                     }
                     let Some(result) = tasks.join_next().await else { break; };
-                    let (key, bytes, result) = match result {
+                    let (bytes, results) = match result {
                         Ok(Ok(result)) => result,
                         result => {
                             failure = Some(format!("Source worker failed: {result:?}"));
@@ -258,11 +305,13 @@ impl Jobs {
                         }
                     };
                     progress.completed.fetch_add(bytes, Ordering::Relaxed);
-                    if let Err(error) = result {
-                        let file = snapshot.files.remove(&key).unwrap();
-                        snapshot.diagnostics.push(format!(
-                            "Skipped {}: {error:#}", file.path.display(),
-                        ));
+                    for (key, result) in results {
+                        if let Err(error) = result {
+                            let file = snapshot.files.remove(&key).unwrap();
+                            snapshot.diagnostics.push(format!(
+                                "Skipped {}: {error:#}", file.path.display(),
+                            ));
+                        }
                     }
                 }
                 if let Some(failure) = failure {
@@ -279,23 +328,22 @@ impl Jobs {
                         "Workspace changed during source indexing; retry query"
                     ),
                 );
-                for file in snapshot.files.values() {
-                    ensure!(
-                        crate::workspace::Stamp::read(&file.path)? == file.stamp,
-                        crate::diagnostics::RefreshRequired(
-                            "Source changed during indexing; retry query"
-                        ),
-                    );
-                }
-                store.save_manifest(&snapshot)?;
-                for diagnostic in &snapshot.diagnostics {
+                let snapshot = tokio::task::spawn_blocking(move || -> Result<_> {
+                    ensure!(snapshot.sources_current(), crate::diagnostics::RefreshRequired("Source changed during indexing; retry query"));
+                    if !reused { store.save_manifest(&snapshot)?; }
+                    Ok(Arc::new(Snapshot { store, manifest: snapshot }))
+                }).await??;
+                for diagnostic in &snapshot.manifest.diagnostics {
                     tracing::warn!("{diagnostic}");
                 }
                 tracing::info!(
-                    group = group.name(), files = snapshot.files.len(),
+                    group = group.name(), files = snapshot.manifest.files.len(), reused,
+                    workspace = %snapshot.manifest.root.display(),
+                    repository = ?branch.as_ref().map(|b| b.repository.identity.to_string()),
+                    selector = ?branch.as_ref().map(|b| &b.name),
                     elapsed_ms = progress.started.elapsed().as_millis(), "source group ready",
                 );
-                let snapshot = Arc::new(Snapshot { store, manifest: snapshot });
+                progress.retained.store(crate::memory::encoded_size(&snapshot.manifest) as u64 * 3 + 256, Ordering::Relaxed);
                 send.send_replace(Some(Ok(snapshot.clone())));
                 drop(state);
                 drop(branch);

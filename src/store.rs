@@ -1,15 +1,18 @@
 //! Workspace views over shared immutable analysis. See store/shared.rs for ownership.
+pub(crate) mod compatibility;
+mod data;
 pub(crate) mod format;
+mod names;
 pub(crate) mod payload;
 pub mod shared;
 
 use crate::{
     csharp::syntax::{BodyFile, DeclarationFile},
-    model::{Facts, ModuleFile},
+    model::ModuleFile,
 };
 use anyhow::{Context, Result};
 use heed::RoTxn;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::BTreeSet,
     path::Path,
@@ -20,21 +23,41 @@ pub(crate) use payload::DeclarationLookup;
 pub use payload::{ANALYSIS_VERSION, canonical_defines, metadata_id, source_id};
 pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-const MANIFEST_PREFIX: &[u8] = b"sigla-manifest-3\0";
+const MANIFEST_PREFIX: &[u8] = b"sigla-manifest-4\0";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManifestRecord<'a> {
+    version: &'a str,
+    group: Option<crate::native::Group>,
+    policy: [u8; 32],
+    data: &'a [u8],
+}
+
+fn manifest_payload(bytes: &[u8]) -> Result<Option<&[u8]>> {
+    if let Some(bytes) = bytes.strip_prefix(MANIFEST_PREFIX) {
+        let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
+        return Ok((record.version == env!("SIGLA_WORKSPACE_FINGERPRINT")).then_some(record.data));
+    }
+    Ok(compatibility::legacy_workspace()
+        .then(|| bytes.strip_prefix(b"sigla-manifest-3\0"))
+        .flatten())
+}
+
+fn manifest_group(bytes: &[u8]) -> Result<Option<(Option<crate::native::Group>, [u8; 32])>> {
+    if let Some(bytes) = bytes.strip_prefix(MANIFEST_PREFIX) {
+        let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
+        return Ok(Some((record.group, record.policy)));
+    }
+    Ok(inspect_manifest(bytes)?.map(|manifest| (manifest.source_group, manifest.discovery_policy)))
+}
 
 pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<Option<crate::workspace::Manifest>> {
-    bytes
-        .strip_prefix(MANIFEST_PREFIX)
+    manifest_payload(bytes)?
         .map(|bytes| Ok(postcard::from_bytes(bytes)?))
         .transpose()
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct FileData {
-    pub source: String,
-    pub facts: Facts,
-    pub assembly: Option<String>,
-}
+pub use data::FileData;
 
 pub struct Store {
     pub scope: shared::Scope,
@@ -107,6 +130,11 @@ impl Store {
     pub fn read(&self) -> Result<RoTxn<'_, heed::WithTls>> {
         self.scope.read()
     }
+    pub(crate) fn snapshot(&self) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            scope: self.scope.snapshot()?,
+        }))
+    }
     pub fn query_read(&self) -> Result<RoTxn<'_, heed::WithTls>> {
         self.scope.query_read()
     }
@@ -120,18 +148,39 @@ impl Store {
         self.scope.clean()
     }
     pub fn get_manifest<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
-        self.scope
-            .manifest()?
-            .and_then(|bytes| bytes.strip_prefix(MANIFEST_PREFIX).map(<[u8]>::to_vec))
-            .map(|bytes| Ok(postcard::from_bytes(&bytes)?))
+        let bytes =
+            match self.scope.manifest()? {
+                Some(bytes) => Some(bytes),
+                None => self.scope.previous_manifest(|bytes| {
+                    Ok(inspect_manifest(bytes)?
+                        .is_some_and(|manifest| manifest.source_group.is_none()))
+                })?,
+            };
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        manifest_payload(&bytes)?
+            .map(|bytes| Ok(postcard::from_bytes(bytes)?))
             .transpose()
     }
     /// Reconcile against persisted bindings, not only the previous in-memory manifest.
     pub fn save_manifest(&self, manifest: &crate::workspace::Manifest) -> Result<()> {
         let keep = manifest.files.keys().cloned().collect();
         let mut bytes = MANIFEST_PREFIX.to_vec();
-        bytes.extend(postcard::to_allocvec(manifest)?);
-        self.scope.finish_refresh(&bytes, &keep, now())
+        let data = postcard::to_allocvec(manifest)?;
+        postcard::to_io(
+            &ManifestRecord {
+                version: env!("SIGLA_WORKSPACE_FINGERPRINT"),
+                group: manifest.source_group,
+                policy: manifest.discovery_policy,
+                data: &data,
+            },
+            &mut bytes,
+        )?;
+        self.scope.finish_refresh(&bytes, &keep, now())?;
+        self.scope.retire_previous(|bytes| {
+            Ok(manifest_group(bytes)? == Some((manifest.source_group, manifest.discovery_policy)))
+        })
     }
     pub fn remove(&self, file: &str) -> Result<()> {
         self.scope.detach(file, now())
@@ -142,10 +191,15 @@ impl Store {
         revision: &R,
     ) -> Result<Option<Vec<ModuleFile>>> {
         let tx = self.read()?;
-        let Some(binding) = self.scope.binding(&tx, file)? else {
+        let revision = postcard::to_allocvec(revision)?;
+        let binding = match self.scope.binding(&tx, file)? {
+            Some(binding) => Some(binding),
+            None => self.scope.previous_binding(&tx, file, &revision)?,
+        };
+        let Some(binding) = binding else {
             return Ok(None);
         };
-        if binding.revision != postcard::to_allocvec(revision)? {
+        if binding.revision != revision {
             return Ok(None);
         }
         let bytes = self
@@ -154,6 +208,11 @@ impl Store {
             .record(&tx, &binding.object, payload::MODULES)?
             .context("Bound object is missing its module list")?;
         Ok(Some(crate::binary::decode(bytes)?))
+    }
+    pub(crate) fn matches<R: Serialize>(&self, file: &str, revision: &R) -> Result<bool> {
+        let tx = self.read()?;
+        let expected = postcard::to_allocvec(revision)?;
+        self.scope.matches(&tx, file, &expected)
     }
     pub fn install<R: Serialize>(
         &self,
@@ -199,6 +258,14 @@ impl Store {
                 .record(&tx, file, payload::MODULES)?
                 .context("Missing module record")?,
         )
+    }
+    pub(crate) fn object_modules(&self, object: &ObjectId) -> Result<Option<Vec<ModuleFile>>> {
+        let tx = self.read()?;
+        self.scope
+            .database
+            .record(&tx, object, payload::MODULES)?
+            .map(crate::binary::decode)
+            .transpose()
     }
     pub fn load(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<FileData>> {
         self.scope

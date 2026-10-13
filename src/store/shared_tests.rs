@@ -414,7 +414,8 @@ fn retirement_preserves_shared_objects_and_other_workspace_indexes() {
     );
     assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
     assert_eq!(db.binding_count(&tx, &[8; 32]).unwrap(), None);
-    for table in [db.declarations, db.occurrences, db.globals] {
+    {
+        let table = db.members;
         assert!(
             table
                 .prefix_iter(&tx, &retiring_id.to_be_bytes())
@@ -443,6 +444,267 @@ fn retirement_preserves_shared_objects_and_other_workspace_indexes() {
         BTreeSet::from(["keep".into()])
     );
     assert!(db.record(&tx, &[7; 32], &[]).unwrap().is_some());
+}
+
+#[test]
+fn snapshots_keep_objects_without_holding_database_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let workspace = scope(&db, 1);
+    put(&workspace, "file", 1, 7, "Before");
+    clean(&workspace, &["file"]);
+    let snapshot = workspace.snapshot().unwrap();
+    put(&workspace, "file", 2, 8, "After");
+    clean(&workspace, &["file"]);
+    db.collect_unused(100, true).unwrap();
+    {
+        let tx = snapshot.query_read().unwrap();
+        assert_eq!(
+            snapshot.record(&tx, "file", &[1]).unwrap(),
+            Some([7].as_slice())
+        );
+        assert_eq!(
+            snapshot
+                .candidates(&tx, "Before", false, true, |_| false)
+                .unwrap(),
+            BTreeSet::from(["file".into()])
+        );
+        assert!(
+            snapshot
+                .candidates(&tx, "After", false, true, |_| false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            workspace.record(&tx, "file", &[1]).unwrap(),
+            Some([8].as_slice())
+        );
+    }
+    drop(snapshot);
+    db.collect_unused(100, true).unwrap();
+    let tx = workspace.query_read().unwrap();
+    assert!(db.record(&tx, &[7; 32], &[1]).unwrap().is_none());
+}
+
+#[test]
+fn input_aliases_follow_shared_object_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let a = scope(&db, 1);
+    let b = scope(&db, 2);
+    let identity = [9; 32];
+    let pending = a
+        .prepare_install("one", vec![1], [7; 32], 100, || {
+            Ok(object("Shared", b"body"))
+        })
+        .unwrap()
+        .input(Some(identity));
+    a.install_batch(&[pending], |_| Ok(())).unwrap();
+    put(&b, "two", 1, 7, "Shared");
+    a.detach("one", 100).unwrap();
+    db.collect_unused(100, true).unwrap();
+    assert_eq!(a.input(&identity).unwrap(), Some([7; 32]));
+    b.detach("two", 100).unwrap();
+    db.collect_unused(100, true).unwrap();
+    assert!(a.input(&identity).unwrap().is_none());
+    let tx = a.read().unwrap();
+    assert!(
+        db.control
+            .get(&tx, &record_key(&identity, b"input"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn replacing_a_workspace_retires_only_its_previous_source_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let root = Path::new("/same-workspace");
+    let open = |id| crate::store::Store {
+        scope: db.workspace([id; 32], root, None).unwrap(),
+    };
+    let manifest = crate::workspace::Manifest {
+        root: root.into(),
+        ..Default::default()
+    };
+    let old = open(1);
+    old.save_manifest(&manifest).unwrap();
+    let snapshot = old.snapshot().unwrap();
+    let native = open(2);
+    native
+        .save_manifest(&crate::workspace::Manifest {
+            source_group: Some(crate::native::Group::Native),
+            ..manifest.clone()
+        })
+        .unwrap();
+    let replacement = open(3);
+    replacement.save_manifest(&manifest).unwrap();
+    assert_eq!(
+        old.scope.info(&old.read().unwrap()).unwrap().phase,
+        Phase::Deleting
+    );
+    assert!(native.scope.query_read().is_ok());
+    assert!(replacement.scope.query_read().is_ok());
+    assert!(snapshot.scope.query_read().is_ok());
+}
+
+#[test]
+fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let root = Path::new("/workspace");
+    let old = crate::store::Store {
+        scope: db.workspace([1; 32], root, None).unwrap(),
+    };
+    let mut bytes = crate::store::MANIFEST_PREFIX.to_vec();
+    postcard::to_io(
+        &crate::store::ManifestRecord {
+            version: "previous-discovery-layout",
+            group: None,
+            policy: [0; 32],
+            data: b"opaque old manifest",
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    old.scope
+        .finish_refresh(&bytes, &BTreeSet::new(), 100)
+        .unwrap();
+    assert!(
+        old.get_manifest::<crate::workspace::Manifest>()
+            .unwrap()
+            .is_none()
+    );
+    let replacement = crate::store::Store {
+        scope: db.workspace([2; 32], root, None).unwrap(),
+    };
+    replacement
+        .save_manifest(&crate::workspace::Manifest::default())
+        .unwrap();
+    assert_eq!(
+        old.scope.info(&old.read().unwrap()).unwrap().phase,
+        Phase::Deleting
+    );
+    assert!(
+        replacement
+            .get_manifest::<crate::workspace::Manifest>()
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        let old = scope(&db, 1);
+        put(&old, "file", 1, 7, "Shared");
+        clean(&old, &["file"]);
+        let mut tx = db.env.write_txn().unwrap();
+        let live = db.live(&tx, &[7; 32]).unwrap().unwrap();
+        db.objects
+            .put(
+                &mut tx,
+                &[7; 32],
+                &encode(&LegacyLiveness {
+                    bindings: live.bindings,
+                    unused_since: live.unused_since,
+                    encoded_bytes: live.encoded_bytes,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        db.records
+            .delete(&mut tx, &record_key(&[7; 32], POSTING_NAMES))
+            .unwrap();
+        for table in [db.declarations, db.occurrences, db.globals] {
+            table.clear(&mut tx).unwrap();
+        }
+        db.members.clear(&mut tx).unwrap();
+        db.legacy_postings[0]
+            .put(&mut tx, &scope_key(old.id, b"Shared"), "file")
+            .unwrap();
+        db.control
+            .put(
+                &mut tx,
+                b"format",
+                b"d70ac251b161d05505fdc5790766a45bdd917c9e97093b7df3751e7479131b09",
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let db = Database::open(dir.path()).unwrap();
+        let new = db
+            .workspace([2; 32], Path::new("/workspace/1"), None)
+            .unwrap();
+        let tx = new.read().unwrap();
+        let binding = new.previous_binding(&tx, "file", &[1]).unwrap().unwrap();
+        assert_eq!(
+            db.live(&tx, &binding.object).unwrap().unwrap().ordinal,
+            UNINDEXED
+        );
+        drop(tx);
+        let pending = new
+            .prepare_install("file", vec![1], binding.object, 100, || {
+                panic!("Compatible facts must be reused")
+            })
+            .unwrap();
+        assert!(
+            new.install_batch(&[pending], |_| Ok(())).unwrap()[0]
+                .unwrap()
+                .reused
+        );
+        clean(&new, &["file"]);
+    }
+    let db = Database::open(dir.path()).unwrap();
+    let old = db.existing([1; 32]).unwrap().unwrap();
+    old.mark_deleting().unwrap();
+    while !old.delete_batch(100, 1).unwrap() {}
+    db.collect_unused(100, true).unwrap();
+    let new = db.existing([2; 32]).unwrap().unwrap();
+    let tx = new.query_read().unwrap();
+    assert_eq!(
+        new.candidates(&tx, "Shared", false, true, |_| false)
+            .unwrap(),
+        BTreeSet::from(["file".into()])
+    );
+    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
+}
+
+#[test]
+fn preparing_and_attaching_shared_objects_does_not_duplicate_work_or_postings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let a = scope(&db, 1);
+    let b = scope(&db, 2);
+    let builds = AtomicUsize::new(0);
+    let prepare = |scope: &Scope, file| {
+        scope
+            .prepare_install(file, vec![1], [7; 32], 100, || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok(object("Shared", b"content"))
+            })
+            .unwrap()
+    };
+    let first = prepare(&a, "one");
+    let second = prepare(&b, "two");
+    assert_eq!(builds.load(Ordering::Relaxed), 1);
+    a.install_batch(&[first], |_| Ok(())).unwrap();
+    let count = {
+        let tx = a.read().unwrap();
+        db.declarations.len(&tx).unwrap()
+    };
+    b.install_batch(&[second, prepare(&b, "copy")], |_| Ok(()))
+        .unwrap();
+    let tx = b.read().unwrap();
+    assert_eq!(db.declarations.len(&tx).unwrap(), count);
+    assert_eq!(
+        b.candidates(&tx, "Shared", false, true, |_| false).unwrap(),
+        BTreeSet::from(["two".into(), "copy".into()])
+    );
 }
 
 #[test]
