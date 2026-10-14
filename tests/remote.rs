@@ -14,6 +14,8 @@ mod configuration_documents;
 fn git(root: &Path, args: &[&str]) -> Result<()> {
     ensure!(
         Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .arg("-C")
             .arg(root)
             .args(args)
@@ -505,10 +507,30 @@ fn lifecycle() -> Result<()> {
     server.until(feature, "type:Feature", "Feature")?;
     let tag = "git@github.com:fixture/repo.git#release";
     let pinned = format!("git@github.com:fixture/repo.git#{original_commit}");
-    let abbreviated = format!("git@github.com:fixture/repo.git#{}", &original_commit[..8]);
+    // Exercise the generic Git resolver through the local SSH endpoint. GitHub
+    // abbreviations use its commit API and have separate response/live coverage.
+    let abbreviated = format!("ssh://git@fixture.invalid/repo#{}", &original_commit[..8]);
     server.until(tag, "type:Main", "Main")?;
     server.until(&pinned, "type:Main", "Main")?;
     server.until(&abbreviated, "type:Main", "Main")?;
+    let (error, tree) = server.call("browse", json!({"codebase":abbreviated}))?;
+    ensure!(
+        !error && tree.contains("lib.rs"),
+        "Short-SHA browse failed: {tree}"
+    );
+    let (error, source) = server.call(
+        "view",
+        json!({"codebase":abbreviated,"path":"src/lib.rs","mode":"exact"}),
+    )?;
+    ensure!(
+        !error && source.contains("pub struct Main;"),
+        "Short-SHA view failed: {source}"
+    );
+    let (error, history) = server.call("history", json!({"codebase":abbreviated,"query":format!("diff {}..feature/search", &original_commit[..8])}))?;
+    ensure!(
+        !error && history.contains("Feature"),
+        "Short-SHA history range failed: {history}"
+    );
     server.until(
         "git@github.com:fixture/repo.git#refs/heads/release",
         "type:Feature",

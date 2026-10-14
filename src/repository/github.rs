@@ -6,6 +6,7 @@ use std::{
     collections::BTreeMap,
     io::{BufWriter, Read, Write},
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -107,6 +108,95 @@ fn client(
         }
     }
     Ok((client, token))
+}
+
+/// GitHub resolves abbreviations against its repository, including uncached commits.
+pub(super) fn commit(
+    repository: &Repository,
+    prefix: &str,
+    private: bool,
+    cancel: &AtomicBool,
+    remaining: Option<u64>,
+) -> Result<(gix_hash::ObjectId, u64)> {
+    ensure!(
+        !cancel.load(Ordering::Acquire),
+        "Revision resolution cancelled"
+    );
+    let (client, token) = client(repository, private)?;
+    let repo = repository.identity.components.join("/");
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{repo}/commits/{prefix}"
+        ))
+        .header("Accept", "application/vnd.github.sha");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let limit = remaining.unwrap_or(u64::MAX).min(64 * 1024);
+    ensure!(
+        limit > 0,
+        "Repository transfer limit exceeded during revision resolution"
+    );
+    ensure!(
+        !cancel.load(Ordering::Acquire),
+        "Revision resolution cancelled"
+    );
+    let response = request.send().context("GitHub commit lookup failed")?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut response = response.take(limit + 1);
+    let mut buffer = [0; 1024];
+    loop {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "Revision resolution cancelled"
+        );
+        let count = response
+            .read(&mut buffer)
+            .context("Cannot read GitHub commit response")?;
+        if count == 0 {
+            break;
+        }
+        body.extend_from_slice(&buffer[..count]);
+        ensure!(
+            body.len() as u64 <= limit,
+            "GitHub commit response exceeds transfer limit"
+        );
+    }
+    Ok((commit_response(status, &body, prefix)?, body.len() as u64))
+}
+
+fn commit_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    prefix: &str,
+) -> Result<gix_hash::ObjectId> {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY | reqwest::StatusCode::NOT_FOUND
+    ) && let Some(message) = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(|s| s.to_ascii_lowercase()))
+    {
+        if message.contains("ambiguous") {
+            return Err(super::revision::PrefixError::Ambiguous(prefix.into()).into());
+        }
+        if message.starts_with("no commit found for sha:") {
+            return Err(super::revision::PrefixError::Missing(prefix.into()).into());
+        }
+    }
+    ensure!(
+        status.is_success(),
+        "GitHub commit lookup failed (HTTP {status}); check the SHA, API credentials and rate limits"
+    );
+    let value = std::str::from_utf8(body)?.trim();
+    let id =
+        gix_hash::ObjectId::from_hex(value.as_bytes()).context("Invalid GitHub commit identity")?;
+    ensure!(
+        id.to_string().starts_with(prefix),
+        "GitHub returned an unrelated commit"
+    );
+    Ok(id)
 }
 
 /// Read one immutable source object without waiting for bulk Git acquisition.
@@ -214,6 +304,67 @@ fn insert(sizes: &mut BTreeMap<String, u64>, entry: Entry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_api_returns_a_matching_full_identity_and_preserves_failures() {
+        let id = object_id(b"commit identity fixture").to_string();
+        assert_eq!(
+            commit_response(reqwest::StatusCode::OK, id.as_bytes(), &id[..8])
+                .unwrap()
+                .to_string(),
+            id
+        );
+        assert!(commit_response(reqwest::StatusCode::OK, id.as_bytes(), "0000000").is_err());
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(commit_response(status, id.as_bytes(), &id[..8]).is_err());
+        }
+        assert!(
+            commit_response(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                br#"{"message":"The abbreviated object ID is ambiguous"}"#,
+                &id[..7]
+            )
+            .is_err()
+        );
+        assert!(commit_response(reqwest::StatusCode::OK, b"truncated", &id[..8]).is_err());
+    }
+
+    #[test]
+    fn commit_api_distinguishes_absence_ambiguity_and_access_failures() {
+        use super::super::revision::PrefixError;
+        let missing = commit_response(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            br#"{"message":"No commit found for SHA: abcdef0"}"#,
+            "abcdef0",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<PrefixError>(),
+            Some(PrefixError::Missing(_))
+        ));
+        let ambiguous = commit_response(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            br#"{"message":"The abbreviated object ID is ambiguous"}"#,
+            "abcdef0",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            ambiguous.downcast_ref::<PrefixError>(),
+            Some(PrefixError::Ambiguous(_))
+        ));
+        let denied = commit_response(
+            reqwest::StatusCode::NOT_FOUND,
+            br#"{"message":"Not Found"}"#,
+            "abcdef0",
+        )
+        .unwrap_err();
+        assert!(denied.downcast_ref::<PrefixError>().is_none());
+    }
 
     fn object_id(bytes: &[u8]) -> gix_hash::ObjectId {
         let mut hash = gix_hash::hasher(gix_hash::Kind::Sha1);

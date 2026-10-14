@@ -259,6 +259,20 @@ impl Session {
         self.handshake.server_protocol_version == gix_transport::Protocol::V2
     }
 
+    pub(super) fn object_format(&self) -> Result<&'static str> {
+        match self
+            .handshake
+            .capabilities
+            .capability("object-format")
+            .and_then(|c| c.value())
+            .map(|value| -> &[u8] { value.as_ref() })
+        {
+            None | Some(b"sha1") => Ok("sha1"),
+            Some(b"sha256") => Ok("sha256"),
+            _ => anyhow::bail!("Unsupported repository object format"),
+        }
+    }
+
     /// Stream a filtered pack to staging. Explicit blob wants are used only by the materializer.
     pub fn pack(
         &mut self,

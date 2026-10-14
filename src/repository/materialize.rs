@@ -25,7 +25,7 @@ pub enum Target {
 }
 
 impl Target {
-    fn unavailable(&self, name: &str) -> String {
+    pub(super) fn unavailable(&self, name: &str) -> String {
         let kind = match self {
             Self::Branch(_) => "branch",
             Self::Tag(_) => "tag",
@@ -37,7 +37,7 @@ impl Target {
             && name.bytes().all(|b| b.is_ascii_hexdigit())
         {
             message.push_str(
-                " Cached commit abbreviations require at least 7 hexadecimal characters; use a branch, tag, or full SHA.",
+                " Commit abbreviations require at least 7 hexadecimal characters; use a branch, tag, or full SHA.",
             );
         }
         if name.ends_with('"') {
@@ -108,7 +108,7 @@ pub struct Prepared {
     pub unavailable: BTreeSet<String>,
     #[serde(default)]
     pub transport: Option<String>,
-    /// Fixed semantic target when a named selector resolves from the local object cache.
+    /// Fixed semantic target when an abbreviated commit selector resolves.
     #[serde(default)]
     pub resolved_target: Option<Target>,
     pub branch: Option<String>,
@@ -147,63 +147,6 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
 
 fn parse_id(value: &str) -> Result<gix_hash::ObjectId> {
     gix_hash::ObjectId::from_hex(value.as_bytes()).context("Invalid Git object identity")
-}
-
-fn is_cached_commit_prefix(value: &str) -> bool {
-    (7..64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-pub(super) fn cached_commit(store: &Path, selector: &str) -> Result<gix_hash::ObjectId> {
-    let not_found = || {
-        anyhow::anyhow!(
-            "Cached commit prefix {selector:?} was not found; use a branch, tag, or full SHA."
-        )
-    };
-    if !store.join("HEAD").is_file() {
-        return Err(not_found());
-    }
-    let prefix = selector.to_ascii_lowercase();
-    let candidates = run(git(store)
-        .arg("rev-parse")
-        .arg(format!("--disambiguate={prefix}")))?;
-    if candidates.is_empty() {
-        return Err(not_found());
-    }
-    let objects = crate::process::capture(
-        git(store)
-            .arg("cat-file")
-            .arg("--batch-check=%(objectname) %(objecttype)"),
-        Duration::from_secs(120),
-        Some(candidates),
-        None,
-    )?;
-    ensure!(
-        objects.status.success(),
-        "Cannot inspect cached Git objects"
-    );
-    let mut commit = None;
-    for line in objects
-        .stdout
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let line = std::str::from_utf8(line)?;
-        let Some((id, kind)) = line.split_once(' ') else {
-            anyhow::bail!("Invalid cached Git object record");
-        };
-        if kind != "commit" {
-            continue;
-        }
-        let id = parse_id(id)?;
-        ensure!(
-            id.to_string().starts_with(&prefix),
-            "Cached Git disambiguation returned an unrelated object"
-        );
-        if commit.replace(id).is_some() {
-            anyhow::bail!("Cached commit prefix {selector:?} is ambiguous; use a longer SHA.");
-        }
-    }
-    commit.ok_or_else(not_found)
 }
 
 fn receive(
@@ -477,82 +420,38 @@ fn prepare_with(
         "Internal transport must not contain a fragment"
     );
     let mut session = connect(&repository)?;
-    let (branch, revision, resolved_target) = match &request.target {
-        Target::Commit(id) => (None, parse_id(id)?, None),
-        Target::Branch(name) | Target::Tag(name) | Target::Named(name) => {
-            super::validate_branch(name)?;
-            let names = match &request.target {
-                Target::Branch(_) => vec![format!("refs/heads/{name}")],
-                Target::Tag(_) => vec![format!("refs/tags/{name}")],
-                // Match Git's short-name precedence: tags before branches.
-                _ => vec![format!("refs/tags/{name}"), format!("refs/heads/{name}")],
-            };
-            let refs = session.refs(&names)?;
-            let resolved = names.iter().find_map(|name| {
-                refs.iter().find_map(|r| match r {
-                    gix_protocol::handshake::Ref::Direct {
-                        full_ref_name,
-                        object,
-                    }
-                    | gix_protocol::handshake::Ref::Peeled {
-                        full_ref_name,
-                        object,
-                        ..
-                    }
-                    | gix_protocol::handshake::Ref::Symbolic {
-                        full_ref_name,
-                        object,
-                        ..
-                    } if full_ref_name.as_slice() == name.as_bytes() => Some((name, *object)),
-                    _ => None,
-                })
-            });
-            if let Some((resolved, id)) = resolved {
-                (
-                    resolved.strip_prefix("refs/heads/").map(str::to_owned),
-                    id,
-                    None,
-                )
-            } else if matches!(&request.target, Target::Named(_)) && is_cached_commit_prefix(name) {
-                let id = cached_commit(&request.store, name)?;
-                (None, id, Some(Target::Commit(id.to_string())))
-            } else {
-                anyhow::bail!(request.target.unavailable(name));
-            }
+    let resolved = super::revision::resolve(&mut session, &request.target, |session, prefix| {
+        super::revision::init(&request.store, session.object_format()?)?;
+        super::revision::Prefix {
+            repository: &repository,
+            private: request.allow_private,
+            store: &request.store,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            remaining: request.remaining(request.transfer_used),
         }
-        Target::DefaultBranch => {
-            let refs = session.refs(&["HEAD".into()])?;
-            let (name, id) = refs
-                .into_iter()
-                .find_map(|r| match r {
-                    gix_protocol::handshake::Ref::Symbolic {
-                        full_ref_name,
-                        target,
-                        object,
-                        ..
-                    } if full_ref_name.as_slice() == b"HEAD" => Some((target, object)),
-                    _ => None,
-                })
-                .context("Repository does not advertise a default branch")?;
-            let name = std::str::from_utf8(&name)?
-                .strip_prefix("refs/heads/")
-                .context("Default reference is not a branch")?
-                .to_owned();
-            super::validate_branch(&name)?;
-            return Ok(Prepared {
-                omitted: BTreeMap::new(),
-                transfer_bytes: 0,
-                unavailable: BTreeSet::new(),
-                transport: session.endpoint.clone(),
-                resolved_target: None,
-                branch: Some(name),
-                revision: id.to_string(),
-                selected: BTreeMap::new(),
-                tracked: BTreeMap::new(),
-                directories: BTreeSet::new(),
-            });
-        }
-    };
+        .resolve(session, prefix, || connect(&repository))
+    })?;
+    let branch = resolved.branch;
+    let revision = resolved.id;
+    let resolved_target = resolved
+        .pinned
+        .then(|| Target::Commit(revision.to_string()));
+    if matches!(request.target, Target::DefaultBranch) {
+        let name = branch.context("Repository does not advertise a default branch")?;
+        super::validate_branch(&name)?;
+        return Ok(Prepared {
+            omitted: BTreeMap::new(),
+            transfer_bytes: 0,
+            unavailable: BTreeSet::new(),
+            transport: session.endpoint.clone(),
+            resolved_target: None,
+            branch: Some(name),
+            revision: revision.to_string(),
+            selected: BTreeMap::new(),
+            tracked: BTreeMap::new(),
+            directories: BTreeSet::new(),
+        });
+    }
     if !request.store.join("HEAD").is_file() {
         fs::create_dir_all(&request.store)?;
         run(Command::new("git")
@@ -565,7 +464,7 @@ fn prepare_with(
             .arg(&request.store))?;
     }
     let listing = tempfile::tempfile()?;
-    let mut transfer_bytes = request.transfer_used;
+    let mut transfer_bytes = request.transfer_used + resolved.bytes;
     if !cached_tree_inventory(&request.store, &revision.to_string(), &listing)? {
         transfer_bytes += receive(
             &mut session,
@@ -1131,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_abbreviations_resolve_only_after_named_refs_miss() {
+    fn cold_abbreviations_resolve_only_after_named_refs_miss() {
         let root = tempfile::tempdir().unwrap();
         let upstream_path = root.path().join("upstream");
         upstream(&upstream_path, true);
@@ -1165,10 +1064,6 @@ mod tests {
             .to_owned();
         let prefix = &current[..7];
         let mut request = request(root.path());
-        request.target = Target::Commit(current.clone());
-        let seeded = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
-        assert_eq!(seeded.revision, current);
-
         request.staging = root.path().join("stage-too-short");
         request.target = Target::selector(&prefix[..prefix.len() - 1]).unwrap();
         assert!(prepare_with(&request, |_| Session::local(&upstream_path)).is_err());
@@ -1182,7 +1077,16 @@ mod tests {
             abbreviated.resolved_target,
             Some(Target::Commit(ref id)) if id == &current
         ));
-        assert_eq!(abbreviated.transfer_bytes, 0);
+        assert!(abbreviated.transfer_bytes > 0);
+        assert_eq!(
+            fs::read_to_string(request.staging.join("Code.cs")).unwrap(),
+            "class Updated {}\n"
+        );
+
+        request.staging = root.path().join("stage-warm-prefix");
+        let warm = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert_eq!(warm.revision, current);
+        assert_eq!(warm.transfer_bytes, 0);
 
         execute(&["branch", prefix, &current]);
         execute(&["tag", prefix, &old]);
@@ -1209,6 +1113,13 @@ mod tests {
 
     #[test]
     fn cached_prefixes_are_commit_only_unique_and_object_format_aware() {
+        let cached_commit = |store: &Path, prefix: &str| {
+            super::super::revision::local_prefix(
+                store,
+                prefix,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        };
         let root = tempfile::tempdir().unwrap();
         let sha1 = bare_store(root.path(), "sha1");
 

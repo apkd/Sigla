@@ -402,8 +402,8 @@ impl Pool {
 
 /// All current callers authorize before this call. The original job still resolves
 /// branch/tag names and establishes its transport; a warm pool does not bypass it.
-/// The worker may inspect `current` for a cached commit prefix while this operation
-/// lock is held, so rebuild/replacement cannot race abbreviation resolution.
+/// Revision resolution and acquisition hold this operation lock, so pool
+/// rebuild/replacement cannot race commit history inspection.
 /// Return the pin alongside Prepared rather than dropping it inside this function.
 pub fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
     let (prepared, pin) = acquire_git(request, cache)?;
