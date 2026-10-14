@@ -10,7 +10,6 @@ use super::{
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     io::{BufRead, BufReader, Read, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -46,18 +45,7 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
     crate::process::run(command, Duration::from_secs(120))
 }
 pub(super) fn init(path: &Path, format: &str) -> Result<()> {
-    ensure!(
-        matches!(format, "sha1" | "sha256"),
-        "Unsupported Git object format"
-    );
-    if !path.join("HEAD").is_file() {
-        fs::create_dir_all(path)?;
-        run(Command::new("git")
-            .args(["init", "--bare", "--quiet", "--template="])
-            .arg(format!("--object-format={format}"))
-            .arg(path))?;
-    }
-    Ok(())
+    super::revision::init(path, format)
 }
 fn id(value: &str) -> Result<gix_hash::ObjectId> {
     ensure!(
@@ -201,17 +189,56 @@ struct Remote {
     local: Option<PathBuf>,
 }
 impl Remote {
+    fn connect(&self) -> Result<Session> {
+        #[cfg(test)]
+        if let Some(path) = &self.local {
+            return Session::local(path);
+        }
+        Session::connect(&self.repository, None, self.private)
+    }
+
     fn session(&mut self) -> Result<&mut Session> {
         if self.session.is_none() {
-            #[cfg(test)]
-            if let Some(path) = &self.local {
-                self.session = Some(Session::local(path)?);
-            }
-            if self.session.is_none() {
-                self.session = Some(Session::connect(&self.repository, None, self.private)?);
-            }
+            self.session = Some(self.connect()?);
         }
         Ok(self.session.as_mut().unwrap())
+    }
+
+    fn resolve(
+        &mut self,
+        target: &materialize::Target,
+        lease: &ObjectLease,
+        cancel: &AtomicBool,
+    ) -> Result<String> {
+        check(cancel)?;
+        self.session()?;
+        let mut session = self.session.take().unwrap();
+        let result = super::revision::resolve(&mut session, target, |session, prefix| {
+            let mut resolved = None;
+            lease.acquire(|pool, _| {
+                let value = super::revision::Prefix {
+                    repository: &self.repository,
+                    private: self.private,
+                    store: pool,
+                    cancel,
+                    remaining: (!self.unlimited)
+                        .then(|| materialize::TRANSFER_LIMIT.saturating_sub(self.transferred)),
+                }
+                .resolve(session, prefix, || self.connect())?;
+                let bytes = value.bytes;
+                resolved = Some(value);
+                Ok(bytes)
+            })?;
+            Ok(resolved.unwrap())
+        });
+        if result.is_ok() {
+            self.session = Some(session);
+        }
+        let resolved = result?;
+        self.transferred += resolved.bytes;
+        self.requests += resolved.requests;
+        let id = resolved.id.to_string();
+        Ok(id)
     }
 }
 
@@ -254,7 +281,7 @@ impl Store {
         check(&cancel)?;
         let private = super::authorize(rules, &repository)?;
         let unlimited = rules.iter().any(|r| r.exact_match(&repository));
-        let mut remote = Remote {
+        let remote = Remote {
             repository,
             private,
             unlimited,
@@ -265,6 +292,10 @@ impl Store {
             #[cfg(test)]
             local: None,
         };
+        Self::from_remote(remote, cache, cancel)
+    }
+
+    fn from_remote(mut remote: Remote, cache: &Path, cancel: Arc<AtomicBool>) -> Result<Self> {
         // Access is checked on every request, including pinned warm-cache reads.
         let selector = remote.repository.selector.clone();
         let target = selector
@@ -272,30 +303,10 @@ impl Store {
             .map(materialize::Target::selector)
             .transpose()?
             .unwrap_or(materialize::Target::DefaultBranch);
-        let initial = advertised(remote.session()?, &target)?;
-        let format = match &initial {
-            Some(oid) if oid.len() == 64 => "sha256".to_owned(),
-            Some(_) => "sha1".to_owned(),
-            None => {
-                // Cached prefixes do not reveal the repository hash format.
-                let current = cache
-                    .join("git")
-                    .join(remote.repository.identity.storage_key())
-                    .join("current");
-                String::from_utf8(run(
-                    git(&current).args(["rev-parse", "--show-object-format"])
-                )?)?
-                .trim()
-                .to_owned()
-            }
-        };
-        let lease = super::cache::object_lease(cache, &remote.repository.identity, &format)?;
+        let format = remote.session()?.object_format()?;
+        let lease = super::cache::object_lease(cache, &remote.repository.identity, format)?;
+        let revision = remote.resolve(&target, &lease, &cancel)?;
         let mut store = Self::new(lease.path().to_owned(), Some(lease), Some(remote), cancel);
-        let revision = match initial {
-            Some(id) => id,
-            None => materialize::cached_commit(&store.path, selector.as_deref().unwrap_or(""))?
-                .to_string(),
-        };
         store
             .resolved
             .insert(selector.unwrap_or_else(|| "HEAD".into()), revision);
@@ -351,11 +362,15 @@ impl Store {
             materialize::Target::selector(selector)?
         };
         let resolved = if let Some(remote) = &mut self.remote {
-            advertised(remote.session()?, &target)?
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    materialize::cached_commit(&self.path, selector).map(|v| v.to_string())
-                })?
+            let resolved = remote.resolve(
+                &target,
+                self.lease
+                    .as_ref()
+                    .context("Missing repository reader lease")?,
+                &self.cancel,
+            )?;
+            self.batch = None;
+            resolved
         } else {
             let names = match target {
                 materialize::Target::DefaultBranch => vec!["HEAD".into()],
@@ -390,7 +405,7 @@ impl Store {
                 None if (7..64).contains(&selector.len())
                     && selector.bytes().all(|c| c.is_ascii_hexdigit()) =>
                 {
-                    materialize::cached_commit(&self.path, selector)?.to_string()
+                    super::revision::local_prefix(&self.path, selector, &self.cancel)?.to_string()
                 }
                 None => bail!("Revision {selector:?} is unavailable"),
             }
@@ -841,53 +856,6 @@ impl Store {
     }
 }
 
-fn advertised(session: &mut Session, target: &materialize::Target) -> Result<Option<String>> {
-    use materialize::Target;
-    if let Target::Commit(id) = target {
-        return Ok(Some(id.clone()));
-    }
-    let names = match target {
-        Target::DefaultBranch => vec!["HEAD".into()],
-        Target::Branch(s) => vec![format!("refs/heads/{s}")],
-        Target::Tag(s) => vec![format!("refs/tags/{s}")],
-        Target::Named(s) => vec![format!("refs/tags/{s}"), format!("refs/heads/{s}")],
-        Target::Commit(_) => unreachable!(),
-    };
-    let refs = session.refs(&names)?;
-    for name in &names {
-        for r in &refs {
-            use gix_protocol::handshake::Ref;
-            let (full_ref_name, object) = match r {
-                Ref::Direct {
-                    full_ref_name,
-                    object,
-                }
-                | Ref::Peeled {
-                    full_ref_name,
-                    object,
-                    ..
-                }
-                | Ref::Symbolic {
-                    full_ref_name,
-                    object,
-                    ..
-                } => (full_ref_name, object),
-                _ => continue,
-            };
-            if full_ref_name.as_slice() == name.as_bytes() {
-                return Ok(Some(object.to_string()));
-            }
-        }
-    }
-    if let Target::Named(s) = target
-        && (7..64).contains(&s.len())
-        && s.bytes().all(|c| c.is_ascii_hexdigit())
-    {
-        return Ok(None);
-    }
-    bail!("Requested history revision is not advertised")
-}
-
 // Gregorian civil date from the committer's local day; timestamps never order history.
 fn calendar(seconds: i64, zone: &str) -> String {
     let offset = if zone.len() == 5
@@ -915,6 +883,7 @@ fn calendar(seconds: i64, zone: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     fn command(path: &Path, args: &[&str]) -> String {
         String::from_utf8(
             run(Command::new("git")
@@ -1008,16 +977,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let remote = Remote {
-                repository: self.repository.clone(),
-                private: false,
-                unlimited: false,
-                session: None,
-                transferred: 0,
-                requests: 0,
-                commit_filter: Filter::Commits,
-                local: Some(self.directory.path().to_owned()),
-            };
+            let remote = self.remote();
             let mut store = Store::new(
                 lease.path().to_owned(),
                 Some(lease),
@@ -1026,6 +986,18 @@ mod tests {
             );
             store.resolved.insert("HEAD".into(), self.tip.clone());
             store
+        }
+        fn remote(&self) -> Remote {
+            Remote {
+                repository: self.repository.clone(),
+                private: false,
+                unlimited: false,
+                session: None,
+                transferred: 0,
+                requests: 0,
+                commit_filter: Filter::Commits,
+                local: Some(self.directory.path().to_owned()),
+            }
         }
         fn current(&self) -> PathBuf {
             self.cache
@@ -1046,6 +1018,155 @@ mod tests {
             .unwrap()
         }
     }
+    #[test]
+    fn cold_prefixes_and_range_endpoints_resolve_for_both_object_formats() {
+        for format in ["sha1", "sha256"] {
+            let fixture = Fixture::new(format);
+            assert!(!fixture.current().exists());
+            let mut remote = fixture.remote();
+            remote.repository.selector = Some(fixture.tip[..8].to_ascii_uppercase());
+            let mut store = Store::from_remote(
+                remote,
+                fixture.cache.path(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(store.resolve(Some(&fixture.tip[..8])).unwrap(), fixture.tip);
+            assert_eq!(
+                store.resolve(Some(&fixture.first[..8])).unwrap(),
+                fixture.first
+            );
+            let objects = fixture.inventory();
+            assert!(
+                !objects.contains(" blob") && !objects.contains(" tree"),
+                "{objects}"
+            );
+            let query = format!("diff {}..{}", &fixture.first[..8], &fixture.tip[..8]);
+            let diff = crate::history::run(store, None, &query).unwrap();
+            assert!(
+                diff.contains("value * 27") && diff.contains("value * 31"),
+                "{diff}"
+            );
+            assert!(!fixture.cache.path().join("repositories").exists());
+        }
+    }
+
+    #[test]
+    fn prefix_resolution_crosses_cached_shallow_boundaries() {
+        let fixture = Fixture::new("sha1");
+        let mut store = fixture.store();
+        store.commit_window(Some(1));
+        store.commit(&fixture.tip).unwrap();
+        assert!(!fixture.inventory().contains(&fixture.first));
+        assert_eq!(
+            store.resolve(Some(&fixture.first[..8])).unwrap(),
+            fixture.first
+        );
+        assert!(!fixture.inventory().contains(" blob"));
+        let mut warm = fixture.store();
+        assert_eq!(
+            warm.resolve(Some(&fixture.first[..8])).unwrap(),
+            fixture.first
+        );
+        assert_eq!(warm.remote.as_ref().unwrap().transferred, 0);
+    }
+
+    #[test]
+    fn partial_caches_cannot_hide_an_ambiguous_commit_on_another_tag() {
+        let fixture = Fixture::new("sha1");
+        let tree = command(fixture.directory.path(), &["rev-parse", "HEAD^{tree}"]);
+        let body = |nonce| {
+            format!(
+                "tree {tree}\nauthor A <a@a> 0 +0000\ncommitter A <a@a> 0 +0000\n\ncollision {nonce}\n"
+            )
+        };
+        let mut seen = std::collections::HashMap::new();
+        let (first, second) = (0..1_000_000)
+            .find_map(|nonce| {
+                let data = body(nonce);
+                let mut hash = gix_hash::hasher(gix_hash::Kind::Sha1);
+                hash.update(format!("commit {}\0", data.len()).as_bytes());
+                hash.update(data.as_bytes());
+                let id = hash.try_finalize().unwrap().to_string();
+                seen.insert(id[..7].to_owned(), nonce)
+                    .map(|old| (old, nonce))
+            })
+            .expect("Fixture must contain two colliding commit prefixes");
+        let write = |nonce| {
+            let output = crate::process::capture(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(fixture.directory.path())
+                    .args(["hash-object", "-t", "commit", "-w", "--stdin"]),
+                Duration::from_secs(10),
+                Some(body(nonce).into_bytes()),
+                None,
+            )
+            .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let first = write(first);
+        let second = write(second);
+        command(
+            fixture.directory.path(),
+            &["update-ref", "refs/heads/collision", &first],
+        );
+        command(
+            fixture.directory.path(),
+            &["update-ref", "refs/tags/collision", &second],
+        );
+        let mut store = fixture.store();
+        store.commit_window(Some(1));
+        store.commit(&first).unwrap();
+        assert!(!fixture.inventory().contains(&second));
+        let ambiguous = store.resolve(Some(&first[..7])).unwrap_err();
+        assert!(matches!(
+            ambiguous.downcast_ref::<super::super::revision::PrefixError>(),
+            Some(super::super::revision::PrefixError::Ambiguous(_))
+        ));
+        assert!(fixture.inventory().contains(&second));
+        let length = first
+            .bytes()
+            .zip(second.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap()
+            + 1;
+        assert_eq!(store.resolve(Some(&first[..length])).unwrap(), first);
+        assert_eq!(store.resolve(Some(&second[..length])).unwrap(), second);
+    }
+
+    #[test]
+    fn prefix_acquisition_preserves_filters_cancellation_and_transfer_limits() {
+        let fixture = Fixture::new("sha1");
+        command(
+            fixture.directory.path(),
+            &["config", "uploadpackfilter.tree.allow", "false"],
+        );
+        let mut store = fixture.store();
+        assert_eq!(
+            store.resolve(Some(&fixture.first[..8])).unwrap(),
+            fixture.first
+        );
+        assert!(!fixture.inventory().contains(" blob"));
+        let fixture = Fixture::new("sha1");
+        command(
+            fixture.directory.path(),
+            &["config", "uploadpack.allowFilter", "false"],
+        );
+        let mut store = fixture.store();
+        assert!(store.resolve(Some(&fixture.first[..8])).is_err());
+        assert!(fixture.inventory().is_empty());
+        let fixture = Fixture::new("sha1");
+        let mut store = fixture.store();
+        store.remote.as_mut().unwrap().transferred = materialize::TRANSFER_LIMIT;
+        assert!(store.resolve(Some(&fixture.first[..8])).is_err());
+        assert!(fixture.inventory().is_empty());
+        store.cancel.store(true, Ordering::Release);
+        assert!(store.resolve(Some(&fixture.first[..8])).is_err());
+        assert!(fixture.inventory().is_empty());
+    }
+
     #[test]
     fn remote_log_fetches_metadata_only_then_acquires_selected_source_explicitly() {
         for format in ["sha1", "sha256"] {

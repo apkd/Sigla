@@ -982,14 +982,14 @@ fn result_text(result: CallToolResult) -> Result<String> {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
-    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique cached commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
+    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
     pub codebase: String,
     pub query: String,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseArguments {
-    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique cached commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
+    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
     pub codebase: String,
     #[serde(default)]
     pub path: String,
@@ -997,7 +997,7 @@ pub struct BrowseArguments {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViewArguments {
-    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique cached commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
+    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
     pub codebase: String,
     pub path: String,
     #[serde(default)]
