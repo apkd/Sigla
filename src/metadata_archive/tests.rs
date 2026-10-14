@@ -98,6 +98,39 @@ fn packing_follows_dependencies_and_limits_unwanted_downloads() {
     assert_eq!(members, (0..expanded.len()).collect::<Vec<_>>());
 }
 
+fn saved_packs(artifacts: &[Artifact], groups: &[Vec<usize>]) -> Vec<Pack> {
+    groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.len() > 1)
+        .map(|(i, g)| Pack {
+            name: format!("pack-{i}.tar"),
+            hash: [0; 32],
+            size: 0,
+            release: TAG.into(),
+            members: g.iter().map(|&i| artifacts[i].name.clone()).collect(),
+        })
+        .collect()
+}
+
+#[test]
+fn unchanged_dependency_graph_never_creates_additional_packs() {
+    let mut artifacts = vec![package_artifact("shared-runtime", "1.0.0", 100, &[])];
+    for i in 0..50 {
+        let name = format!("com.unity.family.plugin{i}");
+        let companion = format!("companion-{i}");
+        let mut dependencies = vec![("shared-runtime", "1.0.0")];
+        if i > 1 {
+            artifacts.push(package_artifact(&companion, "1.0.0", 100, &[]));
+            dependencies.push((&companion, "1.0.0"));
+        }
+        artifacts.push(package_artifact(&name, "1.0.0", 100, &dependencies));
+    }
+    let first = packing::groups(&artifacts, &[]);
+    let repeated = packing::groups(&artifacts, &saved_packs(&artifacts, &first));
+    assert_eq!(first, repeated);
+}
+
 #[test]
 fn packs_preserve_compressed_bytes_and_individual_analysis() {
     let output = tempfile::tempdir().unwrap();
@@ -271,6 +304,13 @@ fn live_catalog_packing_retains_all_packages_with_headroom() {
         groups.len() + 1
     );
     assert!(groups.len() + 1 < 1000);
+    assert_eq!(
+        groups,
+        packing::groups(
+            &catalog.artifacts,
+            &saved_packs(&catalog.artifacts, &groups)
+        )
+    );
     let mut members: Vec<_> = groups.into_iter().flatten().collect();
     members.sort();
     assert_eq!(members, (0..catalog.artifacts.len()).collect::<Vec<_>>());

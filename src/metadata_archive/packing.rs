@@ -28,7 +28,7 @@ pub(super) fn groups(artifacts: &[Artifact], previous: &[Pack]) -> Vec<Vec<usize
     let nodes: Vec<_> = artifacts
         .iter()
         .enumerate()
-        .filter(|(i, a)| !used.contains(i) && a.manifest.origin.kind == "package")
+        .filter(|(_, a)| a.manifest.origin.kind == "package")
         .collect();
     let packages: Vec<_> = nodes.iter().map(|(_, a)| &a.manifest.packages).collect();
     let keys: BTreeMap<_, _> = nodes
@@ -79,7 +79,13 @@ pub(super) fn groups(artifacts: &[Artifact], previous: &[Pack]) -> Vec<Vec<usize
     };
     let mut edges = Vec::new();
     for a in 0..nodes.len() {
+        if used.contains(&nodes[a].0) {
+            continue;
+        }
         for b in a + 1..nodes.len() {
+            if used.contains(&nodes[b].0) {
+                continue;
+            }
             let x = &nodes[a].1.manifest.origin;
             let y = &nodes[b].1.manifest.origin;
             if x.name == y.name {
@@ -114,7 +120,15 @@ pub(super) fn groups(artifacts: &[Artifact], previous: &[Pack]) -> Vec<Vec<usize
     }
     edges.sort();
     let mut owners: Vec<_> = (0..nodes.len()).collect();
-    let mut groups: Vec<_> = (0..nodes.len()).map(|i| vec![i]).collect();
+    let mut groups: Vec<_> = (0..nodes.len())
+        .map(|i| {
+            if used.contains(&nodes[i].0) {
+                vec![]
+            } else {
+                vec![i]
+            }
+        })
+        .collect();
     for (_, _, a, b) in edges {
         let (a, b) = (owners[a], owners[b]);
         if a == b {

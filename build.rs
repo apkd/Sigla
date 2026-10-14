@@ -528,10 +528,18 @@ fn main() {
     // Planning reuses stamps only within a pass and retains fresh input fences.
     // Batched environment reads preserve the hash; archive changes retain valid
     // inputs and only alter publication or reject conflicting bundle paths.
-    let workspace_aliases: &[(&str, &str)] = &[(
-        "c817019d8f730eef42bb3f4ba0f3e544d0aef8f294914a96695dc89638822525",
-        "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
-    )];
+    // Transport packs retain the same logical artifacts, analysis and discovery
+    // inputs. Release placement and acquisition retries do not change the graph.
+    let workspace_aliases: &[(&str, &str)] = &[
+        (
+            "c817019d8f730eef42bb3f4ba0f3e544d0aef8f294914a96695dc89638822525",
+            "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
+        ),
+        (
+            "3d502949e13e2973211eccd01d18c70bc072c0723e14bd371cd6afd751b24210",
+            "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
+        ),
+    ];
     // Resolved-asset inputs changed only through the equivalent C# extraction.
     // Asset parsing and composition are unchanged in this release.
     let asset_aliases: &[(&str, &str)] = &[(
