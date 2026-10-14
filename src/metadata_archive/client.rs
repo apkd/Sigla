@@ -154,7 +154,12 @@ pub(super) fn materialize(cache: &Path, artifact: &Artifact, catalog: &Catalog) 
     // Complete transport acquisition before taking a materialization permit.
     // Nested acquisition permits can deadlock concurrent package requests.
     let packed = packed_source(cache, REPOSITORY, catalog, artifact)?;
-    acquisition::shared_versioned(&root.to_string_lossy(), &artifact.release, || {
+    let source_version = catalog
+        .packs
+        .iter()
+        .find(|p| p.members.contains(&artifact.name))
+        .map_or(artifact.release.as_str(), |p| p.name.as_str());
+    acquisition::shared_versioned(&root.to_string_lossy(), source_version, || {
         let contents = root.join("contents");
         if contents.join("manifest.bin").is_file() {
             return Ok(contents);

@@ -173,6 +173,21 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
     )
     .unwrap();
     let start = std::sync::Barrier::new(catalog.artifacts.len());
+    for artifact in &catalog.artifacts {
+        let root = cache
+            .path()
+            .join("unity-metadata")
+            .join(hex(&artifact.hash));
+        // The same release can replace a standalone download with a pack.
+        assert!(
+            crate::acquisition::shared_versioned::<()>(
+                &root.to_string_lossy(),
+                &artifact.release,
+                || anyhow::bail!("Standalone asset was retired")
+            )
+            .is_err()
+        );
+    }
     std::thread::scope(|scope| {
         for artifact in &catalog.artifacts {
             let (catalog, cache, start) = (&catalog, cache.path(), &start);
