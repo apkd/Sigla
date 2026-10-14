@@ -1,6 +1,7 @@
 //! Offline production and online consumption of the same immutable analysis records.
 mod bundle;
 mod client;
+mod packing;
 mod producer;
 mod registry;
 mod release;
@@ -69,10 +70,44 @@ pub struct Artifact {
     pub release: String,
     pub manifest: Manifest,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pack {
+    pub name: String,
+    pub hash: [u8; 32],
+    pub size: u64,
+    pub release: String,
+    pub members: Vec<String>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
     pub artifacts: Vec<Artifact>,
     pub unavailable: Vec<String>,
+    pub packs: Vec<Pack>,
+}
+
+impl Catalog {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = b"SIGLACAT2".to_vec();
+        bytes.extend(binary::encode(self)?);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if let Some(bytes) = bytes.strip_prefix(b"SIGLACAT2") {
+            return binary::decode(bytes);
+        }
+        #[derive(Deserialize)]
+        struct Legacy {
+            artifacts: Vec<Artifact>,
+            unavailable: Vec<String>,
+        }
+        let legacy: Legacy = binary::decode(bytes)?;
+        Ok(Self {
+            artifacts: legacy.artifacts,
+            unavailable: legacy.unavailable,
+            packs: vec![],
+        })
+    }
 }
 #[derive(Serialize, Deserialize)]
 pub struct Analysis {

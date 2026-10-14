@@ -13,7 +13,7 @@ type CachedCatalog = Option<(Instant, Arc<Catalog>)>;
 static CATALOG: LazyLock<Mutex<CachedCatalog>> = LazyLock::new(|| Mutex::new(None));
 
 pub(super) fn catalog(repo: &str) -> Result<Catalog> {
-    let url = format!("https://github.com/{repo}/releases/download/{TAG}/catalog.bin");
+    let url = format!("https://github.com/{repo}/releases/latest/download/catalog.bin");
     let client = acquisition::client()?;
     let mut response = client.get(acquisition::https(&url)?).send()?;
     for delay in [100, 250, 500] {
@@ -22,6 +22,20 @@ pub(super) fn catalog(repo: &str) -> Result<Catalog> {
         }
         std::thread::sleep(Duration::from_millis(delay));
         response = client.get(acquisition::https(&url)?).send()?;
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        response = client
+            .get(format!(
+                "https://github.com/{repo}/releases/latest/download/catalog.retiring.bin"
+            ))
+            .send()?;
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        response = client
+            .get(format!(
+                "https://github.com/{repo}/releases/download/{TAG}/catalog.bin"
+            ))
+            .send()?;
     }
     let mut bytes = Vec::new();
     response
@@ -32,7 +46,12 @@ pub(super) fn catalog(repo: &str) -> Result<Catalog> {
         bytes.len() <= 64 * 1024 * 1024,
         "Catalog exceeds size bound"
     );
-    let catalog: Catalog = binary::decode(payload(&bytes)?)?;
+    let catalog = Catalog::decode(payload(&bytes)?)?;
+    validate_catalog(&catalog)?;
+    Ok(catalog)
+}
+
+fn validate_catalog(catalog: &Catalog) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
     for artifact in &catalog.artifacts {
         safe(&artifact.name)?;
@@ -40,7 +59,7 @@ pub(super) fn catalog(repo: &str) -> Result<Catalog> {
         ensure!(
             !artifact.name.contains('/')
                 && !artifact.release.contains('/')
-                && names.insert((&artifact.release, &artifact.name)),
+                && names.insert(&artifact.name),
             "Invalid catalog asset identity"
         );
         ensure!(
@@ -48,7 +67,30 @@ pub(super) fn catalog(repo: &str) -> Result<Catalog> {
             "Catalog contains bundle file inventories"
         );
     }
-    Ok(catalog)
+    let mut packed = std::collections::BTreeSet::new();
+    for pack in &catalog.packs {
+        safe(&pack.name)?;
+        safe(&pack.release)?;
+        ensure!(
+            !pack.name.contains('/')
+                && !pack.release.contains('/')
+                && names.insert(&pack.name)
+                && pack.members.len() >= 2
+                && pack.size <= packing::MAX_PACK,
+            "Invalid pack identity"
+        );
+        for member in &pack.members {
+            ensure!(
+                packed.insert(member)
+                    && catalog
+                        .artifacts
+                        .iter()
+                        .any(|a| &a.name == member && a.manifest.origin.kind == "package"),
+                "Invalid pack membership"
+            );
+        }
+    }
+    Ok(())
 }
 fn current(refresh: bool) -> Result<Arc<Catalog>> {
     let mut cached = CATALOG
@@ -64,7 +106,47 @@ fn current(refresh: bool) -> Result<Arc<Catalog>> {
     *cached = Some((Instant::now(), catalog.clone()));
     Ok(catalog)
 }
-pub(super) fn materialize(cache: &Path, artifact: &Artifact) -> Result<PathBuf> {
+pub(super) fn download(repo: &str, release: &str, name: &str, output: &Path) -> Result<()> {
+    let url = format!("https://github.com/{repo}/releases/download/{release}/{name}");
+    let response = acquisition::client()?
+        .get(acquisition::https(&url)?)
+        .send()?
+        .error_for_status()?;
+    acquisition::transfer(response, &mut fs::File::create(output)?, None)?;
+    Ok(())
+}
+
+/// Cache the compressed members once, so requesting another member uses no network.
+pub(super) fn packed_source(
+    cache: &Path,
+    repo: &str,
+    catalog: &Catalog,
+    artifact: &Artifact,
+) -> Result<Option<PathBuf>> {
+    let Some(pack) = catalog
+        .packs
+        .iter()
+        .find(|p| p.members.contains(&artifact.name))
+    else {
+        return Ok(None);
+    };
+    let root = cache.join("unity-metadata-packs").join(hex(&pack.hash));
+    acquisition::shared(&root.to_string_lossy(), || {
+        let contents = root.join("contents");
+        if !contents.is_dir() {
+            fs::create_dir_all(&root)?;
+            let stage = tempfile::tempdir_in(&root)?;
+            let path = stage.path().join("pack.tar");
+            download(repo, &pack.release, &pack.name, &path)?;
+            let output = stage.path().join("contents");
+            packing::unpack(&path, &output, pack, catalog)?;
+            fs::rename(output, &contents)?;
+        }
+        Ok(Some(contents.join(&artifact.name)))
+    })
+}
+
+pub(super) fn materialize(cache: &Path, artifact: &Artifact, catalog: &Catalog) -> Result<PathBuf> {
     let root = cache.join("unity-metadata").join(hex(&artifact.hash));
     acquisition::shared(&root.to_string_lossy(), || {
         let contents = root.join("contents");
@@ -75,16 +157,13 @@ pub(super) fn materialize(cache: &Path, artifact: &Artifact) -> Result<PathBuf> 
         let stage = tempfile::Builder::new()
             .prefix("stage-")
             .tempdir_in(&root)?;
-        let archive = stage.path().join("bundle.tar.zst");
-        let url = format!(
-            "https://github.com/{REPOSITORY}/releases/download/{}/{}",
-            artifact.release, artifact.name
-        );
-        let response = acquisition::client()?
-            .get(acquisition::https(&url)?)
-            .send()?
-            .error_for_status()?;
-        acquisition::transfer(response, &mut fs::File::create(&archive)?, None)?;
+        let archive = if let Some(path) = packed_source(cache, REPOSITORY, catalog, artifact)? {
+            path
+        } else {
+            let path = stage.path().join("bundle.tar.zst");
+            download(REPOSITORY, &artifact.release, &artifact.name, &path)?;
+            path
+        };
         let output = stage.path().join("contents");
         let manifest = bundle::unpack(&archive, &output, Some(artifact))?;
         if manifest.origin.kind == "editor" {
@@ -120,7 +199,7 @@ fn acquire_editor(cache: &Path, declared: UnityVersion) -> Result<(PathBuf, Orig
     for refresh in [false, true] {
         let catalog = current(refresh)?;
         let artifact = select_editor(&catalog, declared)?;
-        match materialize(cache, artifact) {
+        match materialize(cache, artifact, &catalog) {
             Ok(contents) => {
                 return Ok((
                     contents.join("Editor/Data"),
@@ -223,7 +302,7 @@ pub fn package(
     for refresh in [false, true] {
         let catalog = current(refresh)?;
         let (artifact, info) = select_package(&catalog, name, requested, editor)?;
-        match materialize(cache, artifact) {
+        match materialize(cache, artifact, &catalog) {
             Ok(contents) => {
                 let prefix = if artifact.manifest.origin.kind == "editor" {
                     "Editor/Data/Resources/PackageManager/BuiltInPackages"

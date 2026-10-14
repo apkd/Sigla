@@ -14,6 +14,7 @@ pub const VIEW_KINDS: &[&str] = &[
     "unity-assets",
     "unity-packages",
     "unity-metadata",
+    "unity-metadata-packs",
     "editors",
 ];
 

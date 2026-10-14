@@ -17,11 +17,13 @@ struct Asset {
     id: u64,
     name: String,
     size: u64,
+    state: String,
 }
 #[derive(Clone, JsonDeserialize)]
 struct Release {
     id: u64,
     tag_name: String,
+    draft: bool,
 }
 struct Github {
     client: Client,
@@ -131,7 +133,12 @@ impl Github {
                 r.tag_name == TAG
                     || r.tag_name
                         .strip_prefix(&format!("{TAG}-"))
-                        .is_some_and(|s| s.parse::<u32>().is_ok())
+                        .is_some_and(|s| {
+                            s.parse::<u32>().is_ok()
+                                || s.strip_prefix('g').is_some_and(|s| {
+                                    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
+                                })
+                        })
             })
             .collect())
     }
@@ -139,7 +146,7 @@ impl Github {
         if let Some(release) = self.releases()?.into_iter().find(|r| r.tag_name == tag) {
             return Ok(release);
         }
-        Ok(serde_json::from_value(self.api(Method::POST, "releases", Some(json!({"tag_name":tag,"name":"Metadata archive","body":"---","make_latest":"false"})))?)?)
+        Ok(serde_json::from_value(self.api(Method::POST, "releases", Some(json!({"tag_name":tag,"name":"Metadata archive","body":"---","draft":true,"make_latest":"false"})))?)?)
     }
     fn assets(&self, release: &Release) -> Result<Vec<Asset>> {
         self.pages(&format!("releases/{}/assets", release.id))
@@ -258,165 +265,260 @@ pub(super) fn publish(
     unavailable.sort();
     unavailable.dedup();
     let github = Github::new(repo)?;
-    let main = github.ensure_release(TAG)?;
-    let existing = github.assets(&main)?;
-    if !existing.iter().any(|asset| asset.name == "catalog.bin")
-        && let Some(retiring) = existing
+    selected.sort_by(|a, b| a.name.cmp(&b.name));
+    let work = tempfile::tempdir()?;
+    let groups = packing::groups(&selected, &base.previous.packs);
+    ensure!(
+        groups.len() + 1 < 1000,
+        "Selection requires {} release assets; improve package grouping before publishing",
+        groups.len() + 1
+    );
+    let mut packs = Vec::new();
+    for group in groups.iter().filter(|g| g.len() > 1) {
+        let members: Vec<_> = group.iter().map(|&i| &selected[i]).collect();
+        if let Some(previous) = base
+            .previous
+            .packs
             .iter()
-            .find(|asset| asset.name == "catalog.retiring.bin")
+            .find(|p| p.members == members.iter().map(|a| a.name.clone()).collect::<Vec<_>>())
+        {
+            packs.push(previous.clone());
+        } else {
+            packs.push(packing::build(&members, work.path(), |a| {
+                source(repo, a, &files, &base.previous, work.path())
+            })?);
+        }
+    }
+    let mut catalog = Catalog {
+        artifacts: selected,
+        unavailable,
+        packs,
+    };
+    let packed: BTreeSet<_> = catalog
+        .packs
+        .iter()
+        .flat_map(|p| p.members.iter().cloned())
+        .collect();
+    let mut blobs: Vec<_> = catalog
+        .artifacts
+        .iter()
+        .filter(|a| !packed.contains(&a.name))
+        .map(|a| (a.name.clone(), a.hash, a.size, a.release.clone()))
+        .chain(
+            catalog
+                .packs
+                .iter()
+                .map(|p| (p.name.clone(), p.hash, p.size, p.release.clone())),
+        )
+        .collect();
+    blobs.sort_by(|a, b| a.0.cmp(&b.0));
+    let inventory = github
+        .releases()?
+        .into_iter()
+        .map(|r| {
+            let assets = github.assets(&r)?;
+            Ok((r, assets))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let active = inventory.iter().find(|(r, assets)| {
+        !r.draft
+            && assets
+                .iter()
+                .any(|a| matches!(a.name.as_str(), "catalog.bin" | "catalog.retiring.bin"))
+            && base
+                .previous
+                .artifacts
+                .iter()
+                .all(|a| a.release == r.tag_name)
+            && base.previous.packs.iter().all(|p| p.release == r.tag_name)
+    });
+    let target = if let Some((release, assets)) =
+        active.filter(|(_, assets)| !base.previous.artifacts.is_empty() && fits(assets, &blobs))
+    {
+        tracing::info!(release = %release.tag_name, existing = assets.len(), "Staging update in the current release");
+        release.clone()
+    } else {
+        // Content determines the draft name, so a retry reuses completed uploads.
+        let identity: Vec<_> = blobs.iter().map(|b| (&b.0, b.1)).collect();
+        let generation = blake3::hash(&binary::encode(&identity)?);
+        github.ensure_release(&format!("{TAG}-g{generation}"))?
+    };
+    tracing::info!(artifacts = catalog.artifacts.len(), packs = catalog.packs.len(),
+        assets = blobs.len() + 1, release = %target.tag_name, draft = target.draft,
+        "Metadata publication plan");
+    let mut existing = github.assets(&target)?;
+    if !existing.iter().any(|a| a.name == "catalog.bin")
+        && let Some(retiring) = existing
+            .iter_mut()
+            .find(|a| a.name == "catalog.retiring.bin")
     {
         github.rename(retiring, "catalog.bin")?;
+        retiring.name = "catalog.bin".into();
     }
-    let mut releases = github.releases()?;
-    releases.sort_by(|a, b| a.tag_name.cmp(&b.tag_name));
-    let mut inventory = releases
-        .iter()
-        .map(|r| Ok((r.clone(), github.assets(r)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut uploaded = Vec::new();
-    let publication = (|| -> Result<()> {
-        let mut reused = 0;
-        let mut bytes = 0;
-        for artifact in &mut selected {
-            if let Some((release, existing)) = inventory.iter().find_map(|(r, assets)| {
-                assets
-                    .iter()
-                    .find(|a| a.name == artifact.name)
-                    .map(|a| (r, a))
-            }) {
-                ensure!(
-                    existing.size == artifact.size,
-                    "Existing release asset size differs"
-                );
-                artifact.release = release.tag_name.clone();
-                reused += 1;
-                continue;
-            }
-            let path = files
-                .iter()
-                .find(|p| p.file_name().is_some_and(|n| n == artifact.name.as_str()))
-                .context("New artifact has no local bundle")?;
-            let started = Instant::now();
-            // The producer already validated these records. Check that the
-            // handoff contains the exact bytes it verified.
-            bundle::verify_digest(path, artifact)?;
-            let verified = started.elapsed();
-            let bucket =
-                if let Some(index) = inventory.iter().position(|(_, assets)| assets.len() < 997) {
-                    index
-                } else {
-                    let mut suffix = 2;
-                    while inventory
-                        .iter()
-                        .any(|(r, _)| r.tag_name == format!("{TAG}-{suffix}"))
-                    {
-                        suffix += 1;
-                    }
-                    let release = github.ensure_release(&format!("{TAG}-{suffix}"))?;
-                    inventory.push((release, vec![]));
-                    inventory.len() - 1
-                };
-            let (release, assets) = &mut inventory[bucket];
-            let asset = github.upload(release, path, &artifact.name)?;
-            tracing::info!(
-                name = %artifact.name,
-                bytes = artifact.size,
-                hash_ms = verified.as_millis(),
-                upload_ms = (started.elapsed() - verified).as_millis(),
-                "Uploaded metadata bundle"
-            );
-            artifact.release = release.tag_name.clone();
-            bytes += artifact.size;
-            uploaded.push(asset.clone());
-            assets.push(asset);
-        }
-        tracing::info!(
-            reused,
-            uploads = uploaded.len(),
-            bytes,
-            "Published metadata bundles"
-        );
-        selected.sort_by(|a, b| a.name.cmp(&b.name));
-        let catalog = Catalog {
-            artifacts: selected.clone(),
-            unavailable,
-        };
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("catalog.bin");
-        save(&path, &binary::encode(&catalog)?)?;
-        let assets = github.assets(&main)?;
-        for stale in assets
+    for asset in existing.iter().filter(|a| temporary_catalog(&a.name)) {
+        github.delete(asset)?;
+    }
+    existing.retain(|a| !temporary_catalog(&a.name));
+    let mut uploads = 0;
+    let mut bytes = 0;
+    for (name, hash, size, release) in &blobs {
+        if existing
             .iter()
-            .filter(|a| a.name == "catalog.pending.bin" || a.name == "catalog.retiring.bin")
+            .any(|a| &a.name == name && a.size == *size && a.state == "uploaded")
         {
-            github.delete(stale)?;
+            continue;
         }
-        let pending = github.upload(&main, &path, "catalog.pending.bin")?;
-        uploaded.push(pending.clone());
-        let old = assets.iter().find(|a| a.name == "catalog.bin");
-        switch_catalog(old, &pending, |asset, name| github.rename(asset, name))?;
-        Ok(())
-    })();
-    if publication.is_err() {
-        let assets = github
-            .assets(&main)
-            .context("Publication state is unknown; staging assets remain for recovery")?;
-        let committed = assets
-            .iter()
-            .find(|a| a.name == "catalog.bin")
-            .is_some_and(|current| uploaded.iter().any(|a| a.id == current.id));
-        if committed {
-            tracing::warn!("Catalog was published despite an interrupted response");
+        if let Some(incomplete) = existing.iter().find(|a| &a.name == name) {
+            github.delete(incomplete)?;
+        }
+        // A full replacement copies unchanged compressed files; it never reruns analysis.
+        let temporary = tempfile::tempdir_in(work.path())?;
+        let path = if work.path().join(name).is_file() {
+            work.path().join(name)
+        } else if let Some(artifact) = catalog.artifacts.iter().find(|a| &a.name == name) {
+            source(repo, artifact, &files, &base.previous, temporary.path())?
         } else {
-            if !assets.iter().any(|a| a.name == "catalog.bin")
-                && let Some(retiring) = assets.iter().find(|a| a.name == "catalog.retiring.bin")
-            {
-                github.rename(retiring, "catalog.bin").context(
-                    "Cannot restore the current catalog; staging assets remain for recovery",
-                )?;
-            }
-            for asset in &uploaded {
-                if let Err(error) = github.delete(asset) {
-                    tracing::error!("Cannot remove unpublished asset {}: {error:#}", asset.name);
-                }
-            }
-            return publication;
-        }
+            let path = temporary.path().join(name);
+            client::download(repo, release, name, &path)?;
+            path
+        };
+        ensure!(
+            fs::metadata(&path)?.len() == *size && digest(&path)? == *hash,
+            "Publication source digest or size mismatch"
+        );
+        let at = Instant::now();
+        existing.push(github.upload(&target, &path, name)?);
+        tracing::info!(
+            name,
+            bytes = size,
+            upload_ms = at.elapsed().as_millis(),
+            "Uploaded metadata asset"
+        );
+        uploads += 1;
+        bytes += size;
     }
-    let keep: BTreeSet<_> = selected
+    for artifact in &mut catalog.artifacts {
+        artifact.release.clone_from(&target.tag_name);
+    }
+    for pack in &mut catalog.packs {
+        pack.release.clone_from(&target.tag_name);
+    }
+    let encoded = catalog.encode()?;
+    if encoded != base.previous.encode()? || !existing.iter().any(|a| a.name == "catalog.bin") {
+        let path = work.path().join("catalog.bin");
+        save(&path, &encoded)?;
+        let pending = github.upload(&target, &path, "catalog.pending.bin")?;
+        switch_catalog(
+            existing.iter().find(|a| a.name == "catalog.bin"),
+            &pending,
+            |asset, name| github.rename(asset, name),
+        )?;
+    }
+    // GitHub's latest-release pointer is the stable discovery URL. Publishing a
+    // complete draft switches it without renaming tags or creating an empty release.
+    github.api(
+        Method::PATCH,
+        &format!("releases/{}", target.id),
+        Some(json!({
+            "draft":false, "make_latest":"true", "name":"Metadata archive", "body":"---"
+        })),
+    )?;
+    let keep: BTreeSet<_> = blobs
         .iter()
-        .map(|a| (a.release.clone(), a.name.clone()))
-        .chain(std::iter::once((TAG.to_owned(), "catalog.bin".to_owned())))
+        .map(|b| b.0.as_str())
+        .chain(["catalog.bin"])
         .collect();
-    let cleanup = Instant::now();
     let mut removed = 0;
     for release in github.releases()? {
-        let assets = github.assets(&release)?;
-        let obsolete: Vec<_> = assets
-            .iter()
-            .filter(|a| !keep.contains(&(release.tag_name.clone(), a.name.clone())))
-            .collect();
-        for asset in &obsolete {
-            github.delete(asset)?;
-            removed += 1;
-        }
-        if obsolete.len() == assets.len() && release.tag_name != TAG {
-            github.api(Method::DELETE, &format!("releases/{}", release.id), None)?;
-            github.api(
-                Method::DELETE,
-                &format!("git/refs/tags/{}", release.tag_name),
+        if release.id == target.id {
+            for asset in github
+                .assets(&release)?
+                .iter()
+                .filter(|a| !keep.contains(a.name.as_str()))
+            {
+                github.delete(asset)?;
+                removed += 1;
+            }
+        } else {
+            // Cached catalogs already retry missing assets using the current catalog.
+            // One release deletion also removes its assets, avoiding hundreds of API calls.
+            let refs = github.api(
+                Method::GET,
+                &format!("git/matching-refs/tags/{}", release.tag_name),
                 None,
             )?;
+            if refs
+                .as_array()
+                .context("Invalid Git reference list")?
+                .iter()
+                .any(|r| r["ref"].as_str() == Some(&format!("refs/tags/{}", release.tag_name)))
+            {
+                github.api(
+                    Method::DELETE,
+                    &format!("git/refs/tags/{}", release.tag_name),
+                    None,
+                )?;
+            }
+            github.api(Method::DELETE, &format!("releases/{}", release.id), None)?;
         }
     }
     tracing::info!(
-        artifacts = selected.len(),
+        artifacts = catalog.artifacts.len(),
+        assets = keep.len(),
+        packs = catalog.packs.len(),
+        uploads,
+        bytes,
         removed,
-        cleanup_seconds = cleanup.elapsed().as_secs_f64(),
         total_seconds = started.elapsed().as_secs_f64(),
-        "Published metadata archive and removed obsolete assets"
+        "Published one metadata release"
     );
     Ok(())
+}
+
+fn fits(existing: &[Asset], blobs: &[(String, [u8; 32], u64, String)]) -> bool {
+    let additions = blobs
+        .iter()
+        .filter(|b| !existing.iter().any(|a| a.name == b.0))
+        .count();
+    let restoring = usize::from(
+        !existing.iter().any(|a| a.name == "catalog.bin")
+            && existing.iter().any(|a| a.name == "catalog.retiring.bin"),
+    );
+    // Includes old assets until commit and one extra slot for the pending catalog.
+    existing
+        .iter()
+        .filter(|a| !temporary_catalog(&a.name))
+        .count()
+        + restoring
+        + additions
+        < 1000
+}
+
+fn temporary_catalog(name: &str) -> bool {
+    matches!(name, "catalog.pending.bin" | "catalog.retiring.bin")
+}
+
+fn source(
+    repo: &str,
+    artifact: &Artifact,
+    files: &[PathBuf],
+    previous: &Catalog,
+    work: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = files
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == artifact.name.as_str()))
+    {
+        return Ok(path.clone());
+    }
+    if let Some(path) = client::packed_source(work, repo, previous, artifact)? {
+        return Ok(path);
+    }
+    let path = work.join(&artifact.name);
+    if !path.is_file() {
+        client::download(repo, &artifact.release, &artifact.name, &path)?;
+    }
+    Ok(path)
 }
 
 fn switch_catalog(
@@ -440,6 +542,79 @@ fn switch_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GH_TOKEN and the migrated live metadata release"]
+    fn live_release_has_exactly_the_catalog_assets_and_readable_packs() {
+        let catalog = client::catalog(REPOSITORY).unwrap();
+        let github = Github::new(REPOSITORY).unwrap();
+        let releases = github.releases().unwrap();
+        assert_eq!(releases.len(), 1);
+        assert!(!releases[0].draft);
+        let assets = github.assets(&releases[0]).unwrap();
+        let packed: BTreeSet<_> = catalog.packs.iter().flat_map(|p| &p.members).collect();
+        let expected: BTreeMap<_, _> = catalog
+            .artifacts
+            .iter()
+            .filter(|a| !packed.contains(&a.name))
+            .map(|a| (&a.name, a.size))
+            .chain(catalog.packs.iter().map(|p| (&p.name, p.size)))
+            .collect();
+        assert_eq!(assets.len(), expected.len() + 1);
+        assert!(assets.len() < 1000);
+        for asset in assets.iter().filter(|a| a.name != "catalog.bin") {
+            assert_eq!(expected.get(&asset.name), Some(&asset.size));
+            assert_eq!(asset.state, "uploaded");
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let pack = catalog.packs.first().unwrap();
+        for name in &pack.members {
+            let artifact = catalog.artifacts.iter().find(|a| &a.name == name).unwrap();
+            let path = client::materialize(cache.path(), artifact, &catalog).unwrap();
+            assert!(path.join("manifest.bin").is_file());
+        }
+        println!(
+            "One release, {} assets; all catalog references present; {} packed members materialized",
+            assets.len(),
+            pack.members.len()
+        );
+    }
+
+    #[test]
+    fn staging_counts_old_assets_replacements_and_the_pending_catalog() {
+        let existing: Vec<_> = (0..998)
+            .map(|i| Asset {
+                id: i,
+                name: format!("asset-{i}"),
+                size: 1,
+                state: "uploaded".into(),
+            })
+            .collect();
+        let mut wanted = vec![("asset-0".into(), [0; 32], 1, TAG.into())];
+        assert!(fits(&existing, &wanted));
+        wanted.push(("replacement".into(), [1; 32], 1, TAG.into()));
+        assert!(fits(&existing, &wanted));
+        wanted.push(("another".into(), [2; 32], 1, TAG.into()));
+        assert!(!fits(&existing, &wanted));
+
+        let mut interrupted = existing.clone();
+        interrupted[0].name = "catalog.retiring.bin".into();
+        interrupted.push(Asset {
+            id: 1001,
+            name: "catalog.pending.bin".into(),
+            size: 1,
+            state: "uploaded".into(),
+        });
+        let replacement = vec![("replacement".into(), [1; 32], 1, TAG.into())];
+        assert!(fits(&interrupted, &replacement));
+        interrupted.push(Asset {
+            id: 1002,
+            name: "uncollected-old-bundle".into(),
+            size: 1,
+            state: "uploaded".into(),
+        });
+        assert!(!fits(&interrupted, &replacement));
+    }
 
     #[test]
     fn rate_limits_wait_but_permission_errors_do_not_retry() {
@@ -475,11 +650,13 @@ mod tests {
             id: 1,
             name: "catalog.bin".into(),
             size: 0,
+            state: "uploaded".into(),
         };
         let pending = Asset {
             id: 2,
             name: "catalog.pending.bin".into(),
             size: 0,
+            state: "uploaded".into(),
         };
         for failure in [Some(1), Some(2), None] {
             let mut names = BTreeMap::from([

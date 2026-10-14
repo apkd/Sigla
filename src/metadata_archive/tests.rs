@@ -15,6 +15,208 @@ fn origin() -> Origin {
     }
 }
 
+fn package_artifact(
+    name: &str,
+    version: &str,
+    size: u64,
+    dependencies: &[(&str, &str)],
+) -> Artifact {
+    let mut origin = origin();
+    origin.name = name.into();
+    origin.version = version.into();
+    let package = Package {
+        name: name.into(),
+        version: version.into(),
+        minimum_editor: None,
+        dependencies: dependencies
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect(),
+    };
+    Artifact {
+        name: format!("{name}-{version}.tar.zst"),
+        hash: [0; 32],
+        size,
+        release: TAG.into(),
+        manifest: Manifest {
+            origin,
+            entries: vec![],
+            packages: vec![package],
+            package_names: vec![],
+            recommended: BTreeMap::new(),
+        },
+    }
+}
+
+#[test]
+fn packing_follows_dependencies_and_limits_unwanted_downloads() {
+    let artifacts = vec![
+        package_artifact("runtime", "1.0.0", 10_000, &[]),
+        package_artifact("provider", "1.0.0", 20_000, &[("runtime", "1.0.0")]),
+        package_artifact("unrelated", "1.0.0", 10_000, &[]),
+        package_artifact("runtime", "2.0.0", 10_000, &[]),
+        package_artifact(
+            "large-provider",
+            "1.0.0",
+            2_000_000,
+            &[("runtime", "2.0.0")],
+        ),
+    ];
+    let groups = packing::groups(&artifacts, &[]);
+    assert!(
+        groups
+            .iter()
+            .any(|g| g.len() == 2 && g.contains(&0) && g.contains(&1))
+    );
+    for i in 2..artifacts.len() {
+        assert!(groups.contains(&vec![i]));
+    }
+    let pack = Pack {
+        name: "existing.tar".into(),
+        hash: [0; 32],
+        size: 0,
+        release: TAG.into(),
+        members: vec![artifacts[0].name.clone(), artifacts[1].name.clone()],
+    };
+    let mut expanded = artifacts.clone();
+    expanded.push(package_artifact(
+        "another-provider",
+        "1.0.0",
+        100,
+        &[("runtime", "1.0.0")],
+    ));
+    let groups = packing::groups(&expanded, std::slice::from_ref(&pack));
+    assert!(
+        groups
+            .iter()
+            .any(|g| g.len() == 2 && g.contains(&0) && g.contains(&1))
+    );
+    expanded.remove(0);
+    let groups = packing::groups(&expanded, &[pack]);
+    let mut members: Vec<_> = groups.into_iter().flatten().collect();
+    members.sort();
+    assert_eq!(members, (0..expanded.len()).collect::<Vec<_>>());
+}
+
+#[test]
+fn packs_preserve_compressed_bytes_and_individual_analysis() {
+    let output = tempfile::tempdir().unwrap();
+    let mut artifacts = Vec::new();
+    for name in ["runtime", "provider"] {
+        let mut origin = origin();
+        origin.name = name.into();
+        let mut builder = bundle::Builder::new(origin, vec![vec![]]).unwrap();
+        builder
+            .add(
+                format!("packages/{name}/Code.cs"),
+                b"class C {}".to_vec(),
+                "package",
+            )
+            .unwrap();
+        artifacts.push(builder.finish(output.path()).unwrap());
+    }
+    artifacts.sort_by(|a, b| a.name.cmp(&b.name));
+    let pack = packing::build(&artifacts.iter().collect::<Vec<_>>(), output.path(), |a| {
+        Ok(output.path().join(&a.name))
+    })
+    .unwrap();
+    let catalog = Catalog {
+        artifacts,
+        packs: vec![pack.clone()],
+        unavailable: vec![],
+    };
+    let decoded = Catalog::decode(&catalog.encode().unwrap()).unwrap();
+    assert_eq!(decoded.packs[0].members, pack.members);
+    let extracted = tempfile::tempdir().unwrap();
+    packing::unpack(
+        &output.path().join(&pack.name),
+        extracted.path(),
+        &pack,
+        &catalog,
+    )
+    .unwrap();
+    for artifact in &catalog.artifacts {
+        assert_eq!(
+            fs::read(extracted.path().join(&artifact.name)).unwrap(),
+            fs::read(output.path().join(&artifact.name)).unwrap()
+        );
+        let contents = tempfile::tempdir().unwrap();
+        bundle::unpack(
+            &extracted.path().join(&artifact.name),
+            contents.path(),
+            Some(artifact),
+        )
+        .unwrap();
+        let path = contents.path().join(format!(
+            "packages/{}/Code.cs",
+            artifact.manifest.origin.name
+        ));
+        let id = crate::store::source_id("class C {}", Language::CSharp, &[], "").unwrap();
+        assert!(
+            source_analysis(&path, &id, |_| unreachable!())
+                .unwrap()
+                .is_some()
+        );
+    }
+    let mut broken = pack.clone();
+    broken.members.pop();
+    let invalid = tempfile::tempdir().unwrap();
+    assert!(
+        packing::unpack(
+            &output.path().join(&pack.name),
+            invalid.path(),
+            &broken,
+            &catalog
+        )
+        .is_err()
+    );
+    broken = pack.clone();
+    broken.hash[0] ^= 1;
+    assert!(
+        packing::unpack(
+            &output.path().join(&pack.name),
+            invalid.path(),
+            &broken,
+            &catalog
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn catalog_migrates_without_rebuilding_analysis() {
+    #[derive(Serialize)]
+    struct Legacy {
+        artifacts: Vec<Artifact>,
+        unavailable: Vec<String>,
+    }
+    let legacy = Legacy {
+        artifacts: vec![package_artifact("runtime", "1.0.0", 10, &[])],
+        unavailable: vec![],
+    };
+    let catalog = Catalog::decode(&binary::encode(&legacy).unwrap()).unwrap();
+    assert_eq!(catalog.artifacts[0].manifest, legacy.artifacts[0].manifest);
+    assert_eq!(catalog.artifacts[0].hash, legacy.artifacts[0].hash);
+    assert!(catalog.packs.is_empty());
+}
+
+#[test]
+#[ignore = "requires SIGLA_TEST_CATALOG pointing to a downloaded release catalog"]
+fn live_catalog_packing_retains_all_packages_with_headroom() {
+    let bytes = fs::read(std::env::var("SIGLA_TEST_CATALOG").unwrap()).unwrap();
+    let catalog = Catalog::decode(payload(&bytes).unwrap()).unwrap();
+    let groups = packing::groups(&catalog.artifacts, &catalog.packs);
+    println!(
+        "{} logical bundles -> {} assets including catalog",
+        catalog.artifacts.len(),
+        groups.len() + 1
+    );
+    assert!(groups.len() + 1 < 1000);
+    let mut members: Vec<_> = groups.into_iter().flatten().collect();
+    members.sort();
+    assert_eq!(members, (0..catalog.artifacts.len()).collect::<Vec<_>>());
+}
+
 #[test]
 fn precomputed_sources_preserve_navigation_and_profile_selection() {
     let output = tempfile::tempdir().unwrap();
