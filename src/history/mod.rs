@@ -1,5 +1,6 @@
-//! Anchored, object-only source history. All state belongs to one request; public
-//! pagination is reproducible from commit IDs and ordinary numeric controls.
+//! Anchored, object-only source history. Pagination is reproducible from commit
+//! IDs and ordinary numeric controls; shared facts only avoid repeated work.
+mod cache;
 mod matching;
 mod merges;
 mod paths;
@@ -11,6 +12,7 @@ mod walk;
 
 use crate::repository::history::{Commit, Store, check};
 use anyhow::{Context, Result, ensure};
+pub(crate) use cache::Cache;
 use matching::{Mapping, State, Tracker};
 use query::{Command, Request, Selector};
 use regions::{Region, Value};
@@ -42,15 +44,44 @@ pub(crate) fn validate(input: &str) -> Result<()> {
     Request::parse(input).map(|_| ())
 }
 
-pub(crate) fn run(mut store: Store, selector: Option<&str>, input: &str) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn run(store: Store, selector: Option<&str>, input: &str) -> Result<String> {
+    run_cached(
+        store,
+        selector,
+        input,
+        std::sync::Arc::new(Cache::new(crate::memory::cache_budget() / 4)),
+    )
+}
+
+pub(crate) fn run_cached(
+    mut store: Store,
+    selector: Option<&str>,
+    input: &str,
+    cache: std::sync::Arc<Cache>,
+) -> Result<String> {
     let request = Request::parse(input)?;
     store.commit_window(match (&request.command, &request.selector) {
         (Command::Log { skip, limit }, Selector::Repository) => Some(skip.saturating_add(*limit)),
         (_, Selector::Repository) => Some(1), // Snapshot endpoints need no ancestry lookahead.
         _ => None, // Selected-source lineage has no known commit-count bound.
     });
-    let mut tracker = Tracker::new(store);
+    let mut tracker = Tracker::new(store, cache.clone());
     let result = execute(&mut tracker, selector, &request);
+    let stats = cache.stats();
+    tracing::debug!(
+        bytes = stats.bytes,
+        entries = stats.entries,
+        source_hits = stats.hits[0],
+        tree_hits = stats.hits[1],
+        match_hits = stats.hits[2],
+        evidence_hits = stats.hits[3],
+        source_misses = stats.misses[0],
+        tree_misses = stats.misses[1],
+        match_misses = stats.misses[2],
+        evidence_misses = stats.misses[3],
+        "History derived cache"
+    );
     // Even an incomplete request can publish verified objects, but never a claim
     // of complete ancestry for an interval whose discovery failed.
     let persisted = tracker.store.finish();
@@ -278,30 +309,7 @@ fn backwards(
 const TRACE_MEMORY: usize = 128 * 1024 * 1024;
 
 fn retain_state(bytes: &mut usize, state: &State) -> Result<()> {
-    *bytes = bytes.saturating_add(
-        std::mem::size_of::<State>()
-            + state
-                .regions
-                .iter()
-                .map(|r| {
-                    256 + r.path.capacity()
-                        + r.blob.capacity()
-                        + r.name.capacity()
-                        + r.owner.capacity()
-                        + r.kind.capacity()
-                        + r.written.capacity()
-                        + r.parameters.capacity() * std::mem::size_of::<String>()
-                        + r.parameters.iter().map(String::capacity).sum::<usize>()
-                })
-                .sum::<usize>()
-            + state.paths.iter().map(String::capacity).sum::<usize>()
-            + state.scope_exclusions.capacity() * std::mem::size_of::<paths::Exclusion>()
-            + state
-                .scope_exclusions
-                .iter()
-                .map(paths::Exclusion::heap_bytes)
-                .sum::<usize>(),
-    );
+    *bytes = bytes.saturating_add(std::mem::size_of::<State>() + state.heap_bytes());
     ensure!(
         *bytes <= TRACE_MEMORY,
         "history occurrence graph exceeds request memory bound"

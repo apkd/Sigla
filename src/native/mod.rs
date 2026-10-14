@@ -33,7 +33,11 @@ impl Group {
 }
 
 pub fn language(path: &Path) -> Option<Language> {
-    Some(match path.extension()?.to_str()? {
+    language_extension(path.extension()?.to_str()?)
+}
+
+pub(crate) fn language_extension(extension: &str) -> Option<Language> {
+    Some(match extension {
         "c" => Language::C,
         "h" => Language::Header,
         "C" | "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "ipp"

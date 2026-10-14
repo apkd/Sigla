@@ -144,12 +144,33 @@ pub(crate) fn capture_cancellable(
     destination: Option<std::fs::File>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Output> {
+    let stdin = if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    capture_input(command, timeout, input, stdin, destination, cancel)
+}
+
+pub(crate) fn capture_file(
+    command: &mut Command,
+    timeout: Duration,
+    input: std::fs::File,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Output> {
+    capture_input(command, timeout, None, Stdio::from(input), None, cancel)
+}
+
+fn capture_input(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+    stdin: Stdio,
+    destination: Option<std::fs::File>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Output> {
     command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(stdin)
         .stdout(destination.map(Stdio::from).unwrap_or_else(Stdio::piped))
         .stderr(Stdio::piped());
     let mut child = spawn(command)?;

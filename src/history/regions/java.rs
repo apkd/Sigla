@@ -505,7 +505,7 @@ class Outer {
             std::fs::write(directory.path().join("input"), text).unwrap();
             let blob = git(&["hash-object", "-w", "input"]);
             for paths in [["C.txt", "C.java"], ["C.java", "C.txt"]] {
-                let mut sources = Sources::default();
+                let sources = Sources::default();
                 for path in paths {
                     sources.get(&mut store, path, &blob).unwrap();
                 }

@@ -92,7 +92,13 @@ impl App {
                     .unwrap()
                     .record_history(owner, crate::cache::now());
             }
-            let result = crate::history::run(store, selector.as_deref(), &query);
+            let result = crate::history::run_cached(
+                store,
+                selector.as_deref(),
+                &query,
+                app.history_cache.clone(),
+            );
+            app.trim_idle();
             if let Some(owner) = &owner {
                 let mut owners = app.owners.lock().unwrap();
                 owners.record_history(owner, crate::cache::now());

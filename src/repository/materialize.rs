@@ -164,6 +164,7 @@ fn receive(
         &super::transport::Fetch {
             filter: super::transport::Filter::Trees,
             depth: depth_one.then_some(1),
+            haves: &[],
             cancel: &std::sync::atomic::AtomicBool::new(false),
         },
         remaining,
@@ -214,17 +215,50 @@ pub(super) fn receive_filtered_measured(
     received?;
     output.output.sync_all()?;
     let index = scratch.path().join("incoming.idx");
-    let result = run(git(store)
-        .args(["index-pack", "--index-version=2", "-o"])
-        .arg(&index)
-        .arg(&pack))?;
-    let id = String::from_utf8(result)?.trim().to_owned();
+    let (pack, id) = if options.haves.is_empty() {
+        let result = run(git(store)
+            .args(["index-pack", "--index-version=2", "-o"])
+            .arg(&index)
+            .arg(&pack))?;
+        (pack, String::from_utf8(result)?.trim().to_owned())
+    } else {
+        // Negotiated packs may use bases retained only by this reader's lease.
+        // Expanding thin packs requires stdin; ordinary packs index in place.
+        let indexed = scratch.path().join("indexed.pack");
+        let result = crate::process::capture_file(
+            git(control)
+                .args([
+                    "index-pack",
+                    "--stdin",
+                    "--fix-thin",
+                    "--index-version=2",
+                    "-o",
+                ])
+                .arg(&index)
+                .arg(&indexed),
+            Duration::from_secs(120),
+            File::open(&pack)?,
+            Some(options.cancel),
+        )?;
+        ensure!(
+            result.status.success(),
+            "Cannot index repository pack: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = String::from_utf8(result.stdout)?;
+        let id = result
+            .trim()
+            .strip_prefix("pack\t")
+            .context("Invalid Git pack receipt")?;
+        (indexed, id.to_owned())
+    };
     parse_id(&id)?;
     let destination = store.join("objects/pack").join(format!("pack-{id}"));
     // The marker precedes publication so local inspection never attempts to repair omitted blobs.
     File::open(&index)?.sync_all()?;
     File::create(destination.with_extension("promisor"))?.sync_all()?;
     fs::rename(index, destination.with_extension("idx"))?;
+    File::open(&pack)?.sync_all()?;
     fs::rename(pack, destination.with_extension("pack"))?;
     File::open(store.join("objects/pack"))?.sync_all()?;
     Ok(transfer)

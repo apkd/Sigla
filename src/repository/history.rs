@@ -1,4 +1,5 @@
 //! Object-only history access. No workspace, checkout, content-store import or LFS path.
+mod attributes;
 mod planner;
 
 use super::{
@@ -65,14 +66,33 @@ pub(crate) struct Commit {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Entry {
-    pub id: String,
+    pub id: Arc<str>,
     pub mode: u32,
 }
 pub(crate) type Tree = BTreeMap<String, Entry>;
 
+#[derive(PartialEq, Eq)]
+pub(crate) struct SourcePath {
+    pub entry: Option<Entry>,
+    attributes: Tree,
+}
+
 struct Object {
     kind: String,
     bytes: Vec<u8>,
+}
+struct Directory {
+    entries: Tree,
+    bytes: usize,
+}
+struct CachedObject {
+    object: Arc<Object>,
+    directory: Option<Arc<Directory>>,
+}
+impl CachedObject {
+    fn bytes(&self) -> usize {
+        self.object.bytes.len() + self.directory.as_ref().map_or(0, |d| d.bytes)
+    }
 }
 struct Pipe {
     output: ChildStdout,
@@ -244,13 +264,16 @@ impl Remote {
 
 pub(crate) struct Store {
     path: PathBuf,
+    cache_scope: [u8; 32],
     lease: Option<ObjectLease>,
     remote: Option<Remote>,
     batch: Option<Batch>,
-    objects: lru::LruCache<String, Arc<Object>>,
+    objects: lru::LruCache<String, CachedObject>,
+    attributes: Option<attributes::Reader>,
     bytes: usize,
     resolved: BTreeMap<String, String>,
     planner: planner::Planner,
+    tree_have: Option<gix_hash::ObjectId>,
     pub cancel: Arc<AtomicBool>,
     pub complete: BTreeSet<String>,
     pub boundaries: BTreeSet<String>,
@@ -318,16 +341,30 @@ impl Store {
         remote: Option<Remote>,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        let identity = lease
+            .as_ref()
+            .map(ObjectLease::owner)
+            .unwrap_or_else(|| path.clone());
+        let mut scope = blake3::Hasher::new();
+        scope.update(if lease.is_some() {
+            b"remote\0"
+        } else {
+            b"local\0"
+        });
+        scope.update(identity.as_os_str().as_encoded_bytes());
         Self {
             path,
+            cache_scope: *scope.finalize().as_bytes(),
             lease,
             remote,
             cancel,
             batch: None,
             objects: lru::LruCache::new(NonZeroUsize::new(4096).unwrap()),
+            attributes: None,
             bytes: 0,
             resolved: BTreeMap::new(),
             planner: planner::Planner::default(),
+            tree_have: None,
             complete: BTreeSet::new(),
             boundaries: BTreeSet::new(),
             reads: 0,
@@ -335,6 +372,9 @@ impl Store {
     }
     pub fn owner(&self) -> Option<PathBuf> {
         self.lease.as_ref().map(ObjectLease::owner)
+    }
+    pub fn cache_scope(&self) -> &[u8; 32] {
+        &self.cache_scope
     }
     pub fn finish(&self) -> Result<()> {
         if let Some(lease) = &self.lease {
@@ -418,14 +458,20 @@ impl Store {
         self.planner.commits = commits;
     }
     fn acquisition_kind(&self, kind: &str) -> planner::Kind {
+        let commit_trees = if self.tree_have.is_some() {
+            planner::Kind::IncrementalCommitTrees
+        } else {
+            planner::Kind::CommitTrees
+        };
         match kind {
+            "commit-tree" => commit_trees,
             "commit"
                 if self
                     .remote
                     .as_ref()
                     .is_some_and(|remote| matches!(remote.commit_filter, Filter::Trees)) =>
             {
-                planner::Kind::CommitTrees
+                commit_trees
             }
             "commit" => planner::Kind::Commits,
             "tree" => planner::Kind::Trees,
@@ -447,7 +493,19 @@ impl Store {
             check(&self.cancel)?;
             let class = self.acquisition_kind(kind);
             let remaining = self.remaining();
-            let depth = (kind == "commit").then(|| self.planner.depth(class, ids.len(), remaining));
+            let depth = matches!(kind, "commit" | "commit-tree")
+                .then(|| self.planner.depth(class, ids.len(), remaining));
+            // Partial source trees prove no blob coverage or complete ancestry.
+            let haves = if matches!(
+                class,
+                planner::Kind::Trees
+                    | planner::Kind::CommitTrees
+                    | planner::Kind::IncrementalCommitTrees
+            ) {
+                self.tree_have.as_slice()
+            } else {
+                &[]
+            };
             let remote = self
                 .remote
                 .as_mut()
@@ -463,6 +521,7 @@ impl Store {
                     Filter::Trees
                 },
                 depth,
+                haves,
                 cancel: &self.cancel,
             };
             let start = Instant::now();
@@ -540,7 +599,7 @@ impl Store {
             }
             id(oid)?;
             if let Some(object) = self.objects.get(oid.as_str()) {
-                ensure!(object.kind == kind, "Unexpected history object kind");
+                ensure!(object.object.kind == kind, "Unexpected history object kind");
             } else {
                 inspect.push(oid);
             }
@@ -628,10 +687,13 @@ impl Store {
         Ok(())
     }
     fn object(&mut self, oid: &str, kind: &str) -> Result<Arc<Object>> {
+        self.object_from(oid, kind, None)
+    }
+    fn object_from(&mut self, oid: &str, kind: &str, commit: Option<&str>) -> Result<Arc<Object>> {
         check(&self.cancel)?;
         if let Some(object) = self.objects.get(oid) {
-            ensure!(object.kind == kind, "Unexpected Git object kind");
-            return Ok(object.clone());
+            ensure!(object.object.kind == kind, "Unexpected Git object kind");
+            return Ok(object.object.clone());
         }
         if self.batch.is_none() {
             self.batch = Some(Batch::new(&self.path, self.cancel.clone())?);
@@ -639,7 +701,8 @@ impl Store {
         let mut object = self.batch.as_mut().unwrap().read(oid, &self.cancel)?;
         if object.is_none() {
             self.batch = None;
-            self.acquire(&[oid.into()], kind)
+            let (want, acquisition) = commit.map_or((oid, kind), |id| (id, "commit-tree"));
+            self.acquire(&[want.into()], acquisition)
                 .with_context(|| format!("missing {kind} {oid}"))?;
             self.batch = Some(Batch::new(&self.path, self.cancel.clone())?);
             object = self.batch.as_mut().unwrap().read(oid, &self.cancel)?;
@@ -651,18 +714,46 @@ impl Store {
         if let Some(lease) = &self.lease {
             lease.retain(oid);
         }
-        while self.bytes + object.bytes.len() > MEMORY
-            || self.objects.len() == self.objects.cap().get()
+        self.cache_object(
+            oid,
+            CachedObject {
+                object: object.clone(),
+                directory: None,
+            },
+        );
+        self.reads += 1;
+        Ok(object)
+    }
+    fn cache_object(&mut self, oid: &str, object: CachedObject) {
+        // Replacing a raw object with its decoded directory uses the same budget.
+        if let Some(previous) = self.objects.pop(oid) {
+            self.bytes -= previous.bytes();
+        }
+        let bytes = object.bytes();
+        if bytes > self.object_budget() {
+            return;
+        }
+        self.reserve_objects(bytes, 1);
+        self.bytes += bytes;
+        self.objects.put(oid.into(), object);
+    }
+    fn object_budget(&self) -> usize {
+        MEMORY
+            - if self.attributes.is_some() {
+                attributes::MEMORY
+            } else {
+                0
+            }
+    }
+    fn reserve_objects(&mut self, bytes: usize, entries: usize) {
+        while self.bytes + bytes > self.object_budget()
+            || self.objects.len() + entries > self.objects.cap().get()
         {
             let Some((_, removed)) = self.objects.pop_lru() else {
                 break;
             };
-            self.bytes -= removed.bytes.len();
+            self.bytes -= removed.bytes();
         }
-        self.bytes += object.bytes.len();
-        self.objects.put(oid.into(), object.clone());
-        self.reads += 1;
-        Ok(object)
     }
     pub fn blob(&mut self, oid: &str) -> Result<Vec<u8>> {
         Ok(self.object(oid, "blob")?.bytes.clone())
@@ -709,139 +800,179 @@ impl Store {
         })
     }
     pub fn tree(&mut self, root: &str) -> Result<Tree> {
-        let mut result = Tree::new();
+        let mut result = Vec::new();
         let mut bytes_used = 0usize;
-        let mut pending = vec![(String::new(), root.to_owned())];
+        let mut pending = vec![(String::new(), Arc::<str>::from(root))];
         while let Some((prefix, oid)) = pending.pop() {
             check(&self.cancel)?;
-            let object = self.object(&oid, "tree")?;
-            let mut bytes = object.bytes.as_slice();
-            while !bytes.is_empty() {
-                let space = bytes
-                    .iter()
-                    .position(|&c| c == b' ')
-                    .context("Invalid Git tree mode")?;
-                let nul = bytes
-                    .iter()
-                    .position(|&c| c == 0)
-                    .context("Invalid Git tree path")?;
-                ensure!(
-                    space < nul && bytes.len() >= nul + 1 + oid.len() / 2,
-                    "Truncated Git tree"
-                );
-                let mode = u32::from_str_radix(std::str::from_utf8(&bytes[..space])?, 8)?;
-                let name = std::str::from_utf8(&bytes[space + 1..nul])?;
-                super::selection::validate_path(name)?;
-                ensure!(!name.contains('/'), "Invalid Git tree component");
-                let path = format!("{prefix}{name}");
+            let siblings = pending.len();
+            for (name, entry) in &self.directory(&oid)?.entries {
+                let path = [prefix.as_str(), name.as_str()].concat();
                 bytes_used = bytes_used.saturating_add(path.len() + 160);
                 ensure!(
                     bytes_used <= 64 * 1024 * 1024,
                     "history tree inventory exceeds request memory bound"
                 );
-                let mut hash = String::with_capacity(oid.len());
-                for byte in &bytes[nul + 1..nul + 1 + oid.len() / 2] {
-                    use std::fmt::Write;
-                    write!(hash, "{byte:02x}").unwrap();
+                if entry.mode == 0o40000 {
+                    pending.push(([path.as_str(), "/"].concat(), entry.id.clone()));
                 }
-                bytes = &bytes[nul + 1 + oid.len() / 2..];
-                if mode == 0o40000 {
-                    pending.push((format!("{path}/"), hash.clone()));
-                }
-                result.insert(path, Entry { id: hash, mode });
+                result.push((path, entry.clone()));
+            }
+            // Visit sibling directories in path order, giving bulk tree
+            // construction longer sorted runs to merge.
+            pending[siblings..].reverse();
+        }
+        // Every descendant tree is now verified and retained by this lease.
+        self.tree_have = Some(id(root)?);
+        Ok(result.into_iter().collect())
+    }
+    fn directory(&mut self, oid: &str) -> Result<Arc<Directory>> {
+        let object = self.object(oid, "tree")?;
+        if let Some(directory) = self.objects.get(oid).and_then(|o| o.directory.clone()) {
+            return Ok(directory);
+        }
+        let mut bytes = object.bytes.as_slice();
+        let mut result = Tree::new();
+        let mut used = 0usize;
+        while !bytes.is_empty() {
+            let space = bytes
+                .iter()
+                .position(|&c| c == b' ')
+                .context("Invalid Git tree mode")?;
+            let nul = bytes
+                .iter()
+                .position(|&c| c == 0)
+                .context("Invalid Git tree path")?;
+            let end = nul + 1 + oid.len() / 2;
+            ensure!(space < nul && bytes.len() >= end, "Truncated Git tree");
+            let mode = u32::from_str_radix(std::str::from_utf8(&bytes[..space])?, 8)?;
+            let name = std::str::from_utf8(&bytes[space + 1..nul])?;
+            super::selection::validate_path(name)?;
+            ensure!(!name.contains('/'), "Invalid Git tree component");
+            used += name.len() + 160;
+            ensure!(
+                used <= MEMORY,
+                "history tree inventory exceeds request memory bound"
+            );
+            let hash = gix_hash::ObjectId::from_bytes_or_panic(&bytes[nul + 1..end]).to_string();
+            result.insert(
+                name.into(),
+                Entry {
+                    id: hash.into(),
+                    mode,
+                },
+            );
+            bytes = &bytes[end..];
+        }
+        let directory = Arc::new(Directory {
+            entries: result,
+            bytes: used,
+        });
+        self.cache_object(
+            oid,
+            CachedObject {
+                object,
+                directory: Some(directory.clone()),
+            },
+        );
+        Ok(directory)
+    }
+    /// Read only the path's directories and the attribute identities that govern it.
+    pub fn source_path(&mut self, commit: &Commit, path: &str) -> Result<SourcePath> {
+        super::selection::validate_path(path)?;
+        self.prepare_tree(commit)?;
+        let mut result = SourcePath {
+            entry: None,
+            attributes: Tree::new(),
+        };
+        let mut tree = Arc::<str>::from(commit.tree.as_str());
+        let mut prefix = String::new();
+        let mut parts = path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            let directory = self.directory(&tree)?;
+            if let Some(attributes) = directory.entries.get(".gitattributes")
+                && matches!(attributes.mode, 0o100644 | 0o100755)
+            {
+                result
+                    .attributes
+                    .insert(format!("{prefix}.gitattributes"), attributes.clone());
+            }
+            let Some(entry) = directory.entries.get(part) else {
+                break;
+            };
+            if parts.peek().is_none() {
+                result.entry = Some(entry.clone());
+            } else if entry.mode == 0o40000 {
+                tree = entry.id.clone();
+                prefix.push_str(part);
+                prefix.push('/');
+            } else {
+                break;
             }
         }
         Ok(result)
     }
-    pub fn source_paths(
+    pub fn prepare_tree(&mut self, commit: &Commit) -> Result<()> {
+        // Fetch a bounded ancestry window even when commit metadata is already cached.
+        self.object_from(&commit.tree, "tree", Some(&commit.id))?;
+        Ok(())
+    }
+    pub fn source_exclusions(
         &mut self,
         tree: &str,
         entries: &Tree,
-        paths: &[String],
+        paths: &[&str],
     ) -> Result<BTreeSet<String>> {
         if paths.is_empty() {
             return Ok(BTreeSet::new());
         }
+        let mut policy = blake3::Hasher::new();
         let attributes: Vec<_> = entries
             .iter()
-            .filter(|(path, entry)| {
-                (path.as_str() == ".gitattributes" || path.ends_with("/.gitattributes"))
-                    && matches!(entry.mode, 0o100644 | 0o100755)
+            .filter(|(path, _)| {
+                path.as_str() == ".gitattributes" || path.ends_with("/.gitattributes")
             })
-            .map(|(_, e)| e.id.clone())
+            .filter_map(|(path, entry)| {
+                policy.update(path.as_bytes());
+                policy.update(&[0]);
+                policy.update(entry.id.as_bytes());
+                policy.update(&entry.mode.to_le_bytes());
+                matches!(entry.mode, 0o100644 | 0o100755).then(|| entry.id.to_string())
+            })
             .collect();
         if attributes.is_empty() {
-            return Ok(paths.iter().cloned().collect());
+            return Ok(BTreeSet::new());
         }
         self.prefetch(&attributes, "blob")?;
         // Reading also pins these attribute objects for the declared source policy.
+        let mut value_bytes = b"unspecified".len();
         for oid in &attributes {
-            self.object(oid, "blob")?;
+            let object = self.object(oid, "blob")?;
+            // An attribute value cannot exceed its source line. Account for
+            // custom values as well as Git's built-in set/unset responses.
+            value_bytes = value_bytes.max(
+                object
+                    .bytes
+                    .split(|&b| b == b'\n')
+                    .map(<[u8]>::len)
+                    .max()
+                    .unwrap_or(0),
+            );
         }
-        let control = tempfile::tempdir()?;
-        init(
-            control.path(),
-            if tree.len() == 64 { "sha256" } else { "sha1" },
-        )?;
-        let objects = run(git(&self.path).args(["rev-parse", "--git-path", "objects"]))?;
-        let objects = PathBuf::from(std::str::from_utf8(&objects)?.trim()).canonicalize()?;
-        let mut allowed: BTreeSet<_> = paths.iter().cloned().collect();
-        for chunk in paths.chunks(256) {
-            let mut input = Vec::new();
-            for path in chunk {
-                input.extend_from_slice(path.as_bytes());
-                input.push(0);
-            }
-            let output = crate::process::capture_cancellable(
-                git(control.path())
-                    .env("GIT_OBJECT_DIRECTORY", &objects)
-                    .env("GIT_ATTR_NOSYSTEM", "1")
-                    .args([
-                        "-c",
-                        "core.attributesFile=/dev/null",
-                        "check-attr",
-                        "--source",
-                        tree,
-                        "-z",
-                        "--stdin",
-                        "binary",
-                        "diff",
-                        "filter",
-                    ]),
-                Duration::from_secs(120),
-                Some(input),
-                None,
-                Some(&self.cancel),
-            )?;
-            ensure!(
-                output.status.success(),
-                "Cannot read committed source attributes"
-            );
-            let mut fields: Vec<_> = output.stdout.split(|&b| b == 0).collect();
-            ensure!(
-                fields.last().is_some_and(|s| s.is_empty()),
-                "Invalid Git attribute output"
-            );
-            fields.pop();
-            ensure!(
-                fields.len() == chunk.len() * 9,
-                "Incomplete Git attribute output"
-            );
-            for fields in fields.chunks_exact(3) {
-                let path = std::str::from_utf8(fields[0])?;
-                ensure!(
-                    chunk.iter().any(|p| p == path),
-                    "Unexpected Git attribute path"
-                );
-                if fields[1] == b"binary" && fields[2] == b"set"
-                    || fields[1] == b"diff" && fields[2] == b"unset"
-                    || fields[1] == b"filter" && fields[2] == b"lfs"
-                {
-                    allowed.remove(path);
-                }
-            }
+        if self.attributes.is_none() {
+            self.attributes = Some(attributes::Reader::new(
+                &self.path,
+                if tree.len() == 64 { "sha256" } else { "sha1" },
+            )?);
+            self.reserve_objects(0, 0);
         }
-        Ok(allowed)
+        self.attributes.as_mut().unwrap().exclusions(
+            tree,
+            *policy.finalize().as_bytes(),
+            paths,
+            value_bytes,
+            &self.cancel,
+        )
     }
     pub fn empty_tree(&self) -> Result<String> {
         let output = crate::process::capture_cancellable(
@@ -1238,6 +1369,82 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_trees_reuse_metadata_without_hiding_missing_blobs() {
+        for format in ["sha1", "sha256"] {
+            let fixture = Fixture::new(format);
+            let path = fixture.directory.path();
+            for index in 0..64 {
+                let directory = path.join(format!("part{index}"));
+                fs::create_dir(&directory).unwrap();
+                fs::write(
+                    directory.join("source.rs"),
+                    format!("pub fn part{index}() {{}}\n"),
+                )
+                .unwrap();
+            }
+            command(path, &["add", "."]);
+            command(path, &["commit", "-qm", "shared trees"]);
+            let first = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join("selected.rs"), "pub fn changed() {}\n").unwrap();
+            command(path, &["add", "."]);
+            command(path, &["commit", "-qm", "changed tree"]);
+            let second = command(path, &["rev-parse", "HEAD^{tree}"]);
+            let mut store = fixture.store();
+            let old = store.tree(&first).unwrap();
+            let initial = store.remote.as_ref().unwrap().transferred;
+            let new = store.tree(&second).unwrap();
+            let added = store.remote.as_ref().unwrap().transferred - initial;
+            assert!(
+                added < initial / 2,
+                "Shared trees were downloaded again: {added}/{initial}"
+            );
+            assert_eq!(old["part0/source.rs"], new["part0/source.rs"]);
+            assert!(!fixture.inventory().contains(" blob"));
+            // Tree haves must never imply that their omitted source blobs are available.
+            for entry in [&old["part0/source.rs"], &new["selected.rs"]] {
+                assert!(!store.blob(&entry.id).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tree_windows_batch_even_when_commit_metadata_is_already_cached() {
+        let fixture = Fixture::new("sha1");
+        let path = fixture.directory.path();
+        let mut commits = Vec::new();
+        for index in 0..18 {
+            fs::write(
+                path.join("other.rs"),
+                format!("pub fn other{index}() {{}}\n"),
+            )
+            .unwrap();
+            command(path, &["add", "."]);
+            command(path, &["commit", "-qm", "other change"]);
+            commits.push(command(path, &["rev-parse", "HEAD"]));
+        }
+        let mut store = fixture.store();
+        store.prefetch(&commits, "commit").unwrap();
+        assert!(!fixture.inventory().contains(" tree"));
+        let before = store.remote.as_ref().unwrap().requests;
+        for oid in commits.iter().rev() {
+            let commit = store.commit(oid).unwrap();
+            store.prepare_tree(&commit).unwrap();
+            assert!(
+                store
+                    .tree(&commit.tree)
+                    .unwrap()
+                    .contains_key("selected.rs")
+            );
+        }
+        let requests = store.remote.as_ref().unwrap().requests - before;
+        assert!(
+            requests < commits.len(),
+            "Every commit required a separate tree fetch"
+        );
+        assert!(!fixture.inventory().contains(" blob"));
+    }
+
+    #[test]
     fn selected_wants_complete_across_batches_with_warm_and_cancelled_replays() {
         let fixture = Fixture::new("sha1");
         let path = fixture.directory.path();
@@ -1321,6 +1528,183 @@ mod tests {
             }
             let inventory = fixture.inventory();
             assert!(!inventory.contains(&fixture.excluded) && !inventory.contains(&fixture.lfs));
+        }
+    }
+
+    #[test]
+    fn source_attributes_follow_each_tree_and_ignore_local_overrides() {
+        for format in ["sha1", "sha256"] {
+            let fixture = Fixture::new(format);
+            let path = fixture.directory.path();
+            let allowed = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join("added.rs"), "pub fn added() {}\n").unwrap();
+            command(path, &["add", "added.rs"]);
+            command(
+                path,
+                &["commit", "-qm", "add source without changing attributes"],
+            );
+            let same_policy = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join(".gitattributes"), "selected.rs binary\n").unwrap();
+            command(path, &["add", ".gitattributes"]);
+            command(path, &["commit", "-qm", "exclude source"]);
+            let excluded = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::remove_file(path.join(".gitattributes")).unwrap();
+            command(path, &["add", ".gitattributes"]);
+            command(path, &["commit", "-qm", "remove source attributes"]);
+            let no_attributes = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::create_dir_all(path.join(".git/info")).unwrap();
+            fs::write(path.join(".git/info/attributes"), "selected.rs binary\n").unwrap();
+            let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
+            for (tree, include) in [
+                (&allowed, true),
+                (&same_policy, true),
+                (&excluded, false),
+                (&no_attributes, true),
+                (&excluded, false),
+                (&allowed, true),
+            ] {
+                let entries = store.tree(tree).unwrap();
+                let paths: Vec<_> = ["selected.rs", "added.rs"]
+                    .into_iter()
+                    .filter(|p| entries.contains_key(*p))
+                    .collect();
+                for _ in 0..2 {
+                    let result = store.source_exclusions(tree, &entries, &paths).unwrap();
+                    assert_eq!(result.contains("selected.rs"), !include);
+                    assert!(!result.contains("added.rs"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_directories_are_reused_within_the_object_budget() {
+        let fixture = Fixture::new("sha1");
+        let mut store =
+            Store::local(fixture.directory.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        let tree = store.commit(&fixture.tip).unwrap().tree;
+        let first = store.directory(&tree).unwrap();
+        let reads = store.reads;
+        let repeated = store.directory(&tree).unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert_eq!(store.reads, reads);
+        assert!(store.bytes <= MEMORY);
+        assert_eq!(
+            store.bytes,
+            store
+                .objects
+                .iter()
+                .map(|(_, cached)| {
+                    cached.object.bytes.len() + cached.directory.as_ref().map_or(0, |d| d.bytes)
+                })
+                .sum::<usize>()
+        );
+        // Exercise eviction with real objects and a small entry capacity.
+        let mut small =
+            Store::local(fixture.directory.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        small.objects = lru::LruCache::new(NonZeroUsize::new(1).unwrap());
+        small.directory(&tree).unwrap();
+        small.commit(&fixture.tip).unwrap();
+        let decoded = small.directory(&tree).unwrap();
+        assert_eq!(first.entries, decoded.entries);
+        assert_eq!(small.bytes, small.objects.peek(&tree).unwrap().bytes());
+    }
+
+    #[test]
+    fn source_attributes_cover_large_inventories_with_custom_values_and_utf8_paths() {
+        let fixture = Fixture::new("sha1");
+        let path = fixture.directory.path();
+        fs::write(
+            path.join(".gitattributes"),
+            "*.cs diff=custom-driver\nblocked* -diff\nlarge.rs filter=lfs\nexcluded.cs binary\n",
+        )
+        .unwrap();
+        let mut paths = Vec::new();
+        let mut expected = BTreeSet::new();
+        for index in 0..400 {
+            let blocked = index % 3 == 0;
+            let name = format!(
+                "{}-é space {index}.cs",
+                if blocked { "blocked" } else { "source" }
+            );
+            fs::write(path.join(&name), "class Example {}\n").unwrap();
+            if blocked {
+                expected.insert(name.clone());
+            }
+            paths.push(name);
+        }
+        command(path, &["add", "."]);
+        command(path, &["commit", "-qm", "attribute inventory"]);
+        let tree = command(path, &["rev-parse", "HEAD^{tree}"]);
+        let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
+        let entries = store.tree(&tree).unwrap();
+        let paths: Vec<_> = paths.iter().map(String::as_str).collect();
+        assert_eq!(
+            store.source_exclusions(&tree, &entries, &paths).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn method_comparisons_batch_wider_sources_only_when_needed() {
+        for edited in [false, true] {
+            let mut fixture = Fixture::new("sha1");
+            let path = fixture.directory.path();
+            let mut older = Vec::new();
+            for revision in 0..2 {
+                fs::write(
+                    path.join("Worker.cs"),
+                    format!(
+                        "class Worker {{
+                            int Target(int x) {{
+                                var adjusted = x + 13;
+                                var scaled = adjusted * 17;
+                                var rotated = (scaled << 5) | (scaled >> 27);
+                                var combined = rotated + x;
+                                var spread = combined ^ (combined >> 16);
+                                var folded = spread * 668265263;
+                                return (folded & 65535) + {};
+                            }}
+                            int Sibling() => {};
+                        }}",
+                        if edited { revision } else { 0 },
+                        revision,
+                    ),
+                )
+                .unwrap();
+                for index in 0..24 {
+                    fs::write(
+                        path.join(format!("Other{index}.cs")),
+                        format!(
+                            "class Other{index} {{ int Value() => {}; }}",
+                            index + revision
+                        ),
+                    )
+                    .unwrap();
+                }
+                command(path, &["add", "."]);
+                command(path, &["commit", "-qm", "source changes"]);
+                if revision == 0 {
+                    older.extend((0..24).map(|index| {
+                        command(path, &["rev-parse", &format!("HEAD:Other{index}.cs")])
+                    }));
+                }
+            }
+            fixture.tip = command(path, &["rev-parse", "HEAD"]);
+            let query = format!("show {} method:Worker.Target path:Worker.cs", fixture.tip);
+            let cold = crate::history::run(fixture.store(), None, &query).unwrap();
+            let local = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
+            assert_eq!(cold, crate::history::run(local, None, &query).unwrap());
+            let inventory = fixture.inventory();
+            for id in &older {
+                assert_eq!(inventory.contains(id), edited, "{cold}");
+            }
+            let packs = fs::read_dir(fixture.current().join("objects/pack"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+                .count();
+            assert!(packs < older.len(), "Each source required a separate pack");
         }
     }
 

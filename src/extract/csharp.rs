@@ -181,7 +181,7 @@ fn extract_analysis(analysis: &str) -> Result<Facts> {
             });
         }
         if node.kind() == "identifier" || node.kind() == "predefined_type" {
-            occurrence(node, analysis, &mut facts);
+            occurrence(node, &parents, analysis, &mut facts);
         }
         if node.kind() == "element_access_expression"
             && let Some(arguments) = node.child_by_field_name("subscript")
@@ -192,7 +192,7 @@ fn extract_analysis(analysis: &str) -> Result<Facts> {
                 span: arguments.start_byte()..arguments.start_byte() + 1,
                 call: true,
                 construction: false,
-                write: if node.parent().is_some_and(|p| {
+                write: if parents.last().is_some_and(|p| {
                     p.kind() == "assignment_expression"
                         && p.child_by_field_name("left") == Some(node)
                 }) {
@@ -463,25 +463,25 @@ fn declaration<'a>(
     scopes.push(index, &facts.declarations[index], s);
 }
 
-fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
+fn occurrence<'tree>(n: Node<'tree>, mut parents: &[Node<'tree>], s: &str, facts: &mut Facts) {
     let mut current = n;
     let mut receiver = String::new();
-    if let Some(p) = current.parent()
+    if let Some((&p, rest)) = parents.split_last()
         && p.kind() == "generic_name"
     {
         current = p;
+        parents = rest;
     }
-    if let Some(binding) = current
-        .parent()
-        .filter(|p| p.kind() == "member_binding_expression")
-        && let Some(conditional) = binding
-            .parent()
-            .filter(|p| p.kind() == "conditional_access_expression")
+    if let Some((&binding, rest)) = parents.split_last()
+        && binding.kind() == "member_binding_expression"
+        && let Some((&conditional, rest)) = rest.split_last()
+        && conditional.kind() == "conditional_access_expression"
     {
         receiver = field(conditional, "condition", s);
         current = conditional;
+        parents = rest;
     }
-    if let Some(p) = current.parent()
+    if let Some((&p, rest)) = parents.split_last()
         && matches!(p.kind(), "member_access_expression" | "qualified_name")
         && p.child_by_field_name("name")
             .or_else(|| p.child_by_field_name("right"))
@@ -492,12 +492,13 @@ fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
             receiver = field(p, "qualifier", s);
         }
         current = p;
+        parents = rest;
     }
     let mut call = false;
     let mut construction = false;
     let mut arguments = None;
     let mut write = crate::model::WriteKind::None;
-    if let Some(p) = current.parent() {
+    if let Some(&p) = parents.last() {
         if p.kind() == "invocation_expression"
             && p.child_by_field_name("function") == Some(current)
             && text(current, s) != "nameof"
@@ -553,6 +554,68 @@ fn occurrence(n: Node<'_>, s: &str, facts: &mut Facts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_receivers_keep_calls_and_write_roles() {
+        let source = r#"class Reader { void Read() {
+            factory.Make<Item>(value);
+            factory?.Make<Item>(value);
+            Make<Item>(value);
+            var item = new Item(value);
+            holder.Value += 1;
+            holder.Items[0] = value;
+            Touch(ref value, out result);
+        } }"#;
+        let facts = extract(source, &[]).unwrap();
+        assert!(!facts.errors);
+        let calls: Vec<_> = facts
+            .occurrences
+            .iter()
+            .filter(|o| o.name == "Make" && o.call)
+            .collect();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|o| o.arguments == Some(1)));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|o| o.receiver.as_str())
+                .collect::<Vec<_>>(),
+            ["factory", "factory", ""]
+        );
+        assert!(
+            facts
+                .occurrences
+                .iter()
+                .any(|o| o.name == "Item" && o.construction && o.arguments == Some(1))
+        );
+        for (name, role) in [
+            ("Value", WriteKind::Direct),
+            ("Item", WriteKind::Direct),
+            ("value", WriteKind::Ref),
+            ("result", WriteKind::Out),
+        ] {
+            assert!(
+                facts
+                    .occurrences
+                    .iter()
+                    .any(|o| o.name == name && o.write == role)
+            );
+        }
+        let historical = historical(source).unwrap();
+        let calls: Vec<_> = historical
+            .occurrences
+            .iter()
+            .filter(|o| o.name == "Make")
+            .collect();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|o| o.receiver.as_str())
+                .collect::<Vec<_>>(),
+            ["factory", "factory", ""]
+        );
+    }
+
     #[test]
     fn sibling_scopes_keep_their_own_ancestors() {
         let source = "namespace Outer { using System; class A { const int X = 1; event Action E; void M() { int local = 0; } } namespace Inner { using Other; class B { int field; } } } namespace Next { class C { int value; } }";

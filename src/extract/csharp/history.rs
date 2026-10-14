@@ -37,14 +37,29 @@ struct Work {
 }
 impl Work {
     fn parse(&mut self, parser: &mut tree_sitter::Parser, text: &str) -> Result<tree_sitter::Tree> {
+        self.parse_ranges(parser, text, &[], None)
+    }
+    fn parse_ranges(
+        &mut self,
+        parser: &mut tree_sitter::Parser,
+        text: &str,
+        ranges: &[tree_sitter::Range],
+        previous: Option<&tree_sitter::Tree>,
+    ) -> Result<tree_sitter::Tree> {
+        let bytes = if ranges.is_empty() {
+            text.len()
+        } else {
+            ranges.iter().map(|r| r.end_byte - r.start_byte).sum()
+        };
         ensure!(
-            text.len() <= PARSE_BYTES.saturating_sub(self.bytes),
+            bytes <= PARSE_BYTES.saturating_sub(self.bytes),
             "historical C# parse byte limit reached"
         );
-        self.bytes += text.len();
+        self.bytes += bytes;
         self.parses += 1;
+        parser.set_included_ranges(ranges)?;
         parser
-            .parse(text, None)
+            .parse(text, previous)
             .ok_or_else(|| anyhow::anyhow!("historical C# parsing cancelled"))
     }
 }
@@ -88,12 +103,19 @@ fn explore(
 ) -> Result<()> {
     let document = Document::new(source, conditions)?;
     let whole = Context::whole(source.len());
-    let values = conditions.witness(TRUE, false);
-    let seed = document.sample(conditions, &values)?;
-    let tree = work.parse(parser, &seed)?;
     let mut guards = document.guards();
+    let choices: Vec<_> = guards.iter().copied().filter(|&g| g != TRUE).collect();
+    if choices.len() == 1 || choices.len() == 2 && conditions.not(choices[0])? == choices[1] {
+        // At most two whole-file shapes: avoid rediscovering and reparsing
+        // every declaration when a file has only a simple build condition.
+        explore_context(&document, &whole, false, parser, conditions, result, work)?;
+        return Ok(());
+    }
+    let mut values = conditions.witness(TRUE, false);
+    let seed = document.sample(conditions, &values)?;
+    let mut tree = work.parse(parser, &seed)?;
     if guards.iter().all(|&guard| guard == TRUE) {
-        *result = parse(&tree, &seed, TRUE);
+        *result = parse(&tree, &seed, TRUE, true);
         return Ok(());
     }
     let mut inventory = contexts::Inventory::default();
@@ -101,9 +123,11 @@ fn explore(
     inventory.record(&tree)?;
     guards.retain(|&guard| !conditions.value(guard, &values));
     while !recovered && let Some(&guard) = guards.first() {
-        let values = conditions.witness(guard, true);
-        let text = document.sample(conditions, &values)?;
-        let tree = work.parse(parser, &text)?;
+        let next = conditions.witness(guard, true);
+        let text = document.sample(conditions, &next)?;
+        document.edit_tree(&mut tree, conditions, &values, &next, &whole.ranges);
+        tree = work.parse_ranges(parser, &text, &[], Some(&tree))?;
+        values = next;
         recovered = tree.root_node().has_error();
         inventory.record(&tree)?;
         guards.retain(|&guard| !conditions.value(guard, &values));
@@ -139,16 +163,22 @@ fn explore_context(
     work: &mut Work,
 ) -> Result<bool> {
     work.contexts += 1;
+    let ranges = document.included_ranges(&context.ranges);
     let mut remaining = TRUE;
     let mut count = 0;
+    let mut previous: Option<(tree_sitter::Tree, Vec<bool>)> = None;
     while remaining != FALSE && count < PROJECTIONS {
         let values = conditions.witness(remaining, !count.is_multiple_of(2));
         let projection = document.project(conditions, &values, &context.ranges)?;
-        let tree = work.parse(parser, &projection.text)?;
+        let old = previous.as_mut().map(|(tree, before)| {
+            document.edit_tree(tree, conditions, before, &values, &context.ranges);
+            &*tree
+        });
+        let tree = work.parse_ranges(parser, &projection.text, &ranges, old)?;
         if validate && (tree.root_node().has_error() || !context.valid(&tree)) {
             return Ok(false);
         }
-        let parsed = parse(&tree, &projection.text, projection.guard);
+        let parsed = parse(&tree, &projection.text, projection.guard, false);
         if parsed.incomplete.is_some() {
             result.incomplete = parsed.incomplete;
         }
@@ -158,6 +188,7 @@ fn explore_context(
             .map(HistoricalDeclaration::heap_bytes)
             .sum::<usize>();
         result.declarations.extend(parsed.declarations);
+        previous = Some((tree, values));
         // Even one local shape says nothing about calls in sibling choices.
         // Calls survive only the single-whole-source-shape fast path above.
         count += 1;
@@ -192,7 +223,7 @@ fn blank(source: &str, bytes: &mut [u8], range: Range<usize>) {
     }
 }
 
-fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFacts {
+fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard, calls: bool) -> HistoricalFacts {
     let mut facts = Facts::default();
     let recovered = tree.root_node().has_error();
     let mut tokens = Vec::new();
@@ -215,8 +246,8 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFa
         if facts.declarations.len() != before {
             scopes.push(before, &facts.declarations[before], analysis);
         }
-        if node.kind() == "identifier" || node.kind() == "predefined_type" {
-            occurrence(node, analysis, &mut facts);
+        if calls && matches!(node.kind(), "identifier" | "predefined_type") {
+            occurrence(node, &parents, analysis, &mut facts);
             if facts
                 .occurrences
                 .last()

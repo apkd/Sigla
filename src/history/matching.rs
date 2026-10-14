@@ -1,6 +1,7 @@
 //! Direction-independent matching of occurrences across actual Git edges.
 //! Names are evidence, never a substitute for source/context continuity.
 use super::{
+    cache::{self, Cache, SourceTree},
     paths,
     query::{self, Selector},
     regions::{self, Region, Source, Sources},
@@ -10,12 +11,11 @@ use crate::repository::history::{Commit, Store, Tree, check};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub(super) struct State {
     pub regions: Vec<Region>,
     pub paths: Vec<String>,
@@ -28,6 +28,18 @@ pub(super) struct State {
     pub uncertain: bool,
 }
 impl State {
+    pub fn heap_bytes(&self) -> usize {
+        self.regions.capacity() * std::mem::size_of::<Region>()
+            + self.regions.iter().map(Region::heap_bytes).sum::<usize>()
+            + self.paths.capacity() * std::mem::size_of::<String>()
+            + self.paths.iter().map(String::capacity).sum::<usize>()
+            + self.scope_exclusions.capacity() * std::mem::size_of::<paths::Exclusion>()
+            + self
+                .scope_exclusions
+                .iter()
+                .map(paths::Exclusion::heap_bytes)
+                .sum::<usize>()
+    }
     pub fn absent() -> Self {
         Self {
             absent: true,
@@ -136,6 +148,16 @@ pub(super) struct Mapping {
     pub links: Vec<Link>,
 }
 impl Mapping {
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.state.heap_bytes()
+            + self.links.capacity() * std::mem::size_of::<Link>()
+            + self
+                .links
+                .iter()
+                .map(|link| link.from.heap_bytes() + link.to.heap_bytes())
+                .sum::<usize>()
+    }
     pub fn absent() -> Self {
         Self {
             state: State::absent(),
@@ -202,59 +224,58 @@ struct Assignment {
 pub(super) struct Tracker {
     pub store: Store,
     pub sources: Sources,
-    trees: lru::LruCache<String, Arc<Tree>>,
-    tree_bytes: usize,
-    excluded: BTreeMap<String, BTreeSet<String>>,
+    cache: Arc<Cache>,
 }
 impl Tracker {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Store, cache: Arc<Cache>) -> Self {
         Self {
             store,
-            sources: Sources::default(),
-            trees: lru::LruCache::new(NonZeroUsize::new(64).unwrap()),
-            tree_bytes: 0,
-            excluded: BTreeMap::new(),
+            sources: Sources::new(cache.clone()),
+            cache,
         }
     }
-    pub fn tree(&mut self, commit: &Commit) -> Result<Arc<Tree>> {
-        if let Some(tree) = self.trees.get(&commit.tree) {
-            return Ok(tree.clone());
+    pub fn tree(&mut self, commit: &Commit) -> Result<Arc<SourceTree>> {
+        check(&self.store.cancel)?;
+        let key = cache::key(self.store.cache_scope(), &commit.tree);
+        if let Some(tree) = self.cache.tree(&key) {
+            return Ok(tree);
         }
+        self.store.prepare_tree(commit)?;
         let mut tree = self.store.tree(&commit.tree)?;
         let paths: Vec<_> = tree
             .iter()
             .filter(|(p, e)| {
                 matches!(e.mode, 0o100644 | 0o100755) && regions::language(p).is_some()
             })
-            .map(|(p, _)| p.clone())
+            .map(|(p, _)| p.as_str())
             .collect();
-        let allowed = self.store.source_paths(&commit.tree, &tree, &paths)?;
-        let excluded: BTreeSet<_> = paths.into_iter().filter(|p| !allowed.contains(p)).collect();
-        tree.retain(|p, _| !excluded.contains(p));
-        let tree = Arc::new(tree);
-        let cost = tree.keys().map(|p| p.len() + 160).sum::<usize>()
-            + excluded.iter().map(|p| p.len() + 80).sum::<usize>();
-        while self.tree_bytes + cost > 64 * 1024 * 1024
-            || self.trees.len() == self.trees.cap().get()
-        {
-            let Some((key, removed)) = self.trees.pop_lru() else {
-                break;
-            };
-            self.tree_bytes -= removed.keys().map(|p| p.len() + 160).sum::<usize>()
-                + self
-                    .excluded
-                    .remove(&key)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|p| p.len() + 80)
-                    .sum::<usize>();
+        let excluded = self.store.source_exclusions(&commit.tree, &tree, &paths)?;
+        if !excluded.is_empty() {
+            tree.retain(|p, _| !excluded.contains(p));
         }
-        self.tree_bytes += cost;
-        self.excluded.insert(commit.tree.clone(), excluded);
-        self.trees.put(commit.tree.clone(), tree.clone());
-        Ok(tree)
+        check(&self.store.cancel)?;
+        Ok(self.cache.put_tree(
+            key,
+            Arc::new(SourceTree {
+                entries: tree,
+                excluded,
+            }),
+        ))
     }
     pub fn anchor(&mut self, commit: &Commit, selector: &Selector) -> Result<State> {
+        check(&self.store.cancel)?;
+        let key = cache::key(
+            self.store.cache_scope(),
+            &("anchor", &commit.tree, selector),
+        );
+        if let Some(state) = self.cache.anchor(&key) {
+            return Ok((*state).clone());
+        }
+        let state = self.resolve_anchor(commit, selector)?;
+        self.cache.put_anchor(key, &state);
+        Ok(state)
+    }
+    fn resolve_anchor(&mut self, commit: &Commit, selector: &Selector) -> Result<State> {
         let mut state = State::default();
         if matches!(selector, Selector::Repository) {
             return Ok(state);
@@ -312,56 +333,43 @@ impl Tracker {
                     .map(|(path, entry)| (path.clone(), entry.id.clone()))
                     .collect();
                 drop(filters);
-                for chunk in candidates.chunks(16) {
-                    self.store.prefetch(
-                        &chunk.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
-                        "blob",
-                    )?;
-                    for (path, blob) in chunk {
-                        let source = self.sources.get(&mut self.store, path, blob)?;
-                        if source.incomplete.is_some() {
-                            incomplete = source.incomplete.clone();
-                        }
-                        if let Some(location) = &query.target.location {
-                            let offset =
-                                crate::model::offset(&source.text, location.line, location.column)
-                                    .context("Location is outside the anchor source")?;
-                            let mut declarations: Vec<_> = source
-                                .declarations
-                                .iter()
-                                .filter(|d| {
-                                    regions::selectable(d)
-                                        && regions::matches_kind(&query.selector, d)
-                                        && d.span.contains(&offset)
-                                })
-                                .collect();
-                            declarations.sort_by_key(|d| d.span.len());
-                            // Innermost in each feasible environment, not the
-                            // shortest span across mutually exclusive headers.
-                            let mut coverage = source.presence.coverage();
-                            for group in declarations.chunk_by(|a, b| a.span.len() == b.span.len())
-                            {
-                                for declaration in group {
-                                    if coverage.uncovered(declaration.guard).context(
-                                        "Unresolved anchor: historical positional alternatives",
-                                    )? {
-                                        state.regions.push(Region::declaration(
-                                            path,
-                                            blob,
-                                            declaration,
-                                            &source,
-                                        ));
-                                    }
-                                }
-                                for declaration in group {
-                                    coverage.add(declaration.guard).context(
-                                        "Unresolved anchor: historical positional alternatives",
-                                    )?;
-                                }
-                            }
-                        } else {
-                            for declaration in &source.declarations {
-                                if regions::selected(query, declaration) {
+                self.store.prefetch(
+                    &candidates
+                        .iter()
+                        .map(|(_, id)| id.to_string())
+                        .collect::<Vec<_>>(),
+                    "blob",
+                )?;
+                for (path, blob) in &candidates {
+                    let Some(source) = self.sources.anchor(&mut self.store, path, blob, query)?
+                    else {
+                        continue;
+                    };
+                    if let Some(reason) = &source.incomplete {
+                        incomplete = Some(format!("{path}: {reason}"));
+                    }
+                    if let Some(location) = &query.target.location {
+                        let offset =
+                            crate::model::offset(&source.text, location.line, location.column)
+                                .context("Location is outside the anchor source")?;
+                        let mut declarations: Vec<_> = source
+                            .declarations
+                            .iter()
+                            .filter(|d| {
+                                regions::selectable(d)
+                                    && regions::matches_kind(&query.selector, d)
+                                    && d.span.contains(&offset)
+                            })
+                            .collect();
+                        declarations.sort_by_key(|d| d.span.len());
+                        // Innermost in each feasible environment, not the
+                        // shortest span across mutually exclusive headers.
+                        let mut coverage = source.presence.coverage();
+                        for group in declarations.chunk_by(|a, b| a.span.len() == b.span.len()) {
+                            for declaration in group {
+                                if coverage.uncovered(declaration.guard).context(
+                                    "Unresolved anchor: historical positional alternatives",
+                                )? {
                                     state.regions.push(Region::declaration(
                                         path,
                                         blob,
@@ -369,6 +377,22 @@ impl Tracker {
                                         &source,
                                     ));
                                 }
+                            }
+                            for declaration in group {
+                                coverage.add(declaration.guard).context(
+                                    "Unresolved anchor: historical positional alternatives",
+                                )?;
+                            }
+                        }
+                    } else {
+                        for declaration in &source.declarations {
+                            if regions::selected(query, declaration) {
+                                state.regions.push(Region::declaration(
+                                    path,
+                                    blob,
+                                    declaration,
+                                    &source,
+                                ));
                             }
                         }
                     }
@@ -426,6 +450,31 @@ impl Tracker {
                 ..Mapping::default()
             });
         }
+        let key = (!state.uncertain).then(|| {
+            cache::key(
+                self.store.cache_scope(),
+                &(
+                    &from.id,
+                    &from.tree,
+                    &from.parents,
+                    &to.id,
+                    &to.tree,
+                    &to.parents,
+                    state,
+                ),
+            )
+        });
+        if let Some(key) = &key
+            && let Some(mapping) = self.cache.mapping(key)
+        {
+            return Ok((*mapping).clone());
+        }
+        if let Some(mapping) = self.unchanged(from, to, state)? {
+            if let Some(key) = key {
+                self.cache.put_mapping(key, &mapping);
+            }
+            return Ok(mapping);
+        }
         let a = self.tree(from)?;
         let b = self.tree(to)?;
         let mut result = Mapping {
@@ -441,10 +490,7 @@ impl Tracker {
         let mut work = 0;
         for region in &state.regions {
             ensure!(
-                !self
-                    .excluded
-                    .get(&to.tree)
-                    .is_some_and(|paths| paths.contains(&region.path)),
+                !b.excluded.contains(&region.path),
                 "unresolved target at {}: {} is excluded by committed source attributes",
                 to.id,
                 region.path
@@ -503,7 +549,45 @@ impl Tracker {
         if claims.values().any(|c| c.len() > 1) {
             result.state.uncertain = true;
         }
+        check(&self.store.cancel)?;
+        if let Some(key) = key {
+            self.cache.put_mapping(key, &result);
+        }
         Ok(result)
+    }
+    fn unchanged(&mut self, from: &Commit, to: &Commit, state: &State) -> Result<Option<Mapping>> {
+        if !state.paths.is_empty() {
+            return Ok(None);
+        }
+        if from.tree != to.tree {
+            for region in &state.regions {
+                let a = self.store.source_path(from, &region.path)?;
+                let b = self.store.source_path(to, &region.path)?;
+                // Equal source alone is insufficient: a predecessor can exclude
+                // that same blob through a different ancestor .gitattributes.
+                if a != b
+                    || !b.entry.as_ref().is_some_and(|e| {
+                        e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755)
+                    })
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(Mapping {
+            state: state.clone(),
+            links: state
+                .regions
+                .iter()
+                .map(|region| Link {
+                    from: region.clone(),
+                    to: region.clone(),
+                    relation: Relation::Continue,
+                    uncertain: region.weak,
+                    reason: "object+context",
+                })
+                .collect(),
+        }))
     }
     fn region(
         &mut self,
@@ -513,7 +597,10 @@ impl Tracker {
         forward: bool,
         work: &mut usize,
     ) -> Result<Vec<Link>> {
-        if to.get(&region.path).is_some_and(|e| e.id == region.blob) {
+        if to
+            .get(&region.path)
+            .is_some_and(|e| e.id.as_ref() == region.blob)
+        {
             return Ok(vec![Link {
                 from: region.clone(),
                 to: region.clone(),
@@ -525,7 +612,7 @@ impl Tracker {
         // A whole unchanged file carries even tiny members across a file move.
         let exact: Vec<_> = to
             .iter()
-            .filter(|(_, e)| e.id == region.blob && matches!(e.mode, 0o100644 | 0o100755))
+            .filter(|(_, e)| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
             .collect();
         if !exact.is_empty() {
             return Ok(exact
@@ -533,7 +620,7 @@ impl Tracker {
                 .map(|(path, _)| {
                     let mut old = region.clone();
                     old.path = (*path).clone();
-                    let copy = from.get(*path).is_some_and(|e| e.id == old.blob);
+                    let copy = from.get(*path).is_some_and(|e| e.id.as_ref() == old.blob);
                     Link {
                         from: region.clone(),
                         to: old,
@@ -550,7 +637,7 @@ impl Tracker {
                 .filter(|e| matches!(e.mode, 0o100644 | 0o100755))
         {
             let mut previous = region.clone();
-            previous.blob = entry.id.clone();
+            previous.blob = entry.id.to_string();
             return Ok(vec![Link {
                 from: region.clone(),
                 to: previous,
@@ -637,7 +724,7 @@ impl Tracker {
                 && !anonymous
                 && let Some(entry) = from.get(&old.path)
             {
-                if region.kind == "file" && entry.id == old.blob {
+                if region.kind == "file" && entry.id.as_ref() == old.blob {
                     relation = Relation::Copy;
                 } else if !matches!(region.kind.as_str(), "file" | "text") {
                     let fate = self.sources.get(&mut self.store, &old.path, &entry.id)?;
@@ -857,6 +944,9 @@ impl Tracker {
         let anonymous = region.kind == "closure";
         let source_range = region.range(&source);
         let source_body = region.body_range(&source);
+        let body_tokens = std::cell::LazyCell::new(|| {
+            regions::BodyTokens::new(&source.text[source_body.clone()])
+        });
         if search.incomplete.is_none() {
             search.incomplete = source.incomplete.clone();
         }
@@ -871,6 +961,7 @@ impl Tracker {
         if let Some(path) = required.filter(|p| to.contains_key(*p)) {
             paths.push(path.to_owned());
         }
+        let local_count = paths.len();
         paths.extend(
             to.iter()
                 .filter(|(p, e)| {
@@ -895,34 +986,64 @@ impl Tracker {
                     .map(|(p, _)| p.clone()),
             );
         }
-        let mut paths = paths.into_iter();
+        let mut remaining = paths.iter().enumerate();
         let mut expanded = false;
-        for path in paths.by_ref() {
+        let mut prepared = self.sources.pending();
+        for (index, path) in remaining.by_ref() {
             check(&self.store.cancel)?;
+            if index == local_count {
+                // Exact local continuations stop before this point. Once wider
+                // comparison is needed, acquire its blobs in bounded batches.
+                let blobs = paths[local_count..]
+                    .iter()
+                    .filter(|p| {
+                        !search.visited.contains(*p)
+                            && matches!(to[*p].mode, 0o100644 | 0o100755)
+                            && regions::compatible(p, &region.path)
+                    })
+                    .map(|p| to[p].id.to_string())
+                    .collect::<Vec<_>>();
+                self.store.prefetch(&blobs, "blob")?;
+            }
             if !search.visited.insert(path.clone()) {
                 continue;
             }
-            let entry = &to[&path];
+            let entry = &to[path];
             if !matches!(entry.mode, 0o100644 | 0o100755)
-                || !regions::compatible(&path, &region.path)
+                || !regions::compatible(path, &region.path)
             {
                 continue;
             }
             expanded = true;
-            let other = self.sources.get(&mut self.store, &path, &entry.id)?;
+            let other = if index >= local_count {
+                prepared.get(
+                    &mut self.store,
+                    path,
+                    paths[index..]
+                        .iter()
+                        .filter(|p| {
+                            (*p == path || !search.visited.contains(*p))
+                                && matches!(to[*p].mode, 0o100644 | 0o100755)
+                                && regions::compatible(p, &region.path)
+                        })
+                        .map(|p| (p.as_str(), to[p].id.as_ref())),
+                )?
+            } else {
+                self.sources.get(&mut self.store, path, &entry.id)?
+            };
             if other.incomplete.is_some() {
                 search.incomplete = other.incomplete.clone();
             }
-            let mapped = (path == region.path)
+            let mapped = (path == &region.path)
                 .then(|| regions::map_range(&source.text, &other.text, source_range.clone()))
                 .flatten();
             let candidates = if region.kind == "file" {
-                vec![Region::whole(&path, &entry.id, 0)]
+                vec![Region::whole(path, &entry.id, 0)]
             } else if region.kind == "text" {
                 text_candidates(
                     &source.text[source_range.clone()],
                     &other,
-                    &path,
+                    path,
                     &entry.id,
                     mapped.clone(),
                 )
@@ -939,7 +1060,7 @@ impl Tracker {
                                         "method" | "function" | "constructor" | "operator"
                                     ))
                     })
-                    .map(|d| Region::declaration(&path, &entry.id, d, &other))
+                    .map(|d| Region::declaration(path, &entry.id, d, &other))
                     .collect()
             };
             for mut candidate in candidates {
@@ -951,8 +1072,15 @@ impl Tracker {
                 let cr = candidate.body_range(&other);
                 let a = &source.text[source_body.clone()];
                 let b = &other.text[cr.clone()];
-                let sim = regions::similarity(a, b);
-                let same_path = path == region.path;
+                let body = self.cache.body(
+                    cache::key(
+                        self.store.cache_scope(),
+                        &("body", &region.blob, &source_body, &candidate.blob, &cr),
+                    ),
+                    || body_tokens.compare(b),
+                );
+                let sim = body.similarity;
+                let same_path = path == &region.path;
                 let same_owner = region.owner == candidate.owner;
                 // Anonymous labels are display text, never continuity evidence.
                 let same_name = !anonymous && region.name == candidate.name;
@@ -961,7 +1089,7 @@ impl Tracker {
                     .as_ref()
                     .is_some_and(|r| r.start < candidate.span.end && candidate.span.start < r.end);
                 let context = same_path && same_owner && (same_name || overlap);
-                let small = regions::distinctive(a).min(regions::distinctive(b)) < 3;
+                let small = body.small;
                 // A renamed owner loses owner/name evidence even for a close
                 // body edit. Keep rich same-owner scores unchanged: the exact-local
                 // shortcut relies on their bound against non-local competitors.
@@ -994,7 +1122,7 @@ impl Tracker {
                     && region.written == candidate.written;
                 // A reused header must not beat a distinctive unchanged body.
                 // Trigram similarity alone can be 100 for non-identical token streams.
-                let exact = !small && sim == 100 && regions::same_tokens(a, b);
+                let exact = body.exact;
                 // A substantial edited body can establish a member relocation
                 // without establishing an owner move. Share the corroboration
                 // band with sibling evidence, preserving the exact-local bound.
@@ -1007,7 +1135,14 @@ impl Tracker {
                         "method" | "function" | "constructor" | "operator"
                     )
                     && sim >= 70
-                    && regions::ordered_body_anchors(a, b);
+                    && self.cache.anchors(
+                        cache::key(
+                            self.store.cache_scope(),
+                            &("anchors", &region.blob, &source_body, &candidate.blob, &cr),
+                        ),
+                        a,
+                        b,
+                    );
                 let mut score = sim / 2
                     + usize::from(exact) * 24
                     + usize::from(same_path) * 8
@@ -1057,7 +1192,7 @@ impl Tracker {
                     && b.len() > a.len().saturating_mul(3) / 2
                 {
                     let parts = fragments(a, b, cr.start);
-                    if !parts.is_empty() && regions::distinctive(a) >= 2 {
+                    if !parts.is_empty() && regions::has_distinctive_tokens(a, 2) {
                         for range in parts {
                             let mut fragment = candidate.clone();
                             fragment.span = range.clone();
@@ -1098,10 +1233,10 @@ impl Tracker {
                 break;
             }
         }
-        search.remaining = paths.any(|p| {
-            !search.visited.contains(&p)
-                && matches!(to[&p].mode, 0o100644 | 0o100755)
-                && regions::compatible(&p, &region.path)
+        search.remaining = remaining.any(|(_, p)| {
+            !search.visited.contains(p)
+                && matches!(to[p].mode, 0o100644 | 0o100755)
+                && regions::compatible(p, &region.path)
         });
         if expanded {
             search.scored.sort_by(|a, b| {
@@ -1236,7 +1371,7 @@ fn owner_group(a: &Region, source: &Source, b: &Region, other: &Source) -> bool 
         })
         .any(|d| {
             let body = &source.text[d.header.end..d.span.end];
-            regions::distinctive(body) >= 3
+            regions::has_distinctive_tokens(body, 3)
                 && other.declarations.iter().any(|e| {
                     if e.owner != b.owner
                         || e.qualified == b.name
@@ -1248,7 +1383,8 @@ fn owner_group(a: &Region, source: &Source, b: &Region, other: &Source) -> bool 
                         return false;
                     }
                     let previous = &other.text[e.header.end..e.span.end];
-                    regions::distinctive(previous) >= 3 && regions::similarity(body, previous) >= 80
+                    regions::has_distinctive_tokens(previous, 3)
+                        && regions::similarity(body, previous) >= 80
                 })
         })
 }

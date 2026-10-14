@@ -9,6 +9,7 @@ const BATCH_BYTES: u64 = (super::MEMORY / 8) as u64;
 pub(super) enum Kind {
     Commits,
     CommitTrees,
+    IncrementalCommitTrees,
     Trees,
     Blobs,
 }
@@ -22,7 +23,7 @@ struct Cost {
 
 #[derive(Default)]
 pub(super) struct Planner {
-    costs: [Cost; 4],
+    costs: [Cost; 5],
     overhead: Option<f64>,
     seconds_per_byte: Option<f64>,
     /// A useful ancestry horizon, not a stop condition. None means discovery
@@ -48,8 +49,11 @@ impl Planner {
         streaming: Option<(u64, Duration)>,
     ) {
         let cost = &mut self.costs[kind as usize];
-        cost.units = units.max(1);
-        update(&mut cost.wire, bytes as f64 / cost.units as f64);
+        let units = units.max(1);
+        // A narrow request does not erase the capacity measured by a wider one.
+        // Byte and transport estimates still shrink batches when costs increase.
+        cost.units = cost.units.max(units);
+        update(&mut cost.wire, bytes as f64 / units as f64);
         let mut overhead = elapsed.as_secs_f64();
         if let Some((bytes, duration)) = streaming
             && bytes > 0
@@ -76,7 +80,7 @@ impl Planner {
         let cost = &self.costs[kind as usize];
         let growth = if cost.units == 0 {
             // Tree-filter fallback has unmeasured recursive tree fanout.
-            if matches!(kind, Kind::CommitTrees) {
+            if matches!(kind, Kind::CommitTrees | Kind::IncrementalCommitTrees) {
                 1
             } else {
                 PROBE_UNITS
@@ -163,6 +167,18 @@ mod tests {
     }
 
     #[test]
+    fn narrow_requests_preserve_measured_capacity() {
+        let mut planner = measured(1.0, 1_000_000.0, 1024);
+        let broad = planner.count(Kind::Blobs, MAX_UNITS, None);
+        planner.observe(Kind::Blobs, 1, 1024, Duration::from_secs(1), None);
+        assert_eq!(planner.count(Kind::Blobs, MAX_UNITS, None), broad);
+        assert_eq!(planner.count(Kind::Blobs, 1, None), 1);
+        // A small request can still reveal expensive objects.
+        planner.observe(Kind::Blobs, 1, BATCH_BYTES, Duration::from_secs(1), None);
+        assert!(planner.count(Kind::Blobs, MAX_UNITS, None) < broad);
+    }
+
+    #[test]
     fn missing_coverage_and_query_horizon_bound_batches_not_completion() {
         let mut planner = measured(1.0, 1_000_000.0, 1024);
         let broad = planner.count(Kind::Blobs, MAX_UNITS, None);
@@ -217,5 +233,32 @@ mod tests {
         );
         assert!(planner.count(Kind::CommitTrees, MAX_UNITS, None) < commits);
         assert_eq!(planner.count(Kind::Commits, MAX_UNITS, None), commits);
+    }
+
+    #[test]
+    fn initial_tree_closure_does_not_price_incremental_tree_windows() {
+        let mut planner = Planner::default();
+        planner.observe(
+            Kind::CommitTrees,
+            1,
+            BATCH_BYTES,
+            Duration::from_secs(1),
+            None,
+        );
+        let initial = planner.count(Kind::CommitTrees, MAX_UNITS, None);
+        let mut incremental = planner.count(Kind::IncrementalCommitTrees, MAX_UNITS, None);
+        for _ in 0..3 {
+            planner.observe(
+                Kind::IncrementalCommitTrees,
+                incremental,
+                incremental as u64 * 1024,
+                Duration::from_secs(1),
+                None,
+            );
+            incremental = planner.count(Kind::IncrementalCommitTrees, MAX_UNITS, None);
+        }
+        assert!(incremental > initial);
+        assert_eq!(planner.count(Kind::CommitTrees, MAX_UNITS, None), initial);
+        assert!(planner.count(Kind::IncrementalCommitTrees, MAX_UNITS, Some(1024)) < incremental);
     }
 }

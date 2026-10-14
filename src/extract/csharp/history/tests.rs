@@ -502,6 +502,181 @@ fn independent_methods(count: usize) -> String {
 }
 
 #[test]
+fn sparse_context_parses_preserve_tokens_spans_and_line_comments() {
+    for gap in [" ", "\r\n  \r\n", "\u{2028}\t", "\n\n// 🦀\r\n"] {
+        let source = format!(
+            "class Café {{ int Before;{gap}// selected\nint Target() {{ return 1; }}{gap}int After; }}"
+        );
+        let mut conditions = Conditions::default();
+        let document = Document::new(&source, &mut conditions).unwrap();
+        let context = Context::whole(source.len());
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let seed = Work::default().parse(&mut parser, &source).unwrap();
+        let mut inventory = contexts::Inventory::default();
+        inventory.record(&seed).unwrap();
+        for context in inventory
+            .plan(source.len())
+            .unwrap()
+            .into_iter()
+            .chain([context])
+        {
+            let projection = document
+                .project(&mut conditions, &[], &context.ranges)
+                .unwrap();
+            let full = Work::default()
+                .parse(&mut parser, &projection.text)
+                .unwrap();
+            let sparse = Work::default()
+                .parse_ranges(
+                    &mut parser,
+                    &projection.text,
+                    &document.included_ranges(&context.ranges),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(sparse.root_node().has_error(), full.root_node().has_error());
+            // Invalid speculative seams are discarded before their facts are
+            // used. Recovery spans need not agree, but rejection must agree.
+            if full.root_node().has_error() {
+                continue;
+            }
+            assert_eq!(sparse.root_node().to_sexp(), full.root_node().to_sexp());
+            let spans = |tree: &tree_sitter::Tree| {
+                let mut result = Vec::new();
+                let mut cursor = tree.walk();
+                'walk: loop {
+                    let node = cursor.node();
+                    if node.child_count() == 0 {
+                        result.push((
+                            node.kind().to_owned(),
+                            node.byte_range(),
+                            node.start_position(),
+                            node.end_position(),
+                        ));
+                    }
+                    if cursor.goto_first_child() {
+                        continue;
+                    }
+                    loop {
+                        if cursor.goto_next_sibling() {
+                            break;
+                        }
+                        if !cursor.goto_parent() {
+                            break 'walk;
+                        }
+                    }
+                }
+                result
+            };
+            assert_eq!(spans(&sparse), spans(&full));
+            assert_eq!(context.valid(&sparse), context.valid(&full));
+        }
+    }
+}
+
+#[test]
+fn incremental_alternatives_match_fresh_trees_and_positions() {
+    fn same_tree(actual: &tree_sitter::Tree, expected: &tree_sitter::Tree) {
+        let mut a = actual.walk();
+        let mut b = expected.walk();
+        loop {
+            let (left, right) = (a.node(), b.node());
+            assert_eq!(
+                (
+                    left.kind(),
+                    left.byte_range(),
+                    left.start_position(),
+                    left.end_position()
+                ),
+                (
+                    right.kind(),
+                    right.byte_range(),
+                    right.start_position(),
+                    right.end_position()
+                ),
+            );
+            assert_eq!(left.has_error(), right.has_error());
+            assert_eq!(left.is_missing(), right.is_missing());
+            let descend = a.goto_first_child();
+            assert_eq!(descend, b.goto_first_child());
+            if descend {
+                continue;
+            }
+            loop {
+                let sibling = a.goto_next_sibling();
+                assert_eq!(sibling, b.goto_next_sibling());
+                if sibling {
+                    break;
+                }
+                let ascend = a.goto_parent();
+                assert_eq!(ascend, b.goto_parent());
+                if !ascend {
+                    return;
+                }
+            }
+        }
+    }
+    for source in [
+        "\u{feff}class Café {\r\nint Common() => 1;\r\n#if A\r\nstring Value => \"é🦀\";\r\n#else\r\nint Value => 2;\r\n#endif\r\n#if B\r\nvoid Extra() { Common(); }\r\n#endif\r\n}\r\n",
+        "#if A\nnamespace One {\n#else\nnamespace Two {\n#endif\nclass Data {\n// comment\n#if B\nstring Text => @\"first\n#if literal\n#endif\nend\";\n#else\nstring Text => \"other\";\n#endif\n}\n}\n",
+    ] {
+        let mut conditions = Conditions::default();
+        let document = Document::new(source, &mut conditions).unwrap();
+        let whole = Context::whole(source.len());
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let mut inventory = contexts::Inventory::default();
+        let mut environments = Vec::new();
+        let mut remaining = TRUE;
+        while remaining != FALSE {
+            let values = conditions.witness(remaining, false);
+            let projection = document
+                .project(&mut conditions, &values, &whole.ranges)
+                .unwrap();
+            let tree = Work::default()
+                .parse(&mut parser, &projection.text)
+                .unwrap();
+            assert!(!tree.root_node().has_error());
+            inventory.record(&tree).unwrap();
+            environments.push(values);
+            let other = conditions.not(projection.guard).unwrap();
+            remaining = conditions.and(remaining, other).unwrap();
+        }
+        for context in inventory
+            .plan(source.len())
+            .unwrap()
+            .into_iter()
+            .chain([whole])
+        {
+            let ranges = document.included_ranges(&context.ranges);
+            let mut previous: Option<(tree_sitter::Tree, Vec<bool>)> = None;
+            for values in environments.iter().chain(environments.iter().rev()) {
+                let projection = document
+                    .project(&mut conditions, values, &context.ranges)
+                    .unwrap();
+                let fresh = Work::default()
+                    .parse_ranges(&mut parser, &projection.text, &ranges, None)
+                    .unwrap();
+                let old = previous.as_mut().map(|(tree, before)| {
+                    document.edit_tree(tree, &conditions, before, values, &context.ranges);
+                    &*tree
+                });
+                let reused = Work::default()
+                    .parse_ranges(&mut parser, &projection.text, &ranges, old)
+                    .unwrap();
+                same_tree(&reused, &fresh);
+                previous = Some((reused, values.clone()));
+            }
+        }
+    }
+}
+
+#[test]
 fn independent_declaration_work_is_additive_at_the_symbol_limit() {
     for count in [16, 128] {
         let source = independent_methods(count);
@@ -530,7 +705,14 @@ fn independent_declaration_work_is_additive_at_the_symbol_limit() {
         // Two discovery witnesses, one owner shell, one fixed Target and two
         // parses per Other. This measures work, not machine-dependent timing.
         assert!(work.parses <= 2 * count + 4, "{} parses", work.parses);
-        assert_eq!(work.bytes, work.parses * source.len());
+        // The parser visits each declaration and its owner shell, rather than
+        // scanning a full file of blank sibling declarations on every pass.
+        assert!(
+            work.bytes < 8 * source.len(),
+            "{} parsed bytes for {} source bytes",
+            work.bytes,
+            source.len()
+        );
     }
 }
 
@@ -693,8 +875,28 @@ fn parse_bytes_are_global_across_discovery_and_contexts() {
 }
 
 #[test]
+fn shared_build_conditions_do_not_reparse_every_declaration() {
+    let mut source = String::from("class Worker {\n");
+    for index in 0..64 {
+        source.push_str(&format!(
+            "#if EDITOR\nint Method{index}(int value) {{ return value + {index}; }}\n#else\nstring Method{index}(string value) {{ return value; }}\n#endif\n"
+        ));
+    }
+    source.push_str("}\n");
+    let mut work = Work::default();
+    let facts = run(&source, &mut work).unwrap();
+    assert!(facts.incomplete.is_none(), "{:?}", facts.incomplete);
+    assert_eq!(facts.declarations.len(), 129);
+    assert!(work.parses < 8, "Repeated parsing per declaration");
+    let whole = exhaustive(&source);
+    for offset in 0..source.len() {
+        assert_eq!(positional(&facts, offset), positional(&whole, offset));
+    }
+}
+
+#[test]
 fn changing_list_boundaries_use_verified_whole_source_fallback() {
-    let source = "class Worker {\n#if A\nvoid Before() {}\n#else\nvoid Before() {\n#endif\nvoid Target() {}\n#if !A\n}\n#endif\n}\n";
+    let source = "class Worker {\n#if A\nvoid Before() {}\n#else\nvoid Before() {\n#endif\nvoid Target() {}\n#if !A\n}\n#endif\n}\n#if B\nclass Other {}\n#endif\n";
     let mut work = Work::default();
     let facts = run(source, &mut work).unwrap();
     assert!(facts.incomplete.is_none(), "{:?}", facts.incomplete);

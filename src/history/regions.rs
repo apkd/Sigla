@@ -1,6 +1,9 @@
 mod java;
 
-use super::sequence;
+use super::{
+    cache::{self, Cache},
+    sequence,
+};
 use crate::{
     extract::{HistoricalDeclaration, HistoricalPresence},
     model::{Declaration, Language},
@@ -8,17 +11,15 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicBool},
 };
 
-const ADAPTER_VERSION: u32 = 6;
-const MEMORY: usize = 64 * 1024 * 1024;
+pub(super) const ADAPTER_VERSION: u32 = 6;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Region {
     pub path: String,
     pub blob: String,
@@ -35,6 +36,16 @@ pub(super) struct Region {
     pub fragment: bool,
 }
 impl Region {
+    pub fn heap_bytes(&self) -> usize {
+        self.path.capacity()
+            + self.blob.capacity()
+            + self.name.capacity()
+            + self.owner.capacity()
+            + self.kind.capacity()
+            + self.written.capacity()
+            + self.parameters.capacity() * std::mem::size_of::<String>()
+            + self.parameters.iter().map(String::capacity).sum::<usize>()
+    }
     pub fn range(&self, source: &Source) -> Range<usize> {
         if self.kind == "file" {
             0..source.text.len()
@@ -171,20 +182,128 @@ pub(super) struct Source {
     pub incomplete: Option<String>,
     cost: usize,
 }
-pub(super) struct Sources {
-    parsed: lru::LruCache<(String, String, u32), Arc<Source>>,
-    bytes: usize,
+impl Source {
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.cost
+    }
 }
-impl Default for Sources {
-    fn default() -> Self {
-        Self {
-            parsed: lru::LruCache::new(NonZeroUsize::new(256).unwrap()),
-            bytes: 0,
+pub(super) struct Sources {
+    cache: Arc<Cache>,
+}
+pub(super) struct PendingSources {
+    sources: Sources,
+    pending: VecDeque<(String, PendingSource)>,
+}
+enum PendingSource {
+    Ready(Result<Arc<Source>>),
+    Running(std::thread::JoinHandle<Result<Arc<Source>>>),
+}
+impl PendingSource {
+    fn finish(self) -> Result<Arc<Source>> {
+        match self {
+            Self::Ready(result) => result,
+            Self::Running(worker) => worker
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Historical source worker panicked"))),
         }
     }
 }
+impl PendingSources {
+    /// Refill before consuming the next source, after the caller has released
+    /// its previous source. The iterator starts at `path` in consumption order.
+    pub fn get<'a>(
+        &mut self,
+        store: &mut Store,
+        path: &str,
+        paths: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Arc<Source>> {
+        static WORKERS: LazyLock<usize> = LazyLock::new(|| {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4)
+        });
+        crate::repository::history::check(&store.cancel)?;
+        for (path, blob) in paths
+            .skip(self.pending.len())
+            .take(*WORKERS - self.pending.len())
+        {
+            let pending = match self.sources.input(store, path, blob) {
+                Ok(input @ Input::Parse { .. }) if *WORKERS > 1 => {
+                    let sources = Sources::new(self.sources.cache.clone());
+                    let cancel = store.cancel.clone();
+                    let path = path.to_owned();
+                    PendingSource::Running(std::thread::spawn(move || {
+                        sources.parse(input, &path, &cancel)
+                    }))
+                }
+                input => PendingSource::Ready(
+                    input.and_then(|input| self.sources.parse(input, path, &store.cancel)),
+                ),
+            };
+            self.pending.push_back((path.to_owned(), pending));
+        }
+        assert_eq!(
+            self.pending.front().expect("queued historical source").0,
+            path,
+            "historical sources must be consumed in order"
+        );
+        let (_, pending) = self.pending.pop_front().unwrap();
+        pending.finish()
+    }
+}
+impl Drop for PendingSources {
+    fn drop(&mut self) {
+        // An early result or error still owns these workers. Reap them without
+        // propagating failures from candidates the caller did not consume.
+        for (_, pending) in self.pending.drain(..) {
+            let _ = pending.finish();
+        }
+    }
+}
+enum Input {
+    Cached(Arc<Source>),
+    Parse {
+        key: cache::Key,
+        bytes: Vec<u8>,
+        language: Language,
+        java: bool,
+    },
+}
+impl Default for Sources {
+    fn default() -> Self {
+        Self::new(Arc::new(Cache::new(crate::memory::cache_budget() / 4)))
+    }
+}
 impl Sources {
-    pub fn get(&mut self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
+    pub fn new(cache: Arc<Cache>) -> Self {
+        Self { cache }
+    }
+    pub fn anchor(
+        &mut self,
+        store: &mut Store,
+        path: &str,
+        blob: &str,
+        query: &crate::query::Query,
+    ) -> Result<Option<Arc<Source>>> {
+        let bytes = store.blob(blob)?;
+        if let Ok(text) = std::str::from_utf8(&bytes)
+            && !may_declare(query, text)
+        {
+            return Ok(None);
+        }
+        self.get(store, path, blob).map(Some)
+    }
+    pub fn get(&self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
+        self.parse(self.input(store, path, blob)?, path, &store.cancel)
+    }
+    pub fn pending(&self) -> PendingSources {
+        PendingSources {
+            sources: Self::new(self.cache.clone()),
+            pending: VecDeque::new(),
+        }
+    }
+    fn input(&self, store: &mut Store, path: &str, blob: &str) -> Result<Input> {
+        crate::repository::history::check(&store.cancel)?;
         let language = language(path).with_context(|| format!("unsupported source path {path}"))?;
         let java = java::path(path);
         // Java remains public Language::Text, but must not share transient facts
@@ -194,13 +313,31 @@ impl Sources {
         } else {
             format!("{language:?}/2024")
         };
-        let key = (blob.to_owned(), policy, ADAPTER_VERSION);
-        if let Some(source) = self.parsed.get(&key) {
-            return Ok(source.clone());
+        let key = cache::key(store.cache_scope(), &(blob, policy));
+        if let Some(source) = self.cache.source(&key) {
+            return Ok(Input::Cached(source));
         }
-        let bytes = store.blob(blob)?;
+        Ok(Input::Parse {
+            key,
+            bytes: store.blob(blob)?,
+            language,
+            java,
+        })
+    }
+    fn parse(&self, input: Input, path: &str, cancel: &AtomicBool) -> Result<Arc<Source>> {
+        crate::repository::history::check(cancel)?;
+        let (key, bytes, language, java) = match input {
+            Input::Cached(source) => return Ok(source),
+            Input::Parse {
+                key,
+                bytes,
+                language,
+                java,
+            } => (key, bytes, language, java),
+        };
+        let _worker = crate::memory::admit_worker();
         let _admission = crate::memory::admit_file(bytes.len() as u64, false);
-        crate::repository::history::check(&store.cancel)?;
+        crate::repository::history::check(cancel)?;
         ensure!(
             !bytes.contains(&0),
             "binary source at {path}; contents were not followed"
@@ -212,12 +349,20 @@ impl Sources {
         let text: Arc<str> = String::from_utf8(bytes)
             .with_context(|| format!("non-UTF-8 source at {path}"))?
             .into();
+        let started = std::time::Instant::now();
         let facts = if java {
-            java::extract(&text, &store.cancel)
+            java::extract(&text, cancel)
         } else {
             crate::extract::historical(&text, language)
         };
-        crate::repository::history::check(&store.cancel)?;
+        tracing::trace!(
+            path,
+            ?language,
+            bytes = text.len(),
+            elapsed_us = started.elapsed().as_micros(),
+            "Historical source parse"
+        );
+        crate::repository::history::check(cancel)?;
         let (declarations, calls, presence, incomplete) = match facts {
             Ok(facts) => (
                 facts.declarations,
@@ -263,15 +408,7 @@ impl Sources {
             incomplete,
             cost,
         });
-        while self.bytes + cost > MEMORY || self.parsed.len() == self.parsed.cap().get() {
-            let Some((_, evicted)) = self.parsed.pop_lru() else {
-                break;
-            };
-            self.bytes -= evicted.cost;
-        }
-        self.bytes += cost;
-        self.parsed.put(key, source.clone());
-        Ok(source)
+        Ok(self.cache.put_source(key, source))
     }
     pub fn text(&mut self, store: &mut Store, region: &Region) -> Result<String> {
         let source = self.get(store, &region.path, &region.blob)?;
@@ -297,18 +434,47 @@ impl Sources {
     }
 }
 
+/// A necessary spelling check, never evidence that a matching declaration exists.
+fn may_declare(query: &crate::query::Query, text: &str) -> bool {
+    if query.loose
+        || query.target.location.is_some()
+        || query.selector == "operator"
+        // A literal \\u marker in a string or comment cannot encode a name.
+        // Retain valid and unfinished identifier escapes, including braced forms.
+        || text.as_bytes().windows(3).any(|s| {
+            s[0] == b'\\' && matches!(s[1], b'u' | b'U')
+                && (s[2].is_ascii_hexdigit() || s[2] == b'{')
+        })
+    {
+        return true;
+    }
+    let parts: Vec<_> = query.target.name.split('.').collect();
+    if parts.iter().any(|part| {
+        part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    }) {
+        return true;
+    }
+    // A damaged owner still leaves its member scope unresolved. Keep every
+    // file naming that owner, even when the requested member spelling is absent.
+    let required = if parts.len() > 1 {
+        &parts[..parts.len() - 1]
+    } else {
+        &parts
+    };
+    required.iter().all(|part| text.contains(part))
+}
+
 pub(super) fn language(path: &str) -> Option<Language> {
     let file = Path::new(path);
-    if let Some(language) =
-        crate::native::language(file).or_else(|| crate::documents::language(file))
-    {
+    let name = file.file_name()?.to_str()?;
+    let extension = file.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if let Some(language) = crate::native::language_extension(extension) {
         return Some(language);
     }
-    let extension = file
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let extension = extension.to_ascii_lowercase();
+    if let Some(language) = crate::documents::language_name(name, &extension) {
+        return Some(language);
+    }
     Some(match extension.as_str() {
         "rs" => Language::Rust,
         "cs" => Language::CSharp,
@@ -319,11 +485,8 @@ pub(super) fn language(path: &str) -> Option<Language> {
         "txt" | "toml" | "yaml" | "yml" | "json" | "xml" | "html" | "css" | "js" | "ts" | "tsx"
         | "jsx" | "py" | "java" | "go" | "sh" | "sql" | "ini" | "cfg" | "rst" | "csproj"
         | "props" | "targets" | "sln" | "lock" => Language::Text,
-        "" if file.file_name().is_some_and(|s| {
-            let s = s.to_string_lossy();
-            s.starts_with('.')
-                || ["LICENSE", "COPYING", "Makefile", "Dockerfile"].contains(&s.as_ref())
-        }) =>
+        "" if name.starts_with('.')
+            || ["LICENSE", "COPYING", "Makefile", "Dockerfile"].contains(&name) =>
         {
             Language::Text
         }
@@ -376,26 +539,29 @@ pub(super) fn tokens(text: &str) -> Vec<Range<usize>> {
 pub(super) fn words<'a>(text: &'a str, tokens: &[Range<usize>]) -> Vec<&'a str> {
     tokens.iter().map(|r| &text[r.clone()]).collect()
 }
-pub(super) fn distinctive(text: &str) -> usize {
-    tokens(text)
-        .iter()
-        .map(|r| &text[r.clone()])
-        .filter(|word| {
-            word.len() >= 3
-                && word.chars().any(char::is_alphanumeric)
-                && ![
-                    "return", "self", "Self", "this", "true", "false", "null", "let", "mut", "pub",
-                ]
-                .contains(word)
-        })
-        .collect::<BTreeSet<_>>()
-        .len()
+pub(super) fn has_distinctive_tokens(text: &str, required: usize) -> bool {
+    has_distinctive_words(TOKENS.find_iter(text).map(|m| m.as_str()), required)
 }
-pub(super) fn same_tokens(a: &str, b: &str) -> bool {
-    TOKENS
-        .find_iter(a)
-        .map(|m| m.as_str())
-        .eq(TOKENS.find_iter(b).map(|m| m.as_str()))
+fn has_distinctive_words<'a>(words: impl Iterator<Item = &'a str>, required: usize) -> bool {
+    let mut distinct = BTreeSet::new();
+    if required == 0 {
+        return true;
+    }
+    for word in words {
+        if word.len() >= 3
+            && word.chars().any(char::is_alphanumeric)
+            && ![
+                "return", "self", "Self", "this", "true", "false", "null", "let", "mut", "pub",
+            ]
+            .contains(&word)
+        {
+            distinct.insert(word);
+            if distinct.len() >= required {
+                return true;
+            }
+        }
+    }
+    false
 }
 /// Corroborate a whole edited body with 80% ordered token coverage and four
 /// disjoint 16-token anchors unique in both bodies. Repetition and overlapping
@@ -442,23 +608,83 @@ pub(super) fn ordered_body_anchors(a: &str, b: &str) -> bool {
     false
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Body {
+    pub similarity: usize,
+    pub small: bool,
+    pub exact: bool,
+}
+
+/// Borrowed evidence for one candidate search. Tokenize the selected body once
+/// and reuse its sorted, unique trigrams across all candidate comparisons.
+pub(super) struct BodyTokens<'a> {
+    words: Vec<&'a str>,
+    trigrams: Vec<usize>,
+    small: bool,
+}
+impl<'a> BodyTokens<'a> {
+    pub fn new(text: &'a str) -> Self {
+        let words: Vec<_> = TOKENS.find_iter(text).map(|m| m.as_str()).collect();
+        let small = !has_distinctive_words(words.iter().copied(), 3);
+        let mut trigrams: Vec<_> = (0..words.len().saturating_sub(2)).collect();
+        trigrams.sort_unstable_by_key(|&i| &words[i..i + 3]);
+        trigrams.dedup_by(|a, b| words[*a..*a + 3] == words[*b..*b + 3]);
+        Self {
+            words,
+            trigrams,
+            small,
+        }
+    }
+
+    pub fn compare(&self, text: &str) -> Body {
+        let other = BodyTokens::new(text);
+        let small = self.small || other.small;
+        Body {
+            similarity: self.similarity(&other),
+            small,
+            exact: !small && self.words == other.words,
+        }
+    }
+
+    fn similarity(&self, other: &BodyTokens<'_>) -> usize {
+        if self.words == other.words {
+            return 100;
+        }
+        if self.trigrams.is_empty() || other.trigrams.is_empty() {
+            return 0;
+        }
+        let mut a = self
+            .trigrams
+            .iter()
+            .map(|&i| &self.words[i..i + 3])
+            .peekable();
+        let mut b = other
+            .trigrams
+            .iter()
+            .map(|&i| &other.words[i..i + 3])
+            .peekable();
+        let mut shared = 0;
+        while let (Some(left), Some(right)) = (a.peek(), b.peek()) {
+            match left.cmp(right) {
+                std::cmp::Ordering::Less => {
+                    a.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    b.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    shared += 1;
+                    a.next();
+                    b.next();
+                }
+            }
+        }
+        200 * shared / (self.trigrams.len() + other.trigrams.len())
+    }
+}
+
 pub(super) fn similarity(a: &str, b: &str) -> usize {
-    let at = tokens(a);
-    let bt = tokens(b);
-    let aw = words(a, &at);
-    let bw = words(b, &bt);
-    if aw == bw {
-        return 100;
-    }
-    if aw.is_empty() || bw.is_empty() {
-        return 0;
-    }
-    let a: BTreeSet<_> = aw.windows(3).collect();
-    let b: BTreeSet<_> = bw.windows(3).collect();
-    if a.is_empty() || b.is_empty() {
-        return 0;
-    }
-    200 * a.intersection(&b).count() / (a.len() + b.len())
+    BodyTokens::new(a).similarity(&BodyTokens::new(b))
 }
 
 /// Textual range mapping includes changed gaps inside retained surrounding anchors.
@@ -505,6 +731,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pending_sources_join_unused_workers_and_discard_their_errors() {
+        use std::sync::{Barrier, atomic::Ordering};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut pending = Sources::default().pending();
+        pending.pending.push_back((
+            "unused.cs".into(),
+            PendingSource::Running(std::thread::spawn({
+                let finished = finished.clone();
+                let barrier = barrier.clone();
+                move || {
+                    barrier.wait();
+                    finished.store(true, Ordering::Release);
+                    Err(anyhow::anyhow!("unused source failed"))
+                }
+            })),
+        ));
+        // The worker is still live when the queue is moved to its dropping
+        // thread; dropping must wait for it without returning its unused error.
+        assert!(!finished.load(Ordering::Acquire));
+        let dropped = std::thread::spawn(move || drop(pending));
+        barrier.wait();
+        dropped.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn consumed_worker_panics_become_source_errors() {
+        let pending = PendingSource::Running(std::thread::spawn(|| {
+            panic!("source worker failed");
+        }));
+        assert!(pending.finish().is_err());
+    }
+
+    #[test]
     fn edited_body_anchors_require_whole_ordered_nonrepeating_source() {
         let check = |a: &str, b: &str, expected: bool| {
             assert_eq!(ordered_body_anchors(a, b), expected);
@@ -547,8 +809,55 @@ mod tests {
         let a = "begin alpha beta alpha beta alpha end";
         let b = "begin alpha beta alpha beta alpha beta alpha end";
         assert_eq!(similarity(a, b), 100);
-        assert!(!same_tokens(a, b));
-        assert!(same_tokens(a, &a.replace(' ', "\r\n")));
+        let tokens = BodyTokens::new(a);
+        assert!(!tokens.compare(b).exact);
+        assert!(tokens.compare(&a.replace(' ', "\r\n")).exact);
+    }
+
+    #[test]
+    fn body_evidence_matches_unique_token_trigrams() {
+        let texts = [
+            "",
+            " ",
+            "a",
+            "a b",
+            "a c",
+            "return true;",
+            "return false;",
+            "alpha beta gamma delta",
+            "alpha beta gamma changed",
+            "alpha beta alpha beta alpha",
+            "alpha beta alpha beta alpha beta alpha",
+            "var café = \"two words\"; return café + '\\n';",
+            "var café=\"two words\";\nreturn café+'\\n';",
+        ];
+        for a in texts {
+            let at = tokens(a);
+            let aw = words(a, &at);
+            let evidence = BodyTokens::new(a);
+            for b in texts {
+                let bt = tokens(b);
+                let bw = words(b, &bt);
+                let left: BTreeSet<_> = aw.windows(3).collect();
+                let right: BTreeSet<_> = bw.windows(3).collect();
+                let expected = if aw == bw {
+                    100
+                } else if left.is_empty() || right.is_empty() {
+                    0
+                } else {
+                    200 * left.intersection(&right).count() / (left.len() + right.len())
+                };
+                assert_eq!(evidence.compare(b).similarity, expected, "{a:?}, {b:?}");
+            }
+        }
+        assert!(!has_distinctive_tokens("return self + self + self;", 2));
+        assert!(!has_distinctive_tokens("alpha alpha beta beta", 3));
+        assert!(has_distinctive_tokens("alpha alpha beta gamma", 3));
+        assert!(
+            BodyTokens::new("return true;")
+                .compare("return true;")
+                .small
+        );
     }
 
     #[test]

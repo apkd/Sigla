@@ -46,6 +46,7 @@ pub struct App {
     inspection_shutdown: tokio_util::sync::CancellationToken,
     assets: crate::unity::assets::jobs::Jobs,
     sources: crate::native::jobs::Jobs,
+    history_cache: Arc<crate::history::Cache>,
     monitor: Arc<crate::watch::Monitor>,
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
@@ -82,6 +83,7 @@ impl App {
         let budget = crate::memory::cache_budget();
         self.assets.trim_to(budget / 2);
         self.sources.trim_to(budget / 4);
+        let workspace_budget = (budget / 4).saturating_sub(self.history_cache.stats().bytes);
         loop {
             let retired = {
                 let mut registry = self.workspaces.lock().unwrap();
@@ -95,7 +97,7 @@ impl App {
                         })
                     })
                     .sum();
-                if bytes <= budget / 4 {
+                if bytes <= workspace_budget {
                     return;
                 }
                 let oldest = registry
@@ -160,6 +162,9 @@ impl App {
             inspection_shutdown: tokio_util::sync::CancellationToken::new(),
             assets: Default::default(),
             sources: Default::default(),
+            history_cache: Arc::new(crate::history::Cache::new(
+                crate::memory::cache_budget() / 4,
+            )),
             monitor: Arc::new(crate::watch::Monitor::default()),
             remote: None,
             upstream: None,
@@ -982,14 +987,15 @@ fn result_text(result: CallToolResult) -> Result<String> {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
-    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
+    /// Local project path or repository URL. Append # and a branch, tag, or commit SHA to select a revision.
     pub codebase: String,
+    /// Query using the syntax and examples in the tool description.
     pub query: String,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseArguments {
-    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
+    /// Local project path or repository URL. Append # and a branch, tag, or commit SHA to select a revision.
     pub codebase: String,
     #[serde(default)]
     pub path: String,
@@ -997,7 +1003,7 @@ pub struct BrowseArguments {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViewArguments {
-    /// Local project path or repository URL with optional #branch, #tag, full commit ID, or unique commit prefix of at least 7 hex characters. Explicit #refs/heads/name and #refs/tags/name are supported.
+    /// Local project path or repository URL. Append # and a branch, tag, or commit SHA to select a revision.
     pub codebase: String,
     pub path: String,
     #[serde(default)]
@@ -1098,22 +1104,21 @@ file:src/**/*.cs"#,
 
     #[tool(
         name = "history",
-        description = r#"Read committed Git history without preparing, checking out, or building historical workspaces.
-The codebase revision anchors every selector; output at is a full commit ID. Dirty and staged files are ignored.
+        description = r#"Read Git history for code and files. Start with log to find a change, then use show with its commit SHA to read the diff.
 
-log [selector] [skip:N] [limit:N]
-show COMMIT [selector] [parent:N] [offset:N]
-diff FROM..TO [selector] [offset:N]
+Select a declaration, file, directory, or source location as it appears at the codebase revision. History follows renames and moves. diff compares two commits.
 
-Selectors: file:src/Parser.cs, path:src/**, method:Parser.Parse(string), @src/Parser.cs:20:5, @docs/design.md:20-35.
-Omit the selector for repository history. path: narrows declaration lookup only at the anchor.
-Names, written signatures, kind aliases and quoting follow search. Relationships such as calls: and uses: are not history selectors.
+To continue a long result, repeat the query with the returned skip: or offset: value and keep the codebase revision fixed.
 
-log follows actual parents, renames, moves, implementation transfers and copies. ~ marks inferred/ambiguous links.
-skip counts selected, finalized records after merge-rejection filtering; incomplete is not an introduction.
-show compares the actual parent (1-based; default 1), or the empty tree at a root. diff compares two snapshots, not a commit range.
-Offsets are UTF-8 byte positions in the canonical diff, not cursors. Continue with pinned codebase, endpoint IDs and the returned offset.
-Binary diffs, LFS payloads, historical builds, blame and working-tree changes are excluded."#,
+Examples
+log method:Parser.Parse
+show abc1234 method:Parser.Parse
+log limit:5
+log file:src/Parser.cs limit:5
+log path:src/**
+log @src/Parser.cs:20:5
+log @docs/design.md:20-35
+diff abc1234..def5678 file:src/Parser.cs"#,
         annotations(read_only_hint = true)
     )]
     async fn history(
