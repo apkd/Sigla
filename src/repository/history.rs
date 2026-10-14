@@ -244,6 +244,7 @@ impl Remote {
 
 pub(crate) struct Store {
     path: PathBuf,
+    cache_scope: [u8; 32],
     lease: Option<ObjectLease>,
     remote: Option<Remote>,
     batch: Option<Batch>,
@@ -318,8 +319,20 @@ impl Store {
         remote: Option<Remote>,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        let identity = lease
+            .as_ref()
+            .map(ObjectLease::owner)
+            .unwrap_or_else(|| path.clone());
+        let mut scope = blake3::Hasher::new();
+        scope.update(if lease.is_some() {
+            b"remote\0"
+        } else {
+            b"local\0"
+        });
+        scope.update(identity.as_os_str().as_encoded_bytes());
         Self {
             path,
+            cache_scope: *scope.finalize().as_bytes(),
             lease,
             remote,
             cancel,
@@ -335,6 +348,9 @@ impl Store {
     }
     pub fn owner(&self) -> Option<PathBuf> {
         self.lease.as_ref().map(ObjectLease::owner)
+    }
+    pub fn cache_scope(&self) -> &[u8; 32] {
+        &self.cache_scope
     }
     pub fn finish(&self) -> Result<()> {
         if let Some(lease) = &self.lease {

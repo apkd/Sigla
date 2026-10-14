@@ -1,6 +1,9 @@
 mod java;
 
-use super::sequence;
+use super::{
+    cache::{self, Cache},
+    sequence,
+};
 use crate::{
     extract::{HistoricalDeclaration, HistoricalPresence},
     model::{Declaration, Language},
@@ -9,16 +12,14 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
     ops::Range,
     path::Path,
     sync::{Arc, LazyLock},
 };
 
-const ADAPTER_VERSION: u32 = 6;
-const MEMORY: usize = 64 * 1024 * 1024;
+pub(super) const ADAPTER_VERSION: u32 = 6;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Region {
     pub path: String,
     pub blob: String,
@@ -35,6 +36,16 @@ pub(super) struct Region {
     pub fragment: bool,
 }
 impl Region {
+    pub fn heap_bytes(&self) -> usize {
+        self.path.capacity()
+            + self.blob.capacity()
+            + self.name.capacity()
+            + self.owner.capacity()
+            + self.kind.capacity()
+            + self.written.capacity()
+            + self.parameters.capacity() * std::mem::size_of::<String>()
+            + self.parameters.iter().map(String::capacity).sum::<usize>()
+    }
     pub fn range(&self, source: &Source) -> Range<usize> {
         if self.kind == "file" {
             0..source.text.len()
@@ -171,20 +182,25 @@ pub(super) struct Source {
     pub incomplete: Option<String>,
     cost: usize,
 }
+impl Source {
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.cost
+    }
+}
 pub(super) struct Sources {
-    parsed: lru::LruCache<(String, String, u32), Arc<Source>>,
-    bytes: usize,
+    cache: Arc<Cache>,
 }
 impl Default for Sources {
     fn default() -> Self {
-        Self {
-            parsed: lru::LruCache::new(NonZeroUsize::new(256).unwrap()),
-            bytes: 0,
-        }
+        Self::new(Arc::new(Cache::new(crate::memory::cache_budget() / 4)))
     }
 }
 impl Sources {
+    pub fn new(cache: Arc<Cache>) -> Self {
+        Self { cache }
+    }
     pub fn get(&mut self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
+        crate::repository::history::check(&store.cancel)?;
         let language = language(path).with_context(|| format!("unsupported source path {path}"))?;
         let java = java::path(path);
         // Java remains public Language::Text, but must not share transient facts
@@ -194,9 +210,9 @@ impl Sources {
         } else {
             format!("{language:?}/2024")
         };
-        let key = (blob.to_owned(), policy, ADAPTER_VERSION);
-        if let Some(source) = self.parsed.get(&key) {
-            return Ok(source.clone());
+        let key = cache::key(store.cache_scope(), &(blob, policy));
+        if let Some(source) = self.cache.source(&key) {
+            return Ok(source);
         }
         let bytes = store.blob(blob)?;
         let _admission = crate::memory::admit_file(bytes.len() as u64, false);
@@ -263,15 +279,7 @@ impl Sources {
             incomplete,
             cost,
         });
-        while self.bytes + cost > MEMORY || self.parsed.len() == self.parsed.cap().get() {
-            let Some((_, evicted)) = self.parsed.pop_lru() else {
-                break;
-            };
-            self.bytes -= evicted.cost;
-        }
-        self.bytes += cost;
-        self.parsed.put(key, source.clone());
-        Ok(source)
+        Ok(self.cache.put_source(key, source))
     }
     pub fn text(&mut self, store: &mut Store, region: &Region) -> Result<String> {
         let source = self.get(store, &region.path, &region.blob)?;

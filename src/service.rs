@@ -46,6 +46,7 @@ pub struct App {
     inspection_shutdown: tokio_util::sync::CancellationToken,
     assets: crate::unity::assets::jobs::Jobs,
     sources: crate::native::jobs::Jobs,
+    history_cache: Arc<crate::history::Cache>,
     monitor: Arc<crate::watch::Monitor>,
     remote: Option<Arc<crate::repository::manager::Manager>>,
     upstream: Option<crate::upstream::Upstream>,
@@ -82,6 +83,7 @@ impl App {
         let budget = crate::memory::cache_budget();
         self.assets.trim_to(budget / 2);
         self.sources.trim_to(budget / 4);
+        let workspace_budget = (budget / 4).saturating_sub(self.history_cache.stats().bytes);
         loop {
             let retired = {
                 let mut registry = self.workspaces.lock().unwrap();
@@ -95,7 +97,7 @@ impl App {
                         })
                     })
                     .sum();
-                if bytes <= budget / 4 {
+                if bytes <= workspace_budget {
                     return;
                 }
                 let oldest = registry
@@ -160,6 +162,9 @@ impl App {
             inspection_shutdown: tokio_util::sync::CancellationToken::new(),
             assets: Default::default(),
             sources: Default::default(),
+            history_cache: Arc::new(crate::history::Cache::new(
+                crate::memory::cache_budget() / 4,
+            )),
             monitor: Arc::new(crate::watch::Monitor::default()),
             remote: None,
             upstream: None,

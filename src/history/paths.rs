@@ -36,7 +36,7 @@ impl Work<'_> {
 // Preserve arbitrary negative globs in the coordinate system where they
 // applied. A literal suffix can be rewritten directly in State.paths; a glob
 // spanning the moved prefix cannot safely be rewritten by string substitution.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub(super) struct Exclusion {
     root: String,
     original: String,
