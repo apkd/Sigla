@@ -1,4 +1,7 @@
 use regex::Regex;
+#[cfg(test)]
+#[path = "cargo_licenses.rs"]
+pub mod cargo_licenses;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
