@@ -1,3 +1,5 @@
+#[path = "scripts/cargo_licenses.rs"]
+mod cargo_licenses;
 #[path = "scripts/licenses.rs"]
 mod licenses;
 
@@ -35,20 +37,7 @@ fn cargo_notices(output: &Path) -> Result<Vec<licenses::Notice>> {
         manifest_path: PathBuf,
     }
 
-    let json = output.join("cargo-licenses.json");
-    ensure!(
-        Command::new(env::var_os("CARGO").context("Missing CARGO")?)
-            .args([
-                "about", "generate", "--locked", "--fail", "--format", "json", "--target"
-            ])
-            .arg(env::var("TARGET")?)
-            .arg("-o")
-            .arg(&json)
-            .status()?
-            .success(),
-        "Cannot collect Cargo licenses; install cargo-about 0.9.2"
-    );
-    let list: Report = serde_json::from_slice(&fs::read(json)?)?;
+    let list: Report = serde_json::from_slice(&cargo_licenses::collect(output)?)?;
     let mut notices = Vec::new();
     let mut packages = BTreeMap::new();
     for license in list.licenses {
@@ -577,6 +566,7 @@ fn main() {
         "about.toml",
         "scripts/native-libraries.json",
         "scripts/licenses.rs",
+        "scripts/cargo_licenses.rs",
     ] {
         println!("cargo:rerun-if-changed={input}");
     }
