@@ -1,6 +1,7 @@
 //! Direction-independent matching of occurrences across actual Git edges.
 //! Names are evidence, never a substitute for source/context continuity.
 use super::{
+    cache::{self, Cache, SourceTree},
     paths,
     query::{self, Selector},
     regions::{self, Region, Source, Sources},
@@ -10,12 +11,11 @@ use crate::repository::history::{Commit, Store, Tree, check};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub(super) struct State {
     pub regions: Vec<Region>,
     pub paths: Vec<String>,
@@ -28,6 +28,18 @@ pub(super) struct State {
     pub uncertain: bool,
 }
 impl State {
+    pub fn heap_bytes(&self) -> usize {
+        self.regions.capacity() * std::mem::size_of::<Region>()
+            + self.regions.iter().map(Region::heap_bytes).sum::<usize>()
+            + self.paths.capacity() * std::mem::size_of::<String>()
+            + self.paths.iter().map(String::capacity).sum::<usize>()
+            + self.scope_exclusions.capacity() * std::mem::size_of::<paths::Exclusion>()
+            + self
+                .scope_exclusions
+                .iter()
+                .map(paths::Exclusion::heap_bytes)
+                .sum::<usize>()
+    }
     pub fn absent() -> Self {
         Self {
             absent: true,
@@ -136,6 +148,16 @@ pub(super) struct Mapping {
     pub links: Vec<Link>,
 }
 impl Mapping {
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.state.heap_bytes()
+            + self.links.capacity() * std::mem::size_of::<Link>()
+            + self
+                .links
+                .iter()
+                .map(|link| link.from.heap_bytes() + link.to.heap_bytes())
+                .sum::<usize>()
+    }
     pub fn absent() -> Self {
         Self {
             state: State::absent(),
@@ -202,23 +224,21 @@ struct Assignment {
 pub(super) struct Tracker {
     pub store: Store,
     pub sources: Sources,
-    trees: lru::LruCache<String, Arc<Tree>>,
-    tree_bytes: usize,
-    excluded: BTreeMap<String, BTreeSet<String>>,
+    cache: Arc<Cache>,
 }
 impl Tracker {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Store, cache: Arc<Cache>) -> Self {
         Self {
             store,
-            sources: Sources::default(),
-            trees: lru::LruCache::new(NonZeroUsize::new(64).unwrap()),
-            tree_bytes: 0,
-            excluded: BTreeMap::new(),
+            sources: Sources::new(cache.clone()),
+            cache,
         }
     }
-    pub fn tree(&mut self, commit: &Commit) -> Result<Arc<Tree>> {
-        if let Some(tree) = self.trees.get(&commit.tree) {
-            return Ok(tree.clone());
+    pub fn tree(&mut self, commit: &Commit) -> Result<Arc<SourceTree>> {
+        check(&self.store.cancel)?;
+        let key = cache::key(self.store.cache_scope(), &commit.tree);
+        if let Some(tree) = self.cache.tree(&key) {
+            return Ok(tree);
         }
         let mut tree = self.store.tree(&commit.tree)?;
         let paths: Vec<_> = tree
@@ -231,28 +251,14 @@ impl Tracker {
         let allowed = self.store.source_paths(&commit.tree, &tree, &paths)?;
         let excluded: BTreeSet<_> = paths.into_iter().filter(|p| !allowed.contains(p)).collect();
         tree.retain(|p, _| !excluded.contains(p));
-        let tree = Arc::new(tree);
-        let cost = tree.keys().map(|p| p.len() + 160).sum::<usize>()
-            + excluded.iter().map(|p| p.len() + 80).sum::<usize>();
-        while self.tree_bytes + cost > 64 * 1024 * 1024
-            || self.trees.len() == self.trees.cap().get()
-        {
-            let Some((key, removed)) = self.trees.pop_lru() else {
-                break;
-            };
-            self.tree_bytes -= removed.keys().map(|p| p.len() + 160).sum::<usize>()
-                + self
-                    .excluded
-                    .remove(&key)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|p| p.len() + 80)
-                    .sum::<usize>();
-        }
-        self.tree_bytes += cost;
-        self.excluded.insert(commit.tree.clone(), excluded);
-        self.trees.put(commit.tree.clone(), tree.clone());
-        Ok(tree)
+        check(&self.store.cancel)?;
+        Ok(self.cache.put_tree(
+            key,
+            Arc::new(SourceTree {
+                entries: tree,
+                excluded,
+            }),
+        ))
     }
     pub fn anchor(&mut self, commit: &Commit, selector: &Selector) -> Result<State> {
         let mut state = State::default();
@@ -426,6 +432,25 @@ impl Tracker {
                 ..Mapping::default()
             });
         }
+        let key = (!state.uncertain).then(|| {
+            cache::key(
+                self.store.cache_scope(),
+                &(
+                    &from.id,
+                    &from.tree,
+                    &from.parents,
+                    &to.id,
+                    &to.tree,
+                    &to.parents,
+                    state,
+                ),
+            )
+        });
+        if let Some(key) = &key
+            && let Some(mapping) = self.cache.mapping(key)
+        {
+            return Ok((*mapping).clone());
+        }
         let a = self.tree(from)?;
         let b = self.tree(to)?;
         let mut result = Mapping {
@@ -441,10 +466,7 @@ impl Tracker {
         let mut work = 0;
         for region in &state.regions {
             ensure!(
-                !self
-                    .excluded
-                    .get(&to.tree)
-                    .is_some_and(|paths| paths.contains(&region.path)),
+                !b.excluded.contains(&region.path),
                 "unresolved target at {}: {} is excluded by committed source attributes",
                 to.id,
                 region.path
@@ -502,6 +524,10 @@ impl Tracker {
         }
         if claims.values().any(|c| c.len() > 1) {
             result.state.uncertain = true;
+        }
+        check(&self.store.cancel)?;
+        if let Some(key) = key {
+            self.cache.put_mapping(key, &result);
         }
         Ok(result)
     }
@@ -951,7 +977,15 @@ impl Tracker {
                 let cr = candidate.body_range(&other);
                 let a = &source.text[source_body.clone()];
                 let b = &other.text[cr.clone()];
-                let sim = regions::similarity(a, b);
+                let body = self.cache.body(
+                    cache::key(
+                        self.store.cache_scope(),
+                        &("body", &region.blob, &source_body, &candidate.blob, &cr),
+                    ),
+                    a,
+                    b,
+                );
+                let sim = body.similarity;
                 let same_path = path == region.path;
                 let same_owner = region.owner == candidate.owner;
                 // Anonymous labels are display text, never continuity evidence.
@@ -961,7 +995,7 @@ impl Tracker {
                     .as_ref()
                     .is_some_and(|r| r.start < candidate.span.end && candidate.span.start < r.end);
                 let context = same_path && same_owner && (same_name || overlap);
-                let small = regions::distinctive(a).min(regions::distinctive(b)) < 3;
+                let small = body.small;
                 // A renamed owner loses owner/name evidence even for a close
                 // body edit. Keep rich same-owner scores unchanged: the exact-local
                 // shortcut relies on their bound against non-local competitors.
@@ -994,7 +1028,7 @@ impl Tracker {
                     && region.written == candidate.written;
                 // A reused header must not beat a distinctive unchanged body.
                 // Trigram similarity alone can be 100 for non-identical token streams.
-                let exact = !small && sim == 100 && regions::same_tokens(a, b);
+                let exact = body.exact;
                 // A substantial edited body can establish a member relocation
                 // without establishing an owner move. Share the corroboration
                 // band with sibling evidence, preserving the exact-local bound.
@@ -1007,7 +1041,14 @@ impl Tracker {
                         "method" | "function" | "constructor" | "operator"
                     )
                     && sim >= 70
-                    && regions::ordered_body_anchors(a, b);
+                    && self.cache.anchors(
+                        cache::key(
+                            self.store.cache_scope(),
+                            &("anchors", &region.blob, &source_body, &candidate.blob, &cr),
+                        ),
+                        a,
+                        b,
+                    );
                 let mut score = sim / 2
                     + usize::from(exact) * 24
                     + usize::from(same_path) * 8
