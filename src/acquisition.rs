@@ -13,7 +13,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Preparation = Arc<Mutex<Option<(Instant, String)>>>;
+struct Failure {
+    at: Instant,
+    version: String,
+    message: String,
+}
+type Preparation = Arc<Mutex<Option<Failure>>>;
 static PREPARATIONS: LazyLock<Mutex<HashMap<String, Preparation>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CAPACITY: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
@@ -31,6 +36,15 @@ impl Drop for Permit {
 }
 
 pub fn shared<T>(identity: &str, prepare: impl FnOnce() -> Result<T>) -> Result<T> {
+    shared_versioned(identity, "", prepare)
+}
+
+/// Serialize one cache destination while allowing a new source location to retry.
+pub(crate) fn shared_versioned<T>(
+    identity: &str,
+    version: &str,
+    prepare: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let state = PREPARATIONS
         .lock()
         .unwrap()
@@ -38,8 +52,14 @@ pub fn shared<T>(identity: &str, prepare: impl FnOnce() -> Result<T>) -> Result<
         .or_insert_with(|| Arc::new(Mutex::new(None)))
         .clone();
     let mut state = state.lock().unwrap();
-    if let Some((failed, message)) = &*state {
-        ensure!(failed.elapsed() >= Duration::from_secs(30), "{message}");
+    if let Some(failure) = &*state
+        && failure.version == version
+    {
+        ensure!(
+            failure.at.elapsed() >= Duration::from_secs(30),
+            "{}",
+            failure.message
+        );
     }
     let mut active = CAPACITY.0.lock().unwrap();
     while *active >= 2 && !STOPPED.load(std::sync::atomic::Ordering::Acquire) {
@@ -53,10 +73,11 @@ pub fn shared<T>(identity: &str, prepare: impl FnOnce() -> Result<T>) -> Result<
     drop(active);
     let _permit = Permit;
     let result = prepare();
-    *state = result
-        .as_ref()
-        .err()
-        .map(|error| (Instant::now(), error.to_string()));
+    *state = result.as_ref().err().map(|error| Failure {
+        at: Instant::now(),
+        version: version.into(),
+        message: error.to_string(),
+    });
     result
 }
 

@@ -131,7 +131,7 @@ pub(super) fn packed_source(
         return Ok(None);
     };
     let root = cache.join("unity-metadata-packs").join(hex(&pack.hash));
-    acquisition::shared(&root.to_string_lossy(), || {
+    acquisition::shared_versioned(&root.to_string_lossy(), &pack.release, || {
         let contents = root.join("contents");
         if !contents.is_dir() {
             fs::create_dir_all(&root)?;
@@ -148,7 +148,13 @@ pub(super) fn packed_source(
 
 pub(super) fn materialize(cache: &Path, artifact: &Artifact, catalog: &Catalog) -> Result<PathBuf> {
     let root = cache.join("unity-metadata").join(hex(&artifact.hash));
-    acquisition::shared(&root.to_string_lossy(), || {
+    if root.join("contents/manifest.bin").is_file() {
+        return Ok(root.join("contents"));
+    }
+    // Complete transport acquisition before taking a materialization permit.
+    // Nested acquisition permits can deadlock concurrent package requests.
+    let packed = packed_source(cache, REPOSITORY, catalog, artifact)?;
+    acquisition::shared_versioned(&root.to_string_lossy(), &artifact.release, || {
         let contents = root.join("contents");
         if contents.join("manifest.bin").is_file() {
             return Ok(contents);
@@ -157,7 +163,7 @@ pub(super) fn materialize(cache: &Path, artifact: &Artifact, catalog: &Catalog) 
         let stage = tempfile::Builder::new()
             .prefix("stage-")
             .tempdir_in(&root)?;
-        let archive = if let Some(path) = packed_source(cache, REPOSITORY, catalog, artifact)? {
+        let archive = if let Some(path) = packed {
             path
         } else {
             let path = stage.path().join("bundle.tar.zst");

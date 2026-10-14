@@ -158,6 +158,31 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
                 .is_some()
         );
     }
+    // Concurrent members share the pack download but acquire their extraction
+    // permits separately. Seed compressed transport data to keep this offline.
+    let cache = tempfile::tempdir().unwrap();
+    packing::unpack(
+        &output.path().join(&pack.name),
+        &cache
+            .path()
+            .join("unity-metadata-packs")
+            .join(hex(&pack.hash))
+            .join("contents"),
+        &pack,
+        &catalog,
+    )
+    .unwrap();
+    let start = std::sync::Barrier::new(catalog.artifacts.len());
+    std::thread::scope(|scope| {
+        for artifact in &catalog.artifacts {
+            let (catalog, cache, start) = (&catalog, cache.path(), &start);
+            scope.spawn(move || {
+                start.wait();
+                let path = client::materialize(cache, artifact, catalog).unwrap();
+                assert!(path.join("manifest.bin").is_file());
+            });
+        }
+    });
     let mut broken = pack.clone();
     broken.members.pop();
     let invalid = tempfile::tempdir().unwrap();
@@ -181,6 +206,25 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn relocated_archives_retry_without_waiting_for_old_failure_cache() {
+    let cache = tempfile::tempdir().unwrap();
+    let identity = cache.path().to_string_lossy();
+    assert!(
+        crate::acquisition::shared_versioned::<()>(&identity, "old", || anyhow::bail!(
+            "Asset was removed"
+        ))
+        .is_err()
+    );
+    assert!(
+        crate::acquisition::shared_versioned::<()>(&identity, "old", || panic!(
+            "Unchanged sources retain their failure cache"
+        ))
+        .is_err()
+    );
+    crate::acquisition::shared_versioned(&identity, "new", || Ok(())).unwrap();
 }
 
 #[test]
