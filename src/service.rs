@@ -1020,8 +1020,6 @@ derived: matches direct written bases; native impl: is unsupported.
 Macro bodies contribute identifier references, not inferred calls or writes.
 ShaderLab indexes embedded code and entry-point pragmas, not properties or material links.
 
-Background indexing
-Native code, shaders, and Unity assets use independent background jobs.
 Broad queries return ready results and one incomplete-index notice. Stale groups are hidden during refresh.
 Queries narrowed to a background group wait for it; wait:complete waits for all relevant groups.
 

@@ -2,10 +2,11 @@
 mod extract;
 pub(crate) mod jobs;
 mod lex;
+mod shader;
 
 use crate::model::Language;
-pub use extract::extract;
 use serde::{Deserialize, Serialize};
+pub use shader::extract;
 use std::{collections::BTreeMap, ops::Range, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -37,10 +38,10 @@ pub fn language(path: &Path) -> Option<Language> {
         "h" => Language::Header,
         "C" | "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "ipp"
         | "tpp" | "ixx" | "cppm" => Language::Cpp,
-        "hlsl" | "hlsli" | "cginc" | "compute" => Language::Hlsl,
+        "hlsl" | "hlsli" | "cginc" | "compute" | "ngcompute" | "ngshader" => Language::Hlsl,
         "glsl" | "vert" | "frag" | "geom" | "tesc" | "tese" | "comp" | "mesh" | "task" | "rgen"
         | "rint" | "rahit" | "rchit" | "rmiss" | "rcall" => Language::Glsl,
-        "shader" | "surfshader" => Language::ShaderLab,
+        "shader" | "surfshader" | "ngsurface" | "ngsurfshader" => Language::ShaderLab,
         _ => return None,
     })
 }

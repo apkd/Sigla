@@ -219,3 +219,105 @@ ENDGLSL }
         );
     }
 }
+#[tokio::test]
+async fn ng_shader_navigation_refresh_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let source = "BEGIN_PROPERTIES\n_Tint(\"Tint\", Color) = (1,1,1,1)\nEND_PROPERTIES\nBEGIN_VARYINGS\n* : float4 lineData linear\nEND_VARYINGS\nBEGIN_CODE\n#include \"Shared.hlsl\"\nvoid Modify(inout VertexData v) { v.lineData = _Tint; }\nfloat4 SurfaceFunction() { return Shared(_Tint); }\nEND_CODE\n";
+    write(root.path(), "Surface.ngsurface", source);
+    write(
+        root.path(),
+        "Shared.hlsl",
+        "float4 Shared(float4 value) { return value; }\n",
+    );
+    write(
+        root.path(),
+        "Pass.ngshader",
+        "#pragma native_pass Draw _ Vert Frag\nfloat4 Vert() { return 0; }\nfloat4 Frag() { return 1; }\n",
+    );
+    write(
+        root.path(),
+        "Compute.ngcompute",
+        "#pragma kernel Kernel\n[numthreads(1,1,1)] void Kernel() {}\n",
+    );
+    write(
+        root.path(),
+        "Legacy.ngsurfshader",
+        "BEGIN_CODE\nvoid Legacy() {}\nEND_CODE\n",
+    );
+    let path = root.path().to_str().unwrap();
+    for _ in 0..2 {
+        let app = app(root.path(), cache.path());
+        for (query, expected) in [
+            ("file:*.ngsurface", "Surface.ngsurface"),
+            ("property:_Tint lang:shaders", "Surface.ngsurface"),
+            ("field:lineData lang:shaders", "Surface.ngsurface"),
+            ("function:SurfaceFunction lang:hlsl", "Surface.ngsurface"),
+            ("function:Kernel lang:shaders", "Compute.ngcompute"),
+            ("function:Legacy lang:shaders", "Legacy.ngsurfshader"),
+            ("writes:lineData lang:shaders", "v.lineData = _Tint"),
+            ("uses:Vert lang:shaders", "#pragma native_pass"),
+            ("@Pass.ngshader:1:28", "function:Vert()"),
+            ("@Surface.ngsurface:2:1", "_Tint"),
+            ("@Surface.ngsurface:9:48", "property:_Tint"),
+            ("@Surface.ngsurface:8:12", "Include: `Shared.hlsl`"),
+        ] {
+            let result = app.search(path, query).await.unwrap();
+            assert!(result.contains(expected), "{query}: {result}");
+        }
+        assert_eq!(
+            app.search(path, "calls:Vert lang:shaders").await.unwrap(),
+            "No matches."
+        );
+        let viewed = app.view(path, "Surface.ngsurface", "exact").await.unwrap();
+        assert!(
+            viewed.contains("BEGIN_PROPERTIES") && viewed.contains("BEGIN_CODE"),
+            "{viewed}"
+        );
+    }
+    let app = app(root.path(), cache.path());
+    write(
+        root.path(),
+        "Surface.ngsurface",
+        &source.replace("_Tint", "_Color"),
+    );
+    assert_eq!(
+        app.search(path, "property:_Tint lang:shaders")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+    assert!(
+        app.search(path, "property:_Color lang:shaders")
+            .await
+            .unwrap()
+            .contains("Surface.ngsurface")
+    );
+    std::fs::rename(
+        root.path().join("Surface.ngsurface"),
+        root.path().join("Renamed.ngsurface"),
+    )
+    .unwrap();
+    let renamed = app
+        .search(path, "property:_Color lang:shaders")
+        .await
+        .unwrap();
+    assert!(
+        renamed.contains("Renamed.ngsurface") && !renamed.contains("Surface.ngsurface"),
+        "{renamed}"
+    );
+    std::fs::remove_file(root.path().join("Renamed.ngsurface")).unwrap();
+    assert_eq!(
+        app.search(path, "property:_Color lang:shaders")
+            .await
+            .unwrap(),
+        "No matches."
+    );
+    write(root.path(), "Added.ngsurface", source);
+    assert!(
+        app.search(path, "property:_Tint lang:shaders")
+            .await
+            .unwrap()
+            .contains("Added.ngsurface")
+    );
+}

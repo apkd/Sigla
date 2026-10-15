@@ -321,6 +321,10 @@ fn lifecycle() -> Result<()> {
     )?;
     fs::write(upstream.join("src/lib.rs"), "pub struct Main;\n")?;
     fs::write(
+        upstream.join("Surface.ngsurface"),
+        "BEGIN_PROPERTIES\n_Tint(\"Tint\", Color) = (1,1,1,1)\nEND_PROPERTIES\nBEGIN_CODE\nfloat4 SurfaceFunction() { return _Tint; }\nEND_CODE\n",
+    )?;
+    fs::write(
         upstream.join("README.md"),
         "# Remote fixture\n\nKeep  document spacing.\n",
     )?;
@@ -398,6 +402,12 @@ fn lifecycle() -> Result<()> {
         "Initial summary missing: {first}"
     );
     let count = fs::read(root.path().join("requests.log"))?.len();
+    server.until(main, "property:_Tint lang:shaders", "Surface.ngsurface")?;
+    server.until(
+        main,
+        "function:SurfaceFunction lang:shaders",
+        "Surface.ngsurface",
+    )?;
     let (error, document) = server.call(
         "view",
         json!({"codebase":main,"path":"README.md","mode":"minified"}),

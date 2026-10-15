@@ -595,19 +595,15 @@ fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
 }
 
 #[test]
-fn baseline_v3_keeps_object_ids_but_unknown_v3_is_rejected() {
-    let version = "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0";
+fn current_v3_keeps_object_ids_and_rejects_unknown_formats() {
+    let version = crate::store::ANALYSIS_VERSION;
     let source = "class Kept {}";
     let language = crate::model::Language::CSharp;
-    let id =
-        crate::store::payload::source_id_at_version(source, language, &[], "", version).unwrap();
-    assert_eq!(
-        crate::store::source_id(source, language, &[], "").unwrap(),
-        id
-    );
+    let id = crate::store::source_id(source, language, &[], "").unwrap();
     for (format, keep) in [
         (format!("sigla-shared-3:{version}"), true),
-        (format!("sigla-shared-3:0{}", &version[1..]), false),
+        (format!("sigla-shared-3:{version}-unknown"), false),
+        (format!("{version}-unknown"), false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -702,7 +698,7 @@ fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
             .put(
                 &mut tx,
                 b"format",
-                b"d70ac251b161d05505fdc5790766a45bdd917c9e97093b7df3751e7479131b09",
+                crate::store::ANALYSIS_VERSION.as_bytes(),
             )
             .unwrap();
         tx.commit().unwrap();
@@ -712,8 +708,13 @@ fn compatible_legacy_objects_upgrade_on_use_and_retire_independently() {
         let new = db
             .workspace([2; 32], Path::new("/workspace/1"), None)
             .unwrap();
+        let old = db.existing([1; 32]).unwrap().unwrap();
         let tx = new.read().unwrap();
-        let binding = new.previous_binding(&tx, "file", &[1]).unwrap().unwrap();
+        let binding = old.binding(&tx, "file").unwrap().unwrap();
+        assert_eq!(
+            new.previous_binding(&tx, "file", &[1]).unwrap(),
+            crate::store::compatibility::legacy_workspace().then_some(binding.clone())
+        );
         assert_eq!(
             db.live(&tx, &binding.object).unwrap().unwrap().ordinal,
             UNINDEXED
