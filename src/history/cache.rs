@@ -324,20 +324,22 @@ mod tests {
     }
 
     #[test]
-    fn source_batches_preserve_order_facts_errors_and_cancellation() {
+    fn pending_sources_preserve_order_facts_errors_and_cancellation() {
         use super::super::regions::{Region, Sources};
         let root = repository();
-        let inputs: [(&str, &[u8]); 7] = [
+        let inputs: [(&str, &[u8]); 9] = [
             (
                 "C.cs",
                 b"class C {\n#if A\nint Run() => Read();\n#else\nlong Run() => Read();\n#endif\n}",
             ),
             ("R.rs", b"fn run() -> i32 { read() + 1 }"),
+            ("unsupported.unknown", b"contents"),
             ("C.java", b"class C { int run() { return read(); } }"),
             ("C.txt", b"class C { int run() { return read(); } }"),
             ("broken.cs", b"class C { void Run( }"),
             ("binary.cs", b"class C {}\0"),
             ("invalid.cs", &[0xff]),
+            ("after.rs", b"fn after() { read(); }"),
         ];
         let blobs: Vec<_> = inputs
             .iter()
@@ -351,58 +353,57 @@ mod tests {
         let mut store = Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
         let parallel = Sources::default();
         let serial = Sources::default();
-        let mut index = 0;
-        while index < paths.len() {
-            let batch = parallel.batch(&mut store, paths[index..].iter().copied());
-            assert!(!batch.is_empty());
-            for result in batch {
-                let (path, blob) = paths[index];
-                match (result, serial.get(&mut store, path, blob)) {
-                    (Ok(actual), Ok(expected)) => {
-                        assert_eq!(actual.text, expected.text);
-                        assert_eq!(actual.incomplete, expected.incomplete);
-                        let declarations = |source: &Source| {
-                            source
-                                .declarations
-                                .iter()
-                                .map(|d| Region::declaration(path, blob, d, source))
-                                .collect::<Vec<_>>()
-                        };
-                        assert_eq!(declarations(&actual), declarations(&expected));
-                        let calls = |source: &Source| {
-                            source
-                                .calls
-                                .iter()
-                                .map(|c| {
-                                    (
-                                        c.span.clone(),
-                                        c.name.clone(),
-                                        c.arguments,
-                                        c.receiver.clone(),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        };
-                        assert_eq!(calls(&actual), calls(&expected));
-                        assert!(Arc::ptr_eq(
-                            &actual,
-                            &parallel.get(&mut store, path, blob).unwrap()
-                        ));
-                    }
-                    (Err(actual), Err(expected)) => {
-                        assert_eq!(actual.to_string(), expected.to_string())
-                    }
-                    _ => panic!("Batched and serial source outcomes differ"),
+        let mut pending = parallel.pending();
+        for (index, &(path, blob)) in paths.iter().enumerate() {
+            let result = pending.get(&mut store, path, paths[index..].iter().copied());
+            match (result, serial.get(&mut store, path, blob)) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual.text, expected.text);
+                    assert_eq!(actual.incomplete, expected.incomplete);
+                    let declarations = |source: &Source| {
+                        source
+                            .declarations
+                            .iter()
+                            .map(|d| Region::declaration(path, blob, d, source))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(declarations(&actual), declarations(&expected));
+                    let calls = |source: &Source| {
+                        source
+                            .calls
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.span.clone(),
+                                    c.name.clone(),
+                                    c.arguments,
+                                    c.receiver.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(calls(&actual), calls(&expected));
+                    assert!(Arc::ptr_eq(
+                        &actual,
+                        &parallel.get(&mut store, path, blob).unwrap()
+                    ));
                 }
-                index += 1;
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual.to_string(), expected.to_string())
+                }
+                _ => panic!("Queued and serial source outcomes differ"),
             }
         }
+        // Warm results already in the queue must still respect cancellation.
+        let mut pending = parallel.pending();
+        pending
+            .get(&mut store, paths[0].0, paths.iter().copied())
+            .unwrap();
         store.cancel.store(true, Ordering::Release);
         assert!(
-            parallel
-                .batch(&mut store, paths.iter().copied())
-                .iter()
-                .all(Result::is_err)
+            pending
+                .get(&mut store, paths[1].0, paths[1..].iter().copied())
+                .is_err()
         );
     }
 

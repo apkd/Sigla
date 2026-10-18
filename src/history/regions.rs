@@ -190,6 +190,76 @@ impl Source {
 pub(super) struct Sources {
     cache: Arc<Cache>,
 }
+pub(super) struct PendingSources {
+    sources: Sources,
+    pending: VecDeque<(String, PendingSource)>,
+}
+enum PendingSource {
+    Ready(Result<Arc<Source>>),
+    Running(std::thread::JoinHandle<Result<Arc<Source>>>),
+}
+impl PendingSource {
+    fn finish(self) -> Result<Arc<Source>> {
+        match self {
+            Self::Ready(result) => result,
+            Self::Running(worker) => worker
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Historical source worker panicked"))),
+        }
+    }
+}
+impl PendingSources {
+    /// Refill before consuming the next source, after the caller has released
+    /// its previous source. The iterator starts at `path` in consumption order.
+    pub fn get<'a>(
+        &mut self,
+        store: &mut Store,
+        path: &str,
+        paths: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Arc<Source>> {
+        static WORKERS: LazyLock<usize> = LazyLock::new(|| {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4)
+        });
+        crate::repository::history::check(&store.cancel)?;
+        for (path, blob) in paths
+            .skip(self.pending.len())
+            .take(*WORKERS - self.pending.len())
+        {
+            let pending = match self.sources.input(store, path, blob) {
+                Ok(input @ Input::Parse { .. }) if *WORKERS > 1 => {
+                    let sources = Sources::new(self.sources.cache.clone());
+                    let cancel = store.cancel.clone();
+                    let path = path.to_owned();
+                    PendingSource::Running(std::thread::spawn(move || {
+                        sources.parse(input, &path, &cancel)
+                    }))
+                }
+                input => PendingSource::Ready(
+                    input.and_then(|input| self.sources.parse(input, path, &store.cancel)),
+                ),
+            };
+            self.pending.push_back((path.to_owned(), pending));
+        }
+        assert_eq!(
+            self.pending.front().expect("queued historical source").0,
+            path,
+            "historical sources must be consumed in order"
+        );
+        let (_, pending) = self.pending.pop_front().unwrap();
+        pending.finish()
+    }
+}
+impl Drop for PendingSources {
+    fn drop(&mut self) {
+        // An early result or error still owns these workers. Reap them without
+        // propagating failures from candidates the caller did not consume.
+        for (_, pending) in self.pending.drain(..) {
+            let _ = pending.finish();
+        }
+    }
+}
 enum Input {
     Cached(Arc<Source>),
     Parse {
@@ -226,57 +296,11 @@ impl Sources {
     pub fn get(&self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
         self.parse(self.input(store, path, blob)?, path, &store.cancel)
     }
-    /// Prepare only a small batch ahead of the caller. Keep errors in input
-    /// order so an unused later candidate cannot fail an earlier result.
-    pub fn batch<'a>(
-        &self,
-        store: &mut Store,
-        paths: impl Iterator<Item = (&'a str, &'a str)>,
-    ) -> VecDeque<Result<Arc<Source>>> {
-        static WORKERS: LazyLock<usize> = LazyLock::new(|| {
-            std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .min(4)
-        });
-        let inputs: Vec<_> = paths
-            .take(*WORKERS)
-            .map(|(path, blob)| (path, self.input(store, path, blob)))
-            .collect();
-        let misses = inputs
-            .iter()
-            .filter(|(_, input)| matches!(input, Ok(Input::Parse { .. })))
-            .count();
-        let count = inputs.len();
-        let started = std::time::Instant::now();
-        let cancel = &store.cancel;
-        let results = if misses <= 1 {
-            inputs
-                .into_iter()
-                .map(|(path, input)| self.parse(input?, path, cancel))
-                .collect()
-        } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = inputs
-                    .into_iter()
-                    .map(|(path, input)| scope.spawn(move || self.parse(input?, path, cancel)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle.join().unwrap_or_else(|_| {
-                            Err(anyhow::anyhow!("Historical source worker panicked"))
-                        })
-                    })
-                    .collect()
-            })
-        };
-        tracing::trace!(
-            count,
-            misses,
-            elapsed_us = started.elapsed().as_micros(),
-            "Historical source batch"
-        );
-        results
+    pub fn pending(&self) -> PendingSources {
+        PendingSources {
+            sources: Self::new(self.cache.clone()),
+            pending: VecDeque::new(),
+        }
     }
     fn input(&self, store: &mut Store, path: &str, blob: &str) -> Result<Input> {
         crate::repository::history::check(&store.cancel)?;
@@ -705,6 +729,42 @@ pub(super) fn line_range(text: &str, start: usize, end: usize) -> Result<Range<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_sources_join_unused_workers_and_discard_their_errors() {
+        use std::sync::{Barrier, atomic::Ordering};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut pending = Sources::default().pending();
+        pending.pending.push_back((
+            "unused.cs".into(),
+            PendingSource::Running(std::thread::spawn({
+                let finished = finished.clone();
+                let barrier = barrier.clone();
+                move || {
+                    barrier.wait();
+                    finished.store(true, Ordering::Release);
+                    Err(anyhow::anyhow!("unused source failed"))
+                }
+            })),
+        ));
+        // The worker is still live when the queue is moved to its dropping
+        // thread; dropping must wait for it without returning its unused error.
+        assert!(!finished.load(Ordering::Acquire));
+        let dropped = std::thread::spawn(move || drop(pending));
+        barrier.wait();
+        dropped.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn consumed_worker_panics_become_source_errors() {
+        let pending = PendingSource::Running(std::thread::spawn(|| {
+            panic!("source worker failed");
+        }));
+        assert!(pending.finish().is_err());
+    }
 
     #[test]
     fn edited_body_anchors_require_whole_ordered_nonrepeating_source() {
