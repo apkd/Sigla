@@ -338,7 +338,14 @@ fn may_declare(query: &crate::query::Query, text: &str) -> bool {
     }) {
         return true;
     }
-    parts.iter().all(|part| text.contains(part))
+    // A damaged owner still leaves its member scope unresolved. Keep every
+    // file naming that owner, even when the requested member spelling is absent.
+    let required = if parts.len() > 1 {
+        &parts[..parts.len() - 1]
+    } else {
+        &parts
+    };
+    required.iter().all(|part| text.contains(part))
 }
 
 pub(super) fn language(path: &str) -> Option<Language> {
