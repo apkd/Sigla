@@ -1340,8 +1340,19 @@ impl<'a> Search<'a> {
             }
             let data = self.data(key)?;
             let mut previous_line = None;
+            let mut scanned = 0;
+            let mut line_no = 1;
+            let mut line_start = 0;
             for matched in literal.find_iter(&data.source) {
                 self.check()?;
+                for (offset, _) in data.source[scanned..matched.start()].match_indices('\n') {
+                    line_no += 1;
+                    line_start = scanned + offset + 1;
+                }
+                scanned = matched.start();
+                if previous_line == Some(line_no) {
+                    continue;
+                }
                 if let Some(native) = &data.facts.native {
                     let dialect = native
                         .regions
@@ -1365,10 +1376,6 @@ impl<'a> Search<'a> {
                     continue;
                 };
                 let display = self.manifest.display(file, membership);
-                let (line_no, _) = position(&data.source, matched.start());
-                if previous_line == Some(line_no) {
-                    continue;
-                }
                 previous_line = Some(line_no);
                 let rank = (display.to_string(), matched.start());
                 if !units.accepts(&rank) {
@@ -1377,9 +1384,12 @@ impl<'a> Search<'a> {
                 let end = data.source[matched.end()..]
                     .find('\n')
                     .map_or(data.source.len(), |n| matched.end() + n);
-                let start = data.source[..matched.start()]
-                    .rfind('\n')
-                    .map_or(0, |n| n + 1);
+                let last = line_no
+                    + data.source.as_bytes()
+                        [matched.start()..matched.end().saturating_sub(1).max(matched.start())]
+                        .iter()
+                        .filter(|&&b| b == b'\n')
+                        .count();
                 units.insert(
                     rank,
                     crate::render::SearchResult {
@@ -1388,8 +1398,8 @@ impl<'a> Search<'a> {
                             (d.kind, d.qualified)
                         }),
                         path: display.to_string(),
-                        lines: Some(crate::render::lines(&data.source, matched.range())),
-                        source: data.source[start..end].to_owned(),
+                        lines: Some((line_no, last)),
+                        source: data.source[line_start..end].to_owned(),
                         language: file.language,
                         uncertain: false,
                         target: None,
