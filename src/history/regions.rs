@@ -246,27 +246,37 @@ impl Sources {
             .iter()
             .filter(|(_, input)| matches!(input, Ok(Input::Parse { .. })))
             .count();
+        let count = inputs.len();
+        let started = std::time::Instant::now();
         let cancel = &store.cancel;
-        if misses <= 1 {
-            return inputs
+        let results = if misses <= 1 {
+            inputs
                 .into_iter()
                 .map(|(path, input)| self.parse(input?, path, cancel))
-                .collect();
-        }
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = inputs
-                .into_iter()
-                .map(|(path, input)| scope.spawn(move || self.parse(input?, path, cancel)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!("Historical source worker panicked"))
-                    })
-                })
                 .collect()
-        })
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = inputs
+                    .into_iter()
+                    .map(|(path, input)| scope.spawn(move || self.parse(input?, path, cancel)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("Historical source worker panicked"))
+                        })
+                    })
+                    .collect()
+            })
+        };
+        tracing::trace!(
+            count,
+            misses,
+            elapsed_us = started.elapsed().as_micros(),
+            "Historical source batch"
+        );
+        results
     }
     fn input(&self, store: &mut Store, path: &str, blob: &str) -> Result<Input> {
         crate::repository::history::check(&store.cancel)?;
