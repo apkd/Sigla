@@ -595,9 +595,9 @@ mod tests {
                 "path:**/*.unity -unity-project:One",
                 [false, false, false, true],
             ),
-            ("lang:csharp", [true, true, true, true]),
+            ("type-match:exact", [true, true, true, true]),
         ] {
-            let query = Query::parse(&format!("text:needle {filters}")).unwrap();
+            let query = Query::parse(&format!("instance:GameObject {filters}")).unwrap();
             let actual: Vec<_> = assets.iter().map(selection(&query)).collect();
             assert_eq!(actual, expected, "{filters}");
         }
