@@ -42,6 +42,8 @@ impl Deref for SourceTree {
 }
 impl SourceTree {
     fn heap_bytes(&self) -> usize {
+        // Charge shared object IDs in each snapshot: they can outlive the
+        // decoded directories that originally allocated them.
         self.entries
             .keys()
             .map(|p| p.capacity() + 160)

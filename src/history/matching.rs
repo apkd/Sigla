@@ -251,7 +251,9 @@ impl Tracker {
             .collect();
         let allowed = self.store.source_paths(&commit.tree, &tree, &paths)?;
         let excluded: BTreeSet<_> = paths.into_iter().filter(|p| !allowed.contains(p)).collect();
-        tree.retain(|p, _| !excluded.contains(p));
+        if !excluded.is_empty() {
+            tree.retain(|p, _| !excluded.contains(p));
+        }
         check(&self.store.cancel)?;
         Ok(self.cache.put_tree(
             key,
@@ -335,7 +337,7 @@ impl Tracker {
                 self.store.prefetch(
                     &candidates
                         .iter()
-                        .map(|(_, id)| id.clone())
+                        .map(|(_, id)| id.to_string())
                         .collect::<Vec<_>>(),
                     "blob",
                 )?;
@@ -566,7 +568,7 @@ impl Tracker {
                 // that same blob through a different ancestor .gitattributes.
                 if a != b
                     || !b.entry.as_ref().is_some_and(|e| {
-                        e.id == region.blob && matches!(e.mode, 0o100644 | 0o100755)
+                        e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755)
                     })
                 {
                     return Ok(None);
@@ -596,7 +598,10 @@ impl Tracker {
         forward: bool,
         work: &mut usize,
     ) -> Result<Vec<Link>> {
-        if to.get(&region.path).is_some_and(|e| e.id == region.blob) {
+        if to
+            .get(&region.path)
+            .is_some_and(|e| e.id.as_ref() == region.blob)
+        {
             return Ok(vec![Link {
                 from: region.clone(),
                 to: region.clone(),
@@ -608,7 +613,7 @@ impl Tracker {
         // A whole unchanged file carries even tiny members across a file move.
         let exact: Vec<_> = to
             .iter()
-            .filter(|(_, e)| e.id == region.blob && matches!(e.mode, 0o100644 | 0o100755))
+            .filter(|(_, e)| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
             .collect();
         if !exact.is_empty() {
             return Ok(exact
@@ -616,7 +621,7 @@ impl Tracker {
                 .map(|(path, _)| {
                     let mut old = region.clone();
                     old.path = (*path).clone();
-                    let copy = from.get(*path).is_some_and(|e| e.id == old.blob);
+                    let copy = from.get(*path).is_some_and(|e| e.id.as_ref() == old.blob);
                     Link {
                         from: region.clone(),
                         to: old,
@@ -633,7 +638,7 @@ impl Tracker {
                 .filter(|e| matches!(e.mode, 0o100644 | 0o100755))
         {
             let mut previous = region.clone();
-            previous.blob = entry.id.clone();
+            previous.blob = entry.id.to_string();
             return Ok(vec![Link {
                 from: region.clone(),
                 to: previous,
@@ -720,7 +725,7 @@ impl Tracker {
                 && !anonymous
                 && let Some(entry) = from.get(&old.path)
             {
-                if region.kind == "file" && entry.id == old.blob {
+                if region.kind == "file" && entry.id.as_ref() == old.blob {
                     relation = Relation::Copy;
                 } else if !matches!(region.kind.as_str(), "file" | "text") {
                     let fate = self.sources.get(&mut self.store, &old.path, &entry.id)?;
@@ -997,7 +1002,7 @@ impl Tracker {
                             && matches!(to[*p].mode, 0o100644 | 0o100755)
                             && regions::compatible(p, &region.path)
                     })
-                    .map(|p| to[p].id.clone())
+                    .map(|p| to[p].id.to_string())
                     .collect::<Vec<_>>();
                 self.store.prefetch(&blobs, "blob")?;
             }
@@ -1021,7 +1026,7 @@ impl Tracker {
                                 && matches!(to[*p].mode, 0o100644 | 0o100755)
                                 && regions::compatible(p, &region.path)
                         })
-                        .map(|p| (p.as_str(), to[p].id.as_str())),
+                        .map(|p| (p.as_str(), to[p].id.as_ref())),
                 );
             }
             let other = match prepared.pop_front() {

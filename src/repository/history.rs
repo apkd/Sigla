@@ -66,7 +66,7 @@ pub(crate) struct Commit {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Entry {
-    pub id: String,
+    pub id: Arc<str>,
     pub mode: u32,
 }
 pub(crate) type Tree = BTreeMap<String, Entry>;
@@ -802,7 +802,7 @@ impl Store {
     pub fn tree(&mut self, root: &str) -> Result<Tree> {
         let mut result = Vec::new();
         let mut bytes_used = 0usize;
-        let mut pending = vec![(String::new(), root.to_owned())];
+        let mut pending = vec![(String::new(), Arc::<str>::from(root))];
         while let Some((prefix, oid)) = pending.pop() {
             check(&self.cancel)?;
             for (name, entry) in &self.directory(&oid)?.entries {
@@ -851,7 +851,13 @@ impl Store {
                 "history tree inventory exceeds request memory bound"
             );
             let hash = gix_hash::ObjectId::from_bytes_or_panic(&bytes[nul + 1..end]).to_string();
-            result.insert(name.into(), Entry { id: hash, mode });
+            result.insert(
+                name.into(),
+                Entry {
+                    id: hash.into(),
+                    mode,
+                },
+            );
             bytes = &bytes[end..];
         }
         let directory = Arc::new(Directory {
@@ -875,7 +881,7 @@ impl Store {
             entry: None,
             attributes: Tree::new(),
         };
-        let mut tree = commit.tree.clone();
+        let mut tree = Arc::<str>::from(commit.tree.as_str());
         let mut prefix = String::new();
         let mut parts = path.split('/').peekable();
         while let Some(part) = parts.next() {
@@ -927,7 +933,7 @@ impl Store {
                 policy.update(&[0]);
                 policy.update(entry.id.as_bytes());
                 policy.update(&entry.mode.to_le_bytes());
-                matches!(entry.mode, 0o100644 | 0o100755).then(|| entry.id.clone())
+                matches!(entry.mode, 0o100644 | 0o100755).then(|| entry.id.to_string())
             })
             .collect();
         if attributes.is_empty() {
