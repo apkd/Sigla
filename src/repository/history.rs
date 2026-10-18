@@ -937,23 +937,17 @@ impl Store {
                 policy.update(&[0]);
                 policy.update(entry.id.as_bytes());
                 policy.update(&entry.mode.to_le_bytes());
-                matches!(entry.mode, 0o100644 | 0o100755).then_some((path.as_str(), entry))
+                matches!(entry.mode, 0o100644 | 0o100755).then(|| entry.id.to_string())
             })
             .collect();
         if attributes.is_empty() {
             return Ok(BTreeSet::new());
         }
-        self.prefetch(
-            &attributes
-                .iter()
-                .map(|(_, e)| e.id.to_string())
-                .collect::<Vec<_>>(),
-            "blob",
-        )?;
+        self.prefetch(&attributes, "blob")?;
         // Reading also pins these attribute objects for the declared source policy.
         let mut value_bytes = b"unspecified".len();
-        for (_, entry) in &attributes {
-            let object = self.object(&entry.id, "blob")?;
+        for oid in &attributes {
+            let object = self.object(oid, "blob")?;
             // An attribute value cannot exceed its source line. Account for
             // custom values as well as Git's built-in set/unset responses.
             value_bytes = value_bytes.max(
@@ -973,8 +967,8 @@ impl Store {
             self.reserve_objects(0, 0);
         }
         self.attributes.as_mut().unwrap().exclusions(
+            tree,
             *policy.finalize().as_bytes(),
-            &attributes,
             paths,
             value_bytes,
             &self.cancel,
