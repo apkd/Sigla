@@ -796,14 +796,14 @@ impl Store {
         while let Some((prefix, oid)) = pending.pop() {
             check(&self.cancel)?;
             for (name, entry) in &self.directory(&oid)?.entries {
-                let path = format!("{prefix}{name}");
+                let path = [prefix.as_str(), name.as_str()].concat();
                 bytes_used = bytes_used.saturating_add(path.len() + 160);
                 ensure!(
                     bytes_used <= 64 * 1024 * 1024,
                     "history tree inventory exceeds request memory bound"
                 );
                 if entry.mode == 0o40000 {
-                    pending.push((format!("{path}/"), entry.id.clone()));
+                    pending.push(([path.as_str(), "/"].concat(), entry.id.clone()));
                 }
                 result.push((path, entry.clone()));
             }
