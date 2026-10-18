@@ -1580,6 +1580,7 @@ mod tests {
             command(path, &["add", ".gitattributes"]);
             command(path, &["commit", "-qm", "exclude source"]);
             let excluded = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::create_dir_all(path.join(".git/info")).unwrap();
             fs::write(path.join(".git/info/attributes"), "selected.rs binary\n").unwrap();
             let paths = ["selected.rs".to_owned()];
             let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
