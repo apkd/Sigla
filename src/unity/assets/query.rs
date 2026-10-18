@@ -14,22 +14,37 @@ fn decode(input: &str) -> Option<(String, String)> {
         id.into(),
     ))
 }
-fn selected(asset: &Asset, q: &Query) -> bool {
-    q.filters.iter().all(|f| {
-        let matches = match f.key.as_str() {
-            "path" => {
+fn selection(q: &Query) -> impl Fn(&Asset) -> bool + '_ {
+    let filters: Vec<_> = q
+        .filters
+        .iter()
+        .map(|f| {
+            let matcher = if f.key == "path" {
                 globset::Glob::new(&f.value)
-                    .is_ok_and(|g| g.compile_matcher().is_match(&asset.path))
-                    || asset
-                        .path
-                        .strip_prefix(f.value.trim_end_matches('/'))
-                        .is_some_and(|s| s.starts_with('/'))
-            }
-            "unity-project" => crate::query::wildcard(&f.value, &asset.project),
-            _ => return true,
-        };
-        matches != f.negate
-    })
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            } else {
+                None
+            };
+            (f, matcher)
+        })
+        .collect();
+    move |asset| {
+        filters.iter().all(|(f, matcher)| {
+            let matches = match f.key.as_str() {
+                "path" => {
+                    matcher.as_ref().is_some_and(|g| g.is_match(&asset.path))
+                        || asset
+                            .path
+                            .strip_prefix(f.value.trim_end_matches('/'))
+                            .is_some_and(|s| s.starts_with('/'))
+                }
+                "unity-project" => crate::query::wildcard(&f.value, &asset.project),
+                _ => return true,
+            };
+            matches != f.negate
+        })
+    }
 }
 fn describe(
     index: &Index,
@@ -83,8 +98,9 @@ impl Index {
         let literal = regex::RegexBuilder::new(&regex::escape(&q.target.name))
             .case_insensitive(q.loose)
             .build()?;
+        let selected = selection(q);
         for (key, asset) in &self.assets {
-            if !selected(asset, q) || asset.content.is_none() {
+            if !selected(asset) || asset.content.is_none() {
                 continue;
             }
             let parsed = content(asset)?;
@@ -173,8 +189,9 @@ impl Index {
         let target = matches!(q.selector.as_str(), "references" | "dependencies")
             .then(|| self.target(&q.target.name))
             .transpose()?;
+        let selected = selection(q);
         for (key, asset) in &self.assets {
-            if !selected(asset, q) {
+            if !selected(asset) {
                 continue;
             }
             if q.selector == "dependencies"
@@ -545,6 +562,46 @@ mod tests {
     use crate::{render::SearchResult, workspace::Stamp};
     use std::collections::BTreeMap;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn asset_selection_preserves_path_and_project_filters() {
+        let assets = [
+            ("Assets/Scenes/Main.unity", "One"),
+            ("Assets/Scenes/Sub/Main.unity", "One"),
+            ("Assets/Other.asset", "Two"),
+            ("Assets/[Literal/Main.unity", "Two"),
+        ]
+        .map(|(path, project)| Asset {
+            project: project.into(),
+            path: path.into(),
+            guid: String::new(),
+            objects: Vec::new(),
+            content: None,
+            unavailable: None,
+        });
+        for (filters, expected) in [
+            ("", [true, true, true, true]),
+            ("path:Assets/Scenes", [true, true, false, false]),
+            ("path:Assets/Scenes/", [true, true, false, false]),
+            ("path:Assets/Scenes/Main.unity", [true, false, false, false]),
+            ("path:**/*.unity", [true, true, false, true]),
+            ("-path:Assets/Scenes", [false, false, true, true]),
+            (
+                "path:Assets/Scenes -path:Assets/Scenes/Sub",
+                [true, false, false, false],
+            ),
+            ("unity-project:O*", [true, true, false, false]),
+            (
+                "path:**/*.unity -unity-project:One",
+                [false, false, false, true],
+            ),
+            ("lang:csharp", [true, true, true, true]),
+        ] {
+            let query = Query::parse(&format!("text:needle {filters}")).unwrap();
+            let actual: Vec<_> = assets.iter().map(selection(&query)).collect();
+            assert_eq!(actual, expected, "{filters}");
+        }
+    }
 
     fn index(source: &str) -> (tempfile::TempDir, Index) {
         let root = tempfile::tempdir().unwrap();
