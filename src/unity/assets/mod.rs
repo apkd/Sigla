@@ -23,7 +23,7 @@ use std::{
 
 const LOCAL_LIMIT: u64 = 128 * 1024 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ScriptType {
     pub name: String,
     pub assembly: String,
@@ -42,7 +42,7 @@ pub struct Asset {
 pub struct Index {
     pub assets: BTreeMap<String, Asset>,
     pub guids: BTreeMap<(String, String), Vec<String>>,
-    pub scripts: BTreeMap<String, ScriptType>,
+    pub scripts: BTreeMap<String, std::sync::Arc<ScriptType>>,
     pub instances: BTreeMap<String, std::sync::Arc<compose::Composed>>,
     native_types: BTreeMap<String, BTreeMap<i32, native::Resolved>>,
     observed: BTreeMap<PathBuf, Stamp>,
@@ -57,12 +57,40 @@ impl Index {
     fn measure(&mut self) {
         // Count shared object/type allocations once across prefab instances.
         let mut objects = std::collections::HashSet::new();
-        let mut bytes = crate::memory::encoded_size(&(
-            &self.guids,
-            &self.scripts,
-            &self.native_types,
-            &self.observed,
-        )) * 3;
+        let mut types = std::collections::HashSet::new();
+        let mut issues = std::collections::HashSet::new();
+        let mut type_bytes = 0;
+        let mut issue_bytes = 0;
+        let mut count_shared =
+            |ty: Option<&std::sync::Arc<ScriptType>>, issue: Option<&std::sync::Arc<str>>| {
+                if let Some(ty) = ty
+                    && types.insert(std::sync::Arc::as_ptr(ty))
+                {
+                    type_bytes += 2 * std::mem::size_of::<usize>()
+                        + std::mem::size_of::<ScriptType>()
+                        + ty.name.capacity()
+                        + ty.assembly.capacity()
+                        + ty.ancestry.capacity() * std::mem::size_of::<String>()
+                        + ty.ancestry.iter().map(String::capacity).sum::<usize>();
+                }
+                if let Some(issue) = issue
+                    && issues.insert(std::sync::Arc::as_ptr(issue))
+                {
+                    issue_bytes += 2 * std::mem::size_of::<usize>() + issue.len();
+                }
+            };
+        let mut bytes = crate::memory::encoded_size(&(&self.guids, &self.observed)) * 3;
+        for (key, ty) in &self.scripts {
+            bytes += 128 + key.capacity();
+            count_shared(Some(ty), None);
+        }
+        for (project, resolved) in &self.native_types {
+            bytes += 128 + project.capacity();
+            for native in resolved.values() {
+                bytes += 64;
+                count_shared(native.ty.as_ref(), native.issue.as_ref());
+            }
+        }
         for (key, asset) in &self.assets {
             bytes += 256 + key.len() + asset.project.len() + asset.path.len() + asset.guid.len();
             for object in &asset.objects {
@@ -81,17 +109,24 @@ impl Index {
                         &instance.id,
                         &instance.definition,
                         &instance.name,
-                        &instance.ty,
-                        &instance.native_issue,
                         &instance.references,
                         &instance.evidence,
                     )) * 3;
+                count_shared(instance.ty.as_ref(), instance.native_issue.as_ref());
                 if objects.insert(std::sync::Arc::as_ptr(&instance.object)) {
                     bytes += crate::memory::encoded_size(&instance.object) * 3;
                 }
             }
         }
-        self.retained_bytes = bytes;
+        self.retained_bytes = bytes + type_bytes + issue_bytes;
+        tracing::debug!(
+            retained_bytes = self.retained_bytes,
+            shared_types = types.len(),
+            shared_issues = issues.len(),
+            type_bytes,
+            issue_bytes,
+            "Unity asset allocations measured"
+        );
     }
 }
 
@@ -205,7 +240,7 @@ impl Index {
         let paths = self.guids.get(&(project.into(), guid.into()))?;
         (paths.len() == 1).then(|| paths[0].as_str())
     }
-    fn script(&self, asset: &Asset, object: &Object) -> Option<&ScriptType> {
+    fn script(&self, asset: &Asset, object: &Object) -> Option<&std::sync::Arc<ScriptType>> {
         let script = object.pointer("m_Script");
         if script.null() {
             return None;
@@ -487,7 +522,9 @@ pub fn build(
                 if let Some(types) = type_files.get(&(project.clone(), physical.clone()))
                     && types.len() == 1
                 {
-                    index.scripts.insert(asset_key, types[0].clone());
+                    index
+                        .scripts
+                        .insert(asset_key, std::sync::Arc::new(types[0].clone()));
                 }
                 if !physical.is_file()
                     || !is_asset(&physical) && physical.extension().is_none_or(|e| e != "cs")
