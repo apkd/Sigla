@@ -621,7 +621,7 @@ fn incremental_alternatives_match_fresh_trees_and_positions() {
     }
     for source in [
         "\u{feff}class Café {\r\nint Common() => 1;\r\n#if A\r\nstring Value => \"é🦀\";\r\n#else\r\nint Value => 2;\r\n#endif\r\n#if B\r\nvoid Extra() { Common(); }\r\n#endif\r\n}\r\n",
-        "#if A\nnamespace One {\n#else\nnamespace Two {\n#endif\nclass Data {\n// comment\n#if B\nstring Text => @\"first\n#if literal\nend\";\n#else\nstring Text => \"other\";\n#endif\n}\n}\n",
+        "#if A\nnamespace One {\n#else\nnamespace Two {\n#endif\nclass Data {\n// comment\n#if B\nstring Text => @\"first\n#if literal\n#endif\nend\";\n#else\nstring Text => \"other\";\n#endif\n}\n}\n",
     ] {
         let mut conditions = Conditions::default();
         let document = Document::new(source, &mut conditions).unwrap();
