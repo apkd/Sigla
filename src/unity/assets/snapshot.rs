@@ -108,11 +108,31 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
                     .map(move |object| ((key.as_str(), object.id), object))
             })
             .collect();
+        let diagnostics = tracing::enabled!(tracing::Level::DEBUG);
+        let mut null_paths = 0;
+        let mut null_path_capacity = 0;
+        let mut null_path_estimated_bytes = 0;
+        let empty_path_size = crate::memory::encoded_size(&"");
         for (key, composed) in cached.instances {
             let instances = composed
                 .objects
                 .into_iter()
-                .map(|instance| -> Result<_> {
+                .map(|mut instance| -> Result<_> {
+                    // Older snapshots retained destination paths for null
+                    // pointers. Keep their raw evidence, but no destination.
+                    for target in instance
+                        .references
+                        .values_mut()
+                        .filter(|target| target.raw.null())
+                    {
+                        let path = std::mem::take(&mut target.asset);
+                        if diagnostics && !path.is_empty() {
+                            null_paths += 1;
+                            null_path_capacity += path.capacity();
+                            null_path_estimated_bytes +=
+                                (crate::memory::encoded_size(&path) - empty_path_size) * 3;
+                        }
+                    }
                     Ok(compose::Instance {
                         object: Arc::clone(
                             objects
@@ -141,6 +161,12 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
                 }),
             );
         }
+        tracing::debug!(
+            null_paths,
+            null_path_capacity,
+            null_path_estimated_bytes,
+            "Discarded saved null asset destinations"
+        );
         for (key, asset) in &index.assets {
             if !asset.guid.is_empty() {
                 index

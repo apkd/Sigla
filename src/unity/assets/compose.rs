@@ -39,7 +39,9 @@ fn resolve(
     pointer: &Pointer,
 ) -> Target {
     let source = &index.assets[asset];
-    let destination = if pointer.guid.is_empty() {
+    let destination = if pointer.null() {
+        None
+    } else if pointer.guid.is_empty() {
         Some(asset)
     } else {
         index.resolve(&source.project, &pointer.guid)
@@ -759,7 +761,93 @@ mod tests {
             .collect();
         assert_eq!(cameras.len(), 1);
         assert!(cameras[0].references["nested.target"].raw.null());
+        assert!(cameras[0].references["nested.target"].asset.is_empty());
         assert!(scene.incomplete.is_empty());
+    }
+    #[test]
+    fn snapshots_discard_legacy_null_paths_and_preserve_reference_overrides() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut index = Index::default();
+        let source = format!("{PREFAB}  empty: {{fileID: 0, guid: sword, type: 2}}\n");
+        asset(&mut index, "Enemy.prefab", "enemy", &source);
+        asset(&mut index, "Sword.asset", "sword", "name: Sword\n");
+        let changes = "\n    - target: {fileID: 3, guid: enemy, type: 3}\n      propertyPath: nested.target\n      value: \n      objectReference: {fileID: 0}\n    - target: {fileID: 3, guid: enemy, type: 3}\n      propertyPath: empty\n      value: \n      objectReference: {fileID: 1, guid: sword, type: 2}";
+        asset(
+            &mut index,
+            "Variant.prefab",
+            "variant",
+            &placement(10, "enemy", changes, "[]"),
+        );
+        build(&mut index).unwrap();
+        let expected: BTreeMap<_, _> = index
+            .instances
+            .iter()
+            .map(|(key, composed)| {
+                (
+                    key.clone(),
+                    composed
+                        .objects
+                        .iter()
+                        .map(|object| object.references.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let base = index.instances["Enemy.prefab"]
+            .objects
+            .iter()
+            .find(|object| object.object.class == 20)
+            .unwrap();
+        assert!(base.references["empty"].raw.null());
+        assert!(!base.references["empty"].raw.guid.is_empty());
+        let variant = index.instances["Variant.prefab"]
+            .objects
+            .iter()
+            .find(|object| object.object.class == 20)
+            .unwrap();
+        assert!(variant.references["nested.target"].raw.null());
+        assert!(!variant.references["empty"].raw.null());
+        assert_eq!(
+            variant.references["empty"].asset,
+            base.references["nested.target"].asset
+        );
+        for references in expected.values().flatten() {
+            for target in references.values().filter(|target| target.raw.null()) {
+                assert!(target.asset.is_empty());
+                assert!(target.object.is_none());
+            }
+        }
+        let query = crate::query::Query::parse("dependencies:Variant.prefab limit:100").unwrap();
+        let expected_result = index.search(&query).unwrap();
+        // Older snapshots saved an asset path even for null pointers. Preserve
+        // that wire shape here to exercise normalization at the load boundary.
+        for (key, composed) in &mut index.instances {
+            for object in &mut Arc::make_mut(composed).objects {
+                for target in object
+                    .references
+                    .values_mut()
+                    .filter(|target| target.raw.null())
+                {
+                    target.asset = key.clone();
+                }
+            }
+        }
+        index.measure();
+        let legacy_bytes = index.retained_bytes;
+        super::super::snapshot::save(cache.path(), [4; 32], &index).unwrap();
+        let restored = super::super::snapshot::load(cache.path(), [4; 32]).unwrap();
+        for (key, references) in expected {
+            assert_eq!(
+                restored.instances[&key]
+                    .objects
+                    .iter()
+                    .map(|object| &object.references)
+                    .collect::<Vec<_>>(),
+                references.iter().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(restored.search(&query).unwrap(), expected_result);
+        assert!(restored.retained_bytes < legacy_bytes);
     }
     #[test]
     fn removing_gameobject_removes_children_and_components() {
