@@ -315,11 +315,19 @@ impl Sources {
         let text: Arc<str> = String::from_utf8(bytes)
             .with_context(|| format!("non-UTF-8 source at {path}"))?
             .into();
+        let started = std::time::Instant::now();
         let facts = if java {
             java::extract(&text, cancel)
         } else {
             crate::extract::historical(&text, language)
         };
+        tracing::trace!(
+            path,
+            ?language,
+            bytes = text.len(),
+            elapsed_us = started.elapsed().as_micros(),
+            "Historical source parse"
+        );
         crate::repository::history::check(cancel)?;
         let (declarations, calls, presence, incomplete) = match facts {
             Ok(facts) => (
