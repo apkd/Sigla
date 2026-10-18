@@ -114,7 +114,7 @@ fn explore(
     let seed = document.sample(conditions, &values)?;
     let tree = work.parse(parser, &seed)?;
     if guards.iter().all(|&guard| guard == TRUE) {
-        *result = parse(&tree, &seed, TRUE);
+        *result = parse(&tree, &seed, TRUE, true);
         return Ok(());
     }
     let mut inventory = contexts::Inventory::default();
@@ -170,7 +170,7 @@ fn explore_context(
         if validate && (tree.root_node().has_error() || !context.valid(&tree)) {
             return Ok(false);
         }
-        let parsed = parse(&tree, &projection.text, projection.guard);
+        let parsed = parse(&tree, &projection.text, projection.guard, false);
         if parsed.incomplete.is_some() {
             result.incomplete = parsed.incomplete;
         }
@@ -214,7 +214,7 @@ fn blank(source: &str, bytes: &mut [u8], range: Range<usize>) {
     }
 }
 
-fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFacts {
+fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard, calls: bool) -> HistoricalFacts {
     let mut facts = Facts::default();
     let recovered = tree.root_node().has_error();
     let mut tokens = Vec::new();
@@ -237,8 +237,8 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard) -> HistoricalFa
         if facts.declarations.len() != before {
             scopes.push(before, &facts.declarations[before], analysis);
         }
-        if node.kind() == "identifier" || node.kind() == "predefined_type" {
-            occurrence(node, analysis, &mut facts);
+        if calls && matches!(node.kind(), "identifier" | "predefined_type") {
+            occurrence(node, &parents, analysis, &mut facts);
             if facts
                 .occurrences
                 .last()

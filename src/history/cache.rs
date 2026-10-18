@@ -1,7 +1,7 @@
 //! Bounded, disposable history facts. Keys include repository and policy identity.
 use super::{
     matching::{Mapping, State},
-    regions::Source,
+    regions::{Body, Source},
 };
 use crate::repository::history::Tree;
 use serde::Serialize;
@@ -54,12 +54,6 @@ impl SourceTree {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct Body {
-    pub similarity: usize,
-    pub small: bool,
-    pub exact: bool,
-}
 #[derive(Clone, Copy)]
 enum Evidence {
     Body(Body),
@@ -228,20 +222,14 @@ impl Cache {
             );
         }
     }
-    pub(super) fn body(&self, key: Key, a: &str, b: &str) -> Body {
+    pub(super) fn body(&self, key: Key, compute: impl FnOnce() -> Body) -> Body {
         if let Some(value) = self.evidence.lock().unwrap().get(&key) {
             let Evidence::Body(body) = value else {
                 unreachable!()
             };
             return body;
         }
-        let similarity = super::regions::similarity(a, b);
-        let small = super::regions::distinctive(a).min(super::regions::distinctive(b)) < 3;
-        let body = Body {
-            similarity,
-            small,
-            exact: !small && similarity == 100 && super::regions::same_tokens(a, b),
-        };
+        let body = compute();
         insert(
             &self.evidence,
             key,

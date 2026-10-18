@@ -429,20 +429,29 @@ pub(super) fn tokens(text: &str) -> Vec<Range<usize>> {
 pub(super) fn words<'a>(text: &'a str, tokens: &[Range<usize>]) -> Vec<&'a str> {
     tokens.iter().map(|r| &text[r.clone()]).collect()
 }
-pub(super) fn distinctive(text: &str) -> usize {
-    tokens(text)
-        .iter()
-        .map(|r| &text[r.clone()])
-        .filter(|word| {
-            word.len() >= 3
-                && word.chars().any(char::is_alphanumeric)
-                && ![
-                    "return", "self", "Self", "this", "true", "false", "null", "let", "mut", "pub",
-                ]
-                .contains(word)
-        })
-        .collect::<BTreeSet<_>>()
-        .len()
+pub(super) fn has_distinctive_tokens(text: &str, required: usize) -> bool {
+    has_distinctive_words(TOKENS.find_iter(text).map(|m| m.as_str()), required)
+}
+fn has_distinctive_words<'a>(words: impl Iterator<Item = &'a str>, required: usize) -> bool {
+    let mut distinct = BTreeSet::new();
+    if required == 0 {
+        return true;
+    }
+    for word in words {
+        if word.len() >= 3
+            && word.chars().any(char::is_alphanumeric)
+            && ![
+                "return", "self", "Self", "this", "true", "false", "null", "let", "mut", "pub",
+            ]
+            .contains(&word)
+        {
+            distinct.insert(word);
+            if distinct.len() >= required {
+                return true;
+            }
+        }
+    }
+    false
 }
 pub(super) fn same_tokens(a: &str, b: &str) -> bool {
     TOKENS
@@ -495,23 +504,83 @@ pub(super) fn ordered_body_anchors(a: &str, b: &str) -> bool {
     false
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Body {
+    pub similarity: usize,
+    pub small: bool,
+    pub exact: bool,
+}
+
+/// Borrowed evidence for one candidate search. Tokenize the selected body once
+/// and reuse its sorted, unique trigrams across all candidate comparisons.
+pub(super) struct BodyTokens<'a> {
+    words: Vec<&'a str>,
+    trigrams: Vec<usize>,
+    small: bool,
+}
+impl<'a> BodyTokens<'a> {
+    pub fn new(text: &'a str) -> Self {
+        let words: Vec<_> = TOKENS.find_iter(text).map(|m| m.as_str()).collect();
+        let small = !has_distinctive_words(words.iter().copied(), 3);
+        let mut trigrams: Vec<_> = (0..words.len().saturating_sub(2)).collect();
+        trigrams.sort_unstable_by_key(|&i| &words[i..i + 3]);
+        trigrams.dedup_by(|a, b| words[*a..*a + 3] == words[*b..*b + 3]);
+        Self {
+            words,
+            trigrams,
+            small,
+        }
+    }
+
+    pub fn compare(&self, text: &str) -> Body {
+        let other = BodyTokens::new(text);
+        let small = self.small || other.small;
+        Body {
+            similarity: self.similarity(&other),
+            small,
+            exact: !small && self.words == other.words,
+        }
+    }
+
+    fn similarity(&self, other: &BodyTokens<'_>) -> usize {
+        if self.words == other.words {
+            return 100;
+        }
+        if self.trigrams.is_empty() || other.trigrams.is_empty() {
+            return 0;
+        }
+        let mut a = self
+            .trigrams
+            .iter()
+            .map(|&i| &self.words[i..i + 3])
+            .peekable();
+        let mut b = other
+            .trigrams
+            .iter()
+            .map(|&i| &other.words[i..i + 3])
+            .peekable();
+        let mut shared = 0;
+        while let (Some(left), Some(right)) = (a.peek(), b.peek()) {
+            match left.cmp(right) {
+                std::cmp::Ordering::Less => {
+                    a.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    b.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    shared += 1;
+                    a.next();
+                    b.next();
+                }
+            }
+        }
+        200 * shared / (self.trigrams.len() + other.trigrams.len())
+    }
+}
+
 pub(super) fn similarity(a: &str, b: &str) -> usize {
-    let at = tokens(a);
-    let bt = tokens(b);
-    let aw = words(a, &at);
-    let bw = words(b, &bt);
-    if aw == bw {
-        return 100;
-    }
-    if aw.is_empty() || bw.is_empty() {
-        return 0;
-    }
-    let a: BTreeSet<_> = aw.windows(3).collect();
-    let b: BTreeSet<_> = bw.windows(3).collect();
-    if a.is_empty() || b.is_empty() {
-        return 0;
-    }
-    200 * a.intersection(&b).count() / (a.len() + b.len())
+    BodyTokens::new(a).similarity(&BodyTokens::new(b))
 }
 
 /// Textual range mapping includes changed gaps inside retained surrounding anchors.
@@ -602,6 +671,55 @@ mod tests {
         assert_eq!(similarity(a, b), 100);
         assert!(!same_tokens(a, b));
         assert!(same_tokens(a, &a.replace(' ', "\r\n")));
+        let tokens = BodyTokens::new(a);
+        assert!(!tokens.compare(b).exact);
+        assert!(tokens.compare(&a.replace(' ', "\r\n")).exact);
+    }
+
+    #[test]
+    fn body_evidence_matches_unique_token_trigrams() {
+        let texts = [
+            "",
+            " ",
+            "a",
+            "a b",
+            "a c",
+            "return true;",
+            "return false;",
+            "alpha beta gamma delta",
+            "alpha beta gamma changed",
+            "alpha beta alpha beta alpha",
+            "alpha beta alpha beta alpha beta alpha",
+            "var café = \"two words\"; return café + '\\n';",
+            "var café=\"two words\";\nreturn café+'\\n';",
+        ];
+        for a in texts {
+            let at = tokens(a);
+            let aw = words(a, &at);
+            let evidence = BodyTokens::new(a);
+            for b in texts {
+                let bt = tokens(b);
+                let bw = words(b, &bt);
+                let left: BTreeSet<_> = aw.windows(3).collect();
+                let right: BTreeSet<_> = bw.windows(3).collect();
+                let expected = if aw == bw {
+                    100
+                } else if left.is_empty() || right.is_empty() {
+                    0
+                } else {
+                    200 * left.intersection(&right).count() / (left.len() + right.len())
+                };
+                assert_eq!(evidence.compare(b).similarity, expected, "{a:?}, {b:?}");
+            }
+        }
+        assert!(!has_distinctive_tokens("return self + self + self;", 2));
+        assert!(!has_distinctive_tokens("alpha alpha beta beta", 3));
+        assert!(has_distinctive_tokens("alpha alpha beta gamma", 3));
+        assert!(
+            BodyTokens::new("return true;")
+                .compare("return true;")
+                .small
+        );
     }
 
     #[test]

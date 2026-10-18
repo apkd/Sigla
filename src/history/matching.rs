@@ -940,6 +940,9 @@ impl Tracker {
         let anonymous = region.kind == "closure";
         let source_range = region.range(&source);
         let source_body = region.body_range(&source);
+        let body_tokens = std::cell::LazyCell::new(|| {
+            regions::BodyTokens::new(&source.text[source_body.clone()])
+        });
         if search.incomplete.is_none() {
             search.incomplete = source.incomplete.clone();
         }
@@ -1054,8 +1057,7 @@ impl Tracker {
                         self.store.cache_scope(),
                         &("body", &region.blob, &source_body, &candidate.blob, &cr),
                     ),
-                    a,
-                    b,
+                    || body_tokens.compare(b),
                 );
                 let sim = body.similarity;
                 let same_path = path == &region.path;
@@ -1170,7 +1172,7 @@ impl Tracker {
                     && b.len() > a.len().saturating_mul(3) / 2
                 {
                     let parts = fragments(a, b, cr.start);
-                    if !parts.is_empty() && regions::distinctive(a) >= 2 {
+                    if !parts.is_empty() && regions::has_distinctive_tokens(a, 2) {
                         for range in parts {
                             let mut fragment = candidate.clone();
                             fragment.span = range.clone();
@@ -1349,7 +1351,7 @@ fn owner_group(a: &Region, source: &Source, b: &Region, other: &Source) -> bool 
         })
         .any(|d| {
             let body = &source.text[d.header.end..d.span.end];
-            regions::distinctive(body) >= 3
+            regions::has_distinctive_tokens(body, 3)
                 && other.declarations.iter().any(|e| {
                     if e.owner != b.owner
                         || e.qualified == b.name
@@ -1361,7 +1363,8 @@ fn owner_group(a: &Region, source: &Source, b: &Region, other: &Source) -> bool 
                         return false;
                     }
                     let previous = &other.text[e.header.end..e.span.end];
-                    regions::distinctive(previous) >= 3 && regions::similarity(body, previous) >= 80
+                    regions::has_distinctive_tokens(previous, 3)
+                        && regions::similarity(body, previous) >= 80
                 })
         })
 }
