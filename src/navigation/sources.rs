@@ -339,12 +339,17 @@ fn view<T>(
             lines,
         )
     };
-    let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
-    if matches.len() != 1 {
-        return Ok(Some(crate::navigation::choices(&matches, "files")));
-    }
-    let path = matches[0];
-    let Some((language, source)) = read(&files[path])? else {
+    let (path, file) = if let Some((path, file)) = files.get_key_value(&path) {
+        (path.as_str(), file)
+    } else {
+        let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
+        if matches.len() != 1 {
+            return Ok(Some(crate::navigation::choices(&matches, "files")));
+        }
+        let path = matches[0];
+        (path, &files[path])
+    };
+    let Some((language, source)) = read(file)? else {
         return Ok(None);
     };
     let (range, first, last) = crate::navigation::lines(&source, requested)?;
@@ -366,6 +371,44 @@ fn view<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_prefers_literal_filenames_before_location_suffixes() {
+        let files: BTreeMap<_, _> = [
+            "src/Code.cs",
+            "other/src/Code.cs",
+            "src/Code.cs:2",
+            r"src\Code.cs:2",
+        ]
+        .into_iter()
+        .map(|path| (path.to_owned(), path))
+        .collect();
+        for (path, expected) in [
+            ("src/Code.cs", "src/Code.cs"),
+            ("src/Code.cs:2", "src/Code.cs:2"),
+            ("src/Code.cs:2:2", "src/Code.cs:2"),
+            (r"src\Code.cs:2", r"src\Code.cs:2"),
+            (r"src\Code.cs:2:2", r"src\Code.cs:2"),
+        ] {
+            let mut selected = None;
+            view(
+                &files,
+                std::path::Path::new("/repo"),
+                path,
+                crate::navigation::Mode::Exact,
+                false,
+                |file| {
+                    selected = Some(*file);
+                    Ok(Some((
+                        crate::model::Language::CSharp,
+                        "first\nsecond\n".into(),
+                    )))
+                },
+            )
+            .unwrap();
+            assert_eq!(selected, Some(expected), "{path}");
+        }
+    }
 
     #[test]
     fn repository_view_reads_only_the_resolved_source_and_can_defer_contents() {
