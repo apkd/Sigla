@@ -466,7 +466,20 @@ mod tests {
             ("Actor.cs", "actor", "First"),
             ("Other.cs", "other", "Second"),
         ] {
-            asset(&mut index, path, guid, "");
+            index.assets.insert(
+                path.into(),
+                super::super::Asset {
+                    project: ".".into(),
+                    path: path.into(),
+                    guid: guid.into(),
+                    objects: Vec::new(),
+                    content: None,
+                    unavailable: None,
+                },
+            );
+            index
+                .guids
+                .insert((".".into(), guid.into()), vec![path.into()]);
             index.scripts.insert(
                 path.into(),
                 Arc::new(ScriptType {
