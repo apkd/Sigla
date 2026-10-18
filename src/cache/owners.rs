@@ -64,8 +64,6 @@ impl Catalog {
             });
         owner.repository = repository.map(Path::to_owned);
         let cache = self.path.parent().unwrap();
-        let views: Vec<_> = VIEW_KINDS.iter().map(|kind| cache.join(kind)).collect();
-        let legacy = cache.join("dotnet/packages");
         owner.dependencies = manifest
             .files
             .values()
@@ -74,14 +72,17 @@ impl Catalog {
             .chain(manifest.metadata.keys())
             .chain(manifest.dependencies.iter())
             .filter_map(|path| {
-                for view in &views {
-                    if let Ok(relative) = path.strip_prefix(view)
-                        && let Some(first) = relative.components().next()
-                    {
-                        return Some(view.join(first));
-                    }
+                let mut components = path.strip_prefix(cache).ok()?.components();
+                let kind = components.next()?;
+                if VIEW_KINDS.iter().any(|view| kind.as_os_str() == *view) {
+                    Some(cache.join(kind).join(components.next()?))
+                } else if kind.as_os_str() == "dotnet"
+                    && components.next()?.as_os_str() == "packages"
+                {
+                    Some(cache.join("dotnet/packages"))
+                } else {
+                    None
                 }
-                path.starts_with(&legacy).then(|| legacy.clone())
             })
             .collect();
         owner.dependencies.insert(
@@ -160,5 +161,120 @@ impl Catalog {
             }
         }
         roots.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::{FileEntry, Manifest, Stamp};
+
+    #[test]
+    fn observe_tracks_view_roots_across_manifest_paths_and_component_boundaries() {
+        let cache = tempfile::tempdir().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let stamp = Stamp::read(source.path()).unwrap();
+        let file = |path: PathBuf| FileEntry {
+            display: path.to_string_lossy().into_owned(),
+            path,
+            stamp: stamp.clone(),
+            language: crate::model::Language::Cpp,
+            memberships: Vec::new(),
+            modules: Vec::new(),
+            metadata: false,
+        };
+        let entry = cache.path().join("workspace");
+        let mut manifest = Manifest {
+            root: entry.clone(),
+            ..Manifest::default()
+        };
+        let mut catalog = Catalog::open(cache.path()).unwrap();
+        catalog.observe(&entry, None, &manifest, None);
+        let mut expected = catalog.entries[&entry].dependencies.clone();
+        for (i, kind) in VIEW_KINDS.iter().enumerate() {
+            let root = cache.path().join(kind).join("owned");
+            let path = root.join("nested/source.cpp");
+            match i % 4 {
+                0 => {
+                    manifest.files.insert(kind.to_string(), file(path));
+                }
+                1 => {
+                    manifest.deferred.insert(kind.to_string(), file(path));
+                }
+                2 => {
+                    manifest.metadata.insert(path, stamp.clone());
+                }
+                _ => {
+                    manifest.dependencies.insert(path);
+                }
+            }
+            expected.insert(root);
+            manifest.dependencies.extend([
+                cache.path().join(kind),
+                cache.path().join(format!("{kind}-other/ignored")),
+                cache
+                    .path()
+                    .with_extension("other")
+                    .join(kind)
+                    .join("ignored"),
+            ]);
+        }
+        manifest.dependencies.extend([
+            cache.path().join("dotnet/packages-other/ignored"),
+            cache.path().join("dotnet-other/packages/ignored"),
+        ]);
+        let legacy = cache.path().join("dotnet/packages");
+        expected.insert(legacy.clone());
+        for path in [legacy.clone(), legacy.join("package/source.cpp")] {
+            manifest.dependencies.insert(path.clone());
+            catalog.observe(&entry, None, &manifest, None);
+            assert_eq!(catalog.entries[&entry].dependencies, expected);
+            assert!(expected.iter().all(|root| catalog.retains(root)));
+            manifest.dependencies.remove(&path);
+        }
+    }
+
+    #[test]
+    fn observe_replaces_dependencies_without_changing_usage_and_persists_removal() {
+        let cache = tempfile::tempdir().unwrap();
+        let entry = cache.path().join("workspace");
+        let repository = cache.path().join("repository");
+        let mut manifest = Manifest {
+            root: entry.clone(),
+            ..Manifest::default()
+        };
+        let mut catalog = Catalog::open(cache.path()).unwrap();
+        let used = 100;
+        catalog.observe(&entry, None, &manifest, Some(used));
+        let mut expected = catalog.entries[&entry].dependencies.clone();
+        let old = cache.path().join(VIEW_KINDS[0]).join("old");
+        manifest.dependencies.insert(old.join("source.cpp"));
+        catalog.observe(&entry, None, &manifest, None);
+        assert!(catalog.retains(&old));
+        let new = cache.path().join(VIEW_KINDS[0]).join("new");
+        manifest.dependencies = BTreeSet::from([new.join("source.cpp")]);
+        catalog.observe(&entry, Some(&repository), &manifest, None);
+        expected.insert(new.clone());
+        assert_eq!(catalog.entries[&entry].dependencies, expected);
+        assert!(!catalog.retains(&old));
+        assert!(catalog.retains(&new));
+        assert_eq!(catalog.entries[&entry].usage.last_use, used);
+        assert_eq!(
+            catalog.entries[&entry].repository.as_ref(),
+            Some(&repository)
+        );
+        assert!(catalog.dirty);
+        catalog.flush().unwrap();
+        assert!(!catalog.dirty);
+        let mut reopened = Catalog::open(cache.path()).unwrap();
+        assert_eq!(
+            reopened.entries[&entry].dependencies,
+            catalog.entries[&entry].dependencies
+        );
+        reopened.remove(&entry);
+        assert!(reopened.dirty);
+        assert!(!reopened.retains(&new));
+        reopened.flush().unwrap();
+        assert!(Catalog::open(cache.path()).unwrap().entries.is_empty());
     }
 }
