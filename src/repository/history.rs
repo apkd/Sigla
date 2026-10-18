@@ -80,6 +80,32 @@ struct Object {
     kind: String,
     bytes: Vec<u8>,
 }
+struct Directory {
+    entries: Tree,
+    bytes: usize,
+}
+struct CachedObject {
+    object: Arc<Object>,
+    directory: Option<Arc<Directory>>,
+}
+impl CachedObject {
+    fn bytes(&self) -> usize {
+        self.object.bytes.len() + self.directory.as_ref().map_or(0, |d| d.bytes)
+    }
+}
+struct AttributeReader {
+    control: tempfile::TempDir,
+    objects: PathBuf,
+}
+impl AttributeReader {
+    fn new(path: &Path, format: &str) -> Result<Self> {
+        let control = tempfile::tempdir()?;
+        init(control.path(), format)?;
+        let objects = run(git(path).args(["rev-parse", "--git-path", "objects"]))?;
+        let objects = PathBuf::from(std::str::from_utf8(&objects)?.trim()).canonicalize()?;
+        Ok(Self { control, objects })
+    }
+}
 struct Pipe {
     output: ChildStdout,
     cancel: Arc<AtomicBool>,
@@ -254,7 +280,8 @@ pub(crate) struct Store {
     lease: Option<ObjectLease>,
     remote: Option<Remote>,
     batch: Option<Batch>,
-    objects: lru::LruCache<String, Arc<Object>>,
+    objects: lru::LruCache<String, CachedObject>,
+    attributes: Option<AttributeReader>,
     bytes: usize,
     resolved: BTreeMap<String, String>,
     planner: planner::Planner,
@@ -345,6 +372,7 @@ impl Store {
             cancel,
             batch: None,
             objects: lru::LruCache::new(NonZeroUsize::new(4096).unwrap()),
+            attributes: None,
             bytes: 0,
             resolved: BTreeMap::new(),
             planner: planner::Planner::default(),
@@ -573,7 +601,7 @@ impl Store {
             }
             id(oid)?;
             if let Some(object) = self.objects.get(oid.as_str()) {
-                ensure!(object.kind == kind, "Unexpected history object kind");
+                ensure!(object.object.kind == kind, "Unexpected history object kind");
             } else {
                 inspect.push(oid);
             }
@@ -666,8 +694,8 @@ impl Store {
     fn object_from(&mut self, oid: &str, kind: &str, commit: Option<&str>) -> Result<Arc<Object>> {
         check(&self.cancel)?;
         if let Some(object) = self.objects.get(oid) {
-            ensure!(object.kind == kind, "Unexpected Git object kind");
-            return Ok(object.clone());
+            ensure!(object.object.kind == kind, "Unexpected Git object kind");
+            return Ok(object.object.clone());
         }
         if self.batch.is_none() {
             self.batch = Some(Batch::new(&self.path, self.cancel.clone())?);
@@ -688,18 +716,33 @@ impl Store {
         if let Some(lease) = &self.lease {
             lease.retain(oid);
         }
-        while self.bytes + object.bytes.len() > MEMORY
-            || self.objects.len() == self.objects.cap().get()
-        {
+        self.cache_object(
+            oid,
+            CachedObject {
+                object: object.clone(),
+                directory: None,
+            },
+        );
+        self.reads += 1;
+        Ok(object)
+    }
+    fn cache_object(&mut self, oid: &str, object: CachedObject) {
+        // Replacing a raw object with its decoded directory uses the same budget.
+        if let Some(previous) = self.objects.pop(oid) {
+            self.bytes -= previous.bytes();
+        }
+        let bytes = object.bytes();
+        if bytes > MEMORY {
+            return;
+        }
+        while self.bytes + bytes > MEMORY || self.objects.len() == self.objects.cap().get() {
             let Some((_, removed)) = self.objects.pop_lru() else {
                 break;
             };
-            self.bytes -= removed.bytes.len();
+            self.bytes -= removed.bytes();
         }
-        self.bytes += object.bytes.len();
-        self.objects.put(oid.into(), object.clone());
-        self.reads += 1;
-        Ok(object)
+        self.bytes += bytes;
+        self.objects.put(oid.into(), object);
     }
     pub fn blob(&mut self, oid: &str) -> Result<Vec<u8>> {
         Ok(self.object(oid, "blob")?.bytes.clone())
@@ -751,7 +794,7 @@ impl Store {
         let mut pending = vec![(String::new(), root.to_owned())];
         while let Some((prefix, oid)) = pending.pop() {
             check(&self.cancel)?;
-            for (name, entry) in self.directory(&oid)? {
+            for (name, entry) in &self.directory(&oid)?.entries {
                 let path = format!("{prefix}{name}");
                 bytes_used = bytes_used.saturating_add(path.len() + 160);
                 ensure!(
@@ -761,15 +804,18 @@ impl Store {
                 if entry.mode == 0o40000 {
                     pending.push((format!("{path}/"), entry.id.clone()));
                 }
-                result.insert(path, entry);
+                result.insert(path, entry.clone());
             }
         }
         // Every descendant tree is now verified and retained by this lease.
         self.tree_have = Some(id(root)?);
         Ok(result)
     }
-    fn directory(&mut self, oid: &str) -> Result<Tree> {
+    fn directory(&mut self, oid: &str) -> Result<Arc<Directory>> {
         let object = self.object(oid, "tree")?;
+        if let Some(directory) = self.objects.get(oid).and_then(|o| o.directory.clone()) {
+            return Ok(directory);
+        }
         let mut bytes = object.bytes.as_slice();
         let mut result = Tree::new();
         let mut used = 0usize;
@@ -797,7 +843,18 @@ impl Store {
             result.insert(name.into(), Entry { id: hash, mode });
             bytes = &bytes[end..];
         }
-        Ok(result)
+        let directory = Arc::new(Directory {
+            entries: result,
+            bytes: used,
+        });
+        self.cache_object(
+            oid,
+            CachedObject {
+                object,
+                directory: Some(directory.clone()),
+            },
+        );
+        Ok(directory)
     }
     /// Read only the path's directories and the attribute identities that govern it.
     pub fn source_path(&mut self, commit: &Commit, path: &str) -> Result<SourcePath> {
@@ -811,21 +868,21 @@ impl Store {
         let mut prefix = String::new();
         let mut parts = path.split('/').peekable();
         while let Some(part) = parts.next() {
-            let mut entries = self.directory(&tree)?;
-            if let Some(attributes) = entries.get(".gitattributes")
+            let directory = self.directory(&tree)?;
+            if let Some(attributes) = directory.entries.get(".gitattributes")
                 && matches!(attributes.mode, 0o100644 | 0o100755)
             {
                 result
                     .attributes
                     .insert(format!("{prefix}.gitattributes"), attributes.clone());
             }
-            let Some(entry) = entries.remove(part) else {
+            let Some(entry) = directory.entries.get(part) else {
                 break;
             };
             if parts.peek().is_none() {
-                result.entry = Some(entry);
+                result.entry = Some(entry.clone());
             } else if entry.mode == 0o40000 {
-                tree = entry.id;
+                tree = entry.id.clone();
                 prefix.push_str(part);
                 prefix.push('/');
             } else {
@@ -875,13 +932,13 @@ impl Store {
                     .unwrap_or(0),
             );
         }
-        let control = tempfile::tempdir()?;
-        init(
-            control.path(),
-            if tree.len() == 64 { "sha256" } else { "sha1" },
-        )?;
-        let objects = run(git(&self.path).args(["rev-parse", "--git-path", "objects"]))?;
-        let objects = PathBuf::from(std::str::from_utf8(&objects)?.trim()).canonicalize()?;
+        if self.attributes.is_none() {
+            self.attributes = Some(AttributeReader::new(
+                &self.path,
+                if tree.len() == 64 { "sha256" } else { "sha1" },
+            )?);
+        }
+        let reader = self.attributes.as_ref().unwrap();
         let mut allowed: BTreeSet<_> = paths.iter().cloned().collect();
         let mut pending = paths;
         while !pending.is_empty() {
@@ -905,8 +962,8 @@ impl Store {
                 input.push(0);
             }
             let output = crate::process::capture_cancellable(
-                git(control.path())
-                    .env("GIT_OBJECT_DIRECTORY", &objects)
+                git(reader.control.path())
+                    .env("GIT_OBJECT_DIRECTORY", &reader.objects)
                     .env("GIT_ATTR_NOSYSTEM", "1")
                     .args([
                         "-c",
@@ -1511,6 +1568,60 @@ mod tests {
             let inventory = fixture.inventory();
             assert!(!inventory.contains(&fixture.excluded) && !inventory.contains(&fixture.lfs));
         }
+    }
+
+    #[test]
+    fn source_attributes_follow_each_tree_and_ignore_local_overrides() {
+        for format in ["sha1", "sha256"] {
+            let fixture = Fixture::new(format);
+            let path = fixture.directory.path();
+            let allowed = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join(".gitattributes"), "selected.rs binary\n").unwrap();
+            command(path, &["add", ".gitattributes"]);
+            command(path, &["commit", "-qm", "exclude source"]);
+            let excluded = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join(".git/info/attributes"), "selected.rs binary\n").unwrap();
+            let paths = ["selected.rs".to_owned()];
+            let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
+            for (tree, include) in [(&allowed, true), (&excluded, false), (&allowed, true)] {
+                let entries = store.tree(tree).unwrap();
+                let result = store.source_paths(tree, &entries, &paths).unwrap();
+                assert_eq!(result.contains(&paths[0]), include);
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_directories_are_reused_within_the_object_budget() {
+        let fixture = Fixture::new("sha1");
+        let mut store =
+            Store::local(fixture.directory.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        let tree = store.commit(&fixture.tip).unwrap().tree;
+        let first = store.directory(&tree).unwrap();
+        let reads = store.reads;
+        let repeated = store.directory(&tree).unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert_eq!(store.reads, reads);
+        assert!(store.bytes <= MEMORY);
+        assert_eq!(
+            store.bytes,
+            store
+                .objects
+                .iter()
+                .map(|(_, cached)| {
+                    cached.object.bytes.len() + cached.directory.as_ref().map_or(0, |d| d.bytes)
+                })
+                .sum::<usize>()
+        );
+        // Exercise eviction with real objects and a small entry capacity.
+        let mut small =
+            Store::local(fixture.directory.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        small.objects = lru::LruCache::new(NonZeroUsize::new(1).unwrap());
+        small.directory(&tree).unwrap();
+        small.commit(&fixture.tip).unwrap();
+        let decoded = small.directory(&tree).unwrap();
+        assert_eq!(first.entries, decoded.entries);
+        assert_eq!(small.bytes, small.objects.peek(&tree).unwrap().bytes());
     }
 
     #[test]

@@ -48,8 +48,11 @@ impl Planner {
         streaming: Option<(u64, Duration)>,
     ) {
         let cost = &mut self.costs[kind as usize];
-        cost.units = units.max(1);
-        update(&mut cost.wire, bytes as f64 / cost.units as f64);
+        let units = units.max(1);
+        // A narrow request does not erase the capacity measured by a wider one.
+        // Byte and transport estimates still shrink batches when costs increase.
+        cost.units = cost.units.max(units);
+        update(&mut cost.wire, bytes as f64 / units as f64);
         let mut overhead = elapsed.as_secs_f64();
         if let Some((bytes, duration)) = streaming
             && bytes > 0
@@ -160,6 +163,18 @@ mod tests {
         );
         assert!(planner.seconds_per_byte.is_none());
         assert!(planner.count(Kind::Blobs, usize::MAX, None) <= MAX_UNITS);
+    }
+
+    #[test]
+    fn narrow_requests_preserve_measured_capacity() {
+        let mut planner = measured(1.0, 1_000_000.0, 1024);
+        let broad = planner.count(Kind::Blobs, MAX_UNITS, None);
+        planner.observe(Kind::Blobs, 1, 1024, Duration::from_secs(1), None);
+        assert_eq!(planner.count(Kind::Blobs, MAX_UNITS, None), broad);
+        assert_eq!(planner.count(Kind::Blobs, 1, None), 1);
+        // A small request can still reveal expensive objects.
+        planner.observe(Kind::Blobs, 1, BATCH_BYTES, Duration::from_secs(1), None);
+        assert!(planner.count(Kind::Blobs, MAX_UNITS, None) < broad);
     }
 
     #[test]
