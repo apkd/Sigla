@@ -13,6 +13,14 @@ pub(super) enum Filter {
     Commits,
     Trees,
 }
+impl Filter {
+    pub fn shallow_file(self, control: &Path) -> std::path::PathBuf {
+        control.join(match self {
+            Self::Commits => "shallow-commits",
+            Self::Trees => "shallow",
+        })
+    }
+}
 
 pub(super) struct Fetch<'a> {
     pub filter: Filter,
@@ -345,10 +353,7 @@ impl Session {
             fetch::Options {
                 // Commit-only boundaries prove no tree coverage. Sharing them
                 // with tree fetches lets upload-pack choose absent tree delta bases.
-                shallow_file: control.join(match options.filter {
-                    Filter::Commits => "shallow-commits",
-                    Filter::Trees => "shallow",
-                }),
+                shallow_file: options.filter.shallow_file(control),
                 shallow: &shallow,
                 tags: fetch::Tags::None,
                 reject_shallow_remote: false,

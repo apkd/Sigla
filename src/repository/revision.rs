@@ -230,7 +230,7 @@ impl Prefix<'_> {
                 if !session.can_fetch_again() {
                     *session = connect()?;
                 }
-                let shallow = control.path().join("shallow");
+                let shallow = filter.shallow_file(control.path());
                 ensure!(
                     !shallow.try_exists()? || std::fs::read(shallow)?.is_empty(),
                     "Cannot resolve a commit prefix against incomplete upstream history"

@@ -1761,8 +1761,14 @@ async fn a_named_anchor_ignores_unrelated_incomplete_sources() {
                 "class @Worker { int @Target() { return 1; } }\n",
             ),
             ("Other.cs", "#if FEATURE\nclass Other { int Broken(\n"),
-            ("Other.cpp", "class Other { int Broken(\n"),
-            ("Other.h", "struct Header { void Broken(\n"),
+            (
+                "Other.cpp",
+                "const char* marker = \"\\\\u\"; class Other { int Broken(\n",
+            ),
+            (
+                "Other.h",
+                "// Unicode marker: \\uXXXX\nstruct Header { void Broken(\n",
+            ),
             ("other.rs", "pub fn broken(\n"),
         ],
         &[],
@@ -1784,7 +1790,7 @@ async fn escaped_names_in_incomplete_csharp_sources_remain_candidates() {
             ("Worker.cs", "class Worker { int Target() { return 1; } }\n"),
             (
                 "Other.cs",
-                "#if FEATURE\nclass Worker { int \\u0054arget(\n",
+                "#if FEATURE\nclass \\u0057orker { int \\u0054arget(\n",
             ),
         ],
         &[],

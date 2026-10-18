@@ -325,8 +325,12 @@ fn may_declare(query: &crate::query::Query, text: &str) -> bool {
     if query.loose
         || query.target.location.is_some()
         || query.selector == "operator"
-        || text.contains("\\u")
-        || text.contains("\\U")
+        // A literal \\u marker in a string or comment cannot encode a name.
+        // Retain valid and unfinished identifier escapes, including braced forms.
+        || text.as_bytes().windows(3).any(|s| {
+            s[0] == b'\\' && matches!(s[1], b'u' | b'U')
+                && (s[2].is_ascii_hexdigit() || s[2] == b'{')
+        })
     {
         return true;
     }
