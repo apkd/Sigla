@@ -805,6 +805,7 @@ impl Store {
         let mut pending = vec![(String::new(), Arc::<str>::from(root))];
         while let Some((prefix, oid)) = pending.pop() {
             check(&self.cancel)?;
+            let siblings = pending.len();
             for (name, entry) in &self.directory(&oid)?.entries {
                 let path = [prefix.as_str(), name.as_str()].concat();
                 bytes_used = bytes_used.saturating_add(path.len() + 160);
@@ -817,6 +818,9 @@ impl Store {
                 }
                 result.push((path, entry.clone()));
             }
+            // Visit sibling directories in path order, giving bulk tree
+            // construction longer sorted runs to merge.
+            pending[siblings..].reverse();
         }
         // Every descendant tree is now verified and retained by this lease.
         self.tree_have = Some(id(root)?);
@@ -913,11 +917,11 @@ impl Store {
         self.object_from(&commit.tree, "tree", Some(&commit.id))?;
         Ok(())
     }
-    pub fn source_paths(
+    pub fn source_exclusions(
         &mut self,
         tree: &str,
         entries: &Tree,
-        paths: &[String],
+        paths: &[&str],
     ) -> Result<BTreeSet<String>> {
         if paths.is_empty() {
             return Ok(BTreeSet::new());
@@ -937,7 +941,7 @@ impl Store {
             })
             .collect();
         if attributes.is_empty() {
-            return Ok(paths.iter().cloned().collect());
+            return Ok(BTreeSet::new());
         }
         self.prefetch(&attributes, "blob")?;
         // Reading also pins these attribute objects for the declared source policy.
@@ -962,7 +966,7 @@ impl Store {
             )?);
             self.reserve_objects(0, 0);
         }
-        self.attributes.as_mut().unwrap().select(
+        self.attributes.as_mut().unwrap().exclusions(
             tree,
             *policy.finalize().as_bytes(),
             paths,
@@ -1544,6 +1548,10 @@ mod tests {
             command(path, &["add", ".gitattributes"]);
             command(path, &["commit", "-qm", "exclude source"]);
             let excluded = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::remove_file(path.join(".gitattributes")).unwrap();
+            command(path, &["add", ".gitattributes"]);
+            command(path, &["commit", "-qm", "remove source attributes"]);
+            let no_attributes = command(path, &["rev-parse", "HEAD^{tree}"]);
             fs::create_dir_all(path.join(".git/info")).unwrap();
             fs::write(path.join(".git/info/attributes"), "selected.rs binary\n").unwrap();
             let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
@@ -1551,21 +1559,19 @@ mod tests {
                 (&allowed, true),
                 (&same_policy, true),
                 (&excluded, false),
+                (&no_attributes, true),
+                (&excluded, false),
                 (&allowed, true),
             ] {
                 let entries = store.tree(tree).unwrap();
                 let paths: Vec<_> = ["selected.rs", "added.rs"]
                     .into_iter()
                     .filter(|p| entries.contains_key(*p))
-                    .map(str::to_owned)
                     .collect();
                 for _ in 0..2 {
-                    let result = store.source_paths(tree, &entries, &paths).unwrap();
-                    assert_eq!(result.contains("selected.rs"), include);
-                    assert_eq!(
-                        result.contains("added.rs"),
-                        entries.contains_key("added.rs")
-                    );
+                    let result = store.source_exclusions(tree, &entries, &paths).unwrap();
+                    assert_eq!(result.contains("selected.rs"), !include);
+                    assert!(!result.contains("added.rs"));
                 }
             }
         }
@@ -1622,7 +1628,7 @@ mod tests {
                 if blocked { "blocked" } else { "source" }
             );
             fs::write(path.join(&name), "class Example {}\n").unwrap();
-            if !blocked {
+            if blocked {
                 expected.insert(name.clone());
             }
             paths.push(name);
@@ -1632,8 +1638,9 @@ mod tests {
         let tree = command(path, &["rev-parse", "HEAD^{tree}"]);
         let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
         let entries = store.tree(&tree).unwrap();
+        let paths: Vec<_> = paths.iter().map(String::as_str).collect();
         assert_eq!(
-            store.source_paths(&tree, &entries, &paths).unwrap(),
+            store.source_exclusions(&tree, &entries, &paths).unwrap(),
             expected
         );
     }

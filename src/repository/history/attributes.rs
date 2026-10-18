@@ -53,11 +53,11 @@ impl Reader {
         self.paths.put(path, allowed);
     }
 
-    pub fn select(
+    pub fn exclusions(
         &mut self,
         tree: &str,
         policy: [u8; 32],
-        paths: &[String],
+        paths: &[&str],
         value_bytes: usize,
         cancel: &AtomicBool,
     ) -> Result<BTreeSet<String>> {
@@ -67,14 +67,14 @@ impl Reader {
             self.bytes = 0;
             self.policy = Some(policy);
         }
-        let mut allowed = BTreeSet::new();
+        let mut excluded = BTreeSet::new();
         let mut missing = Vec::new();
-        for path in paths {
+        for &path in paths {
             match self.paths.get(path) {
-                Some(true) => {
-                    allowed.insert(path.clone());
+                Some(false) => {
+                    excluded.insert(path.to_owned());
                 }
-                Some(false) => {}
+                Some(true) => {}
                 None => missing.push(path),
             }
         }
@@ -148,12 +148,12 @@ impl Reader {
                     }
                 }
                 self.remember(path, include);
-                if include {
-                    allowed.insert((*path).clone());
+                if !include {
+                    excluded.insert((*path).to_owned());
                 }
             }
         }
-        Ok(allowed)
+        Ok(excluded)
     }
 }
 

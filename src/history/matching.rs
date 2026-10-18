@@ -247,10 +247,9 @@ impl Tracker {
             .filter(|(p, e)| {
                 matches!(e.mode, 0o100644 | 0o100755) && regions::language(p).is_some()
             })
-            .map(|(p, _)| p.clone())
+            .map(|(p, _)| p.as_str())
             .collect();
-        let allowed = self.store.source_paths(&commit.tree, &tree, &paths)?;
-        let excluded: BTreeSet<_> = paths.into_iter().filter(|p| !allowed.contains(p)).collect();
+        let excluded = self.store.source_exclusions(&commit.tree, &tree, &paths)?;
         if !excluded.is_empty() {
             tree.retain(|p, _| !excluded.contains(p));
         }
