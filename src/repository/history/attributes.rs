@@ -9,6 +9,7 @@ use std::{
 };
 
 pub(super) const MEMORY: usize = super::MEMORY / 8;
+const OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const ENTRY_BYTES: usize = 80;
 
 pub(super) struct Reader {
@@ -84,7 +85,7 @@ impl Reader {
             let mut count = 0;
             for path in pending {
                 let cost = 3 * (path.len() + value_bytes + 9);
-                if count != 0 && cost > MEMORY.saturating_sub(bytes) {
+                if count != 0 && cost > OUTPUT_BYTES.saturating_sub(bytes) {
                     break;
                 }
                 bytes = bytes.saturating_add(cost);
