@@ -432,16 +432,15 @@ fn may_declare(query: &crate::query::Query, text: &str) -> bool {
 
 pub(super) fn language(path: &str) -> Option<Language> {
     let file = Path::new(path);
-    if let Some(language) =
-        crate::native::language(file).or_else(|| crate::documents::language(file))
-    {
+    let name = file.file_name()?.to_str()?;
+    let extension = file.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if let Some(language) = crate::native::language_extension(extension) {
         return Some(language);
     }
-    let extension = file
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let extension = extension.to_ascii_lowercase();
+    if let Some(language) = crate::documents::language_name(name, &extension) {
+        return Some(language);
+    }
     Some(match extension.as_str() {
         "rs" => Language::Rust,
         "cs" => Language::CSharp,
@@ -452,11 +451,8 @@ pub(super) fn language(path: &str) -> Option<Language> {
         "txt" | "toml" | "yaml" | "yml" | "json" | "xml" | "html" | "css" | "js" | "ts" | "tsx"
         | "jsx" | "py" | "java" | "go" | "sh" | "sql" | "ini" | "cfg" | "rst" | "csproj"
         | "props" | "targets" | "sln" | "lock" => Language::Text,
-        "" if file.file_name().is_some_and(|s| {
-            let s = s.to_string_lossy();
-            s.starts_with('.')
-                || ["LICENSE", "COPYING", "Makefile", "Dockerfile"].contains(&s.as_ref())
-        }) =>
+        "" if name.starts_with('.')
+            || ["LICENSE", "COPYING", "Makefile", "Dockerfile"].contains(&name) =>
         {
             Language::Text
         }

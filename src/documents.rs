@@ -10,11 +10,15 @@ pub fn language(path: &Path) -> Option<Language> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if extension == "md" {
+    language_name(name, &extension)
+}
+
+pub(crate) fn language_name(name: &str, lowercase_extension: &str) -> Option<Language> {
+    if lowercase_extension == "md" {
         return Some(Language::Markdown);
     }
     if matches!(
-        extension.as_str(),
+        lowercase_extension,
         "txt"
             | "toml"
             | "json"
