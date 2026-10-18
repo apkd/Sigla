@@ -39,7 +39,9 @@ fn resolve(
     pointer: &Pointer,
 ) -> Target {
     let source = &index.assets[asset];
-    let destination = if pointer.guid.is_empty() {
+    let destination = if pointer.null() {
+        None
+    } else if pointer.guid.is_empty() {
         Some(asset)
     } else {
         index.resolve(&source.project, &pointer.guid)
@@ -123,7 +125,7 @@ fn compose(
             object: object.clone(),
             name: object.name.clone(),
             ty: if object.class == 114 {
-                index.script(asset, object).cloned().map(Arc::new)
+                index.script(asset, object).cloned()
             } else {
                 native.and_then(|resolved| resolved.ty.clone())
             },
@@ -268,8 +270,7 @@ fn compose(
                     object.ty = index
                         .resolve(&asset.project, &modification.reference.guid)
                         .and_then(|k| index.scripts.get(k))
-                        .cloned()
-                        .map(Arc::new);
+                        .cloned();
                 }
             }
         }
@@ -460,6 +461,156 @@ mod tests {
     }
     const PREFAB: &str = "--- !u!1 &1\nGameObject:\n  m_Name: Enemy\n--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n  m_Father: {fileID: 0}\n--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n  nested:\n    target: {fileID: 1, guid: sword, type: 2}\n";
     #[test]
+    fn snapshots_restore_shared_types_without_merging_different_definitions() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut index = Index::default();
+        for (path, guid, assembly) in [
+            ("Actor.cs", "actor", "First"),
+            ("Other.cs", "other", "Second"),
+        ] {
+            index.assets.insert(
+                path.into(),
+                super::super::Asset {
+                    project: ".".into(),
+                    path: path.into(),
+                    guid: guid.into(),
+                    objects: Vec::new(),
+                    content: None,
+                    unavailable: None,
+                },
+            );
+            index
+                .guids
+                .insert((".".into(), guid.into()), vec![path.into()]);
+            index.scripts.insert(
+                path.into(),
+                Arc::new(ScriptType {
+                    name: "Example.Actor".into(),
+                    assembly: assembly.into(),
+                    ancestry: vec!["Example.Actor".into(), "UnityEngine.Component".into()],
+                }),
+            );
+        }
+        let camera = Arc::new(ScriptType {
+            name: "UnityEngine.Camera".into(),
+            assembly: "UnityEngine".into(),
+            ancestry: vec!["UnityEngine.Camera".into(), "UnityEngine.Component".into()],
+        });
+        index.native_types.insert(
+            ".".into(),
+            BTreeMap::from([
+                (
+                    4,
+                    super::super::native::Resolved {
+                        ty: None,
+                        issue: Some("Native coverage unavailable".into()),
+                    },
+                ),
+                (
+                    20,
+                    super::super::native::Resolved {
+                        ty: Some(camera),
+                        issue: Some("Native coverage unavailable".into()),
+                    },
+                ),
+            ]),
+        );
+        let mut source = PREFAB.to_owned();
+        for (id, script) in [(4, "actor"), (5, "actor"), (6, "other")] {
+            source.push_str(&format!(
+                "--- !u!114 &{id}\nMonoBehaviour:\n  m_GameObject: {{fileID: 1}}\n  m_Script: {{fileID: 11500000, guid: {script}, type: 3}}\n"
+            ));
+        }
+        asset(&mut index, "Base.prefab", "base", &source);
+        let changes = "\n    - target: {fileID: 4, guid: base, type: 3}\n      propertyPath: m_Script\n      value: \n      objectReference: {fileID: 11500000, guid: other, type: 3}";
+        asset(
+            &mut index,
+            "Variant.prefab",
+            "variant",
+            &placement(10, "base", changes, "[]"),
+        );
+        build(&mut index).unwrap();
+        let base = &index.instances["Base.prefab"];
+        for id in ["4", "5"] {
+            let ty = base
+                .objects
+                .iter()
+                .find(|object| object.id == id)
+                .unwrap()
+                .ty
+                .as_ref()
+                .unwrap();
+            assert!(Arc::ptr_eq(ty, &index.scripts["Actor.cs"]));
+        }
+        let overridden = index.instances["Variant.prefab"]
+            .objects
+            .iter()
+            .find(|object| object.object.id == 4)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            overridden.ty.as_ref().unwrap(),
+            &index.scripts["Other.cs"]
+        ));
+
+        super::super::snapshot::save(cache.path(), [3; 32], &index).unwrap();
+        let mut saved = super::super::snapshot::load(cache.path(), [3; 32]).unwrap();
+        for (key, composed) in &index.instances {
+            for (expected, actual) in composed.objects.iter().zip(&saved.instances[key].objects) {
+                assert_eq!(actual.ty, expected.ty);
+                assert_eq!(actual.native_issue, expected.native_issue);
+                if let Some(ty) = &actual.ty {
+                    let catalog = if actual.object.class == 114 {
+                        saved
+                            .scripts
+                            .values()
+                            .find(|candidate| *candidate == ty)
+                            .unwrap()
+                    } else {
+                        saved.native_types["."][&actual.object.class]
+                            .ty
+                            .as_ref()
+                            .unwrap()
+                    };
+                    assert!(Arc::ptr_eq(ty, catalog));
+                }
+                if let Some(issue) = &actual.native_issue {
+                    assert!(Arc::ptr_eq(
+                        issue,
+                        saved.native_types["."][&4].issue.as_ref().unwrap()
+                    ));
+                }
+            }
+        }
+        assert!(!Arc::ptr_eq(
+            &saved.scripts["Actor.cs"],
+            &saved.scripts["Other.cs"]
+        ));
+        for query in [
+            "instance:Example.Actor limit:100",
+            "dependencies:Variant.prefab limit:100",
+        ] {
+            let query = crate::query::Query::parse(query).unwrap();
+            assert_eq!(saved.search(&query).unwrap(), index.search(&query).unwrap());
+        }
+
+        let shared_bytes = saved.retained_bytes;
+        for composed in saved.instances.values_mut() {
+            for object in &mut Arc::make_mut(composed).objects {
+                object.ty = object.ty.as_ref().map(|ty| Arc::new((**ty).clone()));
+                object.native_issue = object
+                    .native_issue
+                    .as_ref()
+                    .map(|issue| Arc::from(issue.as_ref()));
+            }
+        }
+        saved.measure();
+        assert!(
+            saved.retained_bytes > shared_bytes,
+            "Separate allocations must consume more budget"
+        );
+    }
+
+    #[test]
     fn completed_snapshots_restore_shared_definitions_and_invalidate_dependent_prefabs() {
         let cache = tempfile::tempdir().unwrap();
         let mut index = Index::default();
@@ -610,7 +761,93 @@ mod tests {
             .collect();
         assert_eq!(cameras.len(), 1);
         assert!(cameras[0].references["nested.target"].raw.null());
+        assert!(cameras[0].references["nested.target"].asset.is_empty());
         assert!(scene.incomplete.is_empty());
+    }
+    #[test]
+    fn snapshots_discard_legacy_null_paths_and_preserve_reference_overrides() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut index = Index::default();
+        let source = format!("{PREFAB}  empty: {{fileID: 0, guid: sword, type: 2}}\n");
+        asset(&mut index, "Enemy.prefab", "enemy", &source);
+        asset(&mut index, "Sword.asset", "sword", "name: Sword\n");
+        let changes = "\n    - target: {fileID: 3, guid: enemy, type: 3}\n      propertyPath: nested.target\n      value: \n      objectReference: {fileID: 0}\n    - target: {fileID: 3, guid: enemy, type: 3}\n      propertyPath: empty\n      value: \n      objectReference: {fileID: 1, guid: sword, type: 2}";
+        asset(
+            &mut index,
+            "Variant.prefab",
+            "variant",
+            &placement(10, "enemy", changes, "[]"),
+        );
+        build(&mut index).unwrap();
+        let expected: BTreeMap<_, _> = index
+            .instances
+            .iter()
+            .map(|(key, composed)| {
+                (
+                    key.clone(),
+                    composed
+                        .objects
+                        .iter()
+                        .map(|object| object.references.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let base = index.instances["Enemy.prefab"]
+            .objects
+            .iter()
+            .find(|object| object.object.class == 20)
+            .unwrap();
+        assert!(base.references["empty"].raw.null());
+        assert!(!base.references["empty"].raw.guid.is_empty());
+        let variant = index.instances["Variant.prefab"]
+            .objects
+            .iter()
+            .find(|object| object.object.class == 20)
+            .unwrap();
+        assert!(variant.references["nested.target"].raw.null());
+        assert!(!variant.references["empty"].raw.null());
+        assert_eq!(
+            variant.references["empty"].asset,
+            base.references["nested.target"].asset
+        );
+        for references in expected.values().flatten() {
+            for target in references.values().filter(|target| target.raw.null()) {
+                assert!(target.asset.is_empty());
+                assert!(target.object.is_none());
+            }
+        }
+        let query = crate::query::Query::parse("dependencies:Variant.prefab limit:100").unwrap();
+        let expected_result = index.search(&query).unwrap();
+        // Older snapshots saved an asset path even for null pointers. Preserve
+        // that wire shape here to exercise normalization at the load boundary.
+        for (key, composed) in &mut index.instances {
+            for object in &mut Arc::make_mut(composed).objects {
+                for target in object
+                    .references
+                    .values_mut()
+                    .filter(|target| target.raw.null())
+                {
+                    target.asset = key.clone();
+                }
+            }
+        }
+        index.measure();
+        let legacy_bytes = index.retained_bytes;
+        super::super::snapshot::save(cache.path(), [4; 32], &index).unwrap();
+        let restored = super::super::snapshot::load(cache.path(), [4; 32]).unwrap();
+        for (key, references) in expected {
+            assert_eq!(
+                restored.instances[&key]
+                    .objects
+                    .iter()
+                    .map(|object| &object.references)
+                    .collect::<Vec<_>>(),
+                references.iter().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(restored.search(&query).unwrap(), expected_result);
+        assert!(restored.retained_bytes < legacy_bytes);
     }
     #[test]
     fn removing_gameobject_removes_children_and_components() {

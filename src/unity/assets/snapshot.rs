@@ -5,7 +5,7 @@ use crate::workspace::Stamp;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,13 +34,22 @@ struct Cached {
     version: String,
     generation: [u8; 32],
     assets: BTreeMap<String, Asset>,
-    scripts: BTreeMap<String, ScriptType>,
+    scripts: BTreeMap<String, Arc<ScriptType>>,
     instances: BTreeMap<String, Composed>,
     native_types: BTreeMap<String, BTreeMap<i32, native::Resolved>>,
     observed: BTreeMap<PathBuf, Stamp>,
 }
 fn path(cache: &Path) -> PathBuf {
     cache.join("completed.zst")
+}
+
+fn intern<T: ?Sized + Eq + std::hash::Hash>(values: &mut HashSet<Arc<T>>, value: Arc<T>) -> Arc<T> {
+    if let Some(shared) = values.get(&value) {
+        shared.clone()
+    } else {
+        values.insert(value.clone());
+        value
+    }
 }
 
 pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
@@ -66,6 +75,21 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
             observed: cached.observed,
             ..Default::default()
         };
+        // Serialization preserves values, not Arc identities. Restore sharing
+        // before publishing the graph, including script and native catalogs.
+        let mut types = HashSet::new();
+        let mut issues = HashSet::new();
+        for ty in index.scripts.values_mut() {
+            *ty = intern(&mut types, ty.clone());
+        }
+        for native in index
+            .native_types
+            .values_mut()
+            .flat_map(|types| types.values_mut())
+        {
+            native.ty = native.ty.take().map(|ty| intern(&mut types, ty));
+            native.issue = native.issue.take().map(|issue| intern(&mut issues, issue));
+        }
         ensure!(index.current(), "Asset inputs changed");
         ensure!(
             index.assets.values().all(|asset| asset
@@ -84,11 +108,31 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
                     .map(move |object| ((key.as_str(), object.id), object))
             })
             .collect();
+        let diagnostics = tracing::enabled!(tracing::Level::DEBUG);
+        let mut null_paths = 0;
+        let mut null_path_capacity = 0;
+        let mut null_path_estimated_bytes = 0;
+        let empty_path_size = crate::memory::encoded_size(&"");
         for (key, composed) in cached.instances {
             let instances = composed
                 .objects
                 .into_iter()
-                .map(|instance| -> Result<_> {
+                .map(|mut instance| -> Result<_> {
+                    // Older snapshots retained destination paths for null
+                    // pointers. Keep their raw evidence, but no destination.
+                    for target in instance
+                        .references
+                        .values_mut()
+                        .filter(|target| target.raw.null())
+                    {
+                        let path = std::mem::take(&mut target.asset);
+                        if diagnostics && !path.is_empty() {
+                            null_paths += 1;
+                            null_path_capacity += path.capacity();
+                            null_path_estimated_bytes +=
+                                (crate::memory::encoded_size(&path) - empty_path_size) * 3;
+                        }
+                    }
                     Ok(compose::Instance {
                         object: Arc::clone(
                             objects
@@ -98,8 +142,10 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
                         id: instance.id,
                         definition: instance.definition,
                         name: instance.name,
-                        ty: instance.ty,
-                        native_issue: instance.native_issue,
+                        ty: instance.ty.map(|ty| intern(&mut types, ty)),
+                        native_issue: instance
+                            .native_issue
+                            .map(|issue| intern(&mut issues, issue)),
                         references: instance.references,
                         evidence: instance.evidence,
                         alive: instance.alive,
@@ -115,6 +161,12 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
                 }),
             );
         }
+        tracing::debug!(
+            null_paths,
+            null_path_capacity,
+            null_path_estimated_bytes,
+            "Discarded saved null asset destinations"
+        );
         for (key, asset) in &index.assets {
             if !asset.guid.is_empty() {
                 index
