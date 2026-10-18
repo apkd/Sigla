@@ -529,6 +529,7 @@ fn main() {
     // inputs and only alter publication or reject conflicting bundle paths.
     // Transport packs retain the same logical artifacts, analysis and discovery
     // inputs. Release placement and acquisition retries do not change the graph.
+    // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
         (
             "c817019d8f730eef42bb3f4ba0f3e544d0aef8f294914a96695dc89638822525",
@@ -538,16 +539,21 @@ fn main() {
             "3d502949e13e2973211eccd01d18c70bc072c0723e14bd371cd6afd751b24210",
             "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
         ),
+        (
+            "f68ff5a894c70cd60a7bc188b48e92e99cb043d6126bb2a2248f6b2a7a1667a3",
+            "41b545ea1eefd8fe8f203afb2cffb377ec9727fa9303d97e8e5f215836bd629a",
+        ),
     ];
     // The first alias covers equivalent C# extraction. The second covers
-    // query and memory changes: shared Arcs serialize as the same values.
+    // query and memory changes: shared Arcs serialize as the same values,
+    // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
         (
             "21daf083db5802634df74c925bd21eae66fa116ae7308aa56092014bc6732de6",
             "2bd548c115a34ba087131a20b944888147f6a6847f8334c13d29dabfe3595787",
         ),
         (
-            "28d47d445ddc4182423183693786a3d6a4fa27ba40ea47e9eb213fa8ccbe1ba1",
+            "333e9021e9eb5d33885b7d170ef38a10789a8bc119098451070885295013b1b3",
             "5ad4f718fe48de00884cf4f3dbac59e18027bae0fbc56653e0e1d42c723b42e3",
         ),
     ];
