@@ -86,6 +86,7 @@ impl Jobs {
             if !idle {
                 continue;
             }
+            tracing::debug!(workspace = %key.display(), retained_bytes = size, total_bytes = bytes, budget_bytes = limit, "Evicting Unity asset index");
             jobs.remove(&key);
             bytes -= size;
         }
@@ -214,6 +215,7 @@ impl Jobs {
                         super::snapshot::save(&cache, generation, &index)?;
                         tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = started.elapsed().as_millis(), "Unity asset index ready");
                     }
+                    tracing::debug!(workspace = %root.display(), retained_bytes = index.retained_bytes, built, elapsed_ms = started.elapsed().as_millis(), "Unity asset index acquired");
                     Ok(index)
                 })
                 .await?
