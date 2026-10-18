@@ -453,12 +453,6 @@ fn has_distinctive_words<'a>(words: impl Iterator<Item = &'a str>, required: usi
     }
     false
 }
-pub(super) fn same_tokens(a: &str, b: &str) -> bool {
-    TOKENS
-        .find_iter(a)
-        .map(|m| m.as_str())
-        .eq(TOKENS.find_iter(b).map(|m| m.as_str()))
-}
 /// Corroborate a whole edited body with 80% ordered token coverage and four
 /// disjoint 16-token anchors unique in both bodies. Repetition and overlapping
 /// windows cannot inflate the independent source evidence.
@@ -669,8 +663,6 @@ mod tests {
         let a = "begin alpha beta alpha beta alpha end";
         let b = "begin alpha beta alpha beta alpha beta alpha end";
         assert_eq!(similarity(a, b), 100);
-        assert!(!same_tokens(a, b));
-        assert!(same_tokens(a, &a.replace(' ', "\r\n")));
         let tokens = BodyTokens::new(a);
         assert!(!tokens.compare(b).exact);
         assert!(tokens.compare(&a.replace(' ', "\r\n")).exact);
