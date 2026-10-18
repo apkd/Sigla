@@ -2016,6 +2016,10 @@ impl<'a> Search<'a> {
         &self,
         units: crate::selection::Selection<K, crate::render::SearchResult>,
     ) -> String {
+        let (entries, total) = units.into_parts();
+        if entries.is_empty() {
+            return "No matches.".into();
+        }
         let mut paths = crate::render::Paths::new(
             self.manifest
                 .files
@@ -2027,7 +2031,13 @@ impl<'a> Search<'a> {
                         .map(|m| self.manifest.display(f, m).into_owned())
                 }),
         );
-        units.finish_with(|_, unit| unit.render(&mut paths))
+        render_selected(
+            entries
+                .into_values()
+                .map(|unit| unit.render(&mut paths))
+                .collect(),
+            total,
+        )
     }
     fn finish_relationship<K: Ord + Clone>(
         &self,
