@@ -7,7 +7,8 @@ use crate::{
 use anyhow::{Result, ensure};
 mod native;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
     sync::Arc,
 };
 
@@ -18,6 +19,50 @@ struct Hit {
     membership: Membership,
     decl: Declaration,
     rank: u8,
+}
+
+/// Finds the shortest enclosing declaration for nondecreasing source positions.
+struct ContainingDeclarations<'a> {
+    declarations: &'a [Declaration],
+    pending: Vec<usize>,
+    active: BinaryHeap<Reverse<(usize, usize)>>,
+}
+
+impl<'a> ContainingDeclarations<'a> {
+    fn new(declarations: &'a [Declaration]) -> Self {
+        let mut pending: Vec<_> = declarations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| (!d.local()).then_some(i))
+            .collect();
+        pending.sort_unstable_by_key(|&i| Reverse((declarations[i].span.start, i)));
+        Self {
+            declarations,
+            pending,
+            active: BinaryHeap::new(),
+        }
+    }
+
+    fn at(&mut self, position: usize) -> Option<&'a Declaration> {
+        while let Some(&i) = self.pending.last() {
+            let span = &self.declarations[i].span;
+            if span.start > position {
+                break;
+            }
+            self.pending.pop();
+            if span.end > position {
+                self.active.push(Reverse((span.end - span.start, i)));
+            }
+        }
+        while let Some(&Reverse((_, i))) = self.active.peek() {
+            let declaration = &self.declarations[i];
+            if declaration.span.end > position {
+                return Some(declaration);
+            }
+            self.active.pop();
+        }
+        None
+    }
 }
 
 pub struct Search<'a> {
@@ -1340,6 +1385,8 @@ impl<'a> Search<'a> {
             }
             let data = self.data(key)?;
             let mut previous_line = None;
+            let mut first_lookup = true;
+            let mut containing_declarations = None;
             let mut scanned = 0;
             let mut line_no = 1;
             let mut line_start = 0;
@@ -1363,12 +1410,21 @@ impl<'a> Search<'a> {
                         continue;
                     }
                 }
-                let containing = data
-                    .facts
-                    .declarations
-                    .iter()
-                    .filter(|d| !d.local() && d.span.contains(&matched.start()))
-                    .min_by_key(|d| d.span.end - d.span.start);
+                // Single-match files avoid index construction; repeated lookups share a sweep.
+                let containing = if first_lookup {
+                    first_lookup = false;
+                    data.facts
+                        .declarations
+                        .iter()
+                        .filter(|d| !d.local() && d.span.contains(&matched.start()))
+                        .min_by_key(|d| d.span.end - d.span.start)
+                } else {
+                    containing_declarations
+                        .get_or_insert_with(|| {
+                            ContainingDeclarations::new(&data.facts.declarations)
+                        })
+                        .at(matched.start())
+                };
                 let Some(membership) = file.memberships.iter().find(|m| {
                     let containing = containing.map(|d| contextual(d, m));
                     self.filters(q, file, m, containing.as_ref(), matched.start(), inside)
@@ -2334,4 +2390,65 @@ pub(crate) fn render_selected(units: Vec<String>, total: usize) -> String {
         out.push_str(&format!("Showing {shown} of {total} matches; {} omitted. Narrow the query or increase `limit:`.", total - shown));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn containing_declaration_sweep_matches_linear_lookup() {
+        let mut declarations: Vec<_> = [
+            ("method", 25..35),
+            ("class", 0..40),
+            ("local", 12..13),
+            ("method", 10..20),
+            ("method", 15..25),
+            ("method", 10..20),
+            ("method", 4..4),
+            ("parameter", 20..21),
+            ("method", 8..30),
+            ("class", 45..50),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (kind, span))| Declaration {
+            name: i.to_string(),
+            qualified: String::new(),
+            kind: kind.into(),
+            namespace: String::new(),
+            owner: String::new(),
+            name_span: span.clone(),
+            header: span.clone(),
+            scope: span.clone(),
+            span,
+            parameters: Vec::new(),
+            ty: String::new(),
+            access: String::new(),
+            attributes: Vec::new(),
+            modifiers: Vec::new(),
+            bases: Vec::new(),
+        })
+        .collect();
+
+        // Change insertion order to exercise ties independently of source order.
+        for _ in 0..declarations.len() {
+            declarations.rotate_left(1);
+            for start in [0, 7, 26, 40] {
+                let mut sweep = ContainingDeclarations::new(&declarations);
+                for position in (start..=50).flat_map(|p| [p, p]) {
+                    let expected = declarations
+                        .iter()
+                        .filter(|d| !d.local() && d.span.contains(&position))
+                        .min_by_key(|d| d.span.end - d.span.start);
+                    assert_eq!(
+                        sweep.at(position).map(|d| &d.name),
+                        expected.map(|d| &d.name),
+                        "position {position}"
+                    );
+                }
+            }
+        }
+        assert!(ContainingDeclarations::new(&[]).at(0).is_none());
+    }
 }
