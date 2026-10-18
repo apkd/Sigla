@@ -37,13 +37,14 @@ struct Work {
 }
 impl Work {
     fn parse(&mut self, parser: &mut tree_sitter::Parser, text: &str) -> Result<tree_sitter::Tree> {
-        self.parse_ranges(parser, text, &[])
+        self.parse_ranges(parser, text, &[], None)
     }
     fn parse_ranges(
         &mut self,
         parser: &mut tree_sitter::Parser,
         text: &str,
         ranges: &[tree_sitter::Range],
+        previous: Option<&tree_sitter::Tree>,
     ) -> Result<tree_sitter::Tree> {
         let bytes = if ranges.is_empty() {
             text.len()
@@ -58,7 +59,7 @@ impl Work {
         self.parses += 1;
         parser.set_included_ranges(ranges)?;
         parser
-            .parse(text, None)
+            .parse(text, previous)
             .ok_or_else(|| anyhow::anyhow!("historical C# parsing cancelled"))
     }
 }
@@ -110,9 +111,9 @@ fn explore(
         explore_context(&document, &whole, false, parser, conditions, result, work)?;
         return Ok(());
     }
-    let values = conditions.witness(TRUE, false);
+    let mut values = conditions.witness(TRUE, false);
     let seed = document.sample(conditions, &values)?;
-    let tree = work.parse(parser, &seed)?;
+    let mut tree = work.parse(parser, &seed)?;
     if guards.iter().all(|&guard| guard == TRUE) {
         *result = parse(&tree, &seed, TRUE, true);
         return Ok(());
@@ -122,9 +123,11 @@ fn explore(
     inventory.record(&tree)?;
     guards.retain(|&guard| !conditions.value(guard, &values));
     while !recovered && let Some(&guard) = guards.first() {
-        let values = conditions.witness(guard, true);
-        let text = document.sample(conditions, &values)?;
-        let tree = work.parse(parser, &text)?;
+        let next = conditions.witness(guard, true);
+        let text = document.sample(conditions, &next)?;
+        document.edit_tree(&mut tree, conditions, &values, &next, &whole.ranges);
+        tree = work.parse_ranges(parser, &text, &[], Some(&tree))?;
+        values = next;
         recovered = tree.root_node().has_error();
         inventory.record(&tree)?;
         guards.retain(|&guard| !conditions.value(guard, &values));
@@ -163,10 +166,15 @@ fn explore_context(
     let ranges = document.included_ranges(&context.ranges);
     let mut remaining = TRUE;
     let mut count = 0;
+    let mut previous: Option<(tree_sitter::Tree, Vec<bool>)> = None;
     while remaining != FALSE && count < PROJECTIONS {
         let values = conditions.witness(remaining, !count.is_multiple_of(2));
         let projection = document.project(conditions, &values, &context.ranges)?;
-        let tree = work.parse_ranges(parser, &projection.text, &ranges)?;
+        let old = previous.as_mut().map(|(tree, before)| {
+            document.edit_tree(tree, conditions, before, &values, &context.ranges);
+            &*tree
+        });
+        let tree = work.parse_ranges(parser, &projection.text, &ranges, old)?;
         if validate && (tree.root_node().has_error() || !context.valid(&tree)) {
             return Ok(false);
         }
@@ -180,6 +188,7 @@ fn explore_context(
             .map(HistoricalDeclaration::heap_bytes)
             .sum::<usize>();
         result.declarations.extend(parsed.declarations);
+        previous = Some((tree, values));
         // Even one local shape says nothing about calls in sibling choices.
         // Calls survive only the single-whole-source-shape fast path above.
         count += 1;

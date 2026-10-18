@@ -339,22 +339,60 @@ impl<'a> Document<'a> {
             }
             end = range.end;
         }
-        let point = |byte| {
-            let row = self.lines.partition_point(|&start| start <= byte) - 1;
-            tree_sitter::Point {
-                row,
-                column: byte - self.lines[row],
-            }
-        };
         spans
             .into_iter()
             .map(|r| tree_sitter::Range {
                 start_byte: r.start,
                 end_byte: r.end,
-                start_point: point(r.start),
-                end_point: point(r.end),
+                start_point: self.point(r.start),
+                end_point: self.point(r.end),
             })
             .collect()
+    }
+
+    fn point(&self, byte: usize) -> tree_sitter::Point {
+        let row = self.lines.partition_point(|&start| start <= byte) - 1;
+        tree_sitter::Point {
+            row,
+            column: byte - self.lines[row],
+        }
+    }
+
+    /// Mark changed guarded runs before reusing a tree for the same context.
+    /// Projections preserve byte lengths and newlines, so edits never shift
+    /// later ranges, including UTF-8 text and ranges omitted from the parser.
+    pub(super) fn edit_tree(
+        &self,
+        tree: &mut tree_sitter::Tree,
+        conditions: &Conditions,
+        before: &[bool],
+        after: &[bool],
+        ranges: &[Range<usize>],
+    ) {
+        for range in ranges {
+            let start = self.text.partition_point(|t| t.range.end <= range.start);
+            for text in self.text[start..]
+                .iter()
+                .take_while(|t| t.range.start < range.end)
+            {
+                if conditions.value(text.guard, before) == conditions.value(text.guard, after) {
+                    continue;
+                }
+                let overlap = text.range.start.max(range.start)..text.range.end.min(range.end);
+                if self.source[overlap.clone()] == self.blank[overlap.clone()] {
+                    continue;
+                }
+                let end = self.point(overlap.end);
+                tree.edit(&tree_sitter::InputEdit {
+                    start_byte: overlap.start,
+                    old_end_byte: overlap.end,
+                    new_end_byte: overlap.end,
+                    start_position: self.point(overlap.start),
+                    old_end_position: end,
+                    new_end_position: end,
+                });
+            }
+        }
     }
 
     /// Enumerate the text of this context, not assignments to its symbols.

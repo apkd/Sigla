@@ -534,6 +534,7 @@ fn sparse_context_parses_preserve_tokens_spans_and_line_comments() {
                     &mut parser,
                     &projection.text,
                     &document.included_ranges(&context.ranges),
+                    None,
                 )
                 .unwrap();
             assert_eq!(sparse.root_node().has_error(), full.root_node().has_error());
@@ -572,6 +573,105 @@ fn sparse_context_parses_preserve_tokens_spans_and_line_comments() {
             };
             assert_eq!(spans(&sparse), spans(&full));
             assert_eq!(context.valid(&sparse), context.valid(&full));
+        }
+    }
+}
+
+#[test]
+fn incremental_alternatives_match_fresh_trees_and_positions() {
+    fn same_tree(actual: &tree_sitter::Tree, expected: &tree_sitter::Tree) {
+        let mut a = actual.walk();
+        let mut b = expected.walk();
+        loop {
+            let (left, right) = (a.node(), b.node());
+            assert_eq!(
+                (
+                    left.kind(),
+                    left.byte_range(),
+                    left.start_position(),
+                    left.end_position()
+                ),
+                (
+                    right.kind(),
+                    right.byte_range(),
+                    right.start_position(),
+                    right.end_position()
+                ),
+            );
+            assert_eq!(left.has_error(), right.has_error());
+            assert_eq!(left.is_missing(), right.is_missing());
+            let descend = a.goto_first_child();
+            assert_eq!(descend, b.goto_first_child());
+            if descend {
+                continue;
+            }
+            loop {
+                let sibling = a.goto_next_sibling();
+                assert_eq!(sibling, b.goto_next_sibling());
+                if sibling {
+                    break;
+                }
+                let ascend = a.goto_parent();
+                assert_eq!(ascend, b.goto_parent());
+                if !ascend {
+                    return;
+                }
+            }
+        }
+    }
+    for source in [
+        "\u{feff}class Café {\r\nint Common() => 1;\r\n#if A\r\nstring Value => \"é🦀\";\r\n#else\r\nint Value => 2;\r\n#endif\r\n#if B\r\nvoid Extra() { Common(); }\r\n#endif\r\n}\r\n",
+        "#if A\nnamespace One {\n#else\nnamespace Two {\n#endif\nclass Data {\n// comment\n#if B\nstring Text => @\"first\n#if literal\nend\";\n#else\nstring Text => \"other\";\n#endif\n}\n}\n",
+    ] {
+        let mut conditions = Conditions::default();
+        let document = Document::new(source, &mut conditions).unwrap();
+        let whole = Context::whole(source.len());
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let mut inventory = contexts::Inventory::default();
+        let mut environments = Vec::new();
+        let mut remaining = TRUE;
+        while remaining != FALSE {
+            let values = conditions.witness(remaining, false);
+            let projection = document
+                .project(&mut conditions, &values, &whole.ranges)
+                .unwrap();
+            let tree = Work::default()
+                .parse(&mut parser, &projection.text)
+                .unwrap();
+            assert!(!tree.root_node().has_error());
+            inventory.record(&tree).unwrap();
+            environments.push(values);
+            let other = conditions.not(projection.guard).unwrap();
+            remaining = conditions.and(remaining, other).unwrap();
+        }
+        for context in inventory
+            .plan(source.len())
+            .unwrap()
+            .into_iter()
+            .chain([whole])
+        {
+            let ranges = document.included_ranges(&context.ranges);
+            let mut previous: Option<(tree_sitter::Tree, Vec<bool>)> = None;
+            for values in environments.iter().chain(environments.iter().rev()) {
+                let projection = document
+                    .project(&mut conditions, values, &context.ranges)
+                    .unwrap();
+                let fresh = Work::default()
+                    .parse_ranges(&mut parser, &projection.text, &ranges, None)
+                    .unwrap();
+                let old = previous.as_mut().map(|(tree, before)| {
+                    document.edit_tree(tree, &conditions, before, values, &context.ranges);
+                    &*tree
+                });
+                let reused = Work::default()
+                    .parse_ranges(&mut parser, &projection.text, &ranges, old)
+                    .unwrap();
+                same_tree(&reused, &fresh);
+                previous = Some((reused, values.clone()));
+            }
         }
     }
 }
