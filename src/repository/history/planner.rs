@@ -9,6 +9,7 @@ const BATCH_BYTES: u64 = (super::MEMORY / 8) as u64;
 pub(super) enum Kind {
     Commits,
     CommitTrees,
+    IncrementalCommitTrees,
     Trees,
     Blobs,
 }
@@ -22,7 +23,7 @@ struct Cost {
 
 #[derive(Default)]
 pub(super) struct Planner {
-    costs: [Cost; 4],
+    costs: [Cost; 5],
     overhead: Option<f64>,
     seconds_per_byte: Option<f64>,
     /// A useful ancestry horizon, not a stop condition. None means discovery
@@ -79,7 +80,7 @@ impl Planner {
         let cost = &self.costs[kind as usize];
         let growth = if cost.units == 0 {
             // Tree-filter fallback has unmeasured recursive tree fanout.
-            if matches!(kind, Kind::CommitTrees) {
+            if matches!(kind, Kind::CommitTrees | Kind::IncrementalCommitTrees) {
                 1
             } else {
                 PROBE_UNITS
@@ -232,5 +233,32 @@ mod tests {
         );
         assert!(planner.count(Kind::CommitTrees, MAX_UNITS, None) < commits);
         assert_eq!(planner.count(Kind::Commits, MAX_UNITS, None), commits);
+    }
+
+    #[test]
+    fn initial_tree_closure_does_not_price_incremental_tree_windows() {
+        let mut planner = Planner::default();
+        planner.observe(
+            Kind::CommitTrees,
+            1,
+            BATCH_BYTES,
+            Duration::from_secs(1),
+            None,
+        );
+        let initial = planner.count(Kind::CommitTrees, MAX_UNITS, None);
+        let mut incremental = planner.count(Kind::IncrementalCommitTrees, MAX_UNITS, None);
+        for _ in 0..3 {
+            planner.observe(
+                Kind::IncrementalCommitTrees,
+                incremental,
+                incremental as u64 * 1024,
+                Duration::from_secs(1),
+                None,
+            );
+            incremental = planner.count(Kind::IncrementalCommitTrees, MAX_UNITS, None);
+        }
+        assert!(incremental > initial);
+        assert_eq!(planner.count(Kind::CommitTrees, MAX_UNITS, None), initial);
+        assert!(planner.count(Kind::IncrementalCommitTrees, MAX_UNITS, Some(1024)) < incremental);
     }
 }

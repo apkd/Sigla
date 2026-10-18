@@ -458,15 +458,20 @@ impl Store {
         self.planner.commits = commits;
     }
     fn acquisition_kind(&self, kind: &str) -> planner::Kind {
+        let commit_trees = if self.tree_have.is_some() {
+            planner::Kind::IncrementalCommitTrees
+        } else {
+            planner::Kind::CommitTrees
+        };
         match kind {
-            "commit-tree" => planner::Kind::CommitTrees,
+            "commit-tree" => commit_trees,
             "commit"
                 if self
                     .remote
                     .as_ref()
                     .is_some_and(|remote| matches!(remote.commit_filter, Filter::Trees)) =>
             {
-                planner::Kind::CommitTrees
+                commit_trees
             }
             "commit" => planner::Kind::Commits,
             "tree" => planner::Kind::Trees,
@@ -491,7 +496,12 @@ impl Store {
             let depth = matches!(kind, "commit" | "commit-tree")
                 .then(|| self.planner.depth(class, ids.len(), remaining));
             // Partial source trees prove no blob coverage or complete ancestry.
-            let haves = if matches!(class, planner::Kind::Trees | planner::Kind::CommitTrees) {
+            let haves = if matches!(
+                class,
+                planner::Kind::Trees
+                    | planner::Kind::CommitTrees
+                    | planner::Kind::IncrementalCommitTrees
+            ) {
                 self.tree_have.as_slice()
             } else {
                 &[]
