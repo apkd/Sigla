@@ -687,6 +687,102 @@ namespace Game {
 }
 
 #[tokio::test]
+async fn text_search_deduplicates_only_after_containment_accepts_a_match() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Text.csproj",
+        r#"<Project><ItemGroup><Compile Include="Text.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        root.path(),
+        "Text.cs",
+        "// needle\nclass Outer { class Inner { void Skip() { /* needle */ } void Keep() { /* needle needle */\n/* needle needle */ } } }\n",
+    );
+    let a = app(root.path(), cache.path());
+    let result = a
+        .search(
+            root.path().to_str().unwrap(),
+            "text:needle in:Outer.Inner.Keep",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.matches("Text.cs:2").count(), 1, "{result}");
+    assert_eq!(result.matches("Text.cs:3").count(), 1, "{result}");
+    assert!(!result.contains("Text.cs:1"), "{result}");
+    assert_eq!(
+        result.matches("method:Outer.Inner.Keep").count(),
+        2,
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn text_search_preserves_multiline_unicode_and_crlf_locations() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Text.csproj",
+        r#"<Project><ItemGroup><Compile Include="Text.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        root.path(),
+        "Text.cs",
+        "// Café\r\nclass Text {\r\nstring first = @\"α\r\nβ\";\r\nstring second = @\"α\r\nβ\";\r\n}\r\n",
+    );
+    let a = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    let result = a.search(project, "text:\"α\r\nβ\"").await.unwrap();
+    assert!(result.contains("Text.cs:3-4"), "{result}");
+    assert!(result.contains("Text.cs:5-6"), "{result}");
+    assert!(result.contains("string first"), "{result}");
+    assert!(result.contains("string second"), "{result}");
+    let trailing_newline = a.search(project, "text:\"α\r\n\"").await.unwrap();
+    assert!(trailing_newline.contains("Text.cs:3"), "{trailing_newline}");
+    assert!(trailing_newline.contains("Text.cs:5"), "{trailing_newline}");
+    assert!(
+        !trailing_newline.contains("Text.cs:3-"),
+        "{trailing_newline}"
+    );
+    assert!(
+        !trailing_newline.contains("Text.cs:5-"),
+        "{trailing_newline}"
+    );
+    assert_eq!(
+        trailing_newline.matches("β\";").count(),
+        2,
+        "{trailing_newline}"
+    );
+}
+
+#[tokio::test]
+async fn text_search_deduplicates_only_after_native_language_accepts_a_match() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    );
+    write(root.path(), "src/lib.rs", "");
+    write(
+        root.path(),
+        "Mixed.shader",
+        "// needle\nShader \"needle\" { HLSLPROGRAM float needle; float another_needle; ENDHLSL }\n",
+    );
+    let a = app(root.path(), cache.path());
+    let result = a
+        .search(root.path().to_str().unwrap(), "text:needle lang:hlsl")
+        .await
+        .unwrap();
+    assert_eq!(result.matches("Mixed.shader:2").count(), 1, "{result}");
+    assert!(!result.contains("Mixed.shader:1"), "{result}");
+    assert!(result.contains("float needle"), "{result}");
+}
+
+#[tokio::test]
 async fn concurrent_requests_and_invalid_queries() {
     let dir = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

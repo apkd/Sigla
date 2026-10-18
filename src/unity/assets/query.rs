@@ -90,20 +90,26 @@ impl Index {
             let parsed = content(asset)?;
             let mut previous = None;
             for fragment in &parsed.fragments {
+                let mut offset = 0;
+                let mut line = fragment.line;
                 for matched in literal.find_iter(&fragment.text) {
                     let start = fragment.start + matched.start();
-                    let line = fragment.line
-                        + fragment.text[..matched.start()]
-                            .bytes()
-                            .filter(|b| *b == b'\n')
-                            .count();
+                    let end = fragment.start + matched.end();
+                    // Advance between starts so multiline matches retain their newlines.
+                    line += fragment.text[offset..matched.start()]
+                        .bytes()
+                        .filter(|b| *b == b'\n')
+                        .count();
+                    offset = matched.start();
                     if previous == Some(line) {
                         continue;
                     }
                     previous = Some(line);
-                    let owner = asset.objects.iter().find(|o| {
-                        o.span.start <= start && fragment.start + matched.end() <= o.span.end
-                    });
+                    // Parsed object spans are ordered and do not overlap.
+                    let owner = asset
+                        .objects
+                        .get(asset.objects.partition_point(|o| o.span.end < end))
+                        .filter(|o| o.span.start <= start && end <= o.span.end);
                     let mut excerpt_start = fragment.text[..matched.start()]
                         .rfind('\n')
                         .map_or(0, |i| i + 1)
@@ -530,5 +536,128 @@ impl Index {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{render::SearchResult, workspace::Stamp};
+    use std::collections::BTreeMap;
+    use tokio_util::sync::CancellationToken;
+
+    fn index(source: &str) -> (tempfile::TempDir, Index) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Object.prefab");
+        std::fs::write(&path, source).unwrap();
+        let mut records = super::super::records::load_all(
+            root.path(),
+            None,
+            &BTreeMap::from([(path.clone(), Stamp::read(&path).unwrap())]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let record = records.remove(&path).unwrap();
+        assert!(record.unavailable.is_none(), "{:?}", record.unavailable);
+        let mut index = Index::default();
+        index.assets.insert(
+            "fixture".into(),
+            Asset {
+                project: ".".into(),
+                path: "Assets/Object.prefab".into(),
+                guid: String::new(),
+                objects: record.objects,
+                content: record.content,
+                unavailable: record.unavailable,
+            },
+        );
+        (root, index)
+    }
+
+    fn search(index: &Index, needle: &str) -> Vec<(usize, SearchResult)> {
+        let mut query = Query::parse("text:placeholder match:exact").unwrap();
+        query.target.name = needle.into();
+        let mut results = Vec::new();
+        index
+            .visit_text(&query, |offset, result| {
+                results.push((offset, result));
+                Ok(())
+            })
+            .unwrap();
+        results
+    }
+
+    fn positions(source: &str, needle: &str) -> Vec<(usize, Option<(usize, usize)>)> {
+        let mut expected: Vec<_> = source
+            .match_indices(needle)
+            .map(|(offset, _)| {
+                let line = source[..offset].bytes().filter(|b| *b == b'\n').count() + 1;
+                (offset, Some((line, line)))
+            })
+            .collect();
+        expected.dedup_by_key(|(_, line)| *line);
+        expected
+    }
+
+    #[test]
+    fn text_search_preserves_unicode_multiline_positions_and_object_boundaries() {
+        let source = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Café\n  value: |\n    écho écho\n    fin\n    écho\n    fin\n--- !u!1 &2\nGameObject:\n  m_Name: Étape\n  value: |\n    écho\n    fin\n";
+        let (_root, index) = index(source);
+        for needle in ["écho", "écho\n    fin", "fin\n"] {
+            let results = search(&index, needle);
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|(offset, r)| (*offset, r.lines))
+                    .collect::<Vec<_>>(),
+                positions(source, needle),
+                "{needle:?}"
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|(_, r)| r.symbol.as_ref().map(|(_, name)| name.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![Some("Café"), Some("Café"), Some("Étape")],
+                "{needle:?}"
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|(_, r)| decode(r.target.as_ref().unwrap()).unwrap().1)
+                    .collect::<Vec<_>>(),
+                vec!["1", "1", "2"],
+                "{needle:?}"
+            );
+        }
+        for needle in ["%YAML", "\n--- !u!1 &2"] {
+            let results = search(&index, needle);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, source.find(needle).unwrap());
+            assert!(results[0].1.symbol.is_none());
+            assert!(results[0].1.target.is_none());
+        }
+    }
+
+    #[test]
+    fn text_search_preserves_offsets_and_unique_lines_across_trimmed_values() {
+        let source = format!(
+            "--- !u!1 &1\nGameObject:\n  m_Name: Café\n  values: [écho, '{}', écho]\n  other: écho\n",
+            "é".repeat(super::super::yaml::VALUE_LIMIT / 2 + 1)
+        );
+        let (_root, index) = index(&source);
+        assert!(content(&index.assets["fixture"]).unwrap().fragments.len() > 1);
+        let results = search(&index, "écho");
+        assert_eq!(
+            results
+                .iter()
+                .map(|(offset, r)| (*offset, r.lines))
+                .collect::<Vec<_>>(),
+            positions(&source, "écho")
+        );
+        assert!(results.iter().all(|(_, r)| {
+            r.symbol.as_ref().is_some_and(|(_, name)| name == "Café")
+                && decode(r.target.as_ref().unwrap()).unwrap().1 == "1"
+        }));
     }
 }
