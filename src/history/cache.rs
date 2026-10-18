@@ -1,5 +1,8 @@
 //! Bounded, disposable history facts. Keys include repository and policy identity.
-use super::{matching::Mapping, regions::Source};
+use super::{
+    matching::{Mapping, State},
+    regions::Source,
+};
 use crate::repository::history::Tree;
 use serde::Serialize;
 use std::{
@@ -61,6 +64,12 @@ pub(super) struct Body {
 enum Evidence {
     Body(Body),
     Anchors(bool),
+}
+
+#[derive(Clone)]
+enum Match {
+    Anchor(Arc<State>),
+    Mapping(Arc<Mapping>),
 }
 
 struct Entry<V> {
@@ -138,7 +147,7 @@ pub(crate) struct Stats {
 pub(crate) struct Cache {
     sources: Mutex<Lru<Arc<Source>>>,
     trees: Mutex<Lru<Arc<SourceTree>>>,
-    mappings: Mutex<Lru<Arc<Mapping>>>,
+    matches: Mutex<Lru<Match>>,
     evidence: Mutex<Lru<Evidence>>,
 }
 impl Cache {
@@ -149,7 +158,7 @@ impl Cache {
         Self {
             sources: Mutex::new(Lru::new(limit)),
             trees: Mutex::new(Lru::new(limit)),
-            mappings: Mutex::new(Lru::new(limit)),
+            matches: Mutex::new(Lru::new(limit)),
             evidence: Mutex::new(Lru::new(limit)),
         }
     }
@@ -164,7 +173,7 @@ impl Cache {
         let mut stats = Stats::default();
         record(&self.sources, &mut stats, 0);
         record(&self.trees, &mut stats, 1);
-        record(&self.mappings, &mut stats, 2);
+        record(&self.matches, &mut stats, 2);
         record(&self.evidence, &mut stats, 3);
         stats
     }
@@ -183,16 +192,39 @@ impl Cache {
         insert(&self.trees, key, tree, cost)
     }
     pub(super) fn mapping(&self, key: &Key) -> Option<Arc<Mapping>> {
-        self.mappings.lock().unwrap().get(key)
+        self.matches.lock().unwrap().get(key).map(|value| {
+            let Match::Mapping(mapping) = value else {
+                unreachable!()
+            };
+            mapping
+        })
     }
     pub(super) fn put_mapping(&self, key: Key, mapping: &Mapping) {
         // A partial candidate search must never become a cached absence.
         if !mapping.state.uncertain {
             insert(
-                &self.mappings,
+                &self.matches,
                 key,
-                Arc::new(mapping.clone()),
+                Match::Mapping(Arc::new(mapping.clone())),
                 mapping.heap_bytes(),
+            );
+        }
+    }
+    pub(super) fn anchor(&self, key: &Key) -> Option<Arc<State>> {
+        self.matches.lock().unwrap().get(key).map(|value| {
+            let Match::Anchor(state) = value else {
+                unreachable!()
+            };
+            state
+        })
+    }
+    pub(super) fn put_anchor(&self, key: Key, state: &State) {
+        if !state.uncertain {
+            insert(
+                &self.matches,
+                key,
+                Match::Anchor(Arc::new(state.clone())),
+                std::mem::size_of::<State>() + state.heap_bytes(),
             );
         }
     }
@@ -370,6 +402,40 @@ mod tests {
     }
 
     #[test]
+    fn cached_anchors_skip_object_reads_and_preserve_selection_and_cancellation() {
+        let root = repository();
+        let at = commit(root.path(), None, "pub fn first() {}\npub fn second() {}\n");
+        let cache = Arc::new(Cache::new(1024 * 1024));
+        let first = super::super::query::Request::parse("log function:first")
+            .unwrap()
+            .selector;
+        let second = super::super::query::Request::parse("log function:second")
+            .unwrap()
+            .selector;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::local(root.path(), cancel.clone()).unwrap();
+        let mut tracker = super::super::matching::Tracker::new(store, cache.clone());
+        let commit = tracker.store.commit(&at).unwrap();
+        let expected = tracker.anchor(&commit, &first).unwrap();
+        let reads = tracker.store.reads;
+        assert!(
+            tracker
+                .anchor(&commit, &first)
+                .unwrap()
+                .same_occurrences(&expected)
+        );
+        assert_eq!(tracker.store.reads, reads, "Anchor rescanned Git objects");
+        assert!(
+            !tracker
+                .anchor(&commit, &second)
+                .unwrap()
+                .same_occurrences(&expected)
+        );
+        cancel.store(true, Ordering::Release);
+        assert!(tracker.anchor(&commit, &first).is_err());
+    }
+
+    #[test]
     fn cached_facts_do_not_supply_objects_missing_from_another_repository() {
         let private = repository();
         let public = repository();
@@ -443,9 +509,19 @@ mod tests {
             history(root.path(), &tip, &conditional_query, &cache).unwrap(),
             conditional
         );
-        assert_eq!(
-            cache.stats().hits[2],
-            after.hits[2],
+        assert!(
+            cache
+                .matches
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|(_, entry)| {
+                    match &entry.value {
+                        Match::Mapping(mapping) => !mapping.state.uncertain,
+                        Match::Anchor(_) => true,
+                    }
+                }),
             "Uncertain matches were retained"
         );
         assert_eq!(

@@ -861,8 +861,19 @@ impl Store {
         }
         self.prefetch(&attributes, "blob")?;
         // Reading also pins these attribute objects for the declared source policy.
+        let mut value_bytes = b"unspecified".len();
         for oid in &attributes {
-            self.object(oid, "blob")?;
+            let object = self.object(oid, "blob")?;
+            // An attribute value cannot exceed its source line. Account for
+            // custom values as well as Git's built-in set/unset responses.
+            value_bytes = value_bytes.max(
+                object
+                    .bytes
+                    .split(|&b| b == b'\n')
+                    .map(<[u8]>::len)
+                    .max()
+                    .unwrap_or(0),
+            );
         }
         let control = tempfile::tempdir()?;
         init(
@@ -872,7 +883,22 @@ impl Store {
         let objects = run(git(&self.path).args(["rev-parse", "--git-path", "objects"]))?;
         let objects = PathBuf::from(std::str::from_utf8(&objects)?.trim()).canonicalize()?;
         let mut allowed: BTreeSet<_> = paths.iter().cloned().collect();
-        for chunk in paths.chunks(256) {
+        let mut pending = paths;
+        while !pending.is_empty() {
+            // Bound all three output records per path instead of launching a
+            // process for every small fixed number of paths.
+            let mut bytes = 0usize;
+            let mut count = 0;
+            for path in pending {
+                let cost = 3 * (path.len() + value_bytes + 9);
+                if count != 0 && cost > (8 * 1024 * 1024usize).saturating_sub(bytes) {
+                    break;
+                }
+                bytes = bytes.saturating_add(cost);
+                count += 1;
+            }
+            let (chunk, rest) = pending.split_at(count);
+            pending = rest;
             let mut input = Vec::new();
             for path in chunk {
                 input.extend_from_slice(path.as_bytes());
@@ -913,17 +939,18 @@ impl Store {
                 fields.len() == chunk.len() * 9,
                 "Incomplete Git attribute output"
             );
-            for fields in fields.chunks_exact(3) {
-                let path = std::str::from_utf8(fields[0])?;
-                ensure!(
-                    chunk.iter().any(|p| p == path),
-                    "Unexpected Git attribute path"
-                );
-                if fields[1] == b"binary" && fields[2] == b"set"
-                    || fields[1] == b"diff" && fields[2] == b"unset"
-                    || fields[1] == b"filter" && fields[2] == b"lfs"
-                {
-                    allowed.remove(path);
+            for (path, fields) in chunk.iter().zip(fields.chunks_exact(9)) {
+                for fields in fields.chunks_exact(3) {
+                    ensure!(
+                        fields[0] == path.as_bytes(),
+                        "Unexpected Git attribute path"
+                    );
+                    if fields[1] == b"binary" && fields[2] == b"set"
+                        || fields[1] == b"diff" && fields[2] == b"unset"
+                        || fields[1] == b"filter" && fields[2] == b"lfs"
+                    {
+                        allowed.remove(path);
+                    }
                 }
             }
         }
@@ -1484,6 +1511,40 @@ mod tests {
             let inventory = fixture.inventory();
             assert!(!inventory.contains(&fixture.excluded) && !inventory.contains(&fixture.lfs));
         }
+    }
+
+    #[test]
+    fn source_attributes_cover_large_inventories_with_custom_values_and_utf8_paths() {
+        let fixture = Fixture::new("sha1");
+        let path = fixture.directory.path();
+        fs::write(
+            path.join(".gitattributes"),
+            "*.cs diff=custom-driver\nblocked* -diff\nlarge.rs filter=lfs\nexcluded.cs binary\n",
+        )
+        .unwrap();
+        let mut paths = Vec::new();
+        let mut expected = BTreeSet::new();
+        for index in 0..400 {
+            let blocked = index % 3 == 0;
+            let name = format!(
+                "{}-é space {index}.cs",
+                if blocked { "blocked" } else { "source" }
+            );
+            fs::write(path.join(&name), "class Example {}\n").unwrap();
+            if !blocked {
+                expected.insert(name.clone());
+            }
+            paths.push(name);
+        }
+        command(path, &["add", "."]);
+        command(path, &["commit", "-qm", "attribute inventory"]);
+        let tree = command(path, &["rev-parse", "HEAD^{tree}"]);
+        let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
+        let entries = store.tree(&tree).unwrap();
+        assert_eq!(
+            store.source_paths(&tree, &entries, &paths).unwrap(),
+            expected
+        );
     }
 
     #[test]

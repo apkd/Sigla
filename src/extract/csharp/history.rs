@@ -102,10 +102,17 @@ fn explore(
 ) -> Result<()> {
     let document = Document::new(source, conditions)?;
     let whole = Context::whole(source.len());
+    let mut guards = document.guards();
+    let choices: Vec<_> = guards.iter().copied().filter(|&g| g != TRUE).collect();
+    if choices.len() == 1 || choices.len() == 2 && conditions.not(choices[0])? == choices[1] {
+        // At most two whole-file shapes: avoid rediscovering and reparsing
+        // every declaration when a file has only a simple build condition.
+        explore_context(&document, &whole, false, parser, conditions, result, work)?;
+        return Ok(());
+    }
     let values = conditions.witness(TRUE, false);
     let seed = document.sample(conditions, &values)?;
     let tree = work.parse(parser, &seed)?;
-    let mut guards = document.guards();
     if guards.iter().all(|&guard| guard == TRUE) {
         *result = parse(&tree, &seed, TRUE);
         return Ok(());

@@ -18,7 +18,7 @@ pub(super) enum Command {
         offset: usize,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub(super) enum Selector {
     Repository,
     File(String),

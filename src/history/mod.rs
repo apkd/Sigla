@@ -74,11 +74,11 @@ pub(crate) fn run_cached(
         entries = stats.entries,
         source_hits = stats.hits[0],
         tree_hits = stats.hits[1],
-        mapping_hits = stats.hits[2],
+        match_hits = stats.hits[2],
         evidence_hits = stats.hits[3],
         source_misses = stats.misses[0],
         tree_misses = stats.misses[1],
-        mapping_misses = stats.misses[2],
+        match_misses = stats.misses[2],
         evidence_misses = stats.misses[3],
         "History derived cache"
     );

@@ -775,8 +775,28 @@ fn parse_bytes_are_global_across_discovery_and_contexts() {
 }
 
 #[test]
+fn shared_build_conditions_do_not_reparse_every_declaration() {
+    let mut source = String::from("class Worker {\n");
+    for index in 0..64 {
+        source.push_str(&format!(
+            "#if EDITOR\nint Method{index}(int value) {{ return value + {index}; }}\n#else\nstring Method{index}(string value) {{ return value; }}\n#endif\n"
+        ));
+    }
+    source.push_str("}\n");
+    let mut work = Work::default();
+    let facts = run(&source, &mut work).unwrap();
+    assert!(facts.incomplete.is_none(), "{:?}", facts.incomplete);
+    assert_eq!(facts.declarations.len(), 129);
+    assert!(work.parses < 8, "Repeated parsing per declaration");
+    let whole = exhaustive(&source);
+    for offset in 0..source.len() {
+        assert_eq!(positional(&facts, offset), positional(&whole, offset));
+    }
+}
+
+#[test]
 fn changing_list_boundaries_use_verified_whole_source_fallback() {
-    let source = "class Worker {\n#if A\nvoid Before() {}\n#else\nvoid Before() {\n#endif\nvoid Target() {}\n#if !A\n}\n#endif\n}\n";
+    let source = "class Worker {\n#if A\nvoid Before() {}\n#else\nvoid Before() {\n#endif\nvoid Target() {}\n#if !A\n}\n#endif\n}\n#if B\nclass Other {}\n#endif\n";
     let mut work = Work::default();
     let facts = run(source, &mut work).unwrap();
     assert!(facts.incomplete.is_none(), "{:?}", facts.incomplete);

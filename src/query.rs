@@ -3,14 +3,14 @@ use anyhow::{Context, Result, bail, ensure};
 pub const DEFAULT_LIMIT: usize = 20;
 pub const MAX_LIMIT: usize = 100_000;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Location {
     pub path: String,
     pub line: usize,
     pub column: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Target {
     pub name: String,
     pub parameters: Option<Vec<String>>,
@@ -18,14 +18,14 @@ pub struct Target {
     pub qualifiers: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Filter {
     pub key: String,
     pub value: String,
     pub negate: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Query {
     pub selector: String,
     pub target: Target,

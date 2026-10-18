@@ -262,6 +262,19 @@ impl Tracker {
         ))
     }
     pub fn anchor(&mut self, commit: &Commit, selector: &Selector) -> Result<State> {
+        check(&self.store.cancel)?;
+        let key = cache::key(
+            self.store.cache_scope(),
+            &("anchor", &commit.tree, selector),
+        );
+        if let Some(state) = self.cache.anchor(&key) {
+            return Ok((*state).clone());
+        }
+        let state = self.resolve_anchor(commit, selector)?;
+        self.cache.put_anchor(key, &state);
+        Ok(state)
+    }
+    fn resolve_anchor(&mut self, commit: &Commit, selector: &Selector) -> Result<State> {
         let mut state = State::default();
         if matches!(selector, Selector::Repository) {
             return Ok(state);
