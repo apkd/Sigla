@@ -1,4 +1,5 @@
 //! Object-only history access. No workspace, checkout, content-store import or LFS path.
+mod attributes;
 mod planner;
 
 use super::{
@@ -91,19 +92,6 @@ struct CachedObject {
 impl CachedObject {
     fn bytes(&self) -> usize {
         self.object.bytes.len() + self.directory.as_ref().map_or(0, |d| d.bytes)
-    }
-}
-struct AttributeReader {
-    control: tempfile::TempDir,
-    objects: PathBuf,
-}
-impl AttributeReader {
-    fn new(path: &Path, format: &str) -> Result<Self> {
-        let control = tempfile::tempdir()?;
-        init(control.path(), format)?;
-        let objects = run(git(path).args(["rev-parse", "--git-path", "objects"]))?;
-        let objects = PathBuf::from(std::str::from_utf8(&objects)?.trim()).canonicalize()?;
-        Ok(Self { control, objects })
     }
 }
 struct Pipe {
@@ -281,7 +269,7 @@ pub(crate) struct Store {
     remote: Option<Remote>,
     batch: Option<Batch>,
     objects: lru::LruCache<String, CachedObject>,
-    attributes: Option<AttributeReader>,
+    attributes: Option<attributes::Reader>,
     bytes: usize,
     resolved: BTreeMap<String, String>,
     planner: planner::Planner,
@@ -732,17 +720,30 @@ impl Store {
             self.bytes -= previous.bytes();
         }
         let bytes = object.bytes();
-        if bytes > MEMORY {
+        if bytes > self.object_budget() {
             return;
         }
-        while self.bytes + bytes > MEMORY || self.objects.len() == self.objects.cap().get() {
+        self.reserve_objects(bytes, 1);
+        self.bytes += bytes;
+        self.objects.put(oid.into(), object);
+    }
+    fn object_budget(&self) -> usize {
+        MEMORY
+            - if self.attributes.is_some() {
+                attributes::MEMORY
+            } else {
+                0
+            }
+    }
+    fn reserve_objects(&mut self, bytes: usize, entries: usize) {
+        while self.bytes + bytes > self.object_budget()
+            || self.objects.len() + entries > self.objects.cap().get()
+        {
             let Some((_, removed)) = self.objects.pop_lru() else {
                 break;
             };
             self.bytes -= removed.bytes();
         }
-        self.bytes += bytes;
-        self.objects.put(oid.into(), object);
     }
     pub fn blob(&mut self, oid: &str) -> Result<Vec<u8>> {
         Ok(self.object(oid, "blob")?.bytes.clone())
@@ -905,13 +906,19 @@ impl Store {
         if paths.is_empty() {
             return Ok(BTreeSet::new());
         }
+        let mut policy = blake3::Hasher::new();
         let attributes: Vec<_> = entries
             .iter()
-            .filter(|(path, entry)| {
-                (path.as_str() == ".gitattributes" || path.ends_with("/.gitattributes"))
-                    && matches!(entry.mode, 0o100644 | 0o100755)
+            .filter(|(path, _)| {
+                path.as_str() == ".gitattributes" || path.ends_with("/.gitattributes")
             })
-            .map(|(_, e)| e.id.clone())
+            .filter_map(|(path, entry)| {
+                policy.update(path.as_bytes());
+                policy.update(&[0]);
+                policy.update(entry.id.as_bytes());
+                policy.update(&entry.mode.to_le_bytes());
+                matches!(entry.mode, 0o100644 | 0o100755).then(|| entry.id.clone())
+            })
             .collect();
         if attributes.is_empty() {
             return Ok(paths.iter().cloned().collect());
@@ -933,85 +940,19 @@ impl Store {
             );
         }
         if self.attributes.is_none() {
-            self.attributes = Some(AttributeReader::new(
+            self.attributes = Some(attributes::Reader::new(
                 &self.path,
                 if tree.len() == 64 { "sha256" } else { "sha1" },
             )?);
+            self.reserve_objects(0, 0);
         }
-        let reader = self.attributes.as_ref().unwrap();
-        let mut allowed: BTreeSet<_> = paths.iter().cloned().collect();
-        let mut pending = paths;
-        while !pending.is_empty() {
-            // Bound all three output records per path instead of launching a
-            // process for every small fixed number of paths.
-            let mut bytes = 0usize;
-            let mut count = 0;
-            for path in pending {
-                let cost = 3 * (path.len() + value_bytes + 9);
-                if count != 0 && cost > (8 * 1024 * 1024usize).saturating_sub(bytes) {
-                    break;
-                }
-                bytes = bytes.saturating_add(cost);
-                count += 1;
-            }
-            let (chunk, rest) = pending.split_at(count);
-            pending = rest;
-            let mut input = Vec::new();
-            for path in chunk {
-                input.extend_from_slice(path.as_bytes());
-                input.push(0);
-            }
-            let output = crate::process::capture_cancellable(
-                git(reader.control.path())
-                    .env("GIT_OBJECT_DIRECTORY", &reader.objects)
-                    .env("GIT_ATTR_NOSYSTEM", "1")
-                    .args([
-                        "-c",
-                        "core.attributesFile=/dev/null",
-                        "check-attr",
-                        "--source",
-                        tree,
-                        "-z",
-                        "--stdin",
-                        "binary",
-                        "diff",
-                        "filter",
-                    ]),
-                Duration::from_secs(120),
-                Some(input),
-                None,
-                Some(&self.cancel),
-            )?;
-            ensure!(
-                output.status.success(),
-                "Cannot read committed source attributes"
-            );
-            let mut fields: Vec<_> = output.stdout.split(|&b| b == 0).collect();
-            ensure!(
-                fields.last().is_some_and(|s| s.is_empty()),
-                "Invalid Git attribute output"
-            );
-            fields.pop();
-            ensure!(
-                fields.len() == chunk.len() * 9,
-                "Incomplete Git attribute output"
-            );
-            for (path, fields) in chunk.iter().zip(fields.chunks_exact(9)) {
-                for fields in fields.chunks_exact(3) {
-                    ensure!(
-                        fields[0] == path.as_bytes(),
-                        "Unexpected Git attribute path"
-                    );
-                    if fields[1] == b"binary" && fields[2] == b"set"
-                        || fields[1] == b"diff" && fields[2] == b"unset"
-                        || fields[1] == b"filter" && fields[2] == b"lfs"
-                    {
-                        allowed.remove(path);
-                    }
-                }
-            }
-        }
-        Ok(allowed)
+        self.attributes.as_mut().unwrap().select(
+            tree,
+            *policy.finalize().as_bytes(),
+            paths,
+            value_bytes,
+            &self.cancel,
+        )
     }
     pub fn empty_tree(&self) -> Result<String> {
         let output = crate::process::capture_cancellable(
@@ -1576,18 +1517,40 @@ mod tests {
             let fixture = Fixture::new(format);
             let path = fixture.directory.path();
             let allowed = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join("added.rs"), "pub fn added() {}\n").unwrap();
+            command(path, &["add", "added.rs"]);
+            command(
+                path,
+                &["commit", "-qm", "add source without changing attributes"],
+            );
+            let same_policy = command(path, &["rev-parse", "HEAD^{tree}"]);
             fs::write(path.join(".gitattributes"), "selected.rs binary\n").unwrap();
             command(path, &["add", ".gitattributes"]);
             command(path, &["commit", "-qm", "exclude source"]);
             let excluded = command(path, &["rev-parse", "HEAD^{tree}"]);
             fs::create_dir_all(path.join(".git/info")).unwrap();
             fs::write(path.join(".git/info/attributes"), "selected.rs binary\n").unwrap();
-            let paths = ["selected.rs".to_owned()];
             let mut store = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
-            for (tree, include) in [(&allowed, true), (&excluded, false), (&allowed, true)] {
+            for (tree, include) in [
+                (&allowed, true),
+                (&same_policy, true),
+                (&excluded, false),
+                (&allowed, true),
+            ] {
                 let entries = store.tree(tree).unwrap();
-                let result = store.source_paths(tree, &entries, &paths).unwrap();
-                assert_eq!(result.contains(&paths[0]), include);
+                let paths: Vec<_> = ["selected.rs", "added.rs"]
+                    .into_iter()
+                    .filter(|p| entries.contains_key(*p))
+                    .map(str::to_owned)
+                    .collect();
+                for _ in 0..2 {
+                    let result = store.source_paths(tree, &entries, &paths).unwrap();
+                    assert_eq!(result.contains("selected.rs"), include);
+                    assert_eq!(
+                        result.contains("added.rs"),
+                        entries.contains_key("added.rs")
+                    );
+                }
             }
         }
     }
