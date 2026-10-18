@@ -790,7 +790,7 @@ impl Store {
         })
     }
     pub fn tree(&mut self, root: &str) -> Result<Tree> {
-        let mut result = Tree::new();
+        let mut result = Vec::new();
         let mut bytes_used = 0usize;
         let mut pending = vec![(String::new(), root.to_owned())];
         while let Some((prefix, oid)) = pending.pop() {
@@ -805,12 +805,12 @@ impl Store {
                 if entry.mode == 0o40000 {
                     pending.push((format!("{path}/"), entry.id.clone()));
                 }
-                result.insert(path, entry.clone());
+                result.push((path, entry.clone()));
             }
         }
         // Every descendant tree is now verified and retained by this lease.
         self.tree_have = Some(id(root)?);
-        Ok(result)
+        Ok(result.into_iter().collect())
     }
     fn directory(&mut self, oid: &str) -> Result<Arc<Directory>> {
         let object = self.object(oid, "tree")?;
