@@ -179,13 +179,9 @@ pub(super) fn load_all(
 
 pub(super) fn content(path: &Path) -> Result<Parsed> {
     let bytes = zstd::stream::decode_all(std::fs::File::open(path)?)?;
-    let mut parsed: Parsed = postcard::from_bytes(&bytes)?;
-    let name = path.file_name().unwrap().to_string_lossy();
-    let summary = path.with_file_name(name.replace(".text.zst", ".summary.zst"));
-    let bytes = zstd::stream::decode_all(std::fs::File::open(summary)?)?;
-    let cached: Cached = postcard::from_bytes(&bytes)?;
-    parsed.objects = cached.parsed.objects;
-    Ok(parsed)
+    // Object summaries are already held by the index; content consumers use
+    // only fragments, omissions, and the original byte count.
+    Ok(postcard::from_bytes(&bytes)?)
 }
 
 pub(super) fn available(path: &Path) -> bool {
@@ -209,9 +205,10 @@ mod tests {
         let second = tempfile::tempdir_in(root.path()).unwrap();
         let cancel = CancellationToken::new();
         let mut paths = Vec::new();
+        let text = "--- !u!1 &1\nGameObject:\n  m_Name: Example\n";
         for view in [&first, &second] {
             let source = view.path().join("Object.prefab");
-            std::fs::write(&source, "--- !u!1 &1\nGameObject:\n  m_Name: Example\n").unwrap();
+            std::fs::write(&source, text).unwrap();
             let record = load(
                 view.path(),
                 Some(&shared),
@@ -229,7 +226,15 @@ mod tests {
         assert_eq!(shared.collect(true).unwrap(), 0);
         drop(first);
         assert_eq!(shared.collect(true).unwrap(), 0);
-        assert_eq!(content(&paths[1]).unwrap().objects[0].name, "Example");
+        let cached = content(&paths[1]).unwrap();
+        assert_eq!(
+            cached
+                .fragments
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<String>(),
+            text
+        );
         drop(second);
         assert!(shared.collect(true).unwrap() > 0);
     }
@@ -259,7 +264,14 @@ mod tests {
                     path.file_stem().unwrap().to_str().unwrap()
                 );
                 let cached = content(record.content.as_ref().unwrap()).unwrap();
-                assert_eq!(cached.objects[0].name, record.objects[0].name);
+                assert_eq!(
+                    cached
+                        .fragments
+                        .iter()
+                        .map(|f| f.text.as_str())
+                        .collect::<String>(),
+                    std::fs::read_to_string(path).unwrap()
+                );
             }
         }
         let records = load_all(cache.path(), None, &files, &cancel).unwrap();
