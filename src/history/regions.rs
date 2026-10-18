@@ -233,11 +233,13 @@ impl Sources {
         store: &mut Store,
         paths: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> VecDeque<Result<Arc<Source>>> {
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(4);
+        static WORKERS: LazyLock<usize> = LazyLock::new(|| {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4)
+        });
         let inputs: Vec<_> = paths
-            .take(workers)
+            .take(*WORKERS)
             .map(|(path, blob)| (path, self.input(store, path, blob)))
             .collect();
         let misses = inputs
