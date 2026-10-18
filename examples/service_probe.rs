@@ -1,6 +1,6 @@
 //! replay a JSON workload against one shared service instance.
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc, time::Instant};
 #[derive(Deserialize)]
 struct Workload {
@@ -23,6 +23,16 @@ fn serial() -> usize {
 struct Case {
     project: String,
     query: String,
+    #[serde(default)]
+    tool: Tool,
+}
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Tool {
+    #[default]
+    Search,
+    Browse,
+    View,
 }
 
 fn memory_sample() -> Result<serde_json::Value> {
@@ -72,10 +82,14 @@ async fn main() -> Result<()> {
                 let app = app.clone();
                 jobs.spawn(async move {
             let start = Instant::now();
-            let output = app.search(&case.project, &case.query).await?;
+            let output = match case.tool {
+                Tool::Search => app.search(&case.project, &case.query).await?,
+                Tool::Browse => app.browse(&case.project, &case.query).await?,
+                Tool::View => app.view(&case.project, &case.query, "exact").await?,
+            };
             let elapsed = start.elapsed().as_micros();
             let mut sample = memory_sample()?;
-            sample.as_object_mut().unwrap().extend(serde_json::json!({"iteration":iteration,"project":case.project,"query":case.query,"elapsed_us":elapsed,"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string()}).as_object().unwrap().clone());
+            sample.as_object_mut().unwrap().extend(serde_json::json!({"iteration":iteration,"project":case.project,"tool":case.tool,"query":case.query,"elapsed_us":elapsed,"output_bytes":output.len(),"output_hash":blake3::hash(output.as_bytes()).to_hex().to_string()}).as_object().unwrap().clone());
             println!("{sample}");
             Ok::<_, anyhow::Error>(())
             });
