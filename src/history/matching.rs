@@ -984,6 +984,7 @@ impl Tracker {
         }
         let mut remaining = paths.iter().enumerate();
         let mut expanded = false;
+        let mut prepared = std::collections::VecDeque::new();
         for (index, path) in remaining.by_ref() {
             check(&self.store.cancel)?;
             if index == local_count {
@@ -1010,7 +1011,23 @@ impl Tracker {
                 continue;
             }
             expanded = true;
-            let other = self.sources.get(&mut self.store, path, &entry.id)?;
+            if index >= local_count && prepared.is_empty() {
+                prepared = self.sources.batch(
+                    &mut self.store,
+                    paths[index..]
+                        .iter()
+                        .filter(|p| {
+                            (*p == path || !search.visited.contains(*p))
+                                && matches!(to[*p].mode, 0o100644 | 0o100755)
+                                && regions::compatible(p, &region.path)
+                        })
+                        .map(|p| (p.as_str(), to[p].id.as_str())),
+                );
+            }
+            let other = match prepared.pop_front() {
+                Some(source) => source?,
+                None => self.sources.get(&mut self.store, path, &entry.id)?,
+            };
             if other.incomplete.is_some() {
                 search.incomplete = other.incomplete.clone();
             }

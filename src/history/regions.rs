@@ -11,10 +11,10 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicBool},
 };
 
 pub(super) const ADAPTER_VERSION: u32 = 6;
@@ -190,6 +190,15 @@ impl Source {
 pub(super) struct Sources {
     cache: Arc<Cache>,
 }
+enum Input {
+    Cached(Arc<Source>),
+    Parse {
+        key: cache::Key,
+        bytes: Vec<u8>,
+        language: Language,
+        java: bool,
+    },
+}
 impl Default for Sources {
     fn default() -> Self {
         Self::new(Arc::new(Cache::new(crate::memory::cache_budget() / 4)))
@@ -214,7 +223,50 @@ impl Sources {
         }
         self.get(store, path, blob).map(Some)
     }
-    pub fn get(&mut self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
+    pub fn get(&self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
+        self.parse(self.input(store, path, blob)?, path, &store.cancel)
+    }
+    /// Prepare only a small batch ahead of the caller. Keep errors in input
+    /// order so an unused later candidate cannot fail an earlier result.
+    pub fn batch<'a>(
+        &self,
+        store: &mut Store,
+        paths: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> VecDeque<Result<Arc<Source>>> {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4);
+        let inputs: Vec<_> = paths
+            .take(workers)
+            .map(|(path, blob)| (path, self.input(store, path, blob)))
+            .collect();
+        let misses = inputs
+            .iter()
+            .filter(|(_, input)| matches!(input, Ok(Input::Parse { .. })))
+            .count();
+        let cancel = &store.cancel;
+        if misses <= 1 {
+            return inputs
+                .into_iter()
+                .map(|(path, input)| self.parse(input?, path, cancel))
+                .collect();
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = inputs
+                .into_iter()
+                .map(|(path, input)| scope.spawn(move || self.parse(input?, path, cancel)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!("Historical source worker panicked"))
+                    })
+                })
+                .collect()
+        })
+    }
+    fn input(&self, store: &mut Store, path: &str, blob: &str) -> Result<Input> {
         crate::repository::history::check(&store.cancel)?;
         let language = language(path).with_context(|| format!("unsupported source path {path}"))?;
         let java = java::path(path);
@@ -227,11 +279,29 @@ impl Sources {
         };
         let key = cache::key(store.cache_scope(), &(blob, policy));
         if let Some(source) = self.cache.source(&key) {
-            return Ok(source);
+            return Ok(Input::Cached(source));
         }
-        let bytes = store.blob(blob)?;
+        Ok(Input::Parse {
+            key,
+            bytes: store.blob(blob)?,
+            language,
+            java,
+        })
+    }
+    fn parse(&self, input: Input, path: &str, cancel: &AtomicBool) -> Result<Arc<Source>> {
+        crate::repository::history::check(cancel)?;
+        let (key, bytes, language, java) = match input {
+            Input::Cached(source) => return Ok(source),
+            Input::Parse {
+                key,
+                bytes,
+                language,
+                java,
+            } => (key, bytes, language, java),
+        };
+        let _worker = crate::memory::admit_worker();
         let _admission = crate::memory::admit_file(bytes.len() as u64, false);
-        crate::repository::history::check(&store.cancel)?;
+        crate::repository::history::check(cancel)?;
         ensure!(
             !bytes.contains(&0),
             "binary source at {path}; contents were not followed"
@@ -244,11 +314,11 @@ impl Sources {
             .with_context(|| format!("non-UTF-8 source at {path}"))?
             .into();
         let facts = if java {
-            java::extract(&text, &store.cancel)
+            java::extract(&text, cancel)
         } else {
             crate::extract::historical(&text, language)
         };
-        crate::repository::history::check(&store.cancel)?;
+        crate::repository::history::check(cancel)?;
         let (declarations, calls, presence, incomplete) = match facts {
             Ok(facts) => (
                 facts.declarations,

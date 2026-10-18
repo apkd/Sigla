@@ -322,6 +322,89 @@ mod tests {
     }
 
     #[test]
+    fn source_batches_preserve_order_facts_errors_and_cancellation() {
+        use super::super::regions::{Region, Sources};
+        let root = repository();
+        let inputs: [(&str, &[u8]); 7] = [
+            (
+                "C.cs",
+                b"class C {\n#if A\nint Run() => Read();\n#else\nlong Run() => Read();\n#endif\n}",
+            ),
+            ("R.rs", b"fn run() -> i32 { read() + 1 }"),
+            ("C.java", b"class C { int run() { return read(); } }"),
+            ("C.txt", b"class C { int run() { return read(); } }"),
+            ("broken.cs", b"class C { void Run( }"),
+            ("binary.cs", b"class C {}\0"),
+            ("invalid.cs", &[0xff]),
+        ];
+        let blobs: Vec<_> = inputs
+            .iter()
+            .map(|(_, text)| git(root.path(), &["hash-object", "-w", "--stdin"], text))
+            .collect();
+        let paths: Vec<_> = inputs
+            .iter()
+            .zip(&blobs)
+            .map(|((path, _), blob)| (*path, blob.as_str()))
+            .collect();
+        let mut store = Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        let parallel = Sources::default();
+        let serial = Sources::default();
+        let mut index = 0;
+        while index < paths.len() {
+            let batch = parallel.batch(&mut store, paths[index..].iter().copied());
+            assert!(!batch.is_empty());
+            for result in batch {
+                let (path, blob) = paths[index];
+                match (result, serial.get(&mut store, path, blob)) {
+                    (Ok(actual), Ok(expected)) => {
+                        assert_eq!(actual.text, expected.text);
+                        assert_eq!(actual.incomplete, expected.incomplete);
+                        let declarations = |source: &Source| {
+                            source
+                                .declarations
+                                .iter()
+                                .map(|d| Region::declaration(path, blob, d, source))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(declarations(&actual), declarations(&expected));
+                        let calls = |source: &Source| {
+                            source
+                                .calls
+                                .iter()
+                                .map(|c| {
+                                    (
+                                        c.span.clone(),
+                                        c.name.clone(),
+                                        c.arguments,
+                                        c.receiver.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(calls(&actual), calls(&expected));
+                        assert!(Arc::ptr_eq(
+                            &actual,
+                            &parallel.get(&mut store, path, blob).unwrap()
+                        ));
+                    }
+                    (Err(actual), Err(expected)) => {
+                        assert_eq!(actual.to_string(), expected.to_string())
+                    }
+                    _ => panic!("Batched and serial source outcomes differ"),
+                }
+                index += 1;
+            }
+        }
+        store.cancel.store(true, Ordering::Release);
+        assert!(
+            parallel
+                .batch(&mut store, paths.iter().copied())
+                .iter()
+                .all(Result::is_err)
+        );
+    }
+
+    #[test]
     fn repeated_concurrent_and_uncached_queries_preserve_selected_history() {
         let root = repository();
         let base = commit(
@@ -448,7 +531,7 @@ mod tests {
             &["rev-parse", &format!("{at}:code.rs")],
             b"",
         );
-        let mut sources = super::super::regions::Sources::new(cache);
+        let sources = super::super::regions::Sources::new(cache);
         let mut store = Store::local(public.path(), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(sources.get(&mut store, "code.rs", &blob).is_err());
     }
@@ -470,7 +553,7 @@ mod tests {
         let cold = history(root.path(), &tip, &query, &cache).unwrap();
         let conditional = history(root.path(), &tip, &conditional_query, &cache).unwrap();
         assert!(!cold.contains("incomplete:"), "{cold}");
-        let mut sources = super::super::regions::Sources::new(cache.clone());
+        let sources = super::super::regions::Sources::new(cache.clone());
         let mut store = Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
         let size = cache.sources.lock().unwrap().limit / 2;
         for index in 0..3 {
@@ -561,7 +644,7 @@ mod tests {
         );
         let cancel = Arc::new(AtomicBool::new(false));
         let mut store = Store::local(root.path(), cancel.clone()).unwrap();
-        let mut sources = super::super::regions::Sources::default();
+        let sources = super::super::regions::Sources::default();
         let first = sources.get(&mut store, "code.rs", &blob).unwrap();
         cancel.store(true, Ordering::Release);
         assert!(sources.get(&mut store, "code.rs", &blob).is_err());
