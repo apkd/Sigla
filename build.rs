@@ -539,17 +539,29 @@ fn main() {
             "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
         ),
     ];
-    // Resolved-asset inputs changed only through the equivalent C# extraction.
-    // Asset parsing and composition are unchanged in this release.
-    let asset_aliases: &[(&str, &str)] = &[(
-        "21daf083db5802634df74c925bd21eae66fa116ae7308aa56092014bc6732de6",
-        "2bd548c115a34ba087131a20b944888147f6a6847f8334c13d29dabfe3595787",
+    // The first alias covers equivalent C# extraction. The second covers
+    // query and memory changes: shared Arcs serialize as the same values.
+    let asset_aliases: &[(&str, &str)] = &[
+        (
+            "21daf083db5802634df74c925bd21eae66fa116ae7308aa56092014bc6732de6",
+            "2bd548c115a34ba087131a20b944888147f6a6847f8334c13d29dabfe3595787",
+        ),
+        (
+            "28d47d445ddc4182423183693786a3d6a4fa27ba40ea47e9eb213fa8ccbe1ba1",
+            "5ad4f718fe48de00884cf4f3dbac59e18027bae0fbc56653e0e1d42c723b42e3",
+        ),
+    ];
+    // Content reads skip an unused summary decode; record writers and parsers
+    // are unchanged, so existing records retain their identities.
+    let asset_record_aliases: &[(&str, &str)] = &[(
+        "2a314d4f98408707b51bcc64bb3fd0bb86c1dd8315db5a79a9768b799c589f82",
+        "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",
     )];
     for (domain, hash, aliases) in [
         ("ANALYSIS", analysis, analysis_aliases),
         ("WORKSPACE", workspace, workspace_aliases),
         ("ASSET", assets, asset_aliases),
-        ("ASSET_RECORD", asset_records, &[]),
+        ("ASSET_RECORD", asset_records, asset_record_aliases),
     ] {
         let source = format!("{:x}", hash.finalize());
         let version = aliases
