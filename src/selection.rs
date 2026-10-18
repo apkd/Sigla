@@ -41,15 +41,6 @@ impl<K: Ord + Clone, V> Selection<K, V> {
             self.entries.pop_last();
         }
     }
-    pub fn finish_with(self, mut transform: impl FnMut(K, V) -> String) -> String {
-        crate::search::render_selected(
-            self.entries
-                .into_iter()
-                .map(|(key, s)| transform(key, s))
-                .collect(),
-            self.seen.len(),
-        )
-    }
     pub fn into_parts(self) -> (BTreeMap<K, V>, usize) {
         (self.entries, self.seen.len())
     }
@@ -58,7 +49,8 @@ impl<K: Ord + Clone, V> Selection<K, V> {
 #[cfg(test)]
 impl<K: Ord + Clone> Selection<K> {
     pub fn finish(self) -> String {
-        self.finish_with(|_, unit| unit)
+        let (entries, total) = self.into_parts();
+        crate::search::render_selected(entries.into_values().collect(), total)
     }
 }
 
