@@ -199,6 +199,23 @@ impl Sources {
     pub fn new(cache: Arc<Cache>) -> Self {
         Self { cache }
     }
+    pub fn anchor(
+        &mut self,
+        store: &mut Store,
+        path: &str,
+        blob: &str,
+        query: &crate::query::Query,
+    ) -> Result<Option<Arc<Source>>> {
+        if language(path) == Some(Language::CSharp) {
+            let bytes = store.blob(blob)?;
+            if let Ok(text) = std::str::from_utf8(&bytes)
+                && !may_declare(query, text)
+            {
+                return Ok(None);
+            }
+        }
+        self.get(store, path, blob).map(Some)
+    }
     pub fn get(&mut self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
         crate::repository::history::check(&store.cancel)?;
         let language = language(path).with_context(|| format!("unsupported source path {path}"))?;
@@ -303,6 +320,25 @@ impl Sources {
                 .into(),
         )
     }
+}
+
+/// A necessary spelling check, never evidence that a matching declaration exists.
+fn may_declare(query: &crate::query::Query, text: &str) -> bool {
+    if query.loose
+        || query.target.location.is_some()
+        || query.selector == "operator"
+        || text.contains("\\u")
+        || text.contains("\\U")
+    {
+        return true;
+    }
+    let parts: Vec<_> = query.target.name.split('.').collect();
+    if parts.iter().any(|part| {
+        part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    }) {
+        return true;
+    }
+    parts.iter().all(|part| text.contains(part))
 }
 
 pub(super) fn language(path: &str) -> Option<Language> {

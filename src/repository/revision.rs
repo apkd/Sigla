@@ -201,6 +201,7 @@ impl Prefix<'_> {
                         &Fetch {
                             filter,
                             depth: None,
+                            haves: &[],
                             cancel: self.cancel,
                         },
                         self.remaining,

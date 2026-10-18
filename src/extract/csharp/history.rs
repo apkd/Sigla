@@ -37,12 +37,26 @@ struct Work {
 }
 impl Work {
     fn parse(&mut self, parser: &mut tree_sitter::Parser, text: &str) -> Result<tree_sitter::Tree> {
+        self.parse_ranges(parser, text, &[])
+    }
+    fn parse_ranges(
+        &mut self,
+        parser: &mut tree_sitter::Parser,
+        text: &str,
+        ranges: &[tree_sitter::Range],
+    ) -> Result<tree_sitter::Tree> {
+        let bytes = if ranges.is_empty() {
+            text.len()
+        } else {
+            ranges.iter().map(|r| r.end_byte - r.start_byte).sum()
+        };
         ensure!(
-            text.len() <= PARSE_BYTES.saturating_sub(self.bytes),
+            bytes <= PARSE_BYTES.saturating_sub(self.bytes),
             "historical C# parse byte limit reached"
         );
-        self.bytes += text.len();
+        self.bytes += bytes;
         self.parses += 1;
+        parser.set_included_ranges(ranges)?;
         parser
             .parse(text, None)
             .ok_or_else(|| anyhow::anyhow!("historical C# parsing cancelled"))
@@ -139,12 +153,13 @@ fn explore_context(
     work: &mut Work,
 ) -> Result<bool> {
     work.contexts += 1;
+    let ranges = document.included_ranges(&context.ranges);
     let mut remaining = TRUE;
     let mut count = 0;
     while remaining != FALSE && count < PROJECTIONS {
         let values = conditions.witness(remaining, !count.is_multiple_of(2));
         let projection = document.project(conditions, &values, &context.ranges)?;
-        let tree = work.parse(parser, &projection.text)?;
+        let tree = work.parse_ranges(parser, &projection.text, &ranges)?;
         if validate && (tree.root_node().has_error() || !context.valid(&tree)) {
             return Ok(false);
         }

@@ -17,6 +17,8 @@ pub(super) enum Filter {
 pub(super) struct Fetch<'a> {
     pub filter: Filter,
     pub depth: Option<u32>,
+    /// Complete tree closures in the reader's object database. Never use for blob wants.
+    pub haves: &'a [gix_hash::ObjectId],
     pub cancel: &'a AtomicBool,
 }
 
@@ -287,6 +289,7 @@ impl Session {
             &Fetch {
                 filter: Filter::Trees,
                 depth: depth_one.then_some(1),
+                haves: &[],
                 cancel: &AtomicBool::new(false),
             },
             output,
@@ -305,6 +308,7 @@ impl Session {
             objects,
             unsupported: false,
             filter: options.filter,
+            haves: options.haves,
         };
         let shallow = match options.depth {
             Some(depth) => fetch::Shallow::DepthAtRemote(
@@ -339,7 +343,12 @@ impl Session {
                 trace_packetlines: false,
             },
             fetch::Options {
-                shallow_file: control.join("shallow"),
+                // Commit-only boundaries prove no tree coverage. Sharing them
+                // with tree fetches lets upload-pack choose absent tree delta bases.
+                shallow_file: control.join(match options.filter {
+                    Filter::Commits => "shallow-commits",
+                    Filter::Trees => "shallow",
+                }),
                 shallow: &shallow,
                 tags: fetch::Tags::None,
                 reject_shallow_remote: false,
@@ -385,12 +394,13 @@ impl Drop for Session {
     }
 }
 
-struct Wants {
+struct Wants<'a> {
     objects: Vec<gix_hash::ObjectId>,
     unsupported: bool,
     filter: Filter,
+    haves: &'a [gix_hash::ObjectId],
 }
-impl fetch::Negotiate for Wants {
+impl fetch::Negotiate for Wants<'_> {
     fn mark_complete_and_common_ref(&mut self) -> Result<negotiate::Action, negotiate::Error> {
         Ok(negotiate::Action::MustNegotiate {
             remote_ref_target_known: vec![false; self.objects.len()],
@@ -414,12 +424,15 @@ impl fetch::Negotiate for Wants {
     fn one_round(
         &mut self,
         _: &mut negotiate::one_round::State,
-        _: &mut fetch::Arguments,
+        arguments: &mut fetch::Arguments,
         _: Option<&fetch::Response>,
     ) -> Result<(negotiate::Round, bool), negotiate::Error> {
+        for have in self.haves {
+            arguments.have(have);
+        }
         Ok((
             negotiate::Round {
-                haves_sent: 0,
+                haves_sent: self.haves.len(),
                 in_vain: 0,
                 haves_to_send: 0,
                 previous_response_had_at_least_one_in_common: false,

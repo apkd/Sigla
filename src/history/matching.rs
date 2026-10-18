@@ -240,6 +240,7 @@ impl Tracker {
         if let Some(tree) = self.cache.tree(&key) {
             return Ok(tree);
         }
+        self.store.prepare_tree(commit)?;
         let mut tree = self.store.tree(&commit.tree)?;
         let paths: Vec<_> = tree
             .iter()
@@ -324,7 +325,11 @@ impl Tracker {
                         "blob",
                     )?;
                     for (path, blob) in chunk {
-                        let source = self.sources.get(&mut self.store, path, blob)?;
+                        let Some(source) =
+                            self.sources.anchor(&mut self.store, path, blob, query)?
+                        else {
+                            continue;
+                        };
                         if source.incomplete.is_some() {
                             incomplete = source.incomplete.clone();
                         }
@@ -451,6 +456,12 @@ impl Tracker {
         {
             return Ok((*mapping).clone());
         }
+        if let Some(mapping) = self.unchanged(from, to, state)? {
+            if let Some(key) = key {
+                self.cache.put_mapping(key, &mapping);
+            }
+            return Ok(mapping);
+        }
         let a = self.tree(from)?;
         let b = self.tree(to)?;
         let mut result = Mapping {
@@ -530,6 +541,40 @@ impl Tracker {
             self.cache.put_mapping(key, &result);
         }
         Ok(result)
+    }
+    fn unchanged(&mut self, from: &Commit, to: &Commit, state: &State) -> Result<Option<Mapping>> {
+        if !state.paths.is_empty() {
+            return Ok(None);
+        }
+        if from.tree != to.tree {
+            for region in &state.regions {
+                let a = self.store.source_path(from, &region.path)?;
+                let b = self.store.source_path(to, &region.path)?;
+                // Equal source alone is insufficient: a predecessor can exclude
+                // that same blob through a different ancestor .gitattributes.
+                if a != b
+                    || !b.entry.as_ref().is_some_and(|e| {
+                        e.id == region.blob && matches!(e.mode, 0o100644 | 0o100755)
+                    })
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(Mapping {
+            state: state.clone(),
+            links: state
+                .regions
+                .iter()
+                .map(|region| Link {
+                    from: region.clone(),
+                    to: region.clone(),
+                    relation: Relation::Continue,
+                    uncertain: region.weak,
+                    reason: "object+context",
+                })
+                .collect(),
+        }))
     }
     fn region(
         &mut self,

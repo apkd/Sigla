@@ -70,6 +70,12 @@ pub(crate) struct Entry {
 }
 pub(crate) type Tree = BTreeMap<String, Entry>;
 
+#[derive(PartialEq, Eq)]
+pub(crate) struct SourcePath {
+    pub entry: Option<Entry>,
+    attributes: Tree,
+}
+
 struct Object {
     kind: String,
     bytes: Vec<u8>,
@@ -252,6 +258,7 @@ pub(crate) struct Store {
     bytes: usize,
     resolved: BTreeMap<String, String>,
     planner: planner::Planner,
+    tree_have: Option<gix_hash::ObjectId>,
     pub cancel: Arc<AtomicBool>,
     pub complete: BTreeSet<String>,
     pub boundaries: BTreeSet<String>,
@@ -341,6 +348,7 @@ impl Store {
             bytes: 0,
             resolved: BTreeMap::new(),
             planner: planner::Planner::default(),
+            tree_have: None,
             complete: BTreeSet::new(),
             boundaries: BTreeSet::new(),
             reads: 0,
@@ -435,6 +443,7 @@ impl Store {
     }
     fn acquisition_kind(&self, kind: &str) -> planner::Kind {
         match kind {
+            "commit-tree" => planner::Kind::CommitTrees,
             "commit"
                 if self
                     .remote
@@ -463,7 +472,14 @@ impl Store {
             check(&self.cancel)?;
             let class = self.acquisition_kind(kind);
             let remaining = self.remaining();
-            let depth = (kind == "commit").then(|| self.planner.depth(class, ids.len(), remaining));
+            let depth = matches!(kind, "commit" | "commit-tree")
+                .then(|| self.planner.depth(class, ids.len(), remaining));
+            // Partial source trees prove no blob coverage or complete ancestry.
+            let haves = if matches!(class, planner::Kind::Trees | planner::Kind::CommitTrees) {
+                self.tree_have.as_slice()
+            } else {
+                &[]
+            };
             let remote = self
                 .remote
                 .as_mut()
@@ -479,6 +495,7 @@ impl Store {
                     Filter::Trees
                 },
                 depth,
+                haves,
                 cancel: &self.cancel,
             };
             let start = Instant::now();
@@ -644,6 +661,9 @@ impl Store {
         Ok(())
     }
     fn object(&mut self, oid: &str, kind: &str) -> Result<Arc<Object>> {
+        self.object_from(oid, kind, None)
+    }
+    fn object_from(&mut self, oid: &str, kind: &str, commit: Option<&str>) -> Result<Arc<Object>> {
         check(&self.cancel)?;
         if let Some(object) = self.objects.get(oid) {
             ensure!(object.kind == kind, "Unexpected Git object kind");
@@ -655,7 +675,8 @@ impl Store {
         let mut object = self.batch.as_mut().unwrap().read(oid, &self.cancel)?;
         if object.is_none() {
             self.batch = None;
-            self.acquire(&[oid.into()], kind)
+            let (want, acquisition) = commit.map_or((oid, kind), |id| (id, "commit-tree"));
+            self.acquire(&[want.into()], acquisition)
                 .with_context(|| format!("missing {kind} {oid}"))?;
             self.batch = Some(Batch::new(&self.path, self.cancel.clone())?);
             object = self.batch.as_mut().unwrap().read(oid, &self.cancel)?;
@@ -730,44 +751,93 @@ impl Store {
         let mut pending = vec![(String::new(), root.to_owned())];
         while let Some((prefix, oid)) = pending.pop() {
             check(&self.cancel)?;
-            let object = self.object(&oid, "tree")?;
-            let mut bytes = object.bytes.as_slice();
-            while !bytes.is_empty() {
-                let space = bytes
-                    .iter()
-                    .position(|&c| c == b' ')
-                    .context("Invalid Git tree mode")?;
-                let nul = bytes
-                    .iter()
-                    .position(|&c| c == 0)
-                    .context("Invalid Git tree path")?;
-                ensure!(
-                    space < nul && bytes.len() >= nul + 1 + oid.len() / 2,
-                    "Truncated Git tree"
-                );
-                let mode = u32::from_str_radix(std::str::from_utf8(&bytes[..space])?, 8)?;
-                let name = std::str::from_utf8(&bytes[space + 1..nul])?;
-                super::selection::validate_path(name)?;
-                ensure!(!name.contains('/'), "Invalid Git tree component");
+            for (name, entry) in self.directory(&oid)? {
                 let path = format!("{prefix}{name}");
                 bytes_used = bytes_used.saturating_add(path.len() + 160);
                 ensure!(
                     bytes_used <= 64 * 1024 * 1024,
                     "history tree inventory exceeds request memory bound"
                 );
-                let mut hash = String::with_capacity(oid.len());
-                for byte in &bytes[nul + 1..nul + 1 + oid.len() / 2] {
-                    use std::fmt::Write;
-                    write!(hash, "{byte:02x}").unwrap();
+                if entry.mode == 0o40000 {
+                    pending.push((format!("{path}/"), entry.id.clone()));
                 }
-                bytes = &bytes[nul + 1 + oid.len() / 2..];
-                if mode == 0o40000 {
-                    pending.push((format!("{path}/"), hash.clone()));
-                }
-                result.insert(path, Entry { id: hash, mode });
+                result.insert(path, entry);
+            }
+        }
+        // Every descendant tree is now verified and retained by this lease.
+        self.tree_have = Some(id(root)?);
+        Ok(result)
+    }
+    fn directory(&mut self, oid: &str) -> Result<Tree> {
+        let object = self.object(oid, "tree")?;
+        let mut bytes = object.bytes.as_slice();
+        let mut result = Tree::new();
+        let mut used = 0usize;
+        while !bytes.is_empty() {
+            let space = bytes
+                .iter()
+                .position(|&c| c == b' ')
+                .context("Invalid Git tree mode")?;
+            let nul = bytes
+                .iter()
+                .position(|&c| c == 0)
+                .context("Invalid Git tree path")?;
+            let end = nul + 1 + oid.len() / 2;
+            ensure!(space < nul && bytes.len() >= end, "Truncated Git tree");
+            let mode = u32::from_str_radix(std::str::from_utf8(&bytes[..space])?, 8)?;
+            let name = std::str::from_utf8(&bytes[space + 1..nul])?;
+            super::selection::validate_path(name)?;
+            ensure!(!name.contains('/'), "Invalid Git tree component");
+            used += name.len() + 160;
+            ensure!(
+                used <= MEMORY,
+                "history tree inventory exceeds request memory bound"
+            );
+            let hash = gix_hash::ObjectId::from_bytes_or_panic(&bytes[nul + 1..end]).to_string();
+            result.insert(name.into(), Entry { id: hash, mode });
+            bytes = &bytes[end..];
+        }
+        Ok(result)
+    }
+    /// Read only the path's directories and the attribute identities that govern it.
+    pub fn source_path(&mut self, commit: &Commit, path: &str) -> Result<SourcePath> {
+        super::selection::validate_path(path)?;
+        self.prepare_tree(commit)?;
+        let mut result = SourcePath {
+            entry: None,
+            attributes: Tree::new(),
+        };
+        let mut tree = commit.tree.clone();
+        let mut prefix = String::new();
+        let mut parts = path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            let mut entries = self.directory(&tree)?;
+            if let Some(attributes) = entries.get(".gitattributes")
+                && matches!(attributes.mode, 0o100644 | 0o100755)
+            {
+                result
+                    .attributes
+                    .insert(format!("{prefix}.gitattributes"), attributes.clone());
+            }
+            let Some(entry) = entries.remove(part) else {
+                break;
+            };
+            if parts.peek().is_none() {
+                result.entry = Some(entry);
+            } else if entry.mode == 0o40000 {
+                tree = entry.id;
+                prefix.push_str(part);
+                prefix.push('/');
+            } else {
+                break;
             }
         }
         Ok(result)
+    }
+    pub fn prepare_tree(&mut self, commit: &Commit) -> Result<()> {
+        // Fetch a bounded ancestry window even when commit metadata is already cached.
+        self.object_from(&commit.tree, "tree", Some(&commit.id))?;
+        Ok(())
     }
     pub fn source_paths(
         &mut self,
@@ -1250,6 +1320,82 @@ mod tests {
         assert!(store.tree(&root).unwrap().contains_key("nested/source.rs"));
         store.prefetch(&wants, "tree").unwrap();
         assert_eq!(store.remote.as_ref().unwrap().requests, requests);
+        assert!(!fixture.inventory().contains(" blob"));
+    }
+
+    #[test]
+    fn negotiated_trees_reuse_metadata_without_hiding_missing_blobs() {
+        for format in ["sha1", "sha256"] {
+            let fixture = Fixture::new(format);
+            let path = fixture.directory.path();
+            for index in 0..64 {
+                let directory = path.join(format!("part{index}"));
+                fs::create_dir(&directory).unwrap();
+                fs::write(
+                    directory.join("source.rs"),
+                    format!("pub fn part{index}() {{}}\n"),
+                )
+                .unwrap();
+            }
+            command(path, &["add", "."]);
+            command(path, &["commit", "-qm", "shared trees"]);
+            let first = command(path, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(path.join("selected.rs"), "pub fn changed() {}\n").unwrap();
+            command(path, &["add", "."]);
+            command(path, &["commit", "-qm", "changed tree"]);
+            let second = command(path, &["rev-parse", "HEAD^{tree}"]);
+            let mut store = fixture.store();
+            let old = store.tree(&first).unwrap();
+            let initial = store.remote.as_ref().unwrap().transferred;
+            let new = store.tree(&second).unwrap();
+            let added = store.remote.as_ref().unwrap().transferred - initial;
+            assert!(
+                added < initial / 2,
+                "Shared trees were downloaded again: {added}/{initial}"
+            );
+            assert_eq!(old["part0/source.rs"], new["part0/source.rs"]);
+            assert!(!fixture.inventory().contains(" blob"));
+            // Tree haves must never imply that their omitted source blobs are available.
+            for entry in [&old["part0/source.rs"], &new["selected.rs"]] {
+                assert!(!store.blob(&entry.id).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tree_windows_batch_even_when_commit_metadata_is_already_cached() {
+        let fixture = Fixture::new("sha1");
+        let path = fixture.directory.path();
+        let mut commits = Vec::new();
+        for index in 0..18 {
+            fs::write(
+                path.join("other.rs"),
+                format!("pub fn other{index}() {{}}\n"),
+            )
+            .unwrap();
+            command(path, &["add", "."]);
+            command(path, &["commit", "-qm", "other change"]);
+            commits.push(command(path, &["rev-parse", "HEAD"]));
+        }
+        let mut store = fixture.store();
+        store.prefetch(&commits, "commit").unwrap();
+        assert!(!fixture.inventory().contains(" tree"));
+        let before = store.remote.as_ref().unwrap().requests;
+        for oid in commits.iter().rev() {
+            let commit = store.commit(oid).unwrap();
+            store.prepare_tree(&commit).unwrap();
+            assert!(
+                store
+                    .tree(&commit.tree)
+                    .unwrap()
+                    .contains_key("selected.rs")
+            );
+        }
+        let requests = store.remote.as_ref().unwrap().requests - before;
+        assert!(
+            requests < commits.len(),
+            "Every commit required a separate tree fetch"
+        );
         assert!(!fixture.inventory().contains(" blob"));
     }
 

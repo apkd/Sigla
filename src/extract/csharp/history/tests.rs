@@ -502,6 +502,81 @@ fn independent_methods(count: usize) -> String {
 }
 
 #[test]
+fn sparse_context_parses_preserve_tokens_spans_and_line_comments() {
+    for gap in [" ", "\r\n  \r\n", "\u{2028}\t", "\n\n// 🦀\r\n"] {
+        let source = format!(
+            "class Café {{ int Before;{gap}// selected\nint Target() {{ return 1; }}{gap}int After; }}"
+        );
+        let mut conditions = Conditions::default();
+        let document = Document::new(&source, &mut conditions).unwrap();
+        let context = Context::whole(source.len());
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let seed = Work::default().parse(&mut parser, &source).unwrap();
+        let mut inventory = contexts::Inventory::default();
+        inventory.record(&seed).unwrap();
+        for context in inventory
+            .plan(source.len())
+            .unwrap()
+            .into_iter()
+            .chain([context])
+        {
+            let projection = document
+                .project(&mut conditions, &[], &context.ranges)
+                .unwrap();
+            let full = Work::default()
+                .parse(&mut parser, &projection.text)
+                .unwrap();
+            let sparse = Work::default()
+                .parse_ranges(
+                    &mut parser,
+                    &projection.text,
+                    &document.included_ranges(&context.ranges),
+                )
+                .unwrap();
+            assert_eq!(sparse.root_node().has_error(), full.root_node().has_error());
+            // Invalid speculative seams are discarded before their facts are
+            // used. Recovery spans need not agree, but rejection must agree.
+            if full.root_node().has_error() {
+                continue;
+            }
+            assert_eq!(sparse.root_node().to_sexp(), full.root_node().to_sexp());
+            let spans = |tree: &tree_sitter::Tree| {
+                let mut result = Vec::new();
+                let mut cursor = tree.walk();
+                'walk: loop {
+                    let node = cursor.node();
+                    if node.child_count() == 0 {
+                        result.push((
+                            node.kind().to_owned(),
+                            node.byte_range(),
+                            node.start_position(),
+                            node.end_position(),
+                        ));
+                    }
+                    if cursor.goto_first_child() {
+                        continue;
+                    }
+                    loop {
+                        if cursor.goto_next_sibling() {
+                            break;
+                        }
+                        if !cursor.goto_parent() {
+                            break 'walk;
+                        }
+                    }
+                }
+                result
+            };
+            assert_eq!(spans(&sparse), spans(&full));
+            assert_eq!(context.valid(&sparse), context.valid(&full));
+        }
+    }
+}
+
+#[test]
 fn independent_declaration_work_is_additive_at_the_symbol_limit() {
     for count in [16, 128] {
         let source = independent_methods(count);
@@ -530,7 +605,14 @@ fn independent_declaration_work_is_additive_at_the_symbol_limit() {
         // Two discovery witnesses, one owner shell, one fixed Target and two
         // parses per Other. This measures work, not machine-dependent timing.
         assert!(work.parses <= 2 * count + 4, "{} parses", work.parses);
-        assert_eq!(work.bytes, work.parses * source.len());
+        // The parser visits each declaration and its owner shell, rather than
+        // scanning a full file of blank sibling declarations on every pass.
+        assert!(
+            work.bytes < 8 * source.len(),
+            "{} parsed bytes for {} source bytes",
+            work.bytes,
+            source.len()
+        );
     }
 }
 

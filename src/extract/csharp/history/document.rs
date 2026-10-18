@@ -111,6 +111,7 @@ pub(super) struct Document<'a> {
     source: &'a str,
     blank: String,
     text: Vec<Text>,
+    lines: Vec<usize>,
 }
 impl<'a> Document<'a> {
     pub(super) fn new(source: &'a str, conditions: &mut Conditions) -> Result<Self> {
@@ -280,6 +281,14 @@ impl<'a> Document<'a> {
             source,
             blank: String::from_utf8(bytes)?,
             text,
+            lines: std::iter::once(0)
+                .chain(
+                    source
+                        .bytes()
+                        .enumerate()
+                        .filter_map(|(i, c)| (c == b'\n').then_some(i + 1)),
+                )
+                .collect(),
         })
     }
 
@@ -306,6 +315,46 @@ impl<'a> Document<'a> {
         guards.sort_unstable();
         guards.dedup();
         guards
+    }
+
+    /// Skip masked holes while keeping original byte/point coordinates. One
+    /// whitespace character per hole preserves token separation; a line break
+    /// also terminates line comments exactly as the full masked source does.
+    pub(super) fn included_ranges(&self, ranges: &[Range<usize>]) -> Vec<tree_sitter::Range> {
+        let mut spans = Vec::new();
+        let mut end = 0;
+        for range in ranges
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.source.len()..self.source.len()))
+        {
+            if end < range.start {
+                let gap = &self.blank[end..range.start];
+                let offset = gap.rfind(newline).unwrap_or(0);
+                let size = gap[offset..].chars().next().unwrap().len_utf8();
+                spans.push(end + offset..end + offset + size);
+            }
+            if !range.is_empty() {
+                spans.push(range.clone());
+            }
+            end = range.end;
+        }
+        let point = |byte| {
+            let row = self.lines.partition_point(|&start| start <= byte) - 1;
+            tree_sitter::Point {
+                row,
+                column: byte - self.lines[row],
+            }
+        };
+        spans
+            .into_iter()
+            .map(|r| tree_sitter::Range {
+                start_byte: r.start,
+                end_byte: r.end,
+                start_point: point(r.start),
+                end_point: point(r.end),
+            })
+            .collect()
     }
 
     /// Enumerate the text of this context, not assignments to its symbols.

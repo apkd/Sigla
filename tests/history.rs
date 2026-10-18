@@ -1752,6 +1752,67 @@ async fn a_positional_anchor_does_not_discard_a_longer_conditional_header() {
 }
 
 #[tokio::test]
+async fn a_named_anchor_ignores_unrelated_incomplete_csharp_sources() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[
+            (
+                "Worker.cs",
+                "class @Worker { int @Target() { return 1; } }\n",
+            ),
+            ("Other.cs", "#if FEATURE\nclass Other { int Broken(\n"),
+        ],
+        &[],
+        "unrelated incomplete source",
+    );
+    let history = f.history(&root, "log method:Worker.Target()").await;
+    assert_eq!(ids(&history), [root.as_str()], "{history}");
+    assert!(history.ends_with("end\n"), "{history}");
+    // A broad selector cannot prove the incomplete file irrelevant.
+    let error = f.error(&root, "log method:*").await;
+    assert!(error.contains("Unresolved anchor"), "{error}");
+}
+
+#[tokio::test]
+async fn escaped_names_in_incomplete_csharp_sources_remain_candidates() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[
+            ("Worker.cs", "class Worker { int Target() { return 1; } }\n"),
+            (
+                "Other.cs",
+                "#if FEATURE\nclass Worker { int \\u0054arget(\n",
+            ),
+        ],
+        &[],
+        "escaped competing source",
+    );
+    let error = f.error(&root, "log method:Worker.Target()").await;
+    assert!(error.contains("Unresolved anchor"), "{error}");
+}
+
+#[tokio::test]
+async fn unchanged_files_still_obey_changed_ancestor_attributes() {
+    let f = Fixture::new();
+    let source = "pub fn selected() {}\n";
+    let root = f.commit(
+        &[
+            ("src/.gitattributes", "*.rs binary\n"),
+            ("src/nested/lib.rs", source),
+        ],
+        &[],
+        "excluded ancestor",
+    );
+    let tip = f.commit(&[("src/nested/lib.rs", source)], &[&root], "allowed source");
+    let history = f.history(&tip, "log file:src/nested/lib.rs").await;
+    assert!(
+        history.contains("incomplete:")
+            && history.contains("excluded by committed source attributes"),
+        "{history}"
+    );
+}
+
+#[tokio::test]
 async fn an_unfinished_candidate_file_cannot_prove_anchor_uniqueness() {
     let f = Fixture::new();
     let root = f.commit(
