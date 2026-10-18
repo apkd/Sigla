@@ -1487,6 +1487,69 @@ mod tests {
     }
 
     #[test]
+    fn method_comparisons_batch_wider_sources_only_when_needed() {
+        for edited in [false, true] {
+            let mut fixture = Fixture::new("sha1");
+            let path = fixture.directory.path();
+            let mut older = Vec::new();
+            for revision in 0..2 {
+                fs::write(
+                    path.join("Worker.cs"),
+                    format!(
+                        "class Worker {{
+                            int Target(int x) {{
+                                var adjusted = x + 13;
+                                var scaled = adjusted * 17;
+                                var rotated = (scaled << 5) | (scaled >> 27);
+                                var combined = rotated + x;
+                                var spread = combined ^ (combined >> 16);
+                                var folded = spread * 668265263;
+                                return (folded & 65535) + {};
+                            }}
+                            int Sibling() => {};
+                        }}",
+                        if edited { revision } else { 0 },
+                        revision,
+                    ),
+                )
+                .unwrap();
+                for index in 0..24 {
+                    fs::write(
+                        path.join(format!("Other{index}.cs")),
+                        format!(
+                            "class Other{index} {{ int Value() => {}; }}",
+                            index + revision
+                        ),
+                    )
+                    .unwrap();
+                }
+                command(path, &["add", "."]);
+                command(path, &["commit", "-qm", "source changes"]);
+                if revision == 0 {
+                    older.extend((0..24).map(|index| {
+                        command(path, &["rev-parse", &format!("HEAD:Other{index}.cs")])
+                    }));
+                }
+            }
+            fixture.tip = command(path, &["rev-parse", "HEAD"]);
+            let query = format!("show {} method:Worker.Target path:Worker.cs", fixture.tip);
+            let cold = crate::history::run(fixture.store(), None, &query).unwrap();
+            let local = Store::local(path, Arc::new(AtomicBool::new(false))).unwrap();
+            assert_eq!(cold, crate::history::run(local, None, &query).unwrap());
+            let inventory = fixture.inventory();
+            for id in &older {
+                assert_eq!(inventory.contains(id), edited, "{cold}");
+            }
+            let packs = fs::read_dir(fixture.current().join("objects/pack"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+                .count();
+            assert!(packs < older.len(), "Each source required a separate pack");
+        }
+    }
+
+    #[test]
     fn real_rust_split_resolves_before_hydrating_unrelated_source() {
         for method in ["force", "new"] {
             let mut fixture = Fixture::new("sha1");

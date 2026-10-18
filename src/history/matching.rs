@@ -941,6 +941,7 @@ impl Tracker {
         if let Some(path) = required.filter(|p| to.contains_key(*p)) {
             paths.push(path.to_owned());
         }
+        let local_count = paths.len();
         paths.extend(
             to.iter()
                 .filter(|(p, e)| {
@@ -965,34 +966,48 @@ impl Tracker {
                     .map(|(p, _)| p.clone()),
             );
         }
-        let mut paths = paths.into_iter();
+        let mut remaining = paths.iter().enumerate();
         let mut expanded = false;
-        for path in paths.by_ref() {
+        for (index, path) in remaining.by_ref() {
             check(&self.store.cancel)?;
+            if index == local_count {
+                // Exact local continuations stop before this point. Once wider
+                // comparison is needed, acquire its blobs in bounded batches.
+                let blobs = paths[local_count..]
+                    .iter()
+                    .filter(|p| {
+                        !search.visited.contains(*p)
+                            && matches!(to[*p].mode, 0o100644 | 0o100755)
+                            && regions::compatible(p, &region.path)
+                    })
+                    .map(|p| to[p].id.clone())
+                    .collect::<Vec<_>>();
+                self.store.prefetch(&blobs, "blob")?;
+            }
             if !search.visited.insert(path.clone()) {
                 continue;
             }
-            let entry = &to[&path];
+            let entry = &to[path];
             if !matches!(entry.mode, 0o100644 | 0o100755)
-                || !regions::compatible(&path, &region.path)
+                || !regions::compatible(path, &region.path)
             {
                 continue;
             }
             expanded = true;
-            let other = self.sources.get(&mut self.store, &path, &entry.id)?;
+            let other = self.sources.get(&mut self.store, path, &entry.id)?;
             if other.incomplete.is_some() {
                 search.incomplete = other.incomplete.clone();
             }
-            let mapped = (path == region.path)
+            let mapped = (path == &region.path)
                 .then(|| regions::map_range(&source.text, &other.text, source_range.clone()))
                 .flatten();
             let candidates = if region.kind == "file" {
-                vec![Region::whole(&path, &entry.id, 0)]
+                vec![Region::whole(path, &entry.id, 0)]
             } else if region.kind == "text" {
                 text_candidates(
                     &source.text[source_range.clone()],
                     &other,
-                    &path,
+                    path,
                     &entry.id,
                     mapped.clone(),
                 )
@@ -1009,7 +1024,7 @@ impl Tracker {
                                         "method" | "function" | "constructor" | "operator"
                                     ))
                     })
-                    .map(|d| Region::declaration(&path, &entry.id, d, &other))
+                    .map(|d| Region::declaration(path, &entry.id, d, &other))
                     .collect()
             };
             for mut candidate in candidates {
@@ -1030,7 +1045,7 @@ impl Tracker {
                     b,
                 );
                 let sim = body.similarity;
-                let same_path = path == region.path;
+                let same_path = path == &region.path;
                 let same_owner = region.owner == candidate.owner;
                 // Anonymous labels are display text, never continuity evidence.
                 let same_name = !anonymous && region.name == candidate.name;
@@ -1183,10 +1198,10 @@ impl Tracker {
                 break;
             }
         }
-        search.remaining = paths.any(|p| {
-            !search.visited.contains(&p)
-                && matches!(to[&p].mode, 0o100644 | 0o100755)
-                && regions::compatible(&p, &region.path)
+        search.remaining = remaining.any(|(_, p)| {
+            !search.visited.contains(p)
+                && matches!(to[p].mode, 0o100644 | 0o100755)
+                && regions::compatible(p, &region.path)
         });
         if expanded {
             search.scored.sort_by(|a, b| {
