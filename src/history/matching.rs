@@ -319,60 +319,43 @@ impl Tracker {
                     .map(|(path, entry)| (path.clone(), entry.id.clone()))
                     .collect();
                 drop(filters);
-                for chunk in candidates.chunks(16) {
-                    self.store.prefetch(
-                        &chunk.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>(),
-                        "blob",
-                    )?;
-                    for (path, blob) in chunk {
-                        let Some(source) =
-                            self.sources.anchor(&mut self.store, path, blob, query)?
-                        else {
-                            continue;
-                        };
-                        if source.incomplete.is_some() {
-                            incomplete = source.incomplete.clone();
-                        }
-                        if let Some(location) = &query.target.location {
-                            let offset =
-                                crate::model::offset(&source.text, location.line, location.column)
-                                    .context("Location is outside the anchor source")?;
-                            let mut declarations: Vec<_> = source
-                                .declarations
-                                .iter()
-                                .filter(|d| {
-                                    regions::selectable(d)
-                                        && regions::matches_kind(&query.selector, d)
-                                        && d.span.contains(&offset)
-                                })
-                                .collect();
-                            declarations.sort_by_key(|d| d.span.len());
-                            // Innermost in each feasible environment, not the
-                            // shortest span across mutually exclusive headers.
-                            let mut coverage = source.presence.coverage();
-                            for group in declarations.chunk_by(|a, b| a.span.len() == b.span.len())
-                            {
-                                for declaration in group {
-                                    if coverage.uncovered(declaration.guard).context(
-                                        "Unresolved anchor: historical positional alternatives",
-                                    )? {
-                                        state.regions.push(Region::declaration(
-                                            path,
-                                            blob,
-                                            declaration,
-                                            &source,
-                                        ));
-                                    }
-                                }
-                                for declaration in group {
-                                    coverage.add(declaration.guard).context(
-                                        "Unresolved anchor: historical positional alternatives",
-                                    )?;
-                                }
-                            }
-                        } else {
-                            for declaration in &source.declarations {
-                                if regions::selected(query, declaration) {
+                self.store.prefetch(
+                    &candidates
+                        .iter()
+                        .map(|(_, id)| id.clone())
+                        .collect::<Vec<_>>(),
+                    "blob",
+                )?;
+                for (path, blob) in &candidates {
+                    let Some(source) = self.sources.anchor(&mut self.store, path, blob, query)?
+                    else {
+                        continue;
+                    };
+                    if let Some(reason) = &source.incomplete {
+                        incomplete = Some(format!("{path}: {reason}"));
+                    }
+                    if let Some(location) = &query.target.location {
+                        let offset =
+                            crate::model::offset(&source.text, location.line, location.column)
+                                .context("Location is outside the anchor source")?;
+                        let mut declarations: Vec<_> = source
+                            .declarations
+                            .iter()
+                            .filter(|d| {
+                                regions::selectable(d)
+                                    && regions::matches_kind(&query.selector, d)
+                                    && d.span.contains(&offset)
+                            })
+                            .collect();
+                        declarations.sort_by_key(|d| d.span.len());
+                        // Innermost in each feasible environment, not the
+                        // shortest span across mutually exclusive headers.
+                        let mut coverage = source.presence.coverage();
+                        for group in declarations.chunk_by(|a, b| a.span.len() == b.span.len()) {
+                            for declaration in group {
+                                if coverage.uncovered(declaration.guard).context(
+                                    "Unresolved anchor: historical positional alternatives",
+                                )? {
                                     state.regions.push(Region::declaration(
                                         path,
                                         blob,
@@ -380,6 +363,22 @@ impl Tracker {
                                         &source,
                                     ));
                                 }
+                            }
+                            for declaration in group {
+                                coverage.add(declaration.guard).context(
+                                    "Unresolved anchor: historical positional alternatives",
+                                )?;
+                            }
+                        }
+                    } else {
+                        for declaration in &source.declarations {
+                            if regions::selected(query, declaration) {
+                                state.regions.push(Region::declaration(
+                                    path,
+                                    blob,
+                                    declaration,
+                                    &source,
+                                ));
                             }
                         }
                     }

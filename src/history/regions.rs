@@ -206,13 +206,11 @@ impl Sources {
         blob: &str,
         query: &crate::query::Query,
     ) -> Result<Option<Arc<Source>>> {
-        if language(path) == Some(Language::CSharp) {
-            let bytes = store.blob(blob)?;
-            if let Ok(text) = std::str::from_utf8(&bytes)
-                && !may_declare(query, text)
-            {
-                return Ok(None);
-            }
+        let bytes = store.blob(blob)?;
+        if let Ok(text) = std::str::from_utf8(&bytes)
+            && !may_declare(query, text)
+        {
+            return Ok(None);
         }
         self.get(store, path, blob).map(Some)
     }

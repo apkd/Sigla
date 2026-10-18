@@ -1752,7 +1752,7 @@ async fn a_positional_anchor_does_not_discard_a_longer_conditional_header() {
 }
 
 #[tokio::test]
-async fn a_named_anchor_ignores_unrelated_incomplete_csharp_sources() {
+async fn a_named_anchor_ignores_unrelated_incomplete_sources() {
     let f = Fixture::new();
     let root = f.commit(
         &[
@@ -1761,6 +1761,9 @@ async fn a_named_anchor_ignores_unrelated_incomplete_csharp_sources() {
                 "class @Worker { int @Target() { return 1; } }\n",
             ),
             ("Other.cs", "#if FEATURE\nclass Other { int Broken(\n"),
+            ("Other.cpp", "class Other { int Broken(\n"),
+            ("Other.h", "struct Header { void Broken(\n"),
+            ("other.rs", "pub fn broken(\n"),
         ],
         &[],
         "unrelated incomplete source",
