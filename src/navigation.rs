@@ -236,9 +236,13 @@ fn edit_distance(a: &str, b: &str, cutoff: usize) -> Option<usize> {
     (row[b.len()] <= cutoff).then_some(row[b.len()])
 }
 
-pub fn choices(paths: &[&str], kind: &str) -> String {
+pub fn choices(paths: &[&str], kind: &str, requested: &str) -> String {
     if paths.is_empty() {
-        return "No matching indexed path.".into();
+        let kind = if kind == "files" { "file" } else { "directory" };
+        return format!(
+            "No indexed {kind} matches {}. Use `browse` to find available paths.",
+            crate::render::inline(&quote(requested))
+        );
     }
     let mut text = String::from("Choose a path:\n");
     text.push_str(
@@ -285,7 +289,7 @@ pub fn location(path: &str) -> Result<(&str, Option<(usize, usize)>)> {
         .unwrap_or(first);
     ensure!(
         first > 0 && last >= first,
-        "Lines are 1-based inclusive; the end must follow the start"
+        "Line numbers start at 1. The end must be greater than or equal to the start. Example: `src/main.rs:10-20`"
     );
     Ok((c.get(1).unwrap().as_str(), Some((first, last))))
 }

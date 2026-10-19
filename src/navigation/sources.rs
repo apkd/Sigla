@@ -287,7 +287,7 @@ fn browse<T>(
     }
     let matches = crate::navigation::matches(dirs.iter().map(String::as_str), &path);
     if matches.len() != 1 {
-        return Ok(crate::navigation::choices(&matches, "directories"));
+        return Ok(crate::navigation::choices(&matches, "directories", &path));
     }
     Ok(tree.at(matches[0]).render(matches[0]))
 }
@@ -344,7 +344,7 @@ fn view<T>(
     } else {
         let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
         if matches.len() != 1 {
-            return Ok(Some(crate::navigation::choices(&matches, "files")));
+            return Ok(Some(crate::navigation::choices(&matches, "files", &path)));
         }
         let path = matches[0];
         (path, &files[path])

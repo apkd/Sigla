@@ -12,6 +12,7 @@ mod history;
 mod indexes;
 mod inspection;
 mod preparation;
+mod validation;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -489,7 +490,6 @@ impl App {
     }
 
     pub async fn search(self: &Arc<Self>, path: &str, query: &str) -> Result<String> {
-        ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit");
         result_text(self.dispatch(path, Request::Search(query.into())).await?)
     }
     pub async fn history(self: &Arc<Self>, codebase: &str, query: &str) -> Result<String> {
@@ -519,13 +519,17 @@ impl App {
         request: Request,
         upstream: Option<&crate::upstream::Upstream>,
     ) -> Result<CallToolResult> {
-        ensure!(path.len() <= 4096, "Codebase exceeds request size limit");
+        ensure!(
+            !path.trim().is_empty(),
+            "Argument `codebase` must not be empty. Provide a local project path or repository URL"
+        );
+        validation::size("codebase", path, 4096)?;
         match &request {
             Request::Browse(path) | Request::View(path, _) => {
-                ensure!(path.len() <= 4096, "Path exceeds request size limit")
+                validation::size("path", path, 4096)?;
             }
             Request::Search(query) | Request::History(query) => {
-                ensure!(query.len() <= 16 * 1024, "Query exceeds request size limit")
+                validation::size("query", query, 16 * 1024)?;
             }
         }
         if let Some(upstream) = upstream
@@ -1231,11 +1235,126 @@ impl Mcp {
     }
 }
 #[tool_handler(router = self.tool_router, name = "sigla", version = "0.1.0")]
-impl ServerHandler for Mcp {}
+impl ServerHandler for Mcp {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let tool = self.tool_router.get(&request.name).ok_or_else(|| {
+            rmcp::ErrorData::invalid_params(
+                format!(
+                    "Unknown tool `{}`. Use `tools/list` to see available tools.",
+                    request.name
+                ),
+                None,
+            )
+        })?;
+        if let Some(message) = validation::arguments(tool, request.arguments.as_ref()) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
+        }
+        self.tool_router
+            .call(rmcp::handler::server::tool::ToolCallContext::new(
+                self, request, context,
+            ))
+            .await
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn mcp_errors_identify_inputs_and_preserve_response_types() {
+        use rmcp::{ServiceExt, model::CallToolRequestParams};
+        use serde_json::{Value, json};
+
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "First line\nSecond line\n").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move { Mcp::new(app).serve(server_io).await.unwrap() });
+        let client = ().serve(client_io).await.unwrap();
+        let server = server.await.unwrap();
+        let project = root.path().to_str().unwrap();
+        for (tool, args, field) in [
+            ("search", json!({"query":"type:X"}), "codebase"),
+            ("history", json!({"codebase":project}), "query"),
+            ("view", json!({"codebase":project}), "path"),
+            ("browse", json!({"codebase":4}), "codebase"),
+            ("search", json!({"codebase":project,"query":null}), "query"),
+            ("view", json!({"codebase":project,"path":[]}), "path"),
+            ("browse", json!({"codebase":" "}), "codebase"),
+            (
+                "search",
+                json!({"codebase":project,"query":"é".repeat(9000)}),
+                "query",
+            ),
+        ] {
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new(tool)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(response["isError"], true, "{response}");
+            let text = response["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(field), "{text}");
+            assert!(!text.contains("deserialize"), "{text}");
+        }
+        let unknown = "unregistered_tool";
+        let error = client
+            .call_tool(CallToolRequestParams::new(unknown))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(unknown));
+        assert!(error.to_string().contains("tools/list"));
+
+        // Defaults and valid tool dispatch still work after argument validation.
+        for (tool, args, expected) in [
+            ("browse", json!({"codebase":project}), "guide.md"),
+            (
+                "view",
+                json!({"codebase":project,"path":"guide.md:1-1"}),
+                "First line",
+            ),
+            (
+                "view",
+                json!({"codebase":project,"path":"absent.rs"}),
+                "absent.rs",
+            ),
+        ] {
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new(tool)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            let response: Value = serde_json::to_value(response).unwrap();
+            assert_ne!(response["isError"], true, "{response}");
+            assert!(
+                response["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{response}"
+            );
+        }
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
+
     #[test]
     fn advertised_tool_arguments_match_deserialization() {
         for tool in Mcp::tool_router().list_all() {
