@@ -458,7 +458,6 @@ fn prepare_with(
         super::revision::init(&request.store, session.object_format()?)?;
         super::revision::Prefix {
             repository: &repository,
-            private: request.allow_private,
             store: &request.store,
             cancel: &std::sync::atomic::AtomicBool::new(false),
             remaining: request.remaining(request.transfer_used),
@@ -618,12 +617,7 @@ fn prepare_with(
     let sizes = if selected.keys().any(|path| {
         super::selection::asset(Path::new(path)) || super::selection::visual_graph(Path::new(path))
     }) {
-        super::github::sizes(
-            &repository,
-            &revision.to_string(),
-            &request.store,
-            request.allow_private,
-        )?
+        super::github::sizes(&repository, &revision.to_string(), &request.store)?
     } else {
         None
     };

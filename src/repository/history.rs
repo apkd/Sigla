@@ -238,7 +238,6 @@ impl Remote {
             lease.acquire(|pool, _| {
                 let value = super::revision::Prefix {
                     repository: &self.repository,
-                    private: self.private,
                     store: pool,
                     cancel,
                     remaining: (!self.unlimited)

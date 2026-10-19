@@ -33,7 +33,6 @@ pub fn sizes(
     repository: &Repository,
     revision: &str,
     store: &Path,
-    private: bool,
 ) -> Result<Option<BTreeMap<String, u64>>> {
     if repository.identity.endpoint != Endpoint::Github {
         return Ok(None);
@@ -46,7 +45,7 @@ pub fn sizes(
         return Ok(Some(saved.sizes));
     }
     let repo = repository.identity.components.join("/");
-    let (client, token) = client(repository, private)?;
+    let (client, token) = client(repository)?;
     let fetch = |sha: &str, recursive: bool| -> Result<Tree> {
         let mut request = client
             .get(format!(
@@ -81,31 +80,27 @@ pub fn sizes(
     Ok(Some(saved.sizes))
 }
 
-fn client(
-    repository: &Repository,
-    private: bool,
-) -> Result<(reqwest::blocking::Client, Option<String>)> {
+fn client(repository: &Repository) -> Result<(reqwest::blocking::Client, Option<String>)> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("sigla")
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let mut token = None;
-    if private {
-        let repo = repository.identity.components.join("/");
-        let result = crate::process::capture(
-            super::credentials::noninteractive(
-                std::process::Command::new("git").args(["credential", "fill"]),
-            ),
-            Duration::from_secs(30),
-            Some(format!("url=https://github.com/{repo}.git\n\n").into_bytes()),
-            None,
-        )?;
-        if result.status.success() {
-            token = String::from_utf8(result.stdout)?
-                .lines()
-                .find_map(|l| l.strip_prefix("password=").map(str::to_owned));
-        }
+    // Callers verify access separately; API credentials also serve public repositories.
+    let repo = repository.identity.components.join("/");
+    let result = crate::process::capture(
+        super::credentials::noninteractive(
+            std::process::Command::new("git").args(["credential", "fill"]),
+        ),
+        Duration::from_secs(30),
+        Some(format!("url=https://github.com/{repo}.git\n\n").into_bytes()),
+        None,
+    )?;
+    if result.status.success() {
+        token = String::from_utf8(result.stdout)?
+            .lines()
+            .find_map(|l| l.strip_prefix("password=").map(str::to_owned));
     }
     Ok((client, token))
 }
@@ -114,7 +109,6 @@ fn client(
 pub(super) fn commit(
     repository: &Repository,
     prefix: &str,
-    private: bool,
     cancel: &AtomicBool,
     remaining: Option<u64>,
 ) -> Result<(gix_hash::ObjectId, u64)> {
@@ -122,7 +116,7 @@ pub(super) fn commit(
         !cancel.load(Ordering::Acquire),
         "Revision resolution cancelled"
     );
-    let (client, token) = client(repository, private)?;
+    let (client, token) = client(repository)?;
     let repo = repository.identity.components.join("/");
     let mut request = client
         .get(format!(
@@ -201,12 +195,12 @@ fn commit_response(
 
 /// Read one immutable source object without waiting for bulk Git acquisition.
 /// Unsupported responses fall back to the ordinary repository materializer.
-pub(super) fn blob(repository: &Repository, oid: &str, private: bool) -> Result<Option<Vec<u8>>> {
+pub(super) fn blob(repository: &Repository, oid: &str) -> Result<Option<Vec<u8>>> {
     if repository.identity.endpoint != Endpoint::Github {
         return Ok(None);
     }
     let id = gix_hash::ObjectId::from_hex(oid.as_bytes())?;
-    let (client, token) = client(repository, private)?;
+    let (client, token) = client(repository)?;
     let repo = repository.identity.components.join("/");
     let mut request = client
         .get(format!(

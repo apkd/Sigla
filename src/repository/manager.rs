@@ -761,8 +761,8 @@ impl Manager {
             .selected
             .get(path)
             .context("Source is not selected")?;
-        let private = authorize(&self.options.rules, &branch.repository)?;
-        match super::github::blob(&branch.repository, oid, private) {
+        authorize(&self.options.rules, &branch.repository)?;
+        match super::github::blob(&branch.repository, oid) {
             Ok(bytes) => Ok(bytes),
             Err(error) => {
                 tracing::warn!(%error, "On-demand source read failed; awaiting repository acquisition");

@@ -121,7 +121,6 @@ pub(super) fn resolve(
 
 pub(super) struct Prefix<'a> {
     pub repository: &'a Repository,
-    pub private: bool,
     pub store: &'a Path,
     pub cancel: &'a AtomicBool,
     pub remaining: Option<u64>,
@@ -137,13 +136,8 @@ impl Prefix<'_> {
         check(self.cancel)?;
         let prefix = prefix.to_ascii_lowercase();
         if self.repository.identity.endpoint == Endpoint::Github {
-            let (id, bytes) = super::github::commit(
-                self.repository,
-                &prefix,
-                self.private,
-                self.cancel,
-                self.remaining,
-            )?;
+            let (id, bytes) =
+                super::github::commit(self.repository, &prefix, self.cancel, self.remaining)?;
             let mut resolved = Resolved::new(id);
             resolved.pinned = true;
             resolved.bytes = bytes;
