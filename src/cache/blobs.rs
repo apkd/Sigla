@@ -256,34 +256,10 @@ impl Store {
             .truncate(false)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.root.join("ownership.lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(0),
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
         let mut bytes = 0;
         let downloads = self.cache().join("lfs");
         if downloads.is_dir() {
-            for entry in fs::read_dir(downloads)? {
-                let entry = entry?;
-                let metadata = entry.metadata()?;
-                let named = entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
-                let unused = metadata.nlink() == 1
-                    || metadata.nlink() == 2 && self.identity(&entry.path(), &metadata)?.is_some();
-                let old = metadata
-                    .modified()?
-                    .elapsed()
-                    .is_ok_and(|age| age >= crate::config::DEFAULT_REPO_TTL);
-                if named && metadata.is_file() && unused && (pressure || old) {
-                    if metadata.nlink() == 1 {
-                        bytes += metadata.blocks() * 512;
-                    }
-                    fs::remove_file(entry.path())?;
-                }
-            }
+            bytes += self.collect_directory(&lock, &downloads, pressure, true)?;
         }
         for shard in fs::read_dir(&self.root)? {
             let shard = shard?;
@@ -293,22 +269,84 @@ impl Store {
                     .to_string_lossy()
                     .starts_with("blob-pending-")
             {
-                fs::remove_file(shard.path())?;
+                bytes += self.collect_batch(&lock, &[shard.path()], false, false)?;
                 continue;
             }
             if !shard.file_type()?.is_dir() || shard.file_name().len() != 2 {
                 continue;
             }
-            for entry in fs::read_dir(shard.path())? {
-                let entry = entry?;
-                let metadata = entry.metadata()?;
-                if metadata.is_file() && metadata.nlink() == 1 {
-                    bytes += metadata.blocks() * 512;
-                    fs::remove_file(entry.path())?;
-                }
-            }
+            bytes += self.collect_directory(&lock, &shard.path(), pressure, false)?;
         }
         Ok(bytes)
+    }
+
+    fn collect_directory(
+        &self,
+        lock: &File,
+        directory: &Path,
+        pressure: bool,
+        downloads: bool,
+    ) -> Result<u64> {
+        let mut entries = fs::read_dir(directory)?;
+        let mut bytes = 0;
+        loop {
+            let paths = entries
+                .by_ref()
+                .take(128)
+                .map(|entry| Ok(entry?.path()))
+                .collect::<Result<Vec<_>>>()?;
+            if paths.is_empty() {
+                return Ok(bytes);
+            }
+            bytes += self.collect_batch(lock, &paths, pressure, downloads)?;
+            std::thread::yield_now();
+        }
+    }
+
+    fn collect_batch(
+        &self,
+        lock: &File,
+        paths: &[PathBuf],
+        pressure: bool,
+        downloads: bool,
+    ) -> Result<u64> {
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(0),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let result = (|| {
+            let mut bytes = 0;
+            for path in paths {
+                let metadata = match fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let unused = metadata.nlink() == 1
+                    || downloads
+                        && metadata.nlink() == 2
+                        && self.identity(path, &metadata)?.is_some();
+                let eligible =
+                    !downloads
+                        || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                            n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit())
+                        }) && (pressure
+                            || metadata
+                                .modified()?
+                                .elapsed()
+                                .is_ok_and(|age| age >= crate::config::DEFAULT_REPO_TTL));
+                if metadata.is_file() && unused && eligible {
+                    if metadata.nlink() == 1 {
+                        bytes += metadata.blocks() * 512;
+                    }
+                    fs::remove_file(path)?;
+                }
+            }
+            Ok(bytes)
+        })();
+        lock.unlock()?;
+        result
     }
 }
 

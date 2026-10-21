@@ -26,6 +26,15 @@ pub struct Request {
     pub expected: [u8; 32],
     pub revision: Option<String>,
     pub refresh: bool,
+    pub leases: crate::cache::views::LeaseSet,
+}
+struct Completed {
+    request: Request,
+    index: Arc<Index>,
+    snapshot: Option<super::snapshot::Pending>,
+    started: std::time::Instant,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _dependencies: crate::cache::views::LeaseSet,
 }
 struct Job {
     generation: [u8; 32],
@@ -99,26 +108,19 @@ impl Jobs {
         self.workers.clone().acquire_owned().await.unwrap()
     }
     pub fn start(&self, request: Request) -> Ticket {
-        let Request {
-            activity,
-            workspace,
-            branch,
-            root,
-            cache,
-            records,
-            expected,
-            revision,
-            refresh,
-        } = request;
         let generation = *blake3::hash(
-            &postcard::to_allocvec(&(expected, &revision)).expect("serializable asset identity"),
+            &postcard::to_allocvec(&(request.expected, &request.revision))
+                .expect("serializable asset identity"),
         )
         .as_bytes();
         let mut jobs = self.running.lock().unwrap();
-        let (same_generation, previous) = if let Some(job) = jobs.get_mut(&root) {
+        let (same_generation, previous) = if let Some(job) = jobs.get_mut(&request.root) {
             let outcome = job.ticket.borrow();
             if job.generation == generation
-                && (outcome.is_none() || outcome.as_ref().is_some_and(|r| r.is_ok() && !refresh))
+                && (outcome.is_none()
+                    || outcome
+                        .as_ref()
+                        .is_some_and(|r| r.is_ok() && !request.refresh))
             {
                 job.used = std::time::Instant::now();
                 return job.ticket.clone();
@@ -132,7 +134,7 @@ impl Jobs {
         let (sender, ticket) = watch::channel(None);
         let cancel = self.shutdown.child_token();
         jobs.insert(
-            root.clone(),
+            request.root.clone(),
             Job {
                 generation,
                 ticket: ticket.clone(),
@@ -142,25 +144,39 @@ impl Jobs {
         );
         let workers = self.workers.clone();
         tokio::spawn(async move {
-            let log_root = root.clone();
+            let log_root = request.root.clone();
             let outcome = async {
                 let permit = tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
                     permit = workers.acquire_owned() => permit?,
                 };
-                let state = workspace.lock_owned().await;
-                let branch_state = match &branch {
-                    Some(branch) => Some(branch.state.clone().read_owned().await),
-                    None => None,
+                let (state, branch_state) = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
+                    guards = async {
+                        let state = request.workspace.clone().lock_owned().await;
+                        let branch_state = match &request.branch {
+                            Some(branch) => Some(branch.state.clone().read_owned().await),
+                            None => None,
+                        };
+                        (state, branch_state)
+                    } => guards,
                 };
-                tokio::task::spawn_blocking(move || -> Result<Arc<Index>> {
-                    let _activity = activity;
-                    let _permit = permit;
+                let building_cancel = cancel.clone();
+                let completed = tokio::task::spawn_blocking(move || -> Result<Completed> {
                     let code = state.as_ref().context("Code workspace unavailable")?;
                     ensure!(
-                        self::generation(&code.manifest)? == expected,
+                        self::generation(&code.manifest)? == request.expected,
                         crate::diagnostics::RefreshRequired(
                             "Workspace changed before asset indexing; retry query"
+                        )
+                    );
+                    ensure!(
+                        branch_state.as_ref().and_then(|s| s.as_ref())
+                            .is_none_or(|state| !state.repair),
+                        crate::diagnostics::RefreshRequired(
+                            "Repository materialization requires repair; retry asset query"
                         )
                     );
                     ensure!(
@@ -168,13 +184,14 @@ impl Jobs {
                             .as_ref()
                             .and_then(|s| s.as_ref())
                             .map(|s| &s.prepared.revision)
-                            == revision.as_ref(),
+                            == request.revision.as_ref(),
                         crate::diagnostics::RefreshRequired(
                             "Repository changed before asset indexing; retry query"
                         )
                     );
                     let store = code.store.snapshot()?;
                     let manifest = code.manifest.clone();
+                    let dependencies = code.leases();
                     let omitted = branch_state
                         .as_ref()
                         .and_then(|s| s.as_ref())
@@ -183,52 +200,96 @@ impl Jobs {
                     drop(branch_state);
                     drop(state);
                     let started = std::time::Instant::now();
-                    let (index, built) = if let Some(previous) = previous.as_ref().filter(|index| same_generation && branch.is_none() && index.current()) {
+                    let (index, built) = if let Some(previous) = previous.as_ref().filter(|index| same_generation && request.branch.is_none() && index.current()) {
                         (previous.clone(), false)
-                    } else if let Some(index) = super::snapshot::load(&cache, generation) {
+                    } else if let Some(index) = super::snapshot::load(&request.cache, generation) {
                         (Arc::new(index), false)
                     } else {
                         (Arc::new(super::build(
-                            &root,
-                            &cache,
+                            &request.root,
+                            &request.cache,
                             &manifest,
                             &store,
-                            super::BuildOptions { previous: previous.as_deref(), records: Some(&records), remote: branch.is_some(), omitted: &omitted, cancel: &cancel },
+                            super::BuildOptions { previous: previous.as_deref(), records: Some(&request.records), remote: request.branch.is_some(), omitted: &omitted, cancel: &building_cancel },
                         )?), true)
                     };
-                    if let Some(branch) = &branch {
-                        let state = branch
-                            .state
-                            .try_read()
-                            .map_err(|_| crate::diagnostics::RefreshRequired(
-                                "Repository is refreshing; retry asset query"
-                            ))?;
-                        ensure!(
-                            state.as_ref().map(|s| &s.prepared.revision) == revision.as_ref(),
-                            crate::diagnostics::RefreshRequired(
-                                "Repository changed during asset indexing; retry query"
-                            )
-                        );
-                    }
-                    ensure!(!cancel.is_cancelled(), "Asset indexing superseded");
-                    if built {
-                        super::snapshot::save(&cache, generation, &index)?;
-                        tracing::info!(workspace = %root.display(), files = index.assets.len(), elapsed_ms = started.elapsed().as_millis(), "Unity asset index ready");
-                    }
-                    tracing::debug!(workspace = %root.display(), retained_bytes = index.retained_bytes, built, elapsed_ms = started.elapsed().as_millis(), "Unity asset index acquired");
-                    Ok(index)
+                    ensure!(!building_cancel.is_cancelled(), "Asset indexing superseded");
+                    let snapshot = built
+                        .then(|| super::snapshot::stage(&request.cache, generation, &index))
+                        .transpose()?;
+                    Ok(Completed { request, index, snapshot, started, _permit: permit, _dependencies: dependencies })
                 })
-                .await?
+                .await??;
+                publish(completed, &cancel, sender.clone()).await
             }
             .await
             .map_err(Arc::new);
-            if let Err(error) = &outcome {
+            if let Err(error) = outcome {
                 tracing::warn!(workspace = %log_root.display(), error = %format_args!("{error:#}"), "Unity asset index failed");
+                sender.send_replace(Some(Err(error)));
             }
-            sender.send_replace(Some(outcome));
         });
         ticket
     }
+}
+
+async fn publish(
+    completed: Completed,
+    cancel: &tokio_util::sync::CancellationToken,
+    sender: watch::Sender<Option<Outcome>>,
+) -> Result<()> {
+    // Use the same workspace -> state order as the initial capture. The request
+    // retains activity, dependency leases and the branch handle through publication.
+    let (state, branch_state) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
+        guards = async {
+            let state = completed.request.workspace.clone().lock_owned().await;
+            let branch_state = match &completed.request.branch {
+                Some(branch) => Some(branch.state.clone().read_owned().await),
+                None => None,
+            };
+            (state, branch_state)
+        } => guards,
+    };
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        // Move every lifetime guard into blocking work, even if its waiter drops.
+        let completed = completed;
+        let code = state.as_ref().context("Code workspace unavailable")?;
+        ensure!(
+            generation(&code.manifest)? == completed.request.expected,
+            crate::diagnostics::RefreshRequired(
+                "Workspace changed during asset indexing; retry query"
+            )
+        );
+        ensure!(
+            branch_state.as_ref().and_then(|s| s.as_ref())
+                .is_none_or(|state| !state.repair),
+            crate::diagnostics::RefreshRequired(
+                "Repository materialization requires repair; retry asset query"
+            )
+        );
+        ensure!(
+            branch_state.as_ref().and_then(|s| s.as_ref())
+                .map(|s| &s.prepared.revision) == completed.request.revision.as_ref(),
+            crate::diagnostics::RefreshRequired(
+                "Repository changed during asset indexing; retry query"
+            )
+        );
+        ensure!(!cancel.is_cancelled(), "Asset indexing superseded");
+        let built = completed.snapshot.is_some();
+        if let Some(snapshot) = completed.snapshot {
+            snapshot.publish()?;
+            tracing::info!(workspace = %completed.request.root.display(), files = completed.index.assets.len(), elapsed_ms = completed.started.elapsed().as_millis(), "Unity asset index ready");
+        }
+        tracing::debug!(workspace = %completed.request.root.display(), retained_bytes = completed.index.retained_bytes, built, elapsed_ms = completed.started.elapsed().as_millis(), "Unity asset index acquired");
+        sender.send_replace(Some(Ok(completed.index)));
+        // Both guards cover the snapshot activation and the watcher notification.
+        drop(branch_state);
+        drop(state);
+        Ok(())
+    }).await?
 }
 pub async fn wait(mut ticket: Ticket) -> Result<Arc<Index>> {
     loop {
@@ -245,6 +306,201 @@ pub async fn wait(mut ticket: Ticket) -> Result<Arc<Index>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn completed(root: &std::path::Path, cache: &std::path::Path) -> Completed {
+        let workspace = Workspace::open(
+            root.into(),
+            cache,
+            crate::discovery::Policy::new(vec![root.into()]).unwrap(),
+            &cache.join("analysis"),
+            None,
+            Arc::new(crate::watch::Monitor::default()),
+        )
+        .unwrap();
+        let expected = generation(&workspace.manifest).unwrap();
+        let dependencies = workspace.leases();
+        let branch = Arc::new(Branch::for_test(root.into()));
+        *branch.state.write().await = Some(crate::repository::manager::State {
+            schema: 1,
+            repository: branch.repository.identity.clone(),
+            transport: branch.repository.transport.clone(),
+            branch: branch.name.clone(),
+            target: Some(branch.target.clone()),
+            last_use: 0,
+            refreshed: 0,
+            policy: String::new(),
+            prepared: crate::repository::materialize::Prepared {
+                revision: "initial".into(),
+                branch: None,
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+                selected: Default::default(),
+                tracked: Default::default(),
+                directories: Default::default(),
+            },
+            indexed_revision: None,
+            repair: false,
+            additional: Default::default(),
+        });
+        let assets = cache.join("unity-assets/test");
+        let leases = crate::cache::views::LeaseSet::new(cache).unwrap();
+        leases.retain(&assets).unwrap();
+        let index = Arc::new(Index::default());
+        let snapshot = Some(super::super::snapshot::stage(&assets, expected, &index).unwrap());
+        Completed {
+            request: Request {
+                activity: Arc::new(Arc::new(tokio::sync::RwLock::new(())).read_owned().await),
+                workspace: Arc::new(tokio::sync::Mutex::new(Some(workspace))),
+                branch: Some(branch),
+                root: root.into(),
+                cache: assets,
+                records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
+                expected,
+                revision: Some("initial".into()),
+                refresh: false,
+                leases,
+            },
+            index,
+            snapshot,
+            started: std::time::Instant::now(),
+            _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
+            _dependencies: dependencies,
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_waits_for_refresh_and_validates_before_activating_snapshot() {
+        use std::{future::Future, task::Poll};
+        for (changed, repair) in [(false, false), (true, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let completed = completed(root.path(), cache.path()).await;
+            let assets = completed.request.cache.clone();
+            let generation = completed.request.expected;
+            let branch = completed.request.branch.clone().unwrap();
+            let mut refreshing = branch.state.write().await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (sender, ticket) = watch::channel(None);
+            let publication = publish(completed, &cancel, sender);
+            tokio::pin!(publication);
+            std::future::poll_fn(|cx| {
+                assert!(publication.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(ticket.borrow().is_none());
+            assert!(super::super::snapshot::load(&assets, generation).is_none());
+            if changed {
+                refreshing.as_mut().unwrap().prepared.revision = "changed".into();
+            }
+            refreshing.as_mut().unwrap().repair = repair;
+            drop(refreshing);
+            let result = publication.await;
+            if changed || repair {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.is::<crate::diagnostics::RefreshRequired>())
+                );
+                assert!(ticket.borrow().is_none());
+                assert!(super::super::snapshot::load(&assets, generation).is_none());
+            } else {
+                result.unwrap();
+                assert!(wait(ticket).await.is_ok());
+                assert!(super::super::snapshot::load(&assets, generation).is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn asset_capture_rejects_repository_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let completed = completed(root.path(), cache.path()).await;
+        completed
+            .request
+            .branch
+            .as_ref()
+            .unwrap()
+            .state
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .repair = true;
+        let jobs = Jobs::default();
+        let error = wait(jobs.start(completed.request)).await.err().unwrap();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::diagnostics::RefreshRequired>())
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_build_pins_dependencies_after_workspace_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let completed = completed(root.path(), cache.path()).await;
+        let dependency = cache.path().join("unity-packages/dependency");
+        std::fs::create_dir_all(&dependency).unwrap();
+        let workspace = completed.request.workspace.clone();
+        workspace
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .leases()
+            .retain(&dependency)
+            .unwrap();
+        let registry = crate::cache::views::Registry::open(cache.path()).unwrap();
+        drop(workspace.lock().await.take());
+        assert!(
+            registry
+                .try_retire(&dependency, || false)
+                .unwrap()
+                .is_none()
+        );
+        drop(completed);
+        assert!(
+            registry
+                .try_retire(&dependency, || false)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_publication_releases_locks_without_waiting_for_refresh() {
+        use std::{future::Future, task::Poll};
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let completed = completed(root.path(), cache.path()).await;
+        let workspace = completed.request.workspace.clone();
+        let branch = completed.request.branch.clone().unwrap();
+        let assets = completed.request.cache.clone();
+        let generation = completed.request.expected;
+        let _refreshing = branch.state.write().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (sender, ticket) = watch::channel(None);
+        let publication = publish(completed, &cancel, sender);
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(publication.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(workspace.try_lock().is_err());
+        cancel.cancel();
+        assert!(publication.await.is_err());
+        assert!(workspace.try_lock().is_ok());
+        assert!(ticket.borrow().is_none());
+        assert!(super::super::snapshot::load(&assets, generation).is_none());
+    }
 
     #[tokio::test]
     async fn asset_wait_preserves_refresh_classification_and_can_read_a_ready_result() {

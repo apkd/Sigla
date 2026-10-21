@@ -55,7 +55,9 @@ impl App {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel = Cancel(cancel.clone());
+        tracing::Span::current().record("stage", "query_admission");
         let permit = self.workers.clone().acquire_owned().await?;
+        tracing::Span::current().record("stage", "maintenance");
         let activity = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.activity.clone().read_owned(),
@@ -64,6 +66,7 @@ impl App {
         .map_err(|_| crate::diagnostics::MaintenanceBusy)?;
         let app = self.clone();
         let query = query.to_owned();
+        tracing::Span::current().record("stage", "evaluation");
         let text = tokio::task::spawn_blocking(move || -> Result<String> {
             let (_permit, _activity) = (permit, activity);
             crate::repository::history::check(&cancel)?;

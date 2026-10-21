@@ -24,12 +24,28 @@ enum Revision {
         inode: u64,
     },
     Immutable(crate::cache::blobs::Id),
+    Missing,
 }
 impl Stamp {
+    pub(crate) fn read_metadata(path: &Path) -> Result<Self> {
+        match Self::read(path) {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(Self {
+                    size: 0,
+                    revision: Revision::Missing,
+                })
+            }
+            result => result,
+        }
+    }
     pub(crate) fn immutable(&self) -> Option<&crate::cache::blobs::Id> {
         match &self.revision {
             Revision::Immutable(id) => Some(id),
-            Revision::File { .. } => None,
+            Revision::File { .. } | Revision::Missing => None,
         }
     }
     pub fn read(path: &Path) -> Result<Self> {
@@ -136,7 +152,7 @@ impl Manifest {
                     .chain(self.deferred.values())
                     .map(|file| (&file.path, &file.stamp)),
             )
-            .all(|(path, stamp)| Stamp::read(path).as_ref().ok() == Some(stamp))
+            .all(|(path, stamp)| Stamp::read_metadata(path).as_ref().ok() == Some(stamp))
     }
     pub fn metadata_visible(&self, file: &FileEntry, project: usize) -> bool {
         self.projects[project].assemblies.iter().any(|reference| {
@@ -174,6 +190,8 @@ impl Manifest {
 
 pub struct Workspace {
     _files: Arc<crate::cache::blobs::Store>,
+    leases: crate::cache::views::LeaseSet,
+    pending_leases: Option<crate::cache::views::LeaseSet>,
     pub entry: PathBuf,
     pub store: Arc<Store>,
     pub manifest: Arc<Manifest>,
@@ -188,6 +206,7 @@ pub struct Workspace {
     materialization: Option<u64>,
 }
 pub(crate) struct IndexPlan {
+    leases: crate::cache::views::LeaseSet,
     pub manifest: Arc<Manifest>,
     pub watch: crate::watch::Snapshot,
     directories: BTreeSet<PathBuf>,
@@ -204,6 +223,9 @@ pub struct Preparation {
     discovery_time: std::time::Duration,
 }
 impl Workspace {
+    pub(crate) fn leases(&self) -> crate::cache::views::LeaseSet {
+        self.leases.clone()
+    }
     pub(crate) fn watch_snapshot(&self) -> crate::watch::Snapshot {
         self.monitor.snapshot(&self.directories, self.fence)
     }
@@ -226,9 +248,24 @@ impl Workspace {
         ))?)
         .as_bytes();
         let store = Store::open_workspace(analysis, key, &entry, owner)?;
-        let manifest = store.get_manifest()?.unwrap_or_default();
+        let manifest: Manifest = store.get_manifest()?.unwrap_or_default();
+        let leases = crate::cache::views::LeaseSet::new(
+            analysis.parent().context("Analysis has no cache root")?,
+        )?;
+        for path in manifest
+            .files
+            .values()
+            .chain(manifest.deferred.values())
+            .map(|f| &f.path)
+            .chain(manifest.metadata.keys())
+            .chain(manifest.dependencies.iter())
+        {
+            leases.retain(path)?;
+        }
         let retained_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3);
         Ok(Self {
+            leases,
+            pending_leases: None,
             _files: crate::cache::blobs::Store::open(
                 analysis.parent().context("Analysis has no cache root")?,
             )?,
@@ -284,16 +321,16 @@ impl Workspace {
             }
         }
         let (dirty, fence) = self.monitor.fence(&self.directories, self.fence);
-        if self.initialized && !dirty && self.store.manifest_current()? {
+        let policy_current = self.manifest.discovery_policy == self.policy.identity()?;
+        if self.initialized && !dirty && policy_current && self.store.manifest_current()? {
             return Ok(None);
         }
         let cache_current = self.store.manifest_current()?;
-        let policy_current = self.manifest.discovery_policy == self.policy.identity()?;
         let changed_metadata = self
             .manifest
             .metadata
             .iter()
-            .find(|(p, s)| Stamp::read(p).as_ref().ok() != Some(s))
+            .find(|(p, s)| Stamp::read_metadata(p).as_ref().ok() != Some(s))
             .map(|(path, _)| path);
         let changed_source = self
             .manifest
@@ -318,6 +355,7 @@ impl Workspace {
             discovery::discover_cached(&self.entry, &self.policy, &self.cache)?
         } else {
             discovery::Discovery {
+                leases: self.leases.clone(),
                 root: self.manifest.root.clone(),
                 projects: self.manifest.projects.clone(),
                 sources: self.manifest.inputs.clone(),
@@ -349,7 +387,9 @@ impl Workspace {
             validation,
             discovery_time,
         } = prepared;
+        self.pending_leases = Some(discovery.leases.clone());
         let mut directories = BTreeSet::new();
+        let mut policy_watches = BTreeSet::new();
         let mut manifest = Manifest {
             source_group: None,
             discovery_policy: self.policy.identity()?,
@@ -369,12 +409,16 @@ impl Workspace {
             } else {
                 p.parent()
             } {
-                directories.insert(dir.to_owned());
+                if p.file_name().is_some_and(|name| name == "global.json") && !p.is_dir() {
+                    policy_watches.insert(dir.to_owned());
+                } else {
+                    directories.insert(dir.to_owned());
+                }
                 if self.directories.insert(dir.into()) {
                     self.monitor.register(dir);
                 }
             }
-            match Stamp::read(&p) {
+            match Stamp::read_metadata(&p) {
                 Ok(stamp) => {
                     manifest.metadata.insert(p, stamp);
                 }
@@ -595,7 +639,11 @@ impl Workspace {
                 manifest.metadata.insert(directory.clone(), stamp);
             }
         }
+        // Ancestor SDK policies need notifications without making unrelated
+        // sibling changes discovery inputs. Source directories still carry stamps.
+        directories.extend(policy_watches);
         Ok(IndexPlan {
+            leases: discovery.leases,
             manifest: Arc::new(manifest),
             watch: self.monitor.snapshot(&directories, fence),
             directories,
@@ -612,6 +660,7 @@ impl Workspace {
         self.store.begin_refresh()?;
         let begin_refresh_time = indexing_started.elapsed();
         let IndexPlan {
+            leases,
             manifest,
             directories,
             fence,
@@ -706,6 +755,8 @@ impl Workspace {
         }
         self.retained_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3);
         self.manifest = Arc::new(manifest);
+        self.leases = leases;
+        self.pending_leases = None;
         self.fence = fence;
         self.initialized = true;
         self.builds += 1;

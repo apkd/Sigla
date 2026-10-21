@@ -226,7 +226,8 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
             let (catalog, cache, start) = (&catalog, cache.path(), &start);
             scope.spawn(move || {
                 start.wait();
-                let path = client::materialize(cache, artifact, catalog).unwrap();
+                let leases = crate::cache::views::LeaseSet::new(cache).unwrap();
+                let path = client::materialize(cache, artifact, catalog, &leases).unwrap();
                 assert!(path.join("manifest.bin").is_file());
             });
         }

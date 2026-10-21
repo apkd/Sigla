@@ -144,13 +144,16 @@ fn numeric_fragment(source: &str) -> bool {
 }
 
 fn error_size(node: Node<'_>) -> usize {
-    if node.is_error() || node.is_missing() {
-        return node.byte_range().len().max(1);
+    let mut size = 0;
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            size += node.byte_range().len().max(1);
+        } else if node.has_error() {
+            pending.extend(node.children(&mut node.walk()));
+        }
     }
-    if !node.has_error() {
-        return 0;
-    }
-    node.children(&mut node.walk()).map(error_size).sum()
+    size
 }
 
 fn shader_regions(source: &str) -> (Vec<Region>, bool) {
@@ -190,6 +193,23 @@ fn shader_regions(source: &str) -> (Vec<Region>, bool) {
 struct Scope {
     span: Range<usize>,
     locals: HashMap<String, Vec<u32>>,
+}
+
+// Exit actions keep scope and binding lifetimes independent of the native stack.
+enum Work<'tree> {
+    Visit(Node<'tree>),
+    ScopedDeclarator(Node<'tree>, u32),
+    LeaveScoped(bool),
+    DeclareRangeBindings(Node<'tree>),
+    LeaveScope,
+    LeaveConditional,
+}
+
+fn children<'tree>(node: Node<'tree>, pending: &mut Vec<Work<'tree>>) {
+    let start = pending.len();
+    pending.extend(node.named_children(&mut node.walk()).map(Work::Visit));
+    // The last scheduled child runs first, so reverse only this node's children.
+    pending[start..].reverse();
 }
 
 #[derive(Clone)]
@@ -251,12 +271,13 @@ impl Walker<'_> {
             .find(|d| d.kind == "namespace")
             .map_or_else(String::new, |d| d.qualified.clone())
     }
-    fn children(&mut self, node: Node<'_>) {
-        for child in node.named_children(&mut node.walk()) {
-            self.walk(child);
-        }
-    }
-    fn scoped(&mut self, node: Node<'_>, owner: Option<u32>, access: &str) {
+    fn scoped<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        owner: Option<u32>,
+        access: &str,
+        pending: &mut Vec<Work<'tree>>,
+    ) {
         self.scopes.push(Scope {
             span: self.span(node),
             locals: HashMap::new(),
@@ -265,12 +286,8 @@ impl Walker<'_> {
         if let Some(owner) = owner {
             self.owners.push(owner);
         }
-        self.children(node);
-        if owner.is_some() {
-            self.owners.pop();
-        }
-        self.access.pop();
-        self.scopes.pop();
+        pending.push(Work::LeaveScoped(owner.is_some()));
+        children(node, pending);
     }
 
     fn declare(&mut self, node: Node<'_>, name: Option<Node<'_>>, kind: &str) -> u32 {
@@ -559,7 +576,12 @@ impl Walker<'_> {
         .into()
     }
 
-    fn declaration(&mut self, node: Node<'_>, alias: bool) {
+    fn declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        alias: bool,
+        pending: &mut Vec<Work<'tree>>,
+    ) {
         let mut functions = BTreeMap::new();
         for i in 0..node.child_count() {
             if node.field_name_for_child(i as u32) != Some("declarator") {
@@ -601,13 +623,15 @@ impl Walker<'_> {
             };
             self.declare(node, Some(name), kind);
         }
+        let start = pending.len();
         for child in node.named_children(&mut node.walk()) {
             if let Some(&owner) = functions.get(&child.id()) {
-                self.scoped(child, Some(owner), "public");
+                pending.push(Work::ScopedDeclarator(child, owner));
             } else {
-                self.walk(child);
+                pending.push(Work::Visit(child));
             }
         }
+        pending[start..].reverse();
     }
 
     fn call(&mut self, node: Node<'_>) {
@@ -708,7 +732,7 @@ impl Walker<'_> {
         self.owners.pop();
     }
 
-    fn directive(&mut self, node: Node<'_>) {
+    fn directive<'tree>(&mut self, node: Node<'tree>, pending: &mut Vec<Work<'tree>>) {
         if node.kind() == "preproc_include" {
             if let Some(path) = node.child_by_field_name("path") {
                 let text = self.text(path);
@@ -720,7 +744,7 @@ impl Walker<'_> {
                         relative: text.starts_with('"'),
                     });
                 } else {
-                    self.walk(path);
+                    pending.push(Work::Visit(path));
                 }
             }
             return;
@@ -748,10 +772,44 @@ impl Walker<'_> {
     }
 
     fn walk(&mut self, node: Node<'_>) {
+        let mut pending = vec![Work::Visit(node)];
+        while let Some(work) = pending.pop() {
+            match work {
+                Work::Visit(node) => self.visit(node, &mut pending),
+                Work::ScopedDeclarator(node, owner) => {
+                    self.scoped(node, Some(owner), "public", &mut pending);
+                }
+                Work::LeaveScoped(owner) => {
+                    if owner {
+                        self.owners.pop();
+                    }
+                    self.access.pop();
+                    self.scopes.pop();
+                }
+                Work::DeclareRangeBindings(node) => {
+                    if let Some(declarator) = node.child_by_field_name("declarator") {
+                        if let Some(binding) = structured_binding(declarator) {
+                            for name in binding.named_children(&mut binding.walk()) {
+                                self.declare(node, Some(name), "local");
+                            }
+                        } else if let Some(name) = declarator_name(declarator) {
+                            self.declare(node, Some(name), "local");
+                        }
+                    }
+                }
+                Work::LeaveScope => {
+                    self.scopes.pop();
+                }
+                Work::LeaveConditional => self.conditional -= 1,
+            }
+        }
+    }
+
+    fn visit<'tree>(&mut self, node: Node<'tree>, pending: &mut Vec<Work<'tree>>) {
         match node.kind() {
             "namespace_definition" => {
                 let owner = self.declare(node, node.child_by_field_name("name"), "namespace");
-                self.scoped(node, Some(owner), "public");
+                self.scoped(node, Some(owner), "public", pending);
                 return;
             }
             "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
@@ -776,6 +834,7 @@ impl Walker<'_> {
                     node,
                     Some(owner),
                     if kind == "class" { "private" } else { "public" },
+                    pending,
                 );
                 return;
             }
@@ -783,16 +842,16 @@ impl Walker<'_> {
                 if let Some(declarator) = node.child_by_field_name("declarator")
                     && let Some(owner) = self.function(node, declarator, true)
                 {
-                    self.scoped(node, Some(owner), "public");
+                    self.scoped(node, Some(owner), "public", pending);
                     return;
                 }
             }
             "declaration" | "field_declaration" => {
-                self.declaration(node, false);
+                self.declaration(node, false, pending);
                 return;
             }
             "type_definition" => {
-                self.declaration(node, true);
+                self.declaration(node, true, pending);
                 return;
             }
             "alias_declaration" | "concept_definition" => {
@@ -827,7 +886,7 @@ impl Walker<'_> {
                     .map(|&i| &self.facts.declarations[i as usize]);
                 let name = declarator_name(node).map(|n| self.span(n));
                 if !current.is_some_and(|d| d.callable() && Some(d.name_span.clone()) == name) {
-                    self.scoped(node, None, "public");
+                    self.scoped(node, None, "public", pending);
                     return;
                 }
             }
@@ -837,25 +896,19 @@ impl Walker<'_> {
                     locals: HashMap::new(),
                 });
                 let body = node.child_by_field_name("body");
+                pending.push(Work::LeaveScope);
+                if let Some(body) = body {
+                    pending.push(Work::Visit(body));
+                }
+                pending.push(Work::DeclareRangeBindings(node));
+                let start = pending.len();
                 for child in node
                     .named_children(&mut node.walk())
                     .filter(|child| Some(*child) != body)
                 {
-                    self.walk(child);
+                    pending.push(Work::Visit(child));
                 }
-                if let Some(declarator) = node.child_by_field_name("declarator") {
-                    if let Some(binding) = structured_binding(declarator) {
-                        for name in binding.named_children(&mut binding.walk()) {
-                            self.declare(node, Some(name), "local");
-                        }
-                    } else if let Some(name) = declarator_name(declarator) {
-                        self.declare(node, Some(name), "local");
-                    }
-                }
-                if let Some(body) = body {
-                    self.walk(body);
-                }
-                self.scopes.pop();
+                pending[start..].reverse();
                 return;
             }
             "template_declaration"
@@ -865,7 +918,12 @@ impl Walker<'_> {
             | "if_statement"
             | "switch_statement"
             | "catch_clause" => {
-                self.scoped(node, None, self.access.last().unwrap().clone().as_str());
+                self.scoped(
+                    node,
+                    None,
+                    self.access.last().unwrap().clone().as_str(),
+                    pending,
+                );
                 return;
             }
             "lambda_expression" => {
@@ -874,7 +932,7 @@ impl Walker<'_> {
                 self.facts.declarations[owner as usize].name = "<lambda>".into();
                 self.facts.declarations[owner as usize].qualified =
                     format!("{}::<lambda@{at}>", self.qualified_owner());
-                self.scoped(node, Some(owner), "public");
+                self.scoped(node, Some(owner), "public", pending);
                 return;
             }
             "preproc_def" | "preproc_function_def" => {
@@ -882,13 +940,13 @@ impl Walker<'_> {
                 return;
             }
             "preproc_include" | "preproc_call" => {
-                self.directive(node);
+                self.directive(node, pending);
                 return;
             }
             "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_else" => {
                 self.conditional += 1;
-                self.children(node);
-                self.conditional -= 1;
+                pending.push(Work::LeaveConditional);
+                children(node, pending);
                 return;
             }
             "call_expression" | "new_expression" => self.call(node),
@@ -927,33 +985,37 @@ impl Walker<'_> {
             }
             _ => (),
         }
-        self.children(node);
+        children(node, pending);
     }
 }
 
-fn declarator_name(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "identifier"
-        | "field_identifier"
-        | "type_identifier"
-        | "namespace_identifier"
-        | "operator_name"
-        | "operator_cast"
-        | "destructor_name" => Some(node),
-        "qualified_identifier" | "template_function" | "template_type" | "template_method" => {
-            node.child_by_field_name("name").and_then(declarator_name)
+fn declarator_name(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = match node.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "namespace_identifier"
+            | "operator_name"
+            | "operator_cast"
+            | "destructor_name" => return Some(node),
+            "qualified_identifier" | "template_function" | "template_type" | "template_method" => {
+                node.child_by_field_name("name")?
+            }
+            "dependent_name" => node.named_child(0)?,
+            _ => declarator_child(node)?,
+        };
+    }
+}
+
+fn qualified_declarator_name(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "qualified_identifier" | "template_function" | "template_type" => return Some(node),
+            "identifier" | "field_identifier" | "type_identifier" | "operator_name"
+            | "operator_cast" | "destructor_name" => return Some(node),
+            _ => node = declarator_child(node)?,
         }
-        "dependent_name" => node.named_child(0).and_then(declarator_name),
-        _ => declarator_child(node).and_then(declarator_name),
-    }
-}
-
-fn qualified_declarator_name(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "qualified_identifier" | "template_function" | "template_type" => Some(node),
-        "identifier" | "field_identifier" | "type_identifier" | "operator_name"
-        | "operator_cast" | "destructor_name" => Some(node),
-        _ => declarator_child(node).and_then(qualified_declarator_name),
     }
 }
 
@@ -998,45 +1060,60 @@ fn function_layer<'a>(root: Node<'a>, name: Node<'a>) -> Option<Node<'a>> {
     }
 }
 
-fn callee_name(node: Node<'_>) -> Option<(Node<'_>, Option<Node<'_>>, bool, bool)> {
-    match node.kind() {
-        "identifier" | "field_identifier" | "type_identifier" | "primitive_type"
-        | "operator_name" | "destructor_name" => Some((node, None, false, false)),
-        "qualified_identifier" => Some((
-            declarator_name(node)?,
-            node.child_by_field_name("scope"),
-            true,
-            false,
-        )),
-        "field_expression" => Some((
-            declarator_name(node.child_by_field_name("field")?)?,
-            node.child_by_field_name("argument"),
-            false,
-            false,
-        )),
-        "template_function" | "template_method" | "template_type" => {
-            callee_name(node.child_by_field_name("name")?)
+fn callee_name(mut node: Node<'_>) -> Option<(Node<'_>, Option<Node<'_>>, bool, bool)> {
+    let mut indirect = false;
+    loop {
+        match node.kind() {
+            "identifier" | "field_identifier" | "type_identifier" | "primitive_type"
+            | "operator_name" | "destructor_name" => return Some((node, None, false, indirect)),
+            "qualified_identifier" => {
+                return Some((
+                    declarator_name(node)?,
+                    node.child_by_field_name("scope"),
+                    true,
+                    indirect,
+                ));
+            }
+            "field_expression" => {
+                return Some((
+                    declarator_name(node.child_by_field_name("field")?)?,
+                    node.child_by_field_name("argument"),
+                    false,
+                    indirect,
+                ));
+            }
+            "template_function" | "template_method" | "template_type" => {
+                node = node.child_by_field_name("name")?;
+            }
+            "parenthesized_expression" => node = node.named_child(0)?,
+            "pointer_expression" | "subscript_expression" => {
+                indirect = true;
+                node = node.child_by_field_name("argument")?;
+            }
+            _ => return None,
         }
-        "parenthesized_expression" => callee_name(node.named_child(0)?),
-        "pointer_expression" | "subscript_expression" => {
-            let (name, receiver, qualified, _) =
-                callee_name(node.child_by_field_name("argument")?)?;
-            Some((name, receiver, qualified, true))
-        }
-        _ => None,
     }
 }
 
-fn lvalue(node: Node<'_>) -> Option<(Node<'_>, bool)> {
-    match node.kind() {
-        "identifier" | "field_identifier" => Some((node, false)),
-        "qualified_identifier" => Some((declarator_name(node)?, false)),
-        "field_expression" => Some((declarator_name(node.child_by_field_name("field")?)?, false)),
-        "parenthesized_expression" => lvalue(node.named_child(0)?),
-        "subscript_expression" | "pointer_expression" => {
-            Some((lvalue(node.child_by_field_name("argument")?)?.0, true))
+fn lvalue(mut node: Node<'_>) -> Option<(Node<'_>, bool)> {
+    let mut indirect = false;
+    loop {
+        match node.kind() {
+            "identifier" | "field_identifier" => return Some((node, indirect)),
+            "qualified_identifier" => return Some((declarator_name(node)?, indirect)),
+            "field_expression" => {
+                return Some((
+                    declarator_name(node.child_by_field_name("field")?)?,
+                    indirect,
+                ));
+            }
+            "parenthesized_expression" => node = node.named_child(0)?,
+            "subscript_expression" | "pointer_expression" => {
+                indirect = true;
+                node = node.child_by_field_name("argument")?;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 

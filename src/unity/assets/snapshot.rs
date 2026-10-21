@@ -182,7 +182,23 @@ pub(super) fn load(cache: &Path, generation: [u8; 32]) -> Option<Index> {
     result.ok()
 }
 
+pub(super) struct Pending {
+    file: tempfile::NamedTempFile,
+    destination: PathBuf,
+}
+impl Pending {
+    pub(super) fn publish(self) -> Result<()> {
+        self.file.persist(self.destination)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub(super) fn save(cache: &Path, generation: [u8; 32], index: &Index) -> Result<()> {
+    stage(cache, generation, index)?.publish()
+}
+
+pub(super) fn stage(cache: &Path, generation: [u8; 32], index: &Index) -> Result<Pending> {
     let instances = index
         .instances
         .iter()
@@ -226,6 +242,8 @@ pub(super) fn save(cache: &Path, generation: [u8; 32], index: &Index) -> Result<
     encoder.include_checksum(true)?;
     postcard::to_io(&cached, &mut encoder)?;
     encoder.finish()?;
-    file.persist(path(cache))?;
-    Ok(())
+    Ok(Pending {
+        file,
+        destination: path(cache),
+    })
 }

@@ -30,6 +30,11 @@ pub struct Catalog {
     path: PathBuf,
     pub entries: BTreeMap<PathBuf, Owner>,
     dirty: bool,
+    revision: u64,
+}
+pub(crate) struct Publication {
+    revision: u64,
+    file: tempfile::NamedTempFile,
 }
 impl Catalog {
     pub fn open(cache: &Path) -> Result<Self> {
@@ -43,6 +48,7 @@ impl Catalog {
             path,
             entries,
             dirty: false,
+            revision: 0,
         })
     }
     pub fn observe(
@@ -52,6 +58,7 @@ impl Catalog {
         manifest: &crate::workspace::Manifest,
         used: Option<u64>,
     ) {
+        self.revision += 1;
         let initial = used.unwrap_or_else(super::now);
         let owner = self
             .entries
@@ -71,19 +78,7 @@ impl Catalog {
             .map(|file| &file.path)
             .chain(manifest.metadata.keys())
             .chain(manifest.dependencies.iter())
-            .filter_map(|path| {
-                let mut components = path.strip_prefix(cache).ok()?.components();
-                let kind = components.next()?;
-                if VIEW_KINDS.iter().any(|view| kind.as_os_str() == *view) {
-                    Some(cache.join(kind).join(components.next()?))
-                } else if kind.as_os_str() == "dotnet"
-                    && components.next()?.as_os_str() == "packages"
-                {
-                    Some(cache.join("dotnet/packages"))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|path| super::views::managed_root(cache, path))
             .collect();
         owner.dependencies.insert(
             cache.join("local-jobs").join(
@@ -105,11 +100,13 @@ impl Catalog {
         self.dirty = true;
     }
     pub fn remove(&mut self, entry: &Path) {
+        self.revision += 1;
         self.entries.remove(entry);
         self.dirty = true;
     }
     pub fn seed(&mut self, entry: &Path, repository: Option<&Path>, at: u64) {
         if !self.entries.contains_key(entry) {
+            self.revision += 1;
             self.entries.insert(
                 entry.to_owned(),
                 Owner {
@@ -124,12 +121,37 @@ impl Catalog {
     }
     pub(crate) fn record_history(&mut self, entry: &Path, now: u64) {
         self.seed(entry, None, now);
+        self.revision += 1;
         self.entries.get_mut(entry).unwrap().usage.record(now);
         self.dirty = true;
     }
     pub fn flush(&mut self) -> Result<()> {
-        if self.dirty {
-            crate::repository::manager::write_json(&self.path, &self.entries)?;
+        if let Some(publication) = self.stage()? {
+            self.publish(publication)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn stage(&self) -> Result<Option<Publication>> {
+        use std::io::Write;
+        if !self.dirty {
+            return Ok(None);
+        }
+        fs::create_dir_all(self.path.parent().unwrap())?;
+        let mut file = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())?;
+        {
+            let mut output = std::io::BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut output, &self.entries)?;
+            output.flush()?;
+        }
+        file.as_file().sync_all()?;
+        Ok(Some(Publication {
+            revision: self.revision,
+            file,
+        }))
+    }
+    pub(crate) fn publish(&mut self, publication: Publication) -> Result<()> {
+        if self.revision == publication.revision {
+            publication.file.persist(&self.path)?;
             self.dirty = false;
         }
         Ok(())
@@ -141,6 +163,9 @@ impl Catalog {
                 .iter()
                 .any(|dependency| dependency.starts_with(path))
         })
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
     pub fn view_roots(&self, owner: &Owner) -> Vec<PathBuf> {
         let cache = self.path.parent().unwrap();
@@ -232,6 +257,22 @@ mod tests {
             assert!(expected.iter().all(|root| catalog.retains(root)));
             manifest.dependencies.remove(&path);
         }
+    }
+
+    #[test]
+    fn stale_publication_does_not_replace_newer_ownership() {
+        let cache = tempfile::tempdir().unwrap();
+        let first = cache.path().join("first");
+        let second = cache.path().join("second");
+        let mut catalog = Catalog::open(cache.path()).unwrap();
+        catalog.seed(&first, None, 1);
+        let old = catalog.clone().stage().unwrap().unwrap();
+        catalog.seed(&second, None, 2);
+        catalog.flush().unwrap();
+        catalog.publish(old).unwrap();
+        let reopened = Catalog::open(cache.path()).unwrap();
+        assert!(reopened.entries.contains_key(&first));
+        assert!(reopened.entries.contains_key(&second));
     }
 
     #[test]

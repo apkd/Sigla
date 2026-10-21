@@ -21,25 +21,28 @@ impl Inventory {
 }
 #[derive(Clone)]
 enum Progress {
-    Pending,
+    Pending(&'static str),
     Files(Arc<Inventory>),
     Ready(Arc<Inventory>),
     Failed(Arc<anyhow::Error>, Option<Arc<Inventory>>),
 }
 #[derive(Clone)]
-pub(super) struct Ticket(watch::Receiver<Progress>);
+pub(super) struct Ticket(watch::Receiver<Progress>, u64);
 impl Ticket {
+    pub fn id(&self) -> u64 {
+        self.1
+    }
     pub fn discovering(&self) -> bool {
-        matches!(*self.0.borrow(), Progress::Pending)
+        matches!(*self.0.borrow(), Progress::Pending(_))
     }
     pub fn running(&self) -> bool {
-        matches!(*self.0.borrow(), Progress::Pending | Progress::Files(_))
+        matches!(*self.0.borrow(), Progress::Pending(_) | Progress::Files(_))
     }
     pub fn needs_refresh(&self) -> bool {
         match &*self.0.borrow() {
             Progress::Ready(inventory) => inventory.watch.changed(),
             Progress::Failed(..) => true,
-            Progress::Pending | Progress::Files(_) => false,
+            Progress::Pending(_) | Progress::Files(_) => false,
         }
     }
     pub fn retained_inventory(&self) -> bool {
@@ -54,7 +57,9 @@ impl Ticket {
                 Progress::Failed(error, None) => {
                     return Err(crate::diagnostics::shared_error(error));
                 }
-                Progress::Pending => (),
+                Progress::Pending(stage) => {
+                    tracing::Span::current().record("stage", stage);
+                }
             }
             self.0.changed().await?;
         }
@@ -66,7 +71,12 @@ impl Ticket {
                 Progress::Failed(error, _) => {
                     return Err(crate::diagnostics::shared_error(error));
                 }
-                _ => (),
+                Progress::Pending(stage) => {
+                    tracing::Span::current().record("stage", stage);
+                }
+                Progress::Files(_) => {
+                    tracing::Span::current().record("stage", "source_indexing");
+                }
             }
             self.0.changed().await?;
         }
@@ -100,6 +110,7 @@ impl App {
         if result.is_some() || !matches!(request, super::Request::View(..)) {
             return Ok(result);
         }
+        tracing::Span::current().record("stage", "acquisition");
         self.remote.as_ref().unwrap().sources_ready(&branch).await?;
         self.navigate_repository_snapshot(branch, request, activity)
             .await
@@ -111,10 +122,21 @@ impl App {
         request: super::Request,
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<Option<CallToolResult>> {
+        tracing::Span::current().record("stage", "query_admission");
         let permit = self.navigation_workers.clone().acquire_owned().await?;
+        tracing::Span::current().record("stage", "evaluation");
         let state = branch.state.clone().read_owned().await;
         let state = state.as_ref().is_some().then_some(state);
         let inventory = branch.inventory.borrow().clone();
+        if let Some(prepared) = state
+            .as_ref()
+            .and_then(|state| state.as_ref())
+            .map(|state| &state.prepared)
+            .or_else(|| inventory.as_ref().map(|inventory| &inventory.prepared))
+        {
+            tracing::Span::current().record("selector", branch.selector(prepared));
+            tracing::Span::current().record("revision", prepared.revision.as_str());
+        }
         let remote = self.remote.as_ref().unwrap().clone();
         tokio::task::spawn_blocking(move || {
             let _activity = activity;
@@ -154,7 +176,9 @@ impl App {
         usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<CallToolResult> {
+        tracing::Span::current().record("stage", "query_admission");
         let permit = self.navigation_workers.clone().acquire_owned().await?;
+        tracing::Span::current().record("stage", "evaluation");
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();
@@ -217,8 +241,11 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         branch: preparing_branch,
         activity: preparing_activity,
     } = request;
-    let (send, receive) = watch::channel(Progress::Pending);
+    let (send, receive) = watch::channel(Progress::Pending("preparation"));
+    static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let job = NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(async move {
+        tracing::debug!(shared_job = job, workspace = %entry.display(), "Workspace preparation started");
         let outcome = async {
             #[cfg(test)]
             preparing_app.preparation_started.notify_one();
@@ -226,7 +253,9 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             // RequiredInputs releases both branch guards before acquisition.
             let mut state = workspace.clone().lock_owned().await;
             if let Some(branch) = &preparing_branch {
+                send.send_replace(Progress::Pending("acquisition"));
                 preparing_app.remote.as_ref().unwrap().ready(branch).await?;
+                send.send_replace(Progress::Pending("preparation"));
             }
             let mut branch_state = match &preparing_branch {
                 Some(branch) => Some(branch.analyze().await),
@@ -261,6 +290,11 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     .as_ref()
                     .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
                 let permit = preparing_app.preparation_workers.clone().acquire_owned().await?;
+                #[cfg(test)]
+                let _discovery_pause = {
+                    preparing_app.discovery_started.notify_one();
+                    preparing_app.discovery_pause.clone().acquire_owned().await?
+                };
                 let (next, result) = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
                     if state.is_none() {
@@ -307,12 +341,14 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .revision
                             .clone();
                         drop(branch_state.take());
+                        send.send_replace(Progress::Pending("acquisition"));
                         preparing_app
                             .remote
                             .as_ref()
                             .unwrap()
                             .require_inputs(branch, &revision, paths)
                             .await?;
+                        send.send_replace(Progress::Pending("preparation"));
                         let gate = branch.analyze().await;
                         let applied = gate
                             .as_ref()
@@ -422,7 +458,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         let progress = match outcome {
             Ok(inventory) => Progress::Ready(inventory),
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "Workspace indexing failed");
+                tracing::warn!(shared_job = job, workspace = %entry.display(), error = %format!("{error:#}"), "Workspace indexing failed");
                 let inventory = match &*send.borrow() {
                     Progress::Files(inventory) => Some(inventory.clone()),
                     _ => None,
@@ -432,5 +468,5 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         };
         send.send_replace(progress);
     });
-    Ticket(receive)
+    Ticket(receive, job)
 }

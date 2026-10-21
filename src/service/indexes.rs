@@ -269,6 +269,8 @@ impl super::App {
                         .as_str(),
                 )
             });
+        let leases = crate::cache::views::LeaseSet::new(&self.cache)?;
+        leases.retain(&cache)?;
         Ok(self.assets.start(crate::unity::assets::jobs::Request {
             workspace,
             branch,
@@ -279,6 +281,7 @@ impl super::App {
             revision,
             refresh,
             activity,
+            leases,
         }))
     }
 }

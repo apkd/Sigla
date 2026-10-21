@@ -122,6 +122,7 @@ pub(super) fn packed_source(
     repo: &str,
     catalog: &Catalog,
     artifact: &Artifact,
+    leases: &crate::cache::views::LeaseSet,
 ) -> Result<Option<PathBuf>> {
     let Some(pack) = catalog
         .packs
@@ -131,6 +132,7 @@ pub(super) fn packed_source(
         return Ok(None);
     };
     let root = cache.join("unity-metadata-packs").join(hex(&pack.hash));
+    leases.retain(&root)?;
     acquisition::shared_versioned(&root.to_string_lossy(), &pack.release, || {
         let contents = root.join("contents");
         if !contents.is_dir() {
@@ -146,14 +148,20 @@ pub(super) fn packed_source(
     })
 }
 
-pub(super) fn materialize(cache: &Path, artifact: &Artifact, catalog: &Catalog) -> Result<PathBuf> {
+pub(super) fn materialize(
+    cache: &Path,
+    artifact: &Artifact,
+    catalog: &Catalog,
+    leases: &crate::cache::views::LeaseSet,
+) -> Result<PathBuf> {
     let root = cache.join("unity-metadata").join(hex(&artifact.hash));
+    leases.retain(&root)?;
     if root.join("contents/manifest.bin").is_file() {
         return Ok(root.join("contents"));
     }
     // Complete transport acquisition before taking a materialization permit.
     // Nested acquisition permits can deadlock concurrent package requests.
-    let packed = packed_source(cache, REPOSITORY, catalog, artifact)?;
+    let packed = packed_source(cache, REPOSITORY, catalog, artifact, leases)?;
     let source_version = catalog
         .packs
         .iter()
@@ -206,11 +214,15 @@ fn select_editor(catalog: &Catalog, declared: UnityVersion) -> Result<&Artifact>
         .map(|(_, a)| a)
         .context("No equal or newer archived Unity editor is available")
 }
-fn acquire_editor(cache: &Path, declared: UnityVersion) -> Result<(PathBuf, Origin)> {
+fn acquire_editor(
+    cache: &Path,
+    declared: UnityVersion,
+    leases: &crate::cache::views::LeaseSet,
+) -> Result<(PathBuf, Origin)> {
     for refresh in [false, true] {
         let catalog = current(refresh)?;
         let artifact = select_editor(&catalog, declared)?;
-        match materialize(cache, artifact, &catalog) {
+        match materialize(cache, artifact, &catalog, leases) {
             Ok(contents) => {
                 return Ok((
                     contents.join("Editor/Data"),
@@ -230,7 +242,8 @@ fn missing_asset(error: &anyhow::Error) -> bool {
         .any(|e| e.status().is_some_and(|s| matches!(s.as_u16(), 404 | 410)))
 }
 pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
-    Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?)?.0)
+    let leases = crate::cache::views::LeaseSet::new(cache)?;
+    Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?, &leases)?.0)
 }
 pub(crate) fn configured(path: &Path, branches: &[ReleaseBranch]) -> bool {
     let Ok(cached) = CATALOG.lock() else {
@@ -250,7 +263,11 @@ pub(crate) fn configured(path: &Path, branches: &[ReleaseBranch]) -> bool {
             })
     })
 }
-pub(crate) fn editor(project: &Path, cache: &Path) -> Result<crate::unity::catalog::Editor> {
+pub(crate) fn editor(
+    project: &Path,
+    cache: &Path,
+    leases: &crate::cache::views::LeaseSet,
+) -> Result<crate::unity::catalog::Editor> {
     let text = fs::read_to_string(project.join("ProjectSettings/ProjectVersion.txt"))?;
     let declared = text
         .lines()
@@ -258,7 +275,7 @@ pub(crate) fn editor(project: &Path, cache: &Path) -> Result<crate::unity::catal
         .context("Unity project has no editor version")?
         .trim()
         .parse()?;
-    let (data, selected) = acquire_editor(cache, declared)?;
+    let (data, selected) = acquire_editor(cache, declared, leases)?;
     Ok(crate::unity::catalog::Editor {
         declared,
         selected: selected.version.parse()?,
@@ -309,11 +326,12 @@ pub fn package(
     name: &str,
     requested: &str,
     editor: UnityVersion,
+    leases: &crate::cache::views::LeaseSet,
 ) -> Result<(PathBuf, String)> {
     for refresh in [false, true] {
         let catalog = current(refresh)?;
         let (artifact, info) = select_package(&catalog, name, requested, editor)?;
-        match materialize(cache, artifact, &catalog) {
+        match materialize(cache, artifact, &catalog, leases) {
             Ok(contents) => {
                 let prefix = if artifact.manifest.origin.kind == "editor" {
                     "Editor/Data/Resources/PackageManager/BuiltInPackages"

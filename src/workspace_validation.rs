@@ -172,6 +172,7 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
     let plan = workspace
         .plan(Preparation {
             discovery: discovery::Discovery {
+                leases: crate::cache::views::LeaseSet::new(cache).unwrap(),
                 root: root.clone(),
                 projects: manifest.projects,
                 sources: manifest.inputs,
@@ -230,6 +231,7 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
         let asset_jobs = crate::unity::assets::jobs::Jobs::default();
         let asset_started = std::time::Instant::now();
         let ticket = asset_jobs.start(crate::unity::assets::jobs::Request {
+            leases: crate::cache::views::LeaseSet::new(cache).unwrap(),
             records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
             activity: activity.clone(),
             workspace: workspace.clone(),
@@ -266,6 +268,7 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
         let cached_started = std::time::Instant::now();
         let cached_jobs = crate::unity::assets::jobs::Jobs::default();
         let cached = cached_jobs.start(crate::unity::assets::jobs::Request {
+            leases: crate::cache::views::LeaseSet::new(cache).unwrap(),
             records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
             activity,
             workspace,
@@ -343,6 +346,7 @@ fn highland_keep_full_context() {
     workspace
         .apply(Preparation {
             discovery: discovery::Discovery {
+                leases: crate::cache::views::LeaseSet::new(cache.path()).unwrap(),
                 root: root.clone(),
                 projects: manifest.projects,
                 sources: manifest.inputs,

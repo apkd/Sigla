@@ -243,7 +243,11 @@ pub struct AssemblyContext {
 }
 
 impl Editor {
-    pub fn local(project: &Path, installations: Option<&Path>) -> Result<Self> {
+    pub fn local(
+        project: &Path,
+        installations: Option<&Path>,
+        leases: &crate::cache::views::LeaseSet,
+    ) -> Result<Self> {
         let version = std::fs::read_to_string(project.join("ProjectSettings/ProjectVersion.txt"))?;
         let declared: UnityVersion = version
             .lines()
@@ -265,7 +269,7 @@ impl Editor {
                 &default
             }
         };
-        Self::from_installations(project, installations, declared, revision)
+        Self::from_installations(project, installations, declared, revision, leases)
     }
 
     fn from_installations(
@@ -273,6 +277,7 @@ impl Editor {
         installations: &Path,
         declared: UnityVersion,
         revision: Option<String>,
+        leases: &crate::cache::views::LeaseSet,
     ) -> Result<Self> {
         let mut candidates = Vec::new();
         let entries = std::fs::read_dir(installations).with_context(|| format!(
@@ -285,6 +290,7 @@ impl Editor {
                 continue;
             };
             let data = entry.path().join("Editor/Data");
+            leases.retain(&data)?;
             if supported(selected)
                 && data
                     .join("Managed/UnityEngine/UnityEngine.CoreModule.dll")
@@ -494,9 +500,10 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "fixture").unwrap();
         }
-        let editor = Editor::local(&project, Some(&installations)).unwrap();
+        let leases = crate::cache::views::LeaseSet::new(root.path()).unwrap();
+        let editor = Editor::local(&project, Some(&installations), &leases).unwrap();
         assert_eq!(editor.selected, editor.declared);
         assert_eq!(editor.data, data.canonicalize().unwrap());
-        assert!(Editor::local(&project, Some(&root.path().join("missing"))).is_err());
+        assert!(Editor::local(&project, Some(&root.path().join("missing")), &leases).is_err());
     }
 }

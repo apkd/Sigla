@@ -511,7 +511,8 @@ fn source(
     {
         return Ok(path.clone());
     }
-    if let Some(path) = client::packed_source(work, repo, previous, artifact)? {
+    let leases = crate::cache::views::LeaseSet::new(work)?;
+    if let Some(path) = client::packed_source(work, repo, previous, artifact, &leases)? {
         return Ok(path);
     }
     let path = work.join(&artifact.name);
@@ -570,7 +571,8 @@ mod tests {
         let pack = catalog.packs.first().unwrap();
         for name in &pack.members {
             let artifact = catalog.artifacts.iter().find(|a| &a.name == name).unwrap();
-            let path = client::materialize(cache.path(), artifact, &catalog).unwrap();
+            let leases = crate::cache::views::LeaseSet::new(cache.path()).unwrap();
+            let path = client::materialize(cache.path(), artifact, &catalog, &leases).unwrap();
             assert!(path.join("manifest.bin").is_file());
         }
         println!(

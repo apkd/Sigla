@@ -53,6 +53,7 @@ pub struct App {
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
     maintenance: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    maintenance_retry: std::sync::atomic::AtomicBool,
     stateless_summaries: crate::summary::Stateless,
     activity: Arc<tokio::sync::RwLock<()>>,
     blobs: Arc<crate::cache::blobs::Store>,
@@ -61,6 +62,10 @@ pub struct App {
     owners: Mutex<crate::cache::owners::Catalog>,
     #[cfg(test)]
     preparation_started: tokio::sync::Notify,
+    #[cfg(test)]
+    discovery_started: tokio::sync::Notify,
+    #[cfg(test)]
+    discovery_pause: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     indexing_pause: Arc<tokio::sync::Semaphore>,
     _ownership: Ownership,
@@ -147,6 +152,7 @@ impl App {
         crate::cache_migration::migrate(&cache)?;
         crate::memory::start_reclaimer()?;
         let app = Self {
+            maintenance_retry: std::sync::atomic::AtomicBool::new(false),
             activity: Arc::new(tokio::sync::RwLock::new(())),
             blobs: crate::cache::blobs::Store::open(&cache)?,
             asset_records: Arc::new(crate::cache::artifacts::Store::open(&cache)?),
@@ -174,6 +180,10 @@ impl App {
             stateless_summaries: Default::default(),
             #[cfg(test)]
             preparation_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            discovery_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            discovery_pause: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             indexing_pause: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -307,7 +317,15 @@ impl App {
                     if tokio::time::Instant::now() < regular {
                         continue;
                     }
-                    let collect = last_collection.elapsed() >= collection_interval;
+                    let collection_delay = if app
+                        .maintenance_retry
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        std::time::Duration::from_secs(30)
+                    } else {
+                        collection_interval
+                    };
+                    let collect = last_collection.elapsed() >= collection_delay;
                     if let Some(remote) = &app.remote {
                         // Fetch failures stay on the branch preparation state, never on valid query results.
                         match remote.maintain(collect).await {
@@ -354,7 +372,15 @@ impl App {
                             tracing::error!(%error, "Cannot maintain Git pools");
                         }
                     }
-                    regular = tokio::time::Instant::now() + interval;
+                    let next = if app
+                        .maintenance_retry
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        interval.min(std::time::Duration::from_secs(30))
+                    } else {
+                        interval
+                    };
+                    regular = tokio::time::Instant::now() + next;
                 }
             });
             *self.maintenance.lock().unwrap() = Some(maintenance);
@@ -378,46 +404,65 @@ impl App {
     }
 
     async fn expire_idle(
-        &self,
+        self: &Arc<Self>,
         expired: Vec<Arc<crate::repository::manager::Branch>>,
     ) -> Result<()> {
-        let _activity = self.activity.read().await;
-        let Some(remote) = &self.remote else {
-            return Ok(());
-        };
-        for branch in expired {
-            let Ok(_gate) = branch.state.try_write() else {
-                continue;
+        let activity = self.activity.clone().read_owned().await;
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _activity = activity;
+            let Some(remote) = &app.remote else {
+                return Ok(());
             };
-            let retired = {
-                let mut registry = self.workspaces.lock().unwrap();
-                let path = branch.source();
-                if registry
-                    .get(&path)
-                    .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
-                {
+            for branch in expired {
+                let Ok(_gate) = branch.state.try_write() else {
                     continue;
-                }
-                registry.remove(&path)
-            };
-            drop(retired);
-            remote
-                .expire(&branch, || self.retire_owner(&branch.root))
-                .await?;
-        }
-        Ok(())
+                };
+                let retired = {
+                    let mut registry = app.workspaces.lock().unwrap();
+                    let path = branch.source();
+                    if registry
+                        .get(&path)
+                        .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
+                    {
+                        continue;
+                    }
+                    registry.remove(&path)
+                };
+                drop(retired);
+                let scopes = app.owner_scopes(&branch.root)?;
+                remote.expire(&branch, || app.retire_owner(scopes))?;
+            }
+            Ok(())
+        })
+        .await?
     }
 
-    fn retire_owner(&self, owner: &Path) -> Result<()> {
+    fn owner_scopes(&self, owner: &Path) -> Result<Vec<(crate::store::shared::Scope, PathBuf)>> {
         let analysis = self.cache.join("analysis");
         if !analysis.try_exists()? {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let database = crate::store::Database::open(&analysis)?;
+        let mut scopes = Vec::new();
         for (key, info) in database.workspaces()? {
-            if info.owner.as_deref() == Some(owner) {
-                self.sources.forget(&info.entry);
-                database.existing(key)?.unwrap().mark_deleting()?;
+            if info.owner.as_deref() == Some(owner)
+                && let Some(scope) = database.existing(key)?
+                && scope.id == info.id
+            {
+                scopes.push((scope, info.entry));
+            }
+        }
+        Ok(scopes)
+    }
+
+    fn retire_owner(&self, scopes: Vec<(crate::store::shared::Scope, PathBuf)>) -> Result<()> {
+        for (scope, entry) in scopes {
+            if let Some(current) = scope.database.existing(scope.fingerprint)?
+                && current.id == scope.id
+            {
+                self.sources.forget(&entry);
+                current.mark_deleting()?;
             }
         }
         Ok(())
@@ -430,8 +475,24 @@ impl App {
         }
         let database = crate::store::Database::open(&analysis)?;
         let now = crate::cache::now();
-        for (key, info) in database.workspaces()? {
-            self.retire_analysis_scope(&database, key, &info, now, drain)?;
+        let mut pending: std::collections::VecDeque<_> = database.workspaces()?.into();
+        while let Some((key, info)) = pending.pop_front() {
+            if self.inspection_shutdown.is_cancelled() {
+                break;
+            }
+            if !self.retire_analysis_scope(&database, key, &info, now, false)?
+                && drain
+                && self
+                    .workspaces
+                    .lock()
+                    .unwrap()
+                    .get(&info.entry)
+                    .is_none_or(|slot| Arc::strong_count(&slot.state) == 1)
+            {
+                pending.push_back((key, info));
+            }
+            // Release the registry between batches and rotate large scopes.
+            std::thread::yield_now();
         }
         if !drain {
             database.collect(now, 128)?;
@@ -535,6 +596,7 @@ impl App {
         if let Some(upstream) = upstream
             && let Some(repository) = crate::repository::Repository::project(path, true)?
         {
+            tracing::Span::current().record("stage", "upstream");
             let mut project = repository.transport;
             if let Some((_, selector)) = path.trim().split_once('#') {
                 project.push('#');
@@ -571,6 +633,7 @@ impl App {
         if let Request::History(query) = &request {
             return self.history_request(path, query).await;
         }
+        tracing::Span::current().record("stage", "maintenance");
         let activity = Arc::new(
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -588,6 +651,11 @@ impl App {
         };
         self.start_setup();
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
+        tracing::Span::current().record("stage", "acquisition");
+        if let Some(repository) = &repository {
+            tracing::Span::current()
+                .record("selector", tracing::field::debug(&repository.selector));
+        }
         let branch = match repository {
             Some(repository) => {
                 let remote = self.remote.as_ref().ok_or_else(|| {
@@ -649,6 +717,7 @@ impl App {
         };
         let usage_entry = entry.clone();
         let usage_branch = branch.clone();
+        tracing::Span::current().record("stage", "preparation");
         let (workspace, mut preparation, inventory) = loop {
             let (workspace, mut preparation, retired) = {
                 let mut registry = self.workspaces.lock().unwrap();
@@ -700,6 +769,7 @@ impl App {
                 (state, ticket, retired)
             };
             drop(retired);
+            tracing::Span::current().record("shared_job", preparation.id());
             if preparation.discovering()
                 && let Some(branch) = &branch
                 && (matches!(request, Request::Browse(_))
@@ -710,7 +780,12 @@ impl App {
             {
                 return Ok(result);
             }
+            tracing::Span::current().record("stage", "preparation");
             let inventory = preparation.inventory().await?;
+            if let Some((_, selector, revision, _)) = &inventory.context {
+                tracing::Span::current().record("selector", selector.as_str());
+                tracing::Span::current().record("revision", revision.as_str());
+            }
             if inventory.current().await? {
                 break (workspace, preparation, inventory);
             }
@@ -734,6 +809,7 @@ impl App {
                 )
                 .await;
         }
+        tracing::Span::current().record("stage", "source_indexing");
         preparation.complete().await?;
         let asset_workspace = workspace.clone();
         let mut state = workspace.lock_owned().await;
@@ -828,6 +904,7 @@ impl App {
                 }
             }
             if wait_assets {
+                tracing::Span::current().record("stage", "assets");
                 crate::unity::assets::jobs::wait(ticket.clone()).await?;
             }
             state = asset_workspace.clone().lock_owned().await;
@@ -853,7 +930,9 @@ impl App {
                 )
             );
         }
+        tracing::Span::current().record("stage", "query_admission");
         let permit = self.workers.clone().acquire_owned().await?;
+        tracing::Span::current().record("stage", "evaluation");
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();
@@ -1165,13 +1244,17 @@ diff abc1234..def5678 file:src/Parser.cs"#,
     }
 }
 impl Mcp {
-    #[tracing::instrument(skip(self, context), fields(request_id = ?context.id))]
+    #[tracing::instrument(skip(self, context), fields(request_id = ?context.id,
+        stage = "validation", elapsed_ms = tracing::field::Empty,
+        selector = tracing::field::Empty, revision = tracing::field::Empty,
+        shared_job = tracing::field::Empty))]
     async fn execute(
         &self,
         codebase: &str,
         request: Result<Request>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
+        let started = Instant::now();
         let search = async {
             self.app
                 .request_cancellable(codebase, request?, &context.ct, self.upstream.as_deref())
@@ -1206,6 +1289,7 @@ impl Mcp {
             result = search => result,
             error = heartbeat => Err(error),
         };
+        tracing::Span::current().record("elapsed_ms", started.elapsed().as_millis() as u64);
         match result {
             Ok(result)
                 if context
@@ -1222,7 +1306,13 @@ impl Mcp {
             }
             Ok(result) => self.session.present(result),
             Err(e) => {
-                tracing::error!(codebase, error = %format!("{e:#}"), "Tool request failed");
+                if e.chain()
+                    .any(|cause| cause.is::<crate::diagnostics::Cancelled>())
+                {
+                    tracing::info!(codebase, "Tool request cancelled");
+                } else {
+                    tracing::error!(codebase, error = %format!("{e:#}"), "Tool request failed");
+                }
                 let mut result =
                     CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))]);
                 result.structured_content = Some(crate::diagnostics::details(
@@ -1268,6 +1358,26 @@ mod tests {
     async fn mcp_errors_identify_inputs_and_preserve_response_types() {
         use rmcp::{ServiceExt, model::CallToolRequestParams};
         use serde_json::{Value, json};
+
+        #[derive(Clone)]
+        struct Logs(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Logs(Arc::new(Mutex::new(Vec::new())));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
 
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1353,6 +1463,14 @@ mod tests {
         }
         client.cancel().await.unwrap();
         server.cancel().await.unwrap();
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let failure = captured
+            .lines()
+            .find(|line| line.contains("Tool request failed"))
+            .unwrap();
+        assert!(failure.contains("request_id="), "{failure}");
+        assert!(failure.contains("stage="), "{failure}");
+        assert!(failure.contains("elapsed_ms="), "{failure}");
     }
 
     #[test]
@@ -1436,10 +1554,20 @@ mod tests {
         );
         let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
         let path = root.path().to_str().unwrap();
+        let cancelled = tokio_util::sync::CancellationToken::new();
         let waiting = {
             let app = app.clone();
             let path = path.to_owned();
-            tokio::spawn(async move { app.search(&path, "type:Available").await })
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                app.request_cancellable(
+                    &path,
+                    Request::Search("type:Available".into()),
+                    &cancelled,
+                    None,
+                )
+                .await
+            })
         };
         app.preparation_started.notified().await;
         tokio::time::timeout(Duration::from_secs(5), app.maintain_disk())
@@ -1471,8 +1599,22 @@ mod tests {
         assert!(source.contains("pub fn child_function() {}"));
         assert!(app.view(path, "../outside.rs", "exact").await.is_err());
         assert!(!waiting.is_finished());
-        waiting.abort();
+        let mut other = Box::pin(app.search(path, "type:Available"));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                other.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        cancelled.cancel();
+        let error = waiting.await.unwrap().unwrap_err();
+        let details = crate::diagnostics::details(&error, "waiter");
+        assert_eq!(details["error_code"], "CANCELLED");
+        assert_eq!(details["retryable"], false);
         drop(pause);
+        assert!(other.await.unwrap().contains("Available"));
         assert!(
             app.search(path, "type:Available")
                 .await
@@ -1735,6 +1877,7 @@ mod tests {
         // handle RequiredInputs. B must not retain branch state while queued.
         let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
         let held_workspace = workspace.lock().await;
+        let discovery_pause = app.discovery_pause.clone().acquire_owned().await.unwrap();
         let request = {
             let app = app.clone();
             tokio::spawn(async move { app.search(project, "Prepared").await })
@@ -1758,6 +1901,25 @@ mod tests {
         assert!(source.contains("pub struct Prepared;"), "{source}");
         assert!(!request.is_finished());
         drop(held_workspace);
+        tokio::time::timeout(Duration::from_secs(5), app.discovery_started.notified())
+            .await
+            .unwrap();
+        // Discovery owns the workspace and branch analysis guards here.
+        let tree = tokio::time::timeout(Duration::from_secs(5), app.browse(project, "src"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tree.contains("lib.rs"));
+        let source = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.view(project, "src/lib.rs", "exact"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(source.contains("pub struct Prepared;"));
+        assert!(!request.is_finished());
+        drop(discovery_pause);
         let mut ticket = app
             .workspaces
             .lock()

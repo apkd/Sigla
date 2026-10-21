@@ -25,16 +25,18 @@ pub struct View {
     store: Arc<Store>,
     root: PathBuf,
     _lock: File,
+    _leases: super::views::LeaseSet,
 }
 
 impl View {
-    pub fn local(cache: &Path, directory: &Path) -> Result<Self> {
+    pub fn local(cache: &Path, directory: &Path, leases: &super::views::LeaseSet) -> Result<Self> {
         let root = cache.join("local-packages").join(
             blake3::hash(directory.as_os_str().as_bytes())
                 .to_hex()
                 .as_str(),
         );
-        let view = Self::open(cache, &root)?;
+        let view = Self::open(cache, &root, leases)?;
+        leases.retain(&cache.join("dotnet/packages"))?;
         let marker = root.join("legacy-imported");
         if !marker.exists() {
             let legacy = cache.join("dotnet/packages");
@@ -46,7 +48,8 @@ impl View {
         }
         Ok(view)
     }
-    pub fn open(cache: &Path, root: &Path) -> Result<Self> {
+    pub fn open(cache: &Path, root: &Path, leases: &super::views::LeaseSet) -> Result<Self> {
+        leases.retain(root)?;
         fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
         let lock = File::options()
@@ -60,6 +63,7 @@ impl View {
             store: Store::open(cache)?,
             root,
             _lock: lock,
+            _leases: leases.clone(),
         };
         view.recover()?;
         fs::create_dir_all(view.path())?;
@@ -260,11 +264,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_package_view_keeps_its_files_until_the_handle_is_dropped() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().join("local-packages/project");
+        let leases = super::super::views::LeaseSet::new(cache.path()).unwrap();
+        let view = View::open(cache.path(), &root, &leases).unwrap();
+        drop(leases);
+        let registry = super::super::views::Registry::open(cache.path()).unwrap();
+        assert!(registry.try_retire(&root, || false).unwrap().is_none());
+        assert!(view.path().is_dir());
+        drop(view);
+        registry
+            .try_retire(&root, || false)
+            .unwrap()
+            .unwrap()
+            .dispose()
+            .unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn recovery_preserves_writes_before_exchange_and_cleans_them_after() {
         for installed in [false, true] {
             let cache = tempfile::tempdir().unwrap();
             let root = cache.path().join("owner");
-            let view = View::open(cache.path(), &root).unwrap();
+            let leases = super::super::views::LeaseSet::new(cache.path()).unwrap();
+            let view = View::open(cache.path(), &root, &leases).unwrap();
             fs::write(view.upper().join("written"), b"pending").unwrap();
             let stage = root.join("package-snapshot-recovery");
             fs::create_dir_all(stage.join("contents")).unwrap();
@@ -282,7 +307,7 @@ mod tests {
                 exchange(&stage.join("contents"), &view.path()).unwrap();
             }
             drop(view);
-            let recovered = View::open(cache.path(), &root).unwrap();
+            let recovered = View::open(cache.path(), &root, &leases).unwrap();
             assert_eq!(recovered.upper().join("written").exists(), !installed);
             assert_eq!(recovered.path().join("published").exists(), installed);
             assert!(!stage.exists());

@@ -31,11 +31,6 @@ fn now() -> u64 {
 type Outcome = std::result::Result<(), String>;
 type Running = watch::Receiver<Option<Outcome>>;
 
-fn remove_branch(root: &Path) -> Result<()> {
-    crate::sandbox::remove_outputs(&root.join("generated"))?;
-    fs::remove_dir_all(root).context("Cannot remove expired repository cache")
-}
-
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
@@ -68,6 +63,70 @@ mod refresh_tests {
             acquiring: AsyncMutex::new(()),
             inventory: watch::channel(None).0,
         }
+    }
+
+    #[test]
+    fn eviction_rechecks_branch_handles_and_identity_after_planning() {
+        for existing in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let manager = Manager::new(cache.path().into(), options()).unwrap();
+            let root = cache.path().join("repositories/candidate");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("source.cs"), "class Retained {}").unwrap();
+            if existing {
+                manager
+                    .branches
+                    .lock()
+                    .unwrap()
+                    .insert("candidate".into(), Arc::new(Branch::for_test(root.clone())));
+            }
+            let mut acquired = None;
+            let removed = manager
+                .evict(
+                    &root,
+                    true,
+                    || {
+                        // This lock also proves planning does not hold the registry.
+                        let mut branches = manager.branches.lock().unwrap();
+                        acquired = Some(
+                            branches
+                                .entry("candidate".into())
+                                .or_insert_with(|| Arc::new(Branch::for_test(root.clone())))
+                                .clone(),
+                        );
+                        Ok(())
+                    },
+                    |()| panic!("Retired newly acquired inputs"),
+                )
+                .unwrap();
+            assert!(!removed);
+            assert!(root.join("source.cs").exists());
+            assert!(acquired.is_some());
+        }
+    }
+
+    #[test]
+    fn eviction_rejects_replaced_directory_after_planning() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let root = cache.path().join("repositories/candidate");
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            !manager
+                .evict(
+                    &root,
+                    true,
+                    || {
+                        fs::rename(&root, cache.path().join("old"))?;
+                        fs::create_dir(&root)?;
+                        fs::write(root.join("new.cs"), "class New {}")?;
+                        Ok(())
+                    },
+                    |()| panic!("Retired replacement inputs")
+                )
+                .unwrap()
+        );
+        assert!(root.join("new.cs").exists());
     }
 
     #[test]
@@ -264,6 +323,26 @@ pub struct Branch {
 }
 
 impl Branch {
+    #[cfg(test)]
+    pub(crate) fn for_test(root: PathBuf) -> Self {
+        Self {
+            root,
+            repository: Repository::parse("https://github.com/owner/repo")
+                .unwrap()
+                .unwrap(),
+            name: "main".into(),
+            target: Target::Branch("main".into()),
+            state: Arc::new(AsyncRwLock::new(None)),
+            analysis: Arc::new(AsyncRwLock::new(())),
+            last_use: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            running: Mutex::new(None),
+            retry_after: AtomicU64::new(0),
+            acquiring: AsyncMutex::new(()),
+            inventory: watch::channel(None).0,
+        }
+    }
+
     /// Publishers wait for long analyses before queuing a state writer. Short
     /// navigation readers can therefore use the stable files while analyses run.
     pub(crate) async fn analyze(&self) -> AnalysisGuard {
@@ -458,43 +537,15 @@ impl Manager {
             .map(|branch| branch.source())
             .collect()
     }
-    pub fn migrate_inputs(&self, root: &Path, store: &crate::cache::blobs::Store) -> Result<bool> {
-        let branches = self.branches.lock().unwrap();
-        let branch = branches.values().find(|branch| branch.root == root);
-        let _gate = if let Some(branch) = branch {
-            if branch
-                .running
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|job| job.borrow().is_none())
-            {
-                return Ok(false);
-            }
-            let Ok(gate) = branch.state.clone().try_write_owned() else {
-                return Ok(false);
-            };
-            Some(gate)
-        } else {
-            None
-        };
-        if root.join("source").is_dir() {
-            store.import_tree(&root.join("source"))?;
-        }
-        if root.join("generated/packages").is_dir() {
-            crate::cache::packages::View::open(&self.cache, &root.join("generated"))?;
-        }
-        Ok(true)
-    }
-
     /// Recheck both protection and in-flight acquisitions at the point of removal.
-    pub fn evict(
+    pub fn evict<T>(
         &self,
         root: &Path,
         pressure: bool,
-        retire: impl FnOnce() -> Result<()>,
+        prepare: impl FnOnce() -> Result<T>,
+        retire: impl FnOnce(T) -> Result<()>,
     ) -> Result<bool> {
-        let mut branches = self.branches.lock().unwrap();
+        let branches = self.branches.lock().unwrap();
         let branch = branches.values().find(|b| b.root == root).cloned();
         let _gate = if let Some(branch) = &branch {
             if Arc::strong_count(branch) > 2
@@ -514,6 +565,40 @@ impl Manager {
         } else {
             None
         };
+        // Keep the per-branch writer, but allow unrelated branch acquisitions
+        // while the caller enumerates analysis namespaces.
+        use std::os::unix::fs::MetadataExt;
+        let identity = fs::symlink_metadata(root)?;
+        drop(branches);
+        let plan = prepare()?;
+        let mut branches = self.branches.lock().unwrap();
+        let current = branches.values().find(|b| b.root == root);
+        let unchanged = match (&branch, current) {
+            (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged
+            || branch.as_ref().is_some_and(|branch| {
+                Arc::strong_count(branch) > 2
+                    || branch
+                        .running
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|job| job.borrow().is_none())
+            })
+        {
+            return Ok(false);
+        }
+        let current_identity = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if (identity.dev(), identity.ino()) != (current_identity.dev(), current_identity.ino()) {
+            return Ok(false);
+        }
         let mut state: State = serde_json::from_slice(&fs::read(root.join("state.json"))?)?;
         if let Some(branch) = &branch {
             state.last_use = branch.last_use.load(Ordering::Relaxed);
@@ -521,9 +606,12 @@ impl Manager {
         if self.retention(&state)?.0 || !pressure && !self.state_expired(&state, state.last_use)? {
             return Ok(false);
         }
-        retire()?;
-        remove_branch(root)?;
+        retire(plan)?;
+        let retired = crate::cache::views::retire(&self.cache, root)?;
         branches.retain(|_, branch| branch.root != root);
+        drop(_gate);
+        drop(branches);
+        retired.dispose()?;
         Ok(true)
     }
 
@@ -673,11 +761,7 @@ impl Manager {
         Ok(expired)
     }
 
-    pub async fn expire(
-        &self,
-        branch: &Arc<Branch>,
-        retire: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+    pub fn expire(&self, branch: &Arc<Branch>, retire: impl FnOnce() -> Result<()>) -> Result<()> {
         let mut branches = self.branches.lock().unwrap();
         if Arc::strong_count(branch) > 2
             || !self.branch_expired(branch)?
@@ -691,8 +775,10 @@ impl Manager {
             return Ok(());
         }
         retire()?;
-        remove_branch(&branch.root)?;
+        let retired = crate::cache::views::retire(&self.cache, &branch.root)?;
         branches.retain(|_, value| !Arc::ptr_eq(value, branch));
+        drop(branches);
+        retired.dispose()?;
         Ok(())
     }
 

@@ -73,8 +73,8 @@ pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discove
         remote.require_analysis_tree(&root.join("Assets"))?;
     }
     let editor = match &policy.remote {
-        Some(remote) => super::acquire::editor(root, &remote.shared)?,
-        None => Editor::local(root, policy.unity_editors.as_deref())?,
+        Some(remote) => super::acquire::editor(root, &remote.shared, &result.leases)?,
+        None => Editor::local(root, policy.unity_editors.as_deref(), &result.leases)?,
     };
     discover_with_editor(root, policy, cache, result, &editor)
 }
@@ -86,6 +86,7 @@ fn discover_with_editor(
     result: &mut Discovery,
     editor: &Editor,
 ) -> Result<()> {
+    result.leases.retain(&editor.data)?;
     let settings = Settings::read(&root.join("ProjectSettings/ProjectSettings.asset"))?;
     let references = super::catalog::References::read(
         &editor.data,
@@ -97,7 +98,7 @@ fn discover_with_editor(
     result
         .diagnostics
         .extend(references.diagnostics.iter().cloned());
-    let packages = Packages::local(root, policy, editor, cache)?;
+    let packages = Packages::local(root, policy, editor, cache, &result.leases)?;
     result.metadata.extend(packages.watched);
     result.metadata.extend([
         root.join("ProjectSettings/ProjectSettings.asset"),
@@ -1077,6 +1078,7 @@ mod tests {
                     inject_bad_inputs(root.path());
                 }
                 let mut actual = Discovery {
+                    leases: crate::cache::views::LeaseSet::new(cache.path()).unwrap(),
                     root: root.path().into(),
                     projects: Vec::new(),
                     sources: Vec::new(),

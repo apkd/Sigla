@@ -6,6 +6,7 @@ pub mod inspect;
 pub mod owners;
 pub mod packages;
 pub mod policy;
+pub mod views;
 
 pub(crate) struct Ownership(pub std::fs::File);
 impl Drop for Ownership {

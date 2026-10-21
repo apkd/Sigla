@@ -58,9 +58,21 @@ impl RemoteContext {
     }
 
     pub fn require_analysis_tree(&self, directory: &Path) -> Result<()> {
+        let Ok(relative) = directory.strip_prefix(&self.workspace) else {
+            return Ok(());
+        };
+        let prefix = if relative.as_os_str().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{}/",
+                relative.to_str().context("Invalid discovery directory")?
+            )
+        };
         self.require(
             self.tracked
-                .iter()
+                .range(prefix.clone()..)
+                .take_while(|path| path.starts_with(&prefix))
                 .map(|p| self.workspace.join(p))
                 .filter(|p| {
                     p.strip_prefix(directory).is_ok_and(|relative| {
@@ -87,6 +99,7 @@ impl Policy {
         if let Some(editors) = &self.unity_editors {
             hash.update(&serde_json::to_vec(editors)?);
         }
+        hash.update(&crate::msbuild::environment_identity()?);
         Ok(*hash.finalize().as_bytes())
     }
     pub fn new(roots: Vec<PathBuf>) -> Result<Self> {
@@ -124,6 +137,7 @@ impl Policy {
 }
 
 pub struct Discovery {
+    pub(crate) leases: crate::cache::views::LeaseSet,
     pub root: PathBuf,
     pub projects: Vec<Project>,
     pub sources: Vec<SourceInput>,
@@ -174,6 +188,12 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         entry.parent().unwrap().to_owned()
     };
     let mut result = Discovery {
+        leases: crate::cache::views::LeaseSet::new(
+            policy
+                .remote
+                .as_ref()
+                .map_or(cache, |remote| &remote.shared),
+        )?,
         root,
         projects: Vec::new(),
         sources: Vec::new(),
@@ -232,31 +252,83 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         }
     }
     if !managed.is_empty() {
-        let projects = result.projects.len();
-        let sources = result.sources.len();
-        if let Err(error) = load_csharp(&managed, policy, cache, &mut result) {
-            if error.downcast_ref::<RequiredInputs>().is_some() {
-                return Err(error);
+        let mut session = crate::msbuild::Session::default();
+        let mut groups = BTreeMap::<_, Vec<PathBuf>>::new();
+        let mut fallback = FallbackScan::default();
+        for input in managed {
+            result.metadata.insert(input.clone());
+            match crate::msbuild::scope(&input, policy.remote.as_ref(), &mut result.metadata) {
+                Ok(scope) => groups.entry(scope).or_default().push(input),
+                Err(error) => {
+                    if error.downcast_ref::<RequiredInputs>().is_some() {
+                        return Err(error);
+                    }
+                    result.diagnostics.push(format!(
+                        "Incomplete SDK policy: {}",
+                        project_failure(&error)
+                    ));
+                    fallback.scan(&input, policy, &mut result)?;
+                }
             }
-            result.projects.truncate(projects);
-            result.sources.truncate(sources);
-            result.diagnostics.push(format!("Incomplete .NET project details: {}. Searching readable sources; references may be incomplete.", project_failure(&error)));
-            for input in &managed {
-                if managed.len() > 1 {
-                    let projects = result.projects.len();
-                    let sources = result.sources.len();
-                    match load_csharp(std::slice::from_ref(input), policy, cache, &mut result) {
-                        Ok(()) => continue,
-                        Err(error) => {
-                            if error.downcast_ref::<RequiredInputs>().is_some() {
-                                return Err(error);
+        }
+        for (scope, managed) in groups {
+            let projects = result.projects.len();
+            let sources = result.sources.len();
+            if let Err(error) = load_csharp(
+                &managed,
+                policy,
+                cache,
+                &scope,
+                &mut session,
+                &mut result,
+                &mut fallback,
+            ) {
+                if error.downcast_ref::<RequiredInputs>().is_some() {
+                    return Err(error);
+                }
+                result.projects.truncate(projects);
+                result.sources.truncate(sources);
+                result.diagnostics.push(format!("Incomplete .NET project details: {}. Searching readable sources; references may be incomplete.", project_failure(&error)));
+                for input in &managed {
+                    if managed.len() > 1 && crate::msbuild::project_retry_can_help(&error) {
+                        let projects = result.projects.len();
+                        let sources = result.sources.len();
+                        match load_csharp(
+                            std::slice::from_ref(input),
+                            policy,
+                            cache,
+                            &scope,
+                            &mut session,
+                            &mut result,
+                            &mut fallback,
+                        ) {
+                            Ok(()) => continue,
+                            Err(error) => {
+                                if error.downcast_ref::<RequiredInputs>().is_some() {
+                                    return Err(error);
+                                }
+                                result.projects.truncate(projects);
+                                result.sources.truncate(sources);
                             }
-                            result.projects.truncate(projects);
-                            result.sources.truncate(sources);
                         }
                     }
+                    fallback.scan(input, policy, &mut result)?;
                 }
-                fallback_sources(input, policy, &mut result)?;
+            } else {
+                // A usable batch can still exclude individual project entry points.
+                let loaded: HashSet<_> = result.projects[projects..]
+                    .iter()
+                    .filter_map(|project| project.origin.clone())
+                    .collect();
+                for input in &managed {
+                    if input
+                        .extension()
+                        .is_some_and(|extension| extension == "csproj")
+                        && !loaded.contains(input)
+                    {
+                        fallback.scan(input, policy, &mut result)?;
+                    }
+                }
             }
         }
     }
@@ -522,147 +594,170 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
 
 /// Recover source facts without claiming that build settings or references are known.
 fn fallback_sources(entry: &Path, policy: &Policy, result: &mut Discovery) -> Result<()> {
-    let base = if entry.is_dir() {
-        entry
-    } else {
-        entry.parent().unwrap()
-    };
-    if let Some(remote) = &policy.remote {
-        remote.require_analysis_tree(base)?;
-    }
-    let mut pending = vec![base.to_owned()];
-    let mut files = Vec::new();
-    while let Some(directory) = pending.pop() {
-        let directory = match policy.canonical(&directory) {
-            Ok(path) => path,
-            Err(error) => {
-                result
-                    .diagnostics
-                    .push(format!("Skipped directory: {error:#}"));
-                continue;
-            }
+    FallbackScan::default().scan(entry, policy, result)
+}
+
+#[derive(Default)]
+struct FallbackScan {
+    directories: BTreeMap<PathBuf, Vec<(PathBuf, std::fs::FileType)>>,
+    completed: BTreeSet<PathBuf>,
+    #[cfg(test)]
+    reads: usize,
+}
+
+impl FallbackScan {
+    fn scan(&mut self, entry: &Path, policy: &Policy, result: &mut Discovery) -> Result<()> {
+        let base = if entry.is_dir() {
+            entry
+        } else {
+            entry.parent().unwrap()
         };
-        result.metadata.insert(directory.clone());
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) => {
-                result
-                    .diagnostics
-                    .push(format!("Cannot read {}: {error}", directory.display()));
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    result.diagnostics.push(error.to_string());
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
+        if self.completed.contains(base) {
+            return Ok(());
+        }
+        if let Some(remote) = &policy.remote {
+            remote.require_analysis_tree(base)?;
+        }
+        let mut pending = vec![base.to_owned()];
+        let mut files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            let directory = match policy.canonical(&directory) {
+                Ok(path) => path,
                 Err(error) => {
                     result
                         .diagnostics
-                        .push(format!("Cannot read {}: {error}", path.display()));
+                        .push(format!("Skipped directory: {error:#}"));
                     continue;
                 }
             };
-            if kind.is_dir() {
-                let name = entry.file_name();
-                if linked_worktree(&path) {
-                    continue;
-                }
-                if crate::unity::assets::is_root(base) && crate::unity::assets::is_root(&path) {
-                    continue;
-                }
-                if name == "Library" && base.join("Assets").is_dir() {
-                    if path.join("PackageCache").is_dir()
-                        && !linked_worktree(&path.join("PackageCache"))
-                    {
-                        pending.push(path.join("PackageCache"));
-                    }
-                } else if !crate::unity::ignored_name(&name)
-                    && !matches!(
-                        name.to_str(),
-                        Some(
-                            "target"
-                                | "bin"
-                                | "obj"
-                                | "node_modules"
-                                | "Temp"
-                                | "Logs"
-                                | "UserSettings"
-                        )
-                    )
+            result.metadata.insert(directory.clone());
+            if !self.directories.contains_key(&directory) {
+                #[cfg(test)]
                 {
-                    pending.push(path);
+                    self.reads += 1;
                 }
-            } else if kind.is_file() {
-                let language = match path.extension().and_then(|e| e.to_str()) {
-                    Some("cs") => Language::CSharp,
-                    Some("rs") => Language::Rust,
-                    _ => continue,
+                let entries = match std::fs::read_dir(&directory) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        result
+                            .diagnostics
+                            .push(format!("Cannot read {}: {error}", directory.display()));
+                        continue;
+                    }
                 };
-                files.push((path, language));
+                let entries = entries
+                    .filter_map(|entry| {
+                        let entry = entry.and_then(|entry| Ok((entry.path(), entry.file_type()?)));
+                        match entry {
+                            Ok(entry) => Some(entry),
+                            Err(error) => {
+                                result.diagnostics.push(format!(
+                                    "Cannot read entry in {}: {error}",
+                                    directory.display()
+                                ));
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                self.directories.insert(directory.clone(), entries);
+            }
+            for (path, kind) in &self.directories[&directory] {
+                if kind.is_dir() {
+                    let name = path.file_name().unwrap();
+                    if linked_worktree(path) {
+                        continue;
+                    }
+                    if crate::unity::assets::is_root(base) && crate::unity::assets::is_root(path) {
+                        continue;
+                    }
+                    if name == "Library" && base.join("Assets").is_dir() {
+                        if path.join("PackageCache").is_dir()
+                            && !linked_worktree(&path.join("PackageCache"))
+                        {
+                            pending.push(path.join("PackageCache"));
+                        }
+                    } else if !crate::unity::ignored_name(name)
+                        && !matches!(
+                            name.to_str(),
+                            Some(
+                                "target"
+                                    | "bin"
+                                    | "obj"
+                                    | "node_modules"
+                                    | "Temp"
+                                    | "Logs"
+                                    | "UserSettings"
+                            )
+                        )
+                    {
+                        pending.push(path.clone());
+                    }
+                } else if kind.is_file() {
+                    let language = match path.extension().and_then(|e| e.to_str()) {
+                        Some("cs") => Language::CSharp,
+                        Some("rs") => Language::Rust,
+                        _ => continue,
+                    };
+                    files.push((path.clone(), language));
+                }
             }
         }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    for language in [Language::CSharp, Language::Rust] {
-        let project = result.projects.len();
-        let name = base
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .replace('-', "_");
-        let sources: Vec<_> = files
-            .iter()
-            .filter(|(_, lang)| *lang == language)
-            .map(|(path, _)| SourceInput {
-                path: path.clone(),
-                project,
-                module: if language == Language::Rust {
-                    std::iter::once(name.clone())
-                        .chain(
-                            path.strip_prefix(base)
-                                .unwrap()
-                                .with_extension("")
-                                .components()
-                                .filter_map(|c| {
-                                    let part = c.as_os_str().to_string_lossy().into_owned();
-                                    (!matches!(part.as_str(), "src" | "lib" | "main" | "mod"))
-                                        .then_some(part)
-                                }),
-                        )
-                        .collect::<Vec<_>>()
-                        .join("::")
-                } else {
-                    String::new()
-                },
-                language,
-                metadata: false,
-            })
-            .collect();
-        if sources.is_empty() {
-            continue;
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        for language in [Language::CSharp, Language::Rust] {
+            let project = result.projects.len();
+            let name = base
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .replace('-', "_");
+            let sources: Vec<_> = files
+                .iter()
+                .filter(|(_, lang)| *lang == language)
+                .map(|(path, _)| SourceInput {
+                    path: path.clone(),
+                    project,
+                    module: if language == Language::Rust {
+                        std::iter::once(name.clone())
+                            .chain(
+                                path.strip_prefix(base)
+                                    .unwrap()
+                                    .with_extension("")
+                                    .components()
+                                    .filter_map(|c| {
+                                        let part = c.as_os_str().to_string_lossy().into_owned();
+                                        (!matches!(part.as_str(), "src" | "lib" | "main" | "mod"))
+                                            .then_some(part)
+                                    }),
+                            )
+                            .collect::<Vec<_>>()
+                            .join("::")
+                    } else {
+                        String::new()
+                    },
+                    language,
+                    metadata: false,
+                })
+                .collect();
+            if sources.is_empty() {
+                continue;
+            }
+            result.projects.push(Project {
+                identity: format!("fallback:{}:{language:?}", base.display()),
+                origin: None,
+                name,
+                defines: Vec::new(),
+                references: Vec::new(),
+                assemblies: Vec::new(),
+                edition: "2024".into(),
+                compiler_options: Default::default(),
+                source_roots: Vec::new(),
+            });
+            result.sources.extend(sources);
         }
-        result.projects.push(Project {
-            identity: format!("fallback:{}:{language:?}", base.display()),
-            origin: None,
-            name,
-            defines: Vec::new(),
-            references: Vec::new(),
-            assemblies: Vec::new(),
-            edition: "2024".into(),
-            compiler_options: Default::default(),
-            source_roots: Vec::new(),
-        });
-        result.sources.extend(sources);
+        self.completed.insert(base.to_owned());
+        Ok(())
     }
-    Ok(())
 }
 
 fn collect_entries(
@@ -750,9 +845,20 @@ fn load_csharp(
     entries: &[PathBuf],
     policy: &Policy,
     cache: &Path,
+    scope: &crate::msbuild::Scope,
+    session: &mut crate::msbuild::Session,
     result: &mut Discovery,
+    fallback: &mut FallbackScan,
 ) -> Result<()> {
-    let snapshot = crate::msbuild::discover_in(entries, cache, policy.remote.as_ref())?;
+    let snapshot = crate::msbuild::discover_in(
+        entries,
+        cache,
+        policy.remote.as_ref(),
+        scope,
+        session,
+        &mut result.metadata,
+        &result.leases,
+    )?;
     result.diagnostics.extend(snapshot.diagnostics);
     ensure!(
         !snapshot.projects.is_empty(),
@@ -768,6 +874,22 @@ fn load_csharp(
     }
     let policy = &approved;
     let source_projects: HashSet<_> = snapshot.projects.iter().map(|p| p.origin.clone()).collect();
+    for entry in snapshot.excluded_entries {
+        if !source_projects.contains(&entry) {
+            let entry = match policy.canonical(&entry) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    result.diagnostics.push(format!(
+                        "Cannot recover excluded project {}: {error:#}",
+                        entry.display()
+                    ));
+                    continue;
+                }
+            };
+            result.metadata.insert(entry.clone());
+            fallback.scan(&entry, policy, result)?;
+        }
+    }
     for project in snapshot.projects {
         let origin = match policy.canonical(&project.origin) {
             Ok(origin) => origin,
@@ -1255,6 +1377,46 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_reuses_directory_reads_and_preserves_nested_memberships() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        write(root, "Parent.cs", "class Parent {}");
+        write(root, "child/Child.cs", "class Child {}");
+        write(root, "child/src/lib.rs", "pub fn child() {}");
+        let policy = Policy::new(vec![root.into()]).unwrap();
+        let mut found = discover_cached(root, &policy, cache.path()).unwrap();
+        found.projects.clear();
+        found.sources.clear();
+        let mut scan = FallbackScan::default();
+        scan.scan(&root.join("First.csproj"), &policy, &mut found)
+            .unwrap();
+        let reads = scan.reads;
+        let sources = found.sources.len();
+        scan.scan(&root.join("Second.csproj"), &policy, &mut found)
+            .unwrap();
+        assert_eq!(found.sources.len(), sources);
+        scan.scan(&root.join("child/Child.csproj"), &policy, &mut found)
+            .unwrap();
+        assert_eq!(scan.reads, reads);
+        let memberships: Vec<_> = found
+            .sources
+            .iter()
+            .filter(|source| source.path == root.join("child/Child.cs"))
+            .map(|source| &found.projects[source.project].identity)
+            .collect();
+        assert_eq!(memberships.len(), 2);
+        assert_ne!(memberships[0], memberships[1]);
+        let modules: BTreeSet<_> = found
+            .sources
+            .iter()
+            .filter(|source| source.path == root.join("child/src/lib.rs"))
+            .map(|source| &source.module)
+            .collect();
+        assert_eq!(modules.len(), 2);
+    }
 
     pub(crate) fn add_worktree(repository: &Path, worktree: &Path) {
         std::fs::create_dir_all(repository).unwrap();

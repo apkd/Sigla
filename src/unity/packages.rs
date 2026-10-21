@@ -87,13 +87,22 @@ fn package(
 }
 
 impl Packages {
-    pub fn local(root: &Path, policy: &Policy, editor: &Editor, cache: &Path) -> Result<Self> {
+    pub fn local(
+        root: &Path,
+        policy: &Policy,
+        editor: &Editor,
+        cache: &Path,
+        leases: &crate::cache::views::LeaseSet,
+    ) -> Result<Self> {
         Self::resolve(
             root,
             policy,
             editor,
             cache,
-            crate::metadata_archive::package,
+            leases,
+            |cache, name, requested, editor| {
+                crate::metadata_archive::package(cache, name, requested, editor, leases)
+            },
         )
     }
 
@@ -102,6 +111,7 @@ impl Packages {
         policy: &Policy,
         editor: &Editor,
         cache: &Path,
+        leases: &crate::cache::views::LeaseSet,
         acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<(PathBuf, String)>,
     ) -> Result<Self> {
         let cache = policy
@@ -338,7 +348,12 @@ impl Packages {
                         let path = policy.canonical(&root.join("Packages").join(relative))?;
                         let path = if path.is_file() {
                             watched.insert(path.clone());
-                            super::package_acquire::local_archive(cache, &path, &package_name)?
+                            super::package_acquire::local_archive(
+                                cache,
+                                &path,
+                                &package_name,
+                                leases,
+                            )?
                         } else {
                             path
                         };
@@ -352,13 +367,15 @@ impl Packages {
                                 .as_deref()
                                 .context("Git package lock has no commit")?,
                         )?;
-                        let path = source.acquire(cache, &package_name, policy.remote.as_ref())?;
+                        let path =
+                            source.acquire(cache, &package_name, policy.remote.as_ref(), leases)?;
                         package(path, &package_name, None, source.identity, testable)
                     }
                     "registry" => {
                         let shared = cache
                             .join("unity-packages")
                             .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
+                        leases.retain(&shared)?;
                         if super::package_acquire::complete(&shared, &identity) {
                             return package(
                                 shared.join("contents"),
@@ -388,6 +405,7 @@ impl Packages {
                                 registry,
                                 &package_name,
                                 &node.version,
+                                leases,
                             )?;
                             return package(
                                 path,
@@ -509,6 +527,7 @@ mod tests {
             &policy,
             &editor,
             temp.path(),
+            &crate::cache::views::LeaseSet::new(&temp.path().join("cache")).unwrap(),
             |_, name, requested, _| {
                 let deps = match name {
                     "com.example.a" => {
@@ -566,7 +585,8 @@ mod tests {
             selected_revision: None,
         };
         let policy = Policy::new(vec![fixture.path().into()]).unwrap();
-        let automatic = Packages::local(&root, &policy, &editor, fixture.path()).unwrap();
+        let leases = crate::cache::views::LeaseSet::new(fixture.path()).unwrap();
+        let automatic = Packages::local(&root, &policy, &editor, fixture.path(), &leases).unwrap();
         assert!(automatic.selected.is_empty());
         assert!(!automatic.watched.iter().any(|p| p.starts_with(&worktree)));
         std::fs::write(
@@ -575,7 +595,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("Packages/packages-lock.json"), r#"{"dependencies":{"com.example.feature":{"version":"file:feature","source":"local","depth":0}}}"#).unwrap();
-        let explicit = Packages::local(&root, &policy, &editor, fixture.path()).unwrap();
+        let explicit = Packages::local(&root, &policy, &editor, fixture.path(), &leases).unwrap();
         assert!(explicit.selected.iter().any(|p| p.root == worktree));
     }
 
@@ -615,6 +635,7 @@ mod tests {
             &Policy::new(vec![root.path().into()]).unwrap(),
             &editor,
             root.path(),
+            &crate::cache::views::LeaseSet::new(root.path()).unwrap(),
         )
         .unwrap();
         assert_eq!(packages.selected.len(), 2);
@@ -635,6 +656,7 @@ mod tests {
             &Policy::new(vec![root.path().into()]).unwrap(),
             &editor,
             root.path(),
+            &crate::cache::views::LeaseSet::new(root.path()).unwrap(),
         )
         .unwrap();
         assert_eq!(

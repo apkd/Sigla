@@ -4,7 +4,10 @@ using Microsoft.Build.Locator;
 using System.Runtime.InteropServices;
 
 // Register before the CLR loads any method using Microsoft.Build types.
-if (args[0] == "--resolve-sdk") return Sdk.Resolve(args[1], args[2], args[3], args[4]);
+if (args[0] == "--resolve-sdk") {
+    try { return Sdk.Resolve(args[1], args[2], args[3], args[4]); }
+    catch (Exception error) { Console.Error.WriteLine($"SDK resolver failed: {error}"); return 1; }
+}
 if (args[0] == "--seal-packages") return PackageSnapshot.Run(args[1], args[2], args[3]);
 // Request structured import events, including conditional and missing imports.
 Environment.SetEnvironmentVariable("MSBUILDLOGIMPORTS", "1");
@@ -27,8 +30,8 @@ static class Sdk
             Result callback = (key, value) => { if (key == 0) sdk = value; };
             var status = resolve(host, directory, 0, callback);
             GC.KeepAlive(callback);
-            if (status != 0 || sdk == null) throw new InvalidOperationException("No installed SDK satisfies global.json");
-            File.WriteAllText(output, JsonSerializer.Serialize(new { Sdk = sdk }));
+            // Report a rejected policy as an ordinary resolver result.
+            File.WriteAllText(output, JsonSerializer.Serialize(new { Sdk = sdk, Status = status }));
             return 0;
         }
         finally { NativeLibrary.Free(handle); }
@@ -110,9 +113,10 @@ static class Discovery
                 collection.UnloadProject(project);
             }
             var diagnostics = new List<string>();
+            var excludedEntries = new HashSet<string>(StringComparer.Ordinal);
             void TryAddEntry(string path, Dictionary<string, string> properties) {
                 try { AddEntry(path, properties); }
-                catch (Exception e) when (required.Count == 0) { diagnostics.Add($"Excluded project {path}: {e.Message}"); }
+                catch (Exception e) when (required.Count == 0) { excludedEntries.Add(path); diagnostics.Add($"Excluded project {path}: {e.Message}"); }
             }
             foreach (var entry in request.Entries)
             {
@@ -135,7 +139,7 @@ static class Discovery
                     continue;
                 }
                 TryAddEntry(entry, defaults);
-                } catch (Exception e) when (required.Count == 0) { diagnostics.Add($"Excluded entry {entry}: {e.Message}"); }
+                } catch (Exception e) when (required.Count == 0) { excludedEntries.Add(entry); diagnostics.Add($"Excluded entry {entry}: {e.Message}"); }
             }
             if (required.Count != 0) return Missing();
             Microsoft.Build.Graph.ProjectGraph CreateGraph(IEnumerable<Microsoft.Build.Graph.ProjectGraphEntryPoint> roots) =>
@@ -155,7 +159,7 @@ static class Discovery
                 foreach (var entry in entries) {
                     try { nodes.AddRange(CreateGraph([entry]).ProjectNodesTopologicallySorted); }
                     catch when (required.Count != 0) { return Missing(); }
-                    catch (Exception error) { diagnostics.Add($"Excluded project graph {entry.ProjectFile}: {error.Message}"); }
+                    catch (Exception error) { excludedEntries.Add(entry.ProjectFile); diagnostics.Add($"Excluded project graph {entry.ProjectFile}: {error.Message}"); }
                 }
             }
             nodes = nodes.DistinctBy(node => Identity(node.ProjectInstance)).ToList();
@@ -255,11 +259,11 @@ static class Discovery
                             .Select(g => Microsoft.Build.Globbing.MSBuildGlob.Parse(evaluated.DirectoryPath, g).FixedDirectoryPart).Distinct().ToArray()
                     });
                     collection.UnloadProject(evaluated);
-                    } catch (Exception e) { diagnostics.Add($"Excluded project {initial.FullPath}: {e.Message}"); }
+                    } catch (Exception e) { excludedEntries.Add(initial.FullPath); diagnostics.Add($"Excluded project {initial.FullPath}: {e.Message}"); }
                 }
             }
             finally { manager.EndBuild(); }
-            File.WriteAllText(resultFile, JsonSerializer.Serialize(new { Version = 1, NeedsRestore = false, DependencyState = dependencyState, Projects = projects, Diagnostics = diagnostics }));
+            File.WriteAllText(resultFile, JsonSerializer.Serialize(new { Version = 1, NeedsRestore = false, DependencyState = dependencyState, Projects = projects, Diagnostics = diagnostics, ExcludedEntries = excludedEntries.Order().ToArray() }));
             return 0;
         }
         catch (Exception e)

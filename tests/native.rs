@@ -11,6 +11,62 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
     Arc::new(App::new(Policy::new(vec![root.into()]).unwrap(), cache.into(), 1).unwrap())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_native_trees_complete_in_an_isolated_worker() {
+    const CHILD: &str = "SIGLA_TEST_DEEP_NATIVE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Stack overflow aborts cannot be caught inside the test runner.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native::deep_native_trees_complete_in_an_isolated_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("Native extraction must complete within its replay budget")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "Child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // Reduced from a generated FidelityFX header whose recovery tree contains
+    // a deep comma expression. This used to abort a normal blocking worker.
+    write(
+        root.path(),
+        "generated.h",
+        &format!("#if 0\n{}\n}};\n", "0x1, ".repeat(3000)),
+    );
+    write(
+        root.path(),
+        "healthy.cpp",
+        "int healthy() { return 1; } void caller() { healthy(); }",
+    );
+    let app = app(root.path(), cache.path());
+    let result = app
+        .search(root.path().to_str().unwrap(), "function:healthy lang:cpp")
+        .await
+        .unwrap();
+    assert!(result.contains("healthy.cpp"), "{result}");
+    let navigation = app
+        .view(root.path().to_str().unwrap(), "healthy.cpp", "exact")
+        .await
+        .unwrap();
+    assert!(navigation.contains("healthy()"), "{navigation}");
+}
+
 #[tokio::test]
 async fn native_sites_signatures_calls_writes_and_refresh() {
     let root = tempfile::tempdir().unwrap();

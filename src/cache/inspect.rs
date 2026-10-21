@@ -85,6 +85,10 @@ pub struct Report {
     pub analysis: Option<super::compaction::Stats>,
     pub workspaces: Vec<Workspace>,
     pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub active_view_leases: Vec<PathBuf>,
+    #[serde(default)]
+    pub pending_retirement_bytes: u64,
     pub preview: Preview,
     pub notes: Vec<String>,
 }
@@ -366,6 +370,12 @@ pub(crate) fn build(
         analysis,
         workspaces,
         dependencies: dependencies.into_values().collect(),
+        active_view_leases: if live_service {
+            super::views::Registry::open(cache)?.roots()
+        } else {
+            Vec::new()
+        },
+        pending_retirement_bytes: super::blobs::allocated(&cache.join("retired-views"))?,
         preview: Preview {
             reclaim_target_bytes,
             cleanup_estimate_bytes: cleanup,
@@ -454,6 +464,11 @@ impl Report {
             self.limits.headroom_percent
         );
         text.push_str("\nDisk by category (shared inodes divided between categories):\n");
+        text.push_str(&format!(
+            "Active dependency leases: {}; pending retired storage: {}\n",
+            self.active_view_leases.len(),
+            size(self.pending_retirement_bytes)
+        ));
         for (name, bytes) in &self.footprint.categories {
             text.push_str(&format!("  {:>12}  {name}\n", size(*bytes)));
         }

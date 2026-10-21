@@ -123,7 +123,11 @@ pub fn remove_outputs(writable: &Path) -> Result<()> {
         match fs::symlink_metadata(&work) {
             Ok(metadata) => {
                 ensure!(metadata.is_dir(), "Invalid overlay work directory");
-                fs::set_permissions(&work, fs::Permissions::from_mode(0o700))?;
+                match fs::set_permissions(&work, fs::Permissions::from_mode(0o700)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -140,7 +144,9 @@ impl Sandbox {
     pub fn new(
         context: &crate::discovery::RemoteContext,
         toolchain_roots: &[PathBuf],
+        leases: &crate::cache::views::LeaseSet,
     ) -> Result<Self> {
+        leases.retain(&context.writable)?;
         let mut toolchains = BTreeSet::new();
         for root in toolchain_roots {
             let root = root.canonicalize()?;
@@ -193,7 +199,11 @@ impl Sandbox {
         let mut hidden = Vec::new();
         git_paths(&source, &source, &mut hidden)?;
         Ok(Self {
-            packages: crate::cache::packages::View::open(&context.shared, &context.writable)?,
+            packages: crate::cache::packages::View::open(
+                &context.shared,
+                &context.writable,
+                leases,
+            )?,
             source,
             writable: context.writable.canonicalize()?,
             toolchains,
@@ -538,7 +548,8 @@ mod tests {
         fs::write(source.join("input"), "source").unwrap();
         std::os::unix::fs::symlink("input", source.join("link")).unwrap();
         std::os::unix::fs::symlink("missing", source.join("dangling")).unwrap();
-        let packages = crate::cache::packages::View::local(&cache, &source).unwrap();
+        let leases = crate::cache::views::LeaseSet::new(&cache).unwrap();
+        let packages = crate::cache::packages::View::local(&cache, &source, &leases).unwrap();
         let mut command =
             local_command(Path::new("/bin/sh"), &source, &cache, &job, &packages).unwrap();
         command

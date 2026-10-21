@@ -344,7 +344,13 @@ impl App {
             let cleanup = if state.cleaned {
                 Ok(())
             } else {
-                let result = crate::cache::compaction::cleanup(&self.cache);
+                let result = (|| {
+                    crate::cache::compaction::cleanup(&self.cache)?;
+                    for retired in crate::cache::views::Registry::open(&self.cache)?.pending()? {
+                        retired.dispose()?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })();
                 state.cleaned = result.is_ok();
                 result
             };
@@ -395,6 +401,13 @@ impl App {
     }
 
     pub(super) async fn maintain_disk(self: &Arc<Self>) -> Result<()> {
+        self.maintain_disk_observed(|| {}).await
+    }
+
+    async fn maintain_disk_observed(
+        self: &Arc<Self>,
+        started: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
         if self.inspection_shutdown.is_cancelled() {
             return Ok(());
         }
@@ -409,12 +422,10 @@ impl App {
         }
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
-            // A queued writer blocks later readers, including navigation, while
-            // existing indexing jobs finish. Maintenance must wait for idle time.
-            let Ok(gate) = app.activity.clone().try_write_owned() else {
-                tracing::info!(
-                    "Disk cache maintenance deferred while queries or indexing are active"
-                );
+            // Routine collection uses domain leases and database snapshots.
+            // Only replacing the database needs an idle service.
+            let Ok(gate) = app.activity.clone().try_read_owned() else {
+                tracing::info!("Disk cache maintenance deferred during database replacement");
                 return Ok(());
             };
             let _gate = gate;
@@ -423,13 +434,29 @@ impl App {
             }
             let start = Instant::now();
             tracing::info!("Disk cache maintenance started");
-            let result = app.maintain_disk_exclusive();
+            started();
+            let result = app.maintain_disk_shared();
+            let compact = result.as_ref().is_ok_and(|pressure| *pressure);
+            app.maintenance_retry.store(
+                result.is_err() || compact,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            drop(_gate);
+            if compact && !app.inspection_shutdown.is_cancelled() {
+                if let Ok(_idle) = app.activity.clone().try_write_owned() {
+                    maintenance_stage("analysis compaction", || app.compact_analysis())?;
+                } else {
+                    tracing::info!(
+                        "Analysis compaction deferred while queries or indexing are active"
+                    );
+                }
+            }
             tracing::info!(
                 elapsed_ms = start.elapsed().as_millis(),
                 success = result.is_ok(),
                 "Disk cache maintenance finished"
             );
-            result
+            result.map(|_| ())
         })
         .await?
     }
@@ -454,6 +481,7 @@ impl App {
                     continue;
                 }
                 if let Some(scope) = database.existing(key)? {
+                    let revision = self.owners.lock().unwrap().revision();
                     let store = crate::store::Store { scope };
                     let manifest: Option<crate::workspace::Manifest> = store.get_manifest()?;
                     if let Some(manifest) = manifest {
@@ -461,36 +489,55 @@ impl App {
                         if manifest.source_group.is_some() {
                             continue;
                         }
-                        self.owners.lock().unwrap().observe(
-                            &info.entry,
-                            info.owner.as_deref(),
-                            &manifest,
-                            None,
-                        );
+                        let mut owners = self.owners.lock().unwrap();
+                        if owners.revision() != revision {
+                            known = false;
+                            continue;
+                        }
+                        owners.observe(&info.entry, info.owner.as_deref(), &manifest, None);
                     } else {
                         known = false;
                     }
                 }
             }
         }
-        let mut owners = self.owners.lock().unwrap();
-        let removed: Vec<_> = owners
+        let snapshot = self.owners.lock().unwrap().clone();
+        let removed: Vec<_> = snapshot
             .entries
             .values()
-            .filter(|owner| !owner.repository.as_deref().unwrap_or(&owner.entry).exists())
+            .filter(|owner| {
+                fs::symlink_metadata(owner.repository.as_deref().unwrap_or(&owner.entry))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            })
             .map(|owner| owner.entry.clone())
             .collect();
-        for entry in removed {
-            owners.remove(&entry);
+        {
+            let mut owners = self.owners.lock().unwrap();
+            if owners.revision() == snapshot.revision() {
+                for entry in removed {
+                    owners.remove(&entry);
+                }
+            } else {
+                known = false;
+            }
         }
-        owners.flush()?;
+        self.flush_owners()?;
         Ok(known)
     }
 
+    fn flush_owners(&self) -> Result<()> {
+        let snapshot = self.owners.lock().unwrap().clone();
+        if let Some(publication) = snapshot.stage()? {
+            self.owners.lock().unwrap().publish(publication)?;
+        }
+        Ok(())
+    }
+
     fn candidates(&self) -> Result<Vec<Candidate>> {
+        let owners = self.owners.lock().unwrap().clone();
         crate::cache::policy::retention_candidates(
             &self.cache,
-            &self.owners.lock().unwrap(),
+            &owners,
             self.remote
                 .as_ref()
                 .map(|remote| crate::repository::retention::Policy::from(&remote.options))
@@ -510,29 +557,80 @@ impl App {
             self.owners.lock().unwrap().remove(&candidate.owner.entry);
             return Ok(true);
         }
-        self.workspaces
-            .lock()
-            .unwrap()
-            .remove(&candidate.owner.entry);
-        self.sources.forget(&candidate.owner.entry);
         if let Some(root) = &candidate.owner.repository {
-            if !self
-                .remote
-                .as_ref()
-                .unwrap()
-                .evict(root, pressure, || self.retire_owner(root))?
-            {
+            if !self.remote.as_ref().unwrap().evict(
+                root,
+                pressure,
+                || self.owner_scopes(root),
+                |scopes| {
+                    self.workspaces
+                        .lock()
+                        .unwrap()
+                        .remove(&candidate.owner.entry);
+                    self.retire_owner(scopes)?;
+                    self.owners.lock().unwrap().remove(&candidate.owner.entry);
+                    Ok(())
+                },
+            )? {
                 return Ok(false);
             }
-        } else if self.cache.join("analysis").is_dir() {
-            let database = crate::store::Database::open(&self.cache.join("analysis"))?;
-            for (key, info) in database.workspaces()? {
-                if info.entry == candidate.owner.entry {
-                    database.existing(key)?.unwrap().mark_deleting()?;
+        } else {
+            // Enumerating every retained fingerprint must not exclude workspace
+            // lookup. Capture identities, then recheck them at each retirement.
+            let mut scopes = Vec::new();
+            if self.cache.join("analysis").is_dir() {
+                let database = crate::store::Database::open(&self.cache.join("analysis"))?;
+                for (key, info) in database.workspaces()? {
+                    if info.entry == candidate.owner.entry
+                        && let Some(scope) = database.existing(key)?
+                        && scope.id == info.id
+                    {
+                        scopes.push(scope);
+                    }
                 }
             }
+            let mut scopes = scopes.into_iter().peekable();
+            let mut started = false;
+            loop {
+                let mut registry = self.workspaces.lock().unwrap();
+                if registry
+                    .get(&candidate.owner.entry)
+                    .is_some_and(|slot| started || Arc::strong_count(&slot.state) != 1)
+                    || self
+                        .owners
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .get(&candidate.owner.entry)
+                        .is_some_and(|owner| owner.usage.last_use != candidate.owner.usage.last_use)
+                {
+                    return Ok(false);
+                }
+                // Keep leases until the catalog guard is released, including
+                // when a storage operation fails below.
+                let removed = registry.remove(&candidate.owner.entry);
+                if !started {
+                    self.sources.forget(&candidate.owner.entry);
+                }
+                started = true;
+                if let Some(scope) = scopes.next()
+                    && let Some(current) = scope.database.existing(scope.fingerprint)?
+                    && current.id == scope.id
+                {
+                    current.mark_deleting()?;
+                }
+                let done = scopes.peek().is_none();
+                if done {
+                    self.owners.lock().unwrap().remove(&candidate.owner.entry);
+                }
+                drop(registry);
+                drop(removed);
+                if done {
+                    return Ok(true);
+                }
+                std::thread::yield_now();
+            }
         }
-        self.owners.lock().unwrap().remove(&candidate.owner.entry);
         tracing::info!(entry = %candidate.owner.entry.display(), pressure, "Evicted cached workspace");
         Ok(true)
     }
@@ -544,7 +642,18 @@ impl App {
         if self.cache.join("analysis").is_dir() {
             let database = crate::store::Database::open(&self.cache.join("analysis"))?;
             if pressure {
-                database.collect_unused(crate::cache::now(), true)?;
+                while !self.inspection_shutdown.is_cancelled()
+                    && database
+                        .collect_with_retention(
+                            crate::cache::now(),
+                            crate::store::shared::PRESSURE_BATCH,
+                            0,
+                        )?
+                        .visited
+                        == crate::store::shared::PRESSURE_BATCH
+                {
+                    std::thread::yield_now();
+                }
             }
             database.checkpoint()?;
         }
@@ -552,6 +661,22 @@ impl App {
     }
 
     fn analysis_savings(&self, disk: Disk) -> Result<u64> {
+        // A compact copy cannot run while indexing owns a workspace or branch.
+        // Do not credit those future savings instead of reclaiming idle files.
+        let active_workspace = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .values()
+            .any(|slot| Arc::strong_count(&slot.state) != 1);
+        if active_workspace
+            || self
+                .remote
+                .as_ref()
+                .is_some_and(|remote| !remote.active_entries().is_empty())
+        {
+            return Ok(0);
+        }
         if !self.cache.join("analysis").is_dir() {
             return Ok(0);
         }
@@ -605,13 +730,16 @@ impl App {
         if !dependencies_known {
             return Ok(());
         }
-        let owners = self.owners.lock().unwrap();
+        let views = crate::cache::views::Registry::open(&self.cache)?;
         for &kind in crate::cache::owners::VIEW_KINDS {
             let directory = self.cache.join(kind);
             if !directory.is_dir() {
                 continue;
             }
             for entry in fs::read_dir(directory)? {
+                if self.inspection_shutdown.is_cancelled() {
+                    return Ok(());
+                }
                 let entry = entry?;
                 let path = entry.path();
                 ensure!(entry.file_type()?.is_dir(), "Invalid cache view directory");
@@ -619,68 +747,46 @@ impl App {
                     && self.remote.as_ref().is_some_and(|remote| {
                         crate::metadata_archive::configured(&path, &remote.options.unity_versions)
                     });
-                if configured || owners.retains(&path) {
+                if configured {
                     continue;
                 }
-                // All project jobs are drained. remove_outputs also handles overlay work dirs.
-                crate::sandbox::remove_outputs(&path)?;
+                if let Some(retired) =
+                    views.try_retire(&path, || self.owners.lock().unwrap().retains(&path))?
+                {
+                    retired.dispose()?;
+                }
             }
         }
         let legacy = self.cache.join("dotnet/packages");
-        if legacy.is_dir() && !owners.retains(&legacy) {
-            crate::sandbox::remove_outputs(&legacy)?;
+        if legacy.is_dir()
+            && let Some(retired) =
+                views.try_retire(&legacy, || self.owners.lock().unwrap().retains(&legacy))?
+        {
+            retired.dispose()?;
         }
         Ok(())
     }
 
-    fn migrate_views(&self) -> Result<()> {
-        if let Some(remote) = &self.remote {
-            for (root, _) in remote.cached()? {
-                let marker = root.join("shared-files-v1");
-                if marker.exists() {
-                    continue;
-                }
-                // Refresh jobs may still be fetching. Import only under the publication gate.
-                if remote.migrate_inputs(&root, &self.blobs)? {
-                    fs::write(marker, b"1")?;
-                }
-            }
-        }
-        let directory = self.cache.join("local-jobs");
-        if directory.is_dir() {
-            for entry in fs::read_dir(directory)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    crate::cache::packages::View::open(&self.cache, &entry.path())?;
-                }
-            }
-        }
-        let directory = self.cache.join("unity-packages");
-        if directory.is_dir() {
-            for entry in fs::read_dir(directory)? {
-                let root = entry?.path();
-                let marker = root.join("shared-files-v1");
-                if root.join("contents").is_dir() && !marker.exists() {
-                    self.blobs.import_tree(&root.join("contents"))?;
-                    fs::write(marker, b"1")?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn maintain_disk_exclusive(&self) -> Result<()> {
+    fn maintain_disk_shared(&self) -> Result<bool> {
         // Retry optional disposal independently of retirement and pressure relief.
         if let Err(error) = crate::cache::compaction::cleanup(&self.cache) {
             tracing::warn!(%error, "Cannot dispose of obsolete compaction files");
         }
-        maintenance_stage("view migration", || self.migrate_views())?;
+        for retired in crate::cache::views::Registry::open(&self.cache)?.pending()? {
+            if self.inspection_shutdown.is_cancelled() {
+                return Ok(false);
+            }
+            retired.dispose()?;
+        }
         let known = maintenance_stage("ownership scan", || self.seed_owners())?;
         let before = maintenance_stage("disk measurement", || blobs::allocated(&self.cache))?;
         let disk = Disk::read(&self.cache)?;
         let pressure = self.cache_limits.pressured(before, disk);
         let mut candidates = maintenance_stage("eviction planning", || self.candidates())?;
         for candidate in candidates.iter().filter(|candidate| candidate.expired) {
+            if self.inspection_shutdown.is_cancelled() {
+                return Ok(false);
+            }
             self.evict_candidate(candidate, false)?;
         }
         maintenance_stage("analysis collection", || self.collect_analysis(pressure))?;
@@ -700,17 +806,17 @@ impl App {
             0
         };
         if remaining > savings {
+            let owners = self.owners.lock().unwrap().clone();
             maintenance_stage("eviction ranking", || {
-                crate::cache::policy::rank(
-                    &self.owners.lock().unwrap(),
-                    &mut candidates,
-                    crate::cache::now(),
-                )
+                crate::cache::policy::rank(&owners, &mut candidates, crate::cache::now())
             })?;
         }
         candidates.retain(|candidate| !candidate.pinned);
         let mut candidates = candidates.into_iter();
         while remaining > savings {
+            if self.inspection_shutdown.is_cancelled() {
+                return Ok(false);
+            }
             // Credit an affordable compact copy, but postpone the copy until all
             // victims are retired. Git packing savings are deliberately not assumed.
             let needed = remaining - savings;
@@ -742,19 +848,12 @@ impl App {
         // Avoid repacking Git when the known compact-copy savings already meet
         // the target. Repacking is the fallback after idle victims are exhausted.
         if remaining > savings {
-            let allocated = after;
             maintenance_stage("Git reclamation", || {
                 crate::repository::cache::reclaim(&self.cache)
             })?;
             after = blobs::allocated(&self.cache)?;
-            remaining = remaining.saturating_add(after).saturating_sub(allocated);
         }
-        if remaining > 0
-            && maintenance_stage("analysis compaction", || self.compact_analysis())? > 0
-        {
-            after = blobs::allocated(&self.cache)?;
-        }
-        self.owners.lock().unwrap().flush()?;
+        self.flush_owners()?;
         let disk = Disk::read(&self.cache)?;
         tracing::info!(
             allocated = after,
@@ -767,10 +866,15 @@ impl App {
                 allocated = after,
                 available = disk.available,
                 shortfall = self.cache_limits.reclaim(after, disk),
-                "Cache targets cannot be met by evicting idle unpinned data"
+                dependencies_known = known,
+                leased_views = crate::cache::views::Registry::open(&self.cache)?
+                    .roots()
+                    .len(),
+                compact_copy_savings = savings,
+                "Cache targets remain unmet; active leases, protected owners, and compaction may defer reclamation"
             );
         }
-        Ok(())
+        Ok(self.cache_limits.pressured(after, disk))
     }
 }
 
@@ -910,7 +1014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_yields_to_activity_and_retries_when_idle() {
+    async fn maintenance_reclaims_idle_storage_during_activity() {
         let cache = tempfile::tempdir().unwrap();
         let app = Arc::new(app(
             cache.path(),
@@ -922,17 +1026,124 @@ mod tests {
             .await
             .expect("Maintenance must not wait behind active work")
             .unwrap();
-        assert!(expired.exists());
+        assert!(
+            !expired.exists(),
+            "Unrelated activity must not defer physical cleanup"
+        );
         assert!(
             app.activity.try_read().is_ok(),
             "Maintenance must not queue ahead of new queries"
         );
         drop(active);
         app.maintain_disk().await.unwrap();
-        assert!(
-            !expired.exists(),
-            "Deferred cleanup must run once the service is idle"
+        assert!(!expired.exists(), "Retired storage must remain absent");
+    }
+
+    #[tokio::test]
+    async fn queries_continue_during_a_slow_maintenance_stage() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), "Available during collection").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
         );
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = app.clone();
+        let maintenance = tokio::spawn(async move {
+            worker
+                .maintain_disk_observed(move || {
+                    started.send(()).unwrap();
+                    wait.recv().unwrap();
+                })
+                .await
+        });
+        ready.await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            app.view(root.path().to_str().unwrap(), "README.md", "exact"),
+        )
+        .await;
+        release.send(()).unwrap();
+        maintenance.await.unwrap().unwrap();
+        assert!(
+            result
+                .unwrap()
+                .unwrap()
+                .contains("Available during collection")
+        );
+        app.shutdown().await;
+    }
+
+    #[test]
+    fn unfinished_discovery_protects_dependencies_while_idle_views_are_removed() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let live = cache.path().join("unity-packages/live");
+        let idle = cache.path().join("unity-packages/idle");
+        let leases = crate::cache::views::LeaseSet::new(cache.path()).unwrap();
+        leases.retain(&live).unwrap();
+        for path in [&live, &idle] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("input.cs"), "class Input {}").unwrap();
+        }
+        app.collect_views(true).unwrap();
+        assert!(live.join("input.cs").is_file());
+        assert!(!idle.exists());
+        drop(leases);
+        app.collect_views(true).unwrap();
+        assert!(!live.exists());
+    }
+
+    #[tokio::test]
+    async fn active_local_workspace_survives_pressure_eviction() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("lib.rs"), "pub struct Retained;").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        app.search(root.path().to_str().unwrap(), "type:Retained")
+            .await
+            .unwrap();
+        let active = app
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(root.path())
+            .unwrap()
+            .state
+            .clone();
+        let candidate = app
+            .candidates()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.owner.entry == root.path())
+            .unwrap();
+        assert!(!app.evict_candidate(&candidate, true).unwrap());
+        assert!(
+            active
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .manifest
+                .files
+                .values()
+                .any(|f| f.path.ends_with("lib.rs"))
+        );
+        drop(active);
+        app.shutdown().await;
     }
 
     #[tokio::test]
@@ -1048,7 +1259,7 @@ mod tests {
         );
         let wildcard = seed(cache.path(), "other", "trunk", "trunk", crate::cache::now());
         app.cache_limits.max_bytes = 1;
-        app.maintain_disk_exclusive().unwrap();
+        app.maintain_disk_shared().unwrap();
         assert!(kept.join("source/File.cs").is_file());
         assert!(!other.exists());
         assert!(!wildcard.exists());
@@ -1143,7 +1354,11 @@ mod tests {
         app.cache_limits.max_bytes = 256 * 1024 * 1024;
         let before = blobs::allocated(cache.path()).unwrap();
         let start = Instant::now();
-        app.maintain_disk_exclusive().unwrap();
+        app.maintain_disk_shared().unwrap();
+        {
+            let _idle = app.activity.try_write().unwrap();
+            app.compact_analysis().unwrap();
+        }
         let elapsed = start.elapsed();
         let after = blobs::allocated(cache.path()).unwrap();
         assert!(
@@ -1160,7 +1375,7 @@ mod tests {
         drop(scope);
         drop(db);
         let start = Instant::now();
-        app.maintain_disk_exclusive().unwrap();
+        app.maintain_disk_shared().unwrap();
         eprintln!("ordinary cleanup: {:?}", start.elapsed());
     }
     #[test]
@@ -1173,7 +1388,7 @@ mod tests {
         let time = crate::cache::now();
         let hot = seed(cache.path(), "hot", "trunk", "trunk", time - 60_000);
         let cold = seed(cache.path(), "cold", "trunk", "trunk", time - 60_000);
-        app.maintain_disk_exclusive().unwrap();
+        app.maintain_disk_shared().unwrap();
         app.owners
             .lock()
             .unwrap()
@@ -1183,7 +1398,7 @@ mod tests {
             .usage
             .record(time);
         app.cache_limits.max_bytes = blobs::allocated(cache.path()).unwrap() - 4096;
-        app.maintain_disk_exclusive().unwrap();
+        app.maintain_disk_shared().unwrap();
         assert!(hot.exists());
         assert!(!cold.exists());
     }
@@ -1334,11 +1549,11 @@ mod tests {
             .unwrap();
         assert!(
             !manager
-                .evict(&root, true, || panic!("Retired a live branch"))
+                .evict(&root, true, || Ok(()), |()| panic!("Retired a live branch"))
                 .unwrap()
         );
         drop(branch);
-        assert!(manager.evict(&root, true, || Ok(())).unwrap());
+        assert!(manager.evict(&root, true, || Ok(()), |()| Ok(())).unwrap());
         assert!(!root.exists());
     }
 
@@ -1366,7 +1581,7 @@ mod tests {
             cache.path(),
             vec![Rule::parse_private("https://github.com/example/*").unwrap()],
         );
-        second.maintain_disk_exclusive().unwrap();
+        second.maintain_disk_shared().unwrap();
         assert!(root.exists(), "Restart must use persisted query recency");
         let candidates = second.candidates().unwrap();
         assert!(!candidates[0].pinned);

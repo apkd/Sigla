@@ -126,7 +126,9 @@ pub fn registry(
     registry: &str,
     name: &str,
     version: &str,
+    leases: &crate::cache::views::LeaseSet,
 ) -> Result<PathBuf> {
+    leases.retain(cache)?;
     acquisition::shared(&cache.to_string_lossy(), || {
         if complete(cache, identity) {
             return Ok(cache.join("contents"));
@@ -192,7 +194,13 @@ pub fn registry(
     })
 }
 
-pub fn local_archive(cache: &Path, path: &Path, name: &str) -> Result<PathBuf> {
+pub fn local_archive(
+    cache: &Path,
+    path: &Path,
+    name: &str,
+    leases: &crate::cache::views::LeaseSet,
+) -> Result<PathBuf> {
+    leases.retain(path)?;
     let mut archive = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut bytes = [0; 128 * 1024];
@@ -207,6 +215,7 @@ pub fn local_archive(cache: &Path, path: &Path, name: &str) -> Result<PathBuf> {
     let root = cache
         .join("unity-packages")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
+    leases.retain(&root)?;
     acquisition::shared(&root.to_string_lossy(), || {
         if complete(&root, &identity) {
             return Ok(root.join("contents"));
@@ -258,6 +267,7 @@ impl GitSource {
         cache: &Path,
         name: &str,
         remote: Option<&crate::discovery::RemoteContext>,
+        leases: &crate::cache::views::LeaseSet,
     ) -> Result<PathBuf> {
         if let Some(remote) = remote
             && !crate::repository::authorize(&remote.repositories, &self.repository)?
@@ -267,6 +277,7 @@ impl GitSource {
         let root = cache
             .join("unity-packages")
             .join(blake3::hash(self.identity.as_bytes()).to_hex().as_str());
+        leases.retain(&root)?;
         acquisition::shared(&root.to_string_lossy(), || {
             if complete(&root, &self.identity) {
                 return Ok(root.join("contents"));

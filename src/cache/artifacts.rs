@@ -1,20 +1,26 @@
 //! Immutable derived files shared by retained workspace views. Hard links are
-//! their ownership records; collection runs under the service activity gate.
+//! their ownership records; final publication and collection share a short lock.
 use anyhow::{Result, ensure};
 use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 pub struct Store {
     root: PathBuf,
+    publication: Mutex<()>,
 }
+
 impl Store {
     pub fn open(cache: &Path) -> Result<Self> {
         let root = cache.join("asset-records");
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            publication: Mutex::new(()),
+        })
     }
     fn path(&self, name: &str) -> Result<PathBuf> {
         ensure!(
@@ -31,6 +37,7 @@ impl Store {
             return Ok(());
         }
         let source = self.path(local.file_name().unwrap().to_str().unwrap())?;
+        let _publication = self.publication.lock().unwrap();
         match fs::hard_link(source, local) {
             Ok(()) => Ok(()),
             Err(error)
@@ -52,6 +59,7 @@ impl Store {
         let stage = tempfile::tempdir_in(target.parent().unwrap())?;
         let link = stage.path().join("record");
         fs::hard_link(local, &link)?;
+        let _publication = self.publication.lock().unwrap();
         fs::rename(link, target)?;
         Ok(())
     }
@@ -64,7 +72,12 @@ impl Store {
             }
             for entry in fs::read_dir(shard.path())? {
                 let entry = entry?;
-                let metadata = entry.metadata()?;
+                let _publication = self.publication.lock().unwrap();
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 if metadata.is_file()
                     && metadata.nlink() == 1
                     && (pressure
@@ -79,5 +92,32 @@ impl Store {
             }
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_preserves_published_links_and_reclaims_unused_records() {
+        let cache = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let path = local.path().join(format!("{}.text.zst", "a".repeat(64)));
+        fs::write(&path, b"record").unwrap();
+        store.publish(&path).unwrap();
+        assert_eq!(store.collect(true).unwrap(), 0);
+        assert!(path.is_file());
+        fs::remove_file(&path).unwrap();
+        store.collect(true).unwrap();
+        assert!(
+            !store
+                .path(path.file_name().unwrap().to_str().unwrap())
+                .unwrap()
+                .exists()
+        );
+        store.restore(&path).unwrap();
+        assert!(!path.exists());
     }
 }

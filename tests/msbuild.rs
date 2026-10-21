@@ -7,6 +7,187 @@ fn write(root: &Path, path: &str, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+fn installed_sdk_policy() -> String {
+    let output = std::process::Command::new("dotnet")
+        .arg("--list-sdks")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inventory = String::from_utf8(output.stdout).unwrap();
+    let version = inventory
+        .lines()
+        .filter_map(|line| line.split_once(" [").map(|(version, _)| version))
+        .find(|version| version.starts_with("10."))
+        .expect("The MSBuild fixtures require an installed .NET 10 SDK");
+    serde_json::json!({"sdk":{"version":version,"rollForward":"disable"}}).to_string()
+}
+
+#[test]
+fn sdk_policy_failure_recovers_and_nested_scopes_remain_independent() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let unavailable = r#"{"sdk":{"version":"9999.0.100","rollForward":"disable"}}"#;
+    let usable = installed_sdk_policy();
+    write(root.path(), "global.json", unavailable);
+    write(
+        root.path(),
+        "NuGet.Config",
+        "<configuration><packageSources><clear /></packageSources></configuration>",
+    );
+    for directory in ["parent", "nested"] {
+        write(
+            root.path(),
+            &format!("{directory}/App.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+        );
+        write(
+            root.path(),
+            &format!("{directory}/Source.cs"),
+            "public class Source {}",
+        );
+    }
+    write(root.path(), "nested/global.json", &usable);
+    let policy = Policy::new(vec![root.path().into()]).unwrap();
+    let mut workspace = sigla::workspace::Workspace::open(
+        root.path().into(),
+        cache.path(),
+        policy.clone(),
+        &cache.path().join("analysis"),
+        None,
+        std::sync::Arc::new(sigla::watch::Monitor::default()),
+    )
+    .unwrap();
+    workspace.refresh().unwrap();
+    let has_project = |workspace: &sigla::workspace::Workspace, directory: &str| {
+        workspace.manifest.projects.iter().any(|project| {
+            project.origin.as_ref() == Some(&root.path().join(directory).join("App.csproj"))
+        })
+    };
+    assert!(!has_project(&workspace, "parent"));
+    assert!(has_project(&workspace, "nested"));
+    assert!(
+        workspace
+            .manifest
+            .files
+            .values()
+            .any(|file| file.path == root.path().join("parent/Source.cs"))
+    );
+    drop(workspace);
+    let mut workspace = sigla::workspace::Workspace::open(
+        root.path().into(),
+        cache.path(),
+        policy,
+        &cache.path().join("analysis"),
+        None,
+        std::sync::Arc::new(sigla::watch::Monitor::default()),
+    )
+    .unwrap();
+    write(root.path(), "global.json", &usable);
+    workspace.refresh().unwrap();
+    assert!(has_project(&workspace, "parent"));
+    write(root.path(), "parent/global.json", unavailable);
+    workspace.refresh().unwrap();
+    assert!(!has_project(&workspace, "parent"));
+    assert!(has_project(&workspace, "nested"));
+    std::fs::remove_file(root.path().join("parent/global.json")).unwrap();
+    workspace.refresh().unwrap();
+    assert!(has_project(&workspace, "parent"));
+    write(root.path(), "parent/replacement.json", unavailable);
+    std::fs::rename(
+        root.path().join("parent/replacement.json"),
+        root.path().join("parent/global.json"),
+    )
+    .unwrap();
+    workspace.refresh().unwrap();
+    assert!(!has_project(&workspace, "parent"));
+    write(root.path(), "parent/replacement.json", &usable);
+    std::fs::rename(
+        root.path().join("parent/replacement.json"),
+        root.path().join("parent/global.json"),
+    )
+    .unwrap();
+    workspace.refresh().unwrap();
+    assert!(has_project(&workspace, "parent"));
+}
+
+#[test]
+fn project_failure_keeps_neighboring_build_context() {
+    check_project_failure(false);
+}
+
+#[test]
+fn partial_solution_keeps_excluded_project_sources_and_recovers() {
+    check_project_failure(true);
+}
+
+fn check_project_failure(solution: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(root.path(), "global.json", &installed_sdk_policy());
+    write(
+        root.path(),
+        "NuGet.Config",
+        "<configuration><packageSources><clear /></packageSources></configuration>",
+    );
+    write(
+        root.path(),
+        "good/Good.csproj",
+        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+    );
+    write(root.path(), "good/Good.cs", "public class Good {}");
+    write(root.path(), "bad/Bad.csproj", "<Project>");
+    write(root.path(), "bad/Bad.cs", "public class Bad {}");
+    if solution {
+        write(
+            root.path(),
+            "Projects.slnx",
+            "<Solution><Project Path=\"good/Good.csproj\" /><Project Path=\"bad/Bad.csproj\" /></Solution>",
+        );
+    }
+    let policy = Policy::new(vec![root.path().into()]).unwrap();
+    let mut workspace = sigla::workspace::Workspace::open(
+        if solution {
+            root.path().join("Projects.slnx")
+        } else {
+            root.path().into()
+        },
+        cache.path(),
+        policy,
+        &cache.path().join("analysis"),
+        None,
+        std::sync::Arc::new(sigla::watch::Monitor::default()),
+    )
+    .unwrap();
+    workspace.refresh().unwrap();
+    let found = &workspace.manifest;
+    assert!(
+        found
+            .projects
+            .iter()
+            .any(|project| project.origin.as_ref() == Some(&root.path().join("good/Good.csproj")))
+    );
+    assert!(
+        found
+            .files
+            .values()
+            .any(|source| source.path == root.path().join("bad/Bad.cs"))
+    );
+    assert!(!found.diagnostics.is_empty());
+    write(
+        root.path(),
+        "bad/Bad.csproj",
+        &std::fs::read_to_string(root.path().join("good/Good.csproj")).unwrap(),
+    );
+    workspace.refresh().unwrap();
+    assert!(
+        workspace
+            .manifest
+            .projects
+            .iter()
+            .any(|project| project.origin.as_ref() == Some(&root.path().join("bad/Bad.csproj")))
+    );
+}
+
 #[test]
 fn package_views_share_storage_and_isolate_project_writes() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
