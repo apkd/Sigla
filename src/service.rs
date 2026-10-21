@@ -53,7 +53,6 @@ pub struct App {
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
     maintenance: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    maintenance_retry: std::sync::atomic::AtomicBool,
     stateless_summaries: crate::summary::Stateless,
     activity: Arc<tokio::sync::RwLock<()>>,
     blobs: Arc<crate::cache::blobs::Store>,
@@ -152,7 +151,6 @@ impl App {
         crate::cache_migration::migrate(&cache)?;
         crate::memory::start_reclaimer()?;
         let app = Self {
-            maintenance_retry: std::sync::atomic::AtomicBool::new(false),
             activity: Arc::new(tokio::sync::RwLock::new(())),
             blobs: crate::cache::blobs::Store::open(&cache)?,
             asset_records: Arc::new(crate::cache::artifacts::Store::open(&cache)?),
@@ -277,16 +275,20 @@ impl App {
             });
             let shutdown = self.inspection_shutdown.clone();
             let maintenance = tokio::spawn(async move {
-                let mut last_collection = Instant::now();
+                let mut schedule = disk::MaintenanceSchedule::new(
+                    tokio::time::Instant::now(),
+                    collection_interval,
+                );
                 let mut regular = tokio::time::Instant::now() + interval;
                 let retry = std::time::Duration::from_secs(1);
                 let mut next_startup = tokio::time::Instant::now() + retry;
                 let mut pending = Some(disk::StartupMaintenance::default());
                 loop {
+                    let deadline = regular.min(schedule.deadline());
                     let deadline = if pending.is_some() {
-                        regular.min(next_startup)
+                        deadline.min(next_startup)
                     } else {
-                        regular
+                        deadline
                     };
                     tokio::select! {
                         biased;
@@ -314,18 +316,20 @@ impl App {
                     if shutdown.is_cancelled() {
                         return;
                     }
-                    if tokio::time::Instant::now() < regular {
+                    let now = tokio::time::Instant::now();
+                    let collect = now >= schedule.collection;
+                    if !collect && schedule.compaction.is_some_and(|deadline| now >= deadline) {
+                        match app.retry_compaction().await {
+                            Ok(outcome) => schedule.compacted(tokio::time::Instant::now(), outcome),
+                            Err(error) => {
+                                tracing::warn!(%error, "Analysis compaction retry failed");
+                                schedule.compaction = None;
+                            }
+                        }
+                    }
+                    if now < regular && !collect {
                         continue;
                     }
-                    let collection_delay = if app
-                        .maintenance_retry
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        std::time::Duration::from_secs(30)
-                    } else {
-                        collection_interval
-                    };
-                    let collect = last_collection.elapsed() >= collection_delay;
                     if let Some(remote) = &app.remote {
                         // Fetch failures stay on the branch preparation state, never on valid query results.
                         match remote.maintain(collect).await {
@@ -347,40 +351,21 @@ impl App {
                         regular = tokio::time::Instant::now() + interval;
                         continue;
                     }
-                    last_collection = Instant::now();
-                    if let Err(error) = app.maintain_disk().await {
-                        tracing::error!(%error, "Cannot maintain disk cache");
-                    }
+                    let outcome = match app.maintain_disk().await {
+                        Ok(outcome) => Some(outcome),
+                        Err(error) => {
+                            tracing::error!(%error, "Cannot maintain disk cache");
+                            None
+                        }
+                    };
+                    schedule.collected(tokio::time::Instant::now(), outcome);
                     if shutdown.is_cancelled() {
                         return;
                     }
-                    {
-                        // Keep ownership and the worker alive until this blocking job ends.
-                        let cache = app.cache.clone();
-                        let ttl = app
-                            .remote
-                            .as_ref()
-                            .map_or(crate::config::DEFAULT_REPO_TTL, |remote| {
-                                remote.options.repo_ttl
-                            });
-                        if let Err(error) = tokio::task::spawn_blocking(move || {
-                            crate::repository::cache::maintain_all(&cache, ttl)
-                        })
-                        .await
-                        .unwrap_or_else(|error| Err(error.into()))
-                        {
-                            tracing::error!(%error, "Cannot maintain Git pools");
-                        }
+                    if let Err(error) = app.maintain_git(outcome).await {
+                        tracing::error!(%error, "Cannot maintain Git pools");
                     }
-                    let next = if app
-                        .maintenance_retry
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        interval.min(std::time::Duration::from_secs(30))
-                    } else {
-                        interval
-                    };
-                    regular = tokio::time::Instant::now() + next;
+                    regular = tokio::time::Instant::now() + interval;
                 }
             });
             *self.maintenance.lock().unwrap() = Some(maintenance);
@@ -468,19 +453,22 @@ impl App {
         Ok(())
     }
 
-    fn maintain_analysis(&self, drain: bool) -> Result<()> {
+    fn maintain_analysis(&self, drain: bool) -> Result<bool> {
         let analysis = self.cache.join("analysis");
         if !analysis.try_exists()? {
-            return Ok(());
+            return Ok(false);
         }
         let database = crate::store::Database::open(&analysis)?;
         let now = crate::cache::now();
+        let mut progress = false;
         let mut pending: std::collections::VecDeque<_> = database.workspaces()?.into();
         while let Some((key, info)) = pending.pop_front() {
             if self.inspection_shutdown.is_cancelled() {
                 break;
             }
-            if !self.retire_analysis_scope(&database, key, &info, now, false)?
+            let retired = self.retire_analysis_scope(&database, key, &info, now)?;
+            progress |= retired.progress;
+            if !retired.done
                 && drain
                 && self
                     .workspaces
@@ -495,9 +483,9 @@ impl App {
             std::thread::yield_now();
         }
         if !drain {
-            database.collect(now, 128)?;
+            progress |= database.collect(now, 128)?.objects > 0;
         }
-        Ok(())
+        Ok(progress)
     }
 
     fn retirement_candidate(info: &crate::store::shared::WorkspaceInfo) -> bool {
@@ -512,42 +500,47 @@ impl App {
         key: [u8; 32],
         info: &crate::store::shared::WorkspaceInfo,
         now: u64,
-        drain: bool,
-    ) -> Result<bool> {
+    ) -> Result<disk::Retirement> {
         let mut registry = self.workspaces.lock().unwrap();
         if registry
             .get(&info.entry)
             .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
         {
-            return Ok(false);
+            return Ok(disk::Retirement {
+                done: false,
+                progress: false,
+            });
         }
         if !Self::retirement_candidate(info) {
-            return Ok(true);
+            return Ok(disk::Retirement {
+                done: true,
+                progress: false,
+            });
         }
         let Some(scope) = database.existing(key)? else {
-            return Ok(true);
+            return Ok(disk::Retirement {
+                done: true,
+                progress: false,
+            });
         };
         // The startup sweep is a snapshot. A retired fingerprint may have been
         // recreated since it was queued; never delete the replacement namespace.
         if scope.id != info.id {
-            return Ok(true);
+            return Ok(disk::Retirement {
+                done: true,
+                progress: false,
+            });
         }
         registry.remove(&info.entry);
         self.sources.forget(&info.entry);
         scope.mark_deleting()?;
         // Preserve activity -> registry -> storage ordering and exclude opens
         // until this transaction commits. Deleting remains durable between turns.
-        loop {
-            let limit = if drain {
-                crate::store::shared::PRESSURE_BATCH
-            } else {
-                128
-            };
-            let done = scope.delete_batch(now, limit)?;
-            if done || !drain {
-                return Ok(done);
-            }
-        }
+        let done = scope.delete_batch(now, 128)?;
+        Ok(disk::Retirement {
+            done,
+            progress: true,
+        })
     }
 
     pub async fn search(self: &Arc<Self>, path: &str, query: &str) -> Result<String> {

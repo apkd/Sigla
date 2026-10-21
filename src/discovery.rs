@@ -58,30 +58,36 @@ impl RemoteContext {
     }
 
     pub fn require_analysis_tree(&self, directory: &Path) -> Result<()> {
-        let Ok(relative) = directory.strip_prefix(&self.workspace) else {
-            return Ok(());
-        };
-        let prefix = if relative.as_os_str().is_empty() {
-            String::new()
-        } else {
-            format!(
+        self.require(self.analysis_inputs(directory)?)
+    }
+
+    fn analysis_inputs<'a>(
+        &'a self,
+        directory: &'a Path,
+    ) -> Result<impl Iterator<Item = PathBuf> + 'a> {
+        let prefix = match directory.strip_prefix(&self.workspace) {
+            Ok(relative) if relative.as_os_str().is_empty() => Some(String::new()),
+            Ok(relative) => Some(format!(
                 "{}/",
                 relative.to_str().context("Invalid discovery directory")?
-            )
+            )),
+            Err(_) => None,
         };
-        self.require(
-            self.tracked
-                .range(prefix.clone()..)
-                .take_while(|path| path.starts_with(&prefix))
-                .map(|p| self.workspace.join(p))
-                .filter(|p| {
-                    p.strip_prefix(directory).is_ok_and(|relative| {
-                        !relative
-                            .components()
-                            .any(|c| crate::unity::ignored_name(c.as_os_str()))
-                    }) && crate::acquisition::analysis_input(p)
-                }),
-        )
+        Ok(prefix
+            .into_iter()
+            .flat_map(move |prefix| {
+                self.tracked
+                    .range(prefix.clone()..)
+                    .take_while(move |path| path.starts_with(&prefix))
+            })
+            .map(move |p| self.workspace.join(p))
+            .filter(move |p| {
+                p.strip_prefix(directory).is_ok_and(|relative| {
+                    !relative
+                        .components()
+                        .any(|c| crate::unity::ignored_name(c.as_os_str()))
+                }) && crate::acquisition::analysis_input(p)
+            }))
     }
 }
 
@@ -257,7 +263,7 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         let mut fallback = FallbackScan::default();
         for input in managed {
             result.metadata.insert(input.clone());
-            match crate::msbuild::scope(&input, policy.remote.as_ref(), &mut result.metadata) {
+            match session.scope(&input, policy.remote.as_ref(), &mut result.metadata) {
                 Ok(scope) => groups.entry(scope).or_default().push(input),
                 Err(error) => {
                     if error.downcast_ref::<RequiredInputs>().is_some() {
@@ -599,13 +605,105 @@ fn fallback_sources(entry: &Path, policy: &Policy, result: &mut Discovery) -> Re
 
 #[derive(Default)]
 struct FallbackScan {
-    directories: BTreeMap<PathBuf, Vec<(PathBuf, std::fs::FileType)>>,
+    directories: BTreeMap<PathBuf, DirectoryFacts>,
+    canonical: BTreeMap<PathBuf, Option<PathBuf>>,
+    materialized: BTreeSet<PathBuf>,
     completed: BTreeSet<PathBuf>,
     #[cfg(test)]
     reads: usize,
+    #[cfg(test)]
+    canonicalizations: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Boundary {
+    linked_worktree: bool,
+    unity_root: bool,
+    has_assets: bool,
+    package_cache: bool,
+}
+
+struct DirectoryFacts {
+    boundary: Boundary,
+    entries: Option<std::sync::Arc<[(PathBuf, std::fs::FileType)]>>,
 }
 
 impl FallbackScan {
+    fn facts(&mut self, path: &Path) -> &mut DirectoryFacts {
+        self.directories
+            .entry(path.into())
+            .or_insert_with(|| DirectoryFacts {
+                boundary: Boundary {
+                    linked_worktree: linked_worktree(path),
+                    unity_root: crate::unity::assets::is_root(path),
+                    has_assets: path.join("Assets").is_dir(),
+                    package_cache: path.file_name().is_some_and(|name| name == "Library")
+                        && path.join("PackageCache").is_dir(),
+                },
+                entries: None,
+            })
+    }
+
+    fn canonical(
+        &mut self,
+        path: &Path,
+        policy: &Policy,
+        diagnostics: &mut Vec<String>,
+    ) -> Option<PathBuf> {
+        self.canonical
+            .entry(path.into())
+            .or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    self.canonicalizations += 1;
+                }
+                match policy.canonical(path) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        diagnostics.push(format!("Skipped directory: {error:#}"));
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
+
+    fn entries(
+        &mut self,
+        directory: &Path,
+        diagnostics: &mut Vec<String>,
+    ) -> std::sync::Arc<[(PathBuf, std::fs::FileType)]> {
+        if let Some(entries) = &self.facts(directory).entries {
+            return entries.clone();
+        }
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        let entries: std::sync::Arc<[_]> = match std::fs::read_dir(directory) {
+            Ok(entries) => entries
+                .filter_map(|entry| {
+                    match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
+                        Ok(entry) => Some(entry),
+                        Err(error) => {
+                            diagnostics.push(format!(
+                                "Cannot read entry in {}: {error}",
+                                directory.display()
+                            ));
+                            None
+                        }
+                    }
+                })
+                .collect(),
+            Err(error) => {
+                diagnostics.push(format!("Cannot read {}: {error}", directory.display()));
+                Default::default()
+            }
+        };
+        self.facts(directory).entries = Some(entries.clone());
+        entries
+    }
+
     fn scan(&mut self, entry: &Path, policy: &Policy, result: &mut Discovery) -> Result<()> {
         let base = if entry.is_dir() {
             entry
@@ -616,64 +714,41 @@ impl FallbackScan {
             return Ok(());
         }
         if let Some(remote) = &policy.remote {
-            remote.require_analysis_tree(base)?;
+            let unchecked: Vec<_> = remote
+                .analysis_inputs(base)?
+                .filter(|path| !self.materialized.contains(path))
+                .collect();
+            remote.require(unchecked.iter().cloned())?;
+            self.materialized.extend(unchecked);
         }
+        let Some(canonical_base) = self.canonical(base, policy, &mut result.diagnostics) else {
+            return Ok(());
+        };
+        let base_boundary = self.facts(&canonical_base).boundary;
         let mut pending = vec![base.to_owned()];
         let mut files = Vec::new();
         while let Some(directory) = pending.pop() {
-            let directory = match policy.canonical(&directory) {
-                Ok(path) => path,
-                Err(error) => {
-                    result
-                        .diagnostics
-                        .push(format!("Skipped directory: {error:#}"));
-                    continue;
-                }
+            let Some(directory) = self.canonical(&directory, policy, &mut result.diagnostics)
+            else {
+                continue;
             };
             result.metadata.insert(directory.clone());
-            if !self.directories.contains_key(&directory) {
-                #[cfg(test)]
-                {
-                    self.reads += 1;
-                }
-                let entries = match std::fs::read_dir(&directory) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        result
-                            .diagnostics
-                            .push(format!("Cannot read {}: {error}", directory.display()));
-                        continue;
-                    }
-                };
-                let entries = entries
-                    .filter_map(|entry| {
-                        let entry = entry.and_then(|entry| Ok((entry.path(), entry.file_type()?)));
-                        match entry {
-                            Ok(entry) => Some(entry),
-                            Err(error) => {
-                                result.diagnostics.push(format!(
-                                    "Cannot read entry in {}: {error}",
-                                    directory.display()
-                                ));
-                                None
-                            }
-                        }
-                    })
-                    .collect();
-                self.directories.insert(directory.clone(), entries);
-            }
-            for (path, kind) in &self.directories[&directory] {
+            for (path, kind) in self.entries(&directory, &mut result.diagnostics).iter() {
                 if kind.is_dir() {
                     let name = path.file_name().unwrap();
-                    if linked_worktree(path) {
+                    let boundary = self.facts(path).boundary;
+                    if boundary.linked_worktree {
                         continue;
                     }
-                    if crate::unity::assets::is_root(base) && crate::unity::assets::is_root(path) {
+                    if base_boundary.unity_root && boundary.unity_root {
                         continue;
                     }
-                    if name == "Library" && base.join("Assets").is_dir() {
-                        if path.join("PackageCache").is_dir()
-                            && !linked_worktree(&path.join("PackageCache"))
+                    if name == "Library" && base_boundary.has_assets {
+                        if boundary.package_cache
+                            && !self
+                                .facts(&path.join("PackageCache"))
+                                .boundary
+                                .linked_worktree
                         {
                             pending.push(path.join("PackageCache"));
                         }
@@ -1378,6 +1453,78 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
 pub(crate) mod tests {
     use super::*;
 
+    fn empty_fallback(root: &Path, cache: &Path) -> Discovery {
+        Discovery {
+            leases: crate::cache::views::LeaseSet::new(cache).unwrap(),
+            root: root.into(),
+            projects: Vec::new(),
+            sources: Vec::new(),
+            metadata: BTreeSet::new(),
+            dependencies: BTreeSet::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[ignore = "release benchmark of overlapping fallback roots"]
+    fn overlapping_fallback_benchmark() {
+        for count in [100, 1000] {
+            for depth in [1, 10] {
+                let fixture = tempfile::tempdir().unwrap();
+                let cache = tempfile::tempdir().unwrap();
+                let root = fixture.path();
+                let mut entries = vec![root.join("Root.csproj")];
+                for group in 0..count / depth {
+                    let mut path = root.join(format!("group{group}"));
+                    for _ in 0..depth {
+                        path.push("child");
+                        write(&path, "Code.cs", "class Code {}");
+                        write(&path, "src/lib.rs", "pub fn code() {}");
+                        entries.push(path.join("Project.csproj"));
+                    }
+                }
+                let policy = Policy::new(vec![root.into()]).unwrap();
+                let mut found = Discovery {
+                    leases: crate::cache::views::LeaseSet::new(cache.path()).unwrap(),
+                    root: root.into(),
+                    projects: Vec::new(),
+                    sources: Vec::new(),
+                    metadata: BTreeSet::new(),
+                    dependencies: BTreeSet::new(),
+                    diagnostics: Vec::new(),
+                };
+                let mut scan = FallbackScan::default();
+                let start = std::time::Instant::now();
+                for entry in &entries {
+                    scan.scan(entry, &policy, &mut found).unwrap();
+                }
+                let elapsed = start.elapsed();
+                assert!(found.diagnostics.is_empty());
+                let mut hash = blake3::Hasher::new();
+                for source in &found.sources {
+                    hash.update(
+                        source
+                            .path
+                            .strip_prefix(root)
+                            .unwrap()
+                            .as_os_str()
+                            .as_encoded_bytes(),
+                    );
+                    hash.update(&source.project.to_le_bytes());
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "benchmark": "fallback", "projects": count, "depth": depth,
+                        "elapsed_us": elapsed.as_micros(), "directory_reads": scan.reads,
+                        "canonicalizations": scan.canonicalizations, "memberships": found.sources.len(),
+                        "result_hash": hash.finalize().to_hex().to_string(),
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn fallback_reuses_directory_reads_and_preserves_nested_memberships() {
         let fixture = tempfile::tempdir().unwrap();
@@ -1394,6 +1541,7 @@ pub(crate) mod tests {
         scan.scan(&root.join("First.csproj"), &policy, &mut found)
             .unwrap();
         let reads = scan.reads;
+        let canonicalizations = scan.canonicalizations;
         let sources = found.sources.len();
         scan.scan(&root.join("Second.csproj"), &policy, &mut found)
             .unwrap();
@@ -1401,6 +1549,7 @@ pub(crate) mod tests {
         scan.scan(&root.join("child/Child.csproj"), &policy, &mut found)
             .unwrap();
         assert_eq!(scan.reads, reads);
+        assert_eq!(scan.canonicalizations, canonicalizations);
         let memberships: Vec<_> = found
             .sources
             .iter()
@@ -1416,6 +1565,109 @@ pub(crate) mod tests {
             .map(|source| &source.module)
             .collect();
         assert_eq!(modules.len(), 2);
+    }
+
+    #[test]
+    fn fallback_boundaries_depend_on_the_selected_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        for directory in ["", "nested"] {
+            let directory = root.join(directory);
+            write(
+                &directory,
+                "ProjectSettings/ProjectVersion.txt",
+                "m_EditorVersion: 6000.0.0f1",
+            );
+            write(&directory, "Assets/Code.cs", "class Code {}");
+            write(
+                &directory,
+                "Library/PackageCache/package/Package.cs",
+                "class Package {}",
+            );
+            write(&directory, "Library/Other.cs", "class Other {}");
+        }
+        write(root, ".hidden/Hidden.cs", "class Hidden {}");
+        let policy = Policy::new(vec![root.into()]).unwrap();
+        let mut found = empty_fallback(root, cache.path());
+        let mut scan = FallbackScan::default();
+        scan.scan(root, &policy, &mut found).unwrap();
+        let paths: BTreeSet<_> = found
+            .sources
+            .iter()
+            .map(|source| source.path.strip_prefix(root).unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                Path::new("Assets/Code.cs"),
+                Path::new("Library/PackageCache/package/Package.cs")
+            ])
+        );
+        for directory in [
+            root.join("nested"),
+            root.join("Library"),
+            root.join(".hidden"),
+        ] {
+            let start = found.sources.len();
+            scan.scan(&directory, &policy, &mut found).unwrap();
+            let mut independent = empty_fallback(&directory, cache.path());
+            FallbackScan::default()
+                .scan(&directory, &policy, &mut independent)
+                .unwrap();
+            assert_eq!(
+                found.sources[start..]
+                    .iter()
+                    .map(|source| (&source.path, &source.module))
+                    .collect::<Vec<_>>(),
+                independent
+                    .sources
+                    .iter()
+                    .map(|source| (&source.path, &source.module))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_materialization_tracks_exact_paths_and_restarts_after_missing_inputs() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        write(root, "Code.cs", "class Code {}");
+        std::fs::create_dir(root.join(".hidden")).unwrap();
+        let mut policy = Policy::new(vec![root.into()]).unwrap();
+        policy.remote = Some(RemoteContext {
+            workspace: root.into(),
+            writable: root.into(),
+            shared: cache.path().into(),
+            repositories: Vec::new(),
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new(BTreeSet::from([
+                "Code.cs".into(),
+                ".hidden/Child.cs".into(),
+            ])),
+        });
+        let mut found = empty_fallback(root, cache.path());
+        let mut scan = FallbackScan::default();
+        scan.scan(root, &policy, &mut found).unwrap();
+        assert_eq!(scan.materialized, BTreeSet::from([root.join("Code.cs")]));
+        let error = scan
+            .scan(&root.join(".hidden"), &policy, &mut found)
+            .unwrap_err();
+        assert!(error.downcast_ref::<RequiredInputs>().is_some());
+        assert!(!scan.completed.contains(&root.join(".hidden")));
+        write(root, ".hidden/Child.cs", "class Child {}");
+        let mut fresh = empty_fallback(root, cache.path());
+        let mut scan = FallbackScan::default();
+        scan.scan(&root.join(".hidden"), &policy, &mut fresh)
+            .unwrap();
+        assert!(
+            fresh
+                .sources
+                .iter()
+                .any(|source| source.path == root.join(".hidden/Child.cs"))
+        );
     }
 
     pub(crate) fn add_worktree(repository: &Path, worktree: &Path) {

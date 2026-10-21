@@ -6,6 +6,86 @@ use crate::cache::{
 };
 use std::{collections::VecDeque, fs};
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct MaintenanceOutcome {
+    pub pressure: bool,
+    pub progress: bool,
+    pub compaction_deferred: Option<CompactionDeferral>,
+    pub git_completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CompactionDeferral {
+    Busy,
+    InsufficientSpace,
+    Ineligible,
+}
+
+/// Deadlines belong to the maintenance worker; requests never mutate them.
+pub(super) struct MaintenanceSchedule {
+    pub collection: tokio::time::Instant,
+    pub compaction: Option<tokio::time::Instant>,
+    interval: std::time::Duration,
+    stalled: std::time::Duration,
+}
+
+impl MaintenanceSchedule {
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub fn new(now: tokio::time::Instant, interval: std::time::Duration) -> Self {
+        Self {
+            collection: now + interval,
+            compaction: None,
+            interval,
+            stalled: Self::RETRY,
+        }
+    }
+
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.compaction
+            .map_or(self.collection, |next| next.min(self.collection))
+    }
+
+    pub fn collected(&mut self, now: tokio::time::Instant, outcome: Option<MaintenanceOutcome>) {
+        let delay = match outcome {
+            Some(outcome) if !outcome.pressure => {
+                self.stalled = Self::RETRY;
+                self.interval
+            }
+            Some(outcome) if outcome.progress => {
+                self.stalled = Self::RETRY;
+                Self::RETRY.min(self.interval)
+            }
+            _ => {
+                let delay = self.stalled.min(self.interval);
+                self.stalled = self.stalled.saturating_mul(2).min(self.interval);
+                delay
+            }
+        };
+        self.collection = now + delay;
+        self.compaction = outcome
+            .filter(|outcome| outcome.compaction_deferred == Some(CompactionDeferral::Busy))
+            .map(|_| now + Self::RETRY.min(self.interval));
+    }
+
+    pub fn compacted(&mut self, now: tokio::time::Instant, outcome: MaintenanceOutcome) {
+        self.compaction = (outcome.compaction_deferred == Some(CompactionDeferral::Busy))
+            .then_some(now + Self::RETRY.min(self.interval));
+        if !outcome.pressure {
+            self.collection = now + self.interval;
+            self.stalled = Self::RETRY;
+        } else if outcome.progress {
+            self.collection = self.collection.min(now + Self::RETRY.min(self.interval));
+            self.stalled = Self::RETRY;
+        }
+    }
+}
+
+pub(super) struct Retirement {
+    pub done: bool,
+    pub progress: bool,
+}
+
 /// One startup sweep, owned by the existing maintenance worker, not by requests.
 /// Only scheduling hints live here; retirement and collection progress live in LMDB.
 #[derive(Default)]
@@ -385,7 +465,7 @@ impl App {
         let scopes = state.scopes.as_mut().unwrap();
         let now = crate::cache::now();
         if let Some((key, info)) = scopes.front() {
-            if self.retire_analysis_scope(&database, *key, info, now, false)? {
+            if self.retire_analysis_scope(&database, *key, info, now)?.done {
                 scopes.pop_front();
             } else {
                 // Large or currently pinned namespaces cannot starve smaller ones.
@@ -400,16 +480,16 @@ impl App {
         Ok(scopes.is_empty() && collected.visited < 128)
     }
 
-    pub(super) async fn maintain_disk(self: &Arc<Self>) -> Result<()> {
+    pub(super) async fn maintain_disk(self: &Arc<Self>) -> Result<MaintenanceOutcome> {
         self.maintain_disk_observed(|| {}).await
     }
 
     async fn maintain_disk_observed(
         self: &Arc<Self>,
         started: impl FnOnce() + Send + 'static,
-    ) -> Result<()> {
+    ) -> Result<MaintenanceOutcome> {
         if self.inspection_shutdown.is_cancelled() {
-            return Ok(());
+            return Ok(MaintenanceOutcome::default());
         }
         if self
             .startup
@@ -418,7 +498,7 @@ impl App {
             .as_ref()
             .is_some_and(|state| state.borrow().is_none())
         {
-            return Ok(());
+            return Ok(MaintenanceOutcome::default());
         }
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -426,39 +506,106 @@ impl App {
             // Only replacing the database needs an idle service.
             let Ok(gate) = app.activity.clone().try_read_owned() else {
                 tracing::info!("Disk cache maintenance deferred during database replacement");
-                return Ok(());
+                return Ok(MaintenanceOutcome {
+                    pressure: true,
+                    ..Default::default()
+                });
             };
             let _gate = gate;
             if app.inspection_shutdown.is_cancelled() {
-                return Ok(());
+                return Ok(MaintenanceOutcome::default());
             }
             let start = Instant::now();
             tracing::info!("Disk cache maintenance started");
             started();
             let result = app.maintain_disk_shared();
-            let compact = result.as_ref().is_ok_and(|pressure| *pressure);
-            app.maintenance_retry.store(
-                result.is_err() || compact,
-                std::sync::atomic::Ordering::Relaxed,
-            );
             drop(_gate);
-            if compact && !app.inspection_shutdown.is_cancelled() {
-                if let Ok(_idle) = app.activity.clone().try_write_owned() {
-                    maintenance_stage("analysis compaction", || app.compact_analysis())?;
-                } else {
-                    tracing::info!(
-                        "Analysis compaction deferred while queries or indexing are active"
-                    );
+            let result = result.and_then(|mut outcome| {
+                if outcome.pressure && !app.inspection_shutdown.is_cancelled() {
+                    let compact = app.try_compaction()?;
+                    outcome.pressure = compact.pressure;
+                    outcome.progress |= compact.progress;
+                    outcome.compaction_deferred = compact.compaction_deferred;
                 }
-            }
+                Ok(outcome)
+            });
             tracing::info!(
                 elapsed_ms = start.elapsed().as_millis(),
                 success = result.is_ok(),
                 "Disk cache maintenance finished"
             );
-            result.map(|_| ())
+            result
         })
         .await?
+    }
+
+    pub(super) async fn retry_compaction(self: &Arc<Self>) -> Result<MaintenanceOutcome> {
+        let app = self.clone();
+        // Await the blocking worker even during shutdown: it owns the cache.
+        tokio::task::spawn_blocking(move || app.try_compaction()).await?
+    }
+
+    pub(super) async fn maintain_git(&self, outcome: Option<MaintenanceOutcome>) -> Result<()> {
+        if self.inspection_shutdown.is_cancelled()
+            || outcome.is_some_and(|outcome| outcome.git_completed)
+        {
+            return Ok(());
+        }
+        let cache = self.cache.clone();
+        let ttl = self
+            .remote
+            .as_ref()
+            .map_or(crate::config::DEFAULT_REPO_TTL, |remote| {
+                remote.options.repo_ttl
+            });
+        // The worker awaits this job before releasing cache ownership.
+        tokio::task::spawn_blocking(move || crate::repository::cache::maintain_all(&cache, ttl))
+            .await?
+    }
+
+    fn try_compaction(&self) -> Result<MaintenanceOutcome> {
+        let mut outcome = MaintenanceOutcome {
+            pressure: true,
+            ..Default::default()
+        };
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(outcome);
+        }
+        let Ok(read) = self.activity.clone().try_read_owned() else {
+            outcome.compaction_deferred = Some(CompactionDeferral::Busy);
+            return Ok(outcome);
+        };
+        if !self.cache.join("analysis").is_dir() {
+            outcome.compaction_deferred = Some(CompactionDeferral::Ineligible);
+            return Ok(outcome);
+        }
+        let stats = crate::store::Database::open(&self.cache.join("analysis"))?.disk_stats()?;
+        if !stats.eligible() {
+            outcome.compaction_deferred = Some(CompactionDeferral::Ineligible);
+            tracing::debug!(reason = ?outcome.compaction_deferred, "Analysis compaction deferred");
+            return Ok(outcome);
+        }
+        if Disk::read(&self.cache)?.available < stats.temporary_bytes() {
+            outcome.compaction_deferred = Some(CompactionDeferral::InsufficientSpace);
+            tracing::info!(reason = ?outcome.compaction_deferred, temporary_bytes = stats.temporary_bytes(), "Analysis compaction deferred");
+            return Ok(outcome);
+        }
+        drop(read);
+        let Ok(_idle) = self.activity.clone().try_write_owned() else {
+            outcome.compaction_deferred = Some(CompactionDeferral::Busy);
+            tracing::info!("Analysis compaction deferred while queries or indexing are active");
+            return Ok(outcome);
+        };
+        let reclaimed = maintenance_stage("analysis compaction", || self.compact_analysis())?;
+        drop(_idle);
+        outcome.progress = reclaimed > 0;
+        // Full filesystem accounting is needed only after an actual copy.
+        if outcome.progress {
+            outcome.pressure = self
+                .cache_limits
+                .pressured(blobs::allocated(&self.cache)?, Disk::read(&self.cache)?);
+        }
+        Ok(outcome)
     }
 
     fn seed_owners(&self) -> Result<bool> {
@@ -635,29 +782,29 @@ impl App {
         Ok(true)
     }
 
-    fn collect_analysis(&self, pressure: bool) -> Result<()> {
+    fn collect_analysis(&self, pressure: bool) -> Result<bool> {
         // Ordinary passes retire and collect bounded batches. Disk pressure
         // drains all retired workspaces and unused objects.
-        self.maintain_analysis(pressure)?;
+        let mut progress = self.maintain_analysis(pressure)?;
         if self.cache.join("analysis").is_dir() {
             let database = crate::store::Database::open(&self.cache.join("analysis"))?;
             if pressure {
-                while !self.inspection_shutdown.is_cancelled()
-                    && database
-                        .collect_with_retention(
-                            crate::cache::now(),
-                            crate::store::shared::PRESSURE_BATCH,
-                            0,
-                        )?
-                        .visited
-                        == crate::store::shared::PRESSURE_BATCH
-                {
+                while !self.inspection_shutdown.is_cancelled() {
+                    let collected = database.collect_with_retention(
+                        crate::cache::now(),
+                        crate::store::shared::PRESSURE_BATCH,
+                        0,
+                    )?;
+                    progress |= collected.objects > 0;
+                    if collected.visited != crate::store::shared::PRESSURE_BATCH {
+                        break;
+                    }
                     std::thread::yield_now();
                 }
             }
             database.checkpoint()?;
         }
-        Ok(())
+        Ok(progress)
     }
 
     fn analysis_savings(&self, disk: Disk) -> Result<u64> {
@@ -726,10 +873,30 @@ impl App {
         }
     }
 
-    fn collect_views(&self, dependencies_known: bool) -> Result<()> {
+    fn collect_views(&self, dependencies_known: bool) -> Result<bool> {
+        self.collect_views_observed(dependencies_known, || {})
+    }
+
+    fn collect_views_observed(
+        &self,
+        dependencies_known: bool,
+        prepared: impl FnOnce(),
+    ) -> Result<bool> {
         if !dependencies_known {
-            return Ok(());
+            return Ok(false);
         }
+        // This snapshot only skips known retained inputs. Candidates still check
+        // current ownership and active leases at the retirement boundary.
+        let owners = self.owners.lock().unwrap().clone();
+        let retained: std::collections::BTreeSet<_> = owners
+            .entries
+            .values()
+            .flat_map(|owner| &owner.dependencies)
+            .filter_map(|path| crate::cache::views::managed_root(&self.cache, path))
+            .collect();
+        drop(owners);
+        prepared();
+        let mut progress = false;
         let views = crate::cache::views::Registry::open(&self.cache)?;
         for &kind in crate::cache::owners::VIEW_KINDS {
             let directory = self.cache.join(kind);
@@ -738,11 +905,14 @@ impl App {
             }
             for entry in fs::read_dir(directory)? {
                 if self.inspection_shutdown.is_cancelled() {
-                    return Ok(());
+                    return Ok(progress);
                 }
                 let entry = entry?;
                 let path = entry.path();
                 ensure!(entry.file_type()?.is_dir(), "Invalid cache view directory");
+                if retained.contains(&path) {
+                    continue;
+                }
                 let configured = kind == "unity-metadata"
                     && self.remote.as_ref().is_some_and(|remote| {
                         crate::metadata_archive::configured(&path, &remote.options.unity_versions)
@@ -754,29 +924,34 @@ impl App {
                     views.try_retire(&path, || self.owners.lock().unwrap().retains(&path))?
                 {
                     retired.dispose()?;
+                    progress = true;
                 }
             }
         }
         let legacy = self.cache.join("dotnet/packages");
         if legacy.is_dir()
+            && !retained.contains(&legacy)
             && let Some(retired) =
                 views.try_retire(&legacy, || self.owners.lock().unwrap().retains(&legacy))?
         {
             retired.dispose()?;
+            progress = true;
         }
-        Ok(())
+        Ok(progress)
     }
 
-    fn maintain_disk_shared(&self) -> Result<bool> {
+    fn maintain_disk_shared(&self) -> Result<MaintenanceOutcome> {
+        let mut outcome = MaintenanceOutcome::default();
         // Retry optional disposal independently of retirement and pressure relief.
         if let Err(error) = crate::cache::compaction::cleanup(&self.cache) {
             tracing::warn!(%error, "Cannot dispose of obsolete compaction files");
         }
         for retired in crate::cache::views::Registry::open(&self.cache)?.pending()? {
             if self.inspection_shutdown.is_cancelled() {
-                return Ok(false);
+                return Ok(outcome);
             }
             retired.dispose()?;
+            outcome.progress = true;
         }
         let known = maintenance_stage("ownership scan", || self.seed_owners())?;
         let before = maintenance_stage("disk measurement", || blobs::allocated(&self.cache))?;
@@ -785,12 +960,13 @@ impl App {
         let mut candidates = maintenance_stage("eviction planning", || self.candidates())?;
         for candidate in candidates.iter().filter(|candidate| candidate.expired) {
             if self.inspection_shutdown.is_cancelled() {
-                return Ok(false);
+                return Ok(outcome);
             }
-            self.evict_candidate(candidate, false)?;
+            outcome.progress |= self.evict_candidate(candidate, false)?;
         }
-        maintenance_stage("analysis collection", || self.collect_analysis(pressure))?;
-        maintenance_stage("view collection", || self.collect_views(known))?;
+        outcome.progress |=
+            maintenance_stage("analysis collection", || self.collect_analysis(pressure))?;
+        outcome.progress |= maintenance_stage("view collection", || self.collect_views(known))?;
         maintenance_stage("blob collection", || {
             self.blobs.collect_with_pressure(pressure)
         })?;
@@ -815,7 +991,7 @@ impl App {
         let mut candidates = candidates.into_iter();
         while remaining > savings {
             if self.inspection_shutdown.is_cancelled() {
-                return Ok(false);
+                return Ok(outcome);
             }
             // Credit an affordable compact copy, but postpone the copy until all
             // victims are retired. Git packing savings are deliberately not assumed.
@@ -826,6 +1002,7 @@ impl App {
             for candidate in candidates.by_ref() {
                 if self.evict_candidate(&candidate, true)? {
                     evicted = true;
+                    outcome.progress = true;
                     estimated += candidate.bytes;
                 }
                 if estimated >= needed {
@@ -835,8 +1012,9 @@ impl App {
             if !evicted {
                 break;
             }
-            maintenance_stage("analysis collection", || self.collect_analysis(true))?;
-            maintenance_stage("view collection", || self.collect_views(known))?;
+            outcome.progress |=
+                maintenance_stage("analysis collection", || self.collect_analysis(true))?;
+            outcome.progress |= maintenance_stage("view collection", || self.collect_views(known))?;
             maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
             maintenance_stage("asset record collection", || {
                 self.asset_records.collect(true)
@@ -851,6 +1029,7 @@ impl App {
             maintenance_stage("Git reclamation", || {
                 crate::repository::cache::reclaim(&self.cache)
             })?;
+            outcome.git_completed = true;
             after = blobs::allocated(&self.cache)?;
         }
         self.flush_owners()?;
@@ -874,7 +1053,9 @@ impl App {
                 "Cache targets remain unmet; active leases, protected owners, and compaction may defer reclamation"
             );
         }
-        Ok(self.cache_limits.pressured(after, disk))
+        outcome.progress |= after < before;
+        outcome.pressure = self.cache_limits.pressured(after, disk);
+        Ok(outcome)
     }
 }
 
@@ -886,6 +1067,227 @@ mod tests {
         manager::{State, write_json},
         materialize::{Prepared, Target},
     };
+
+    #[test]
+    fn pressure_schedule_backs_off_stalls_and_resumes_after_progress() {
+        let now = tokio::time::Instant::now();
+        let interval = std::time::Duration::from_secs(15 * 60);
+        let mut schedule = MaintenanceSchedule::new(now, interval);
+        let stalled = MaintenanceOutcome {
+            pressure: true,
+            compaction_deferred: Some(CompactionDeferral::Busy),
+            ..Default::default()
+        };
+        schedule.collected(now, Some(stalled));
+        let fast = schedule.collection - now;
+        let mut previous = fast;
+        for _ in 0..16 {
+            schedule.collected(now, Some(stalled));
+            let delay = schedule.collection - now;
+            assert!(delay >= previous && delay <= interval);
+            previous = delay;
+        }
+        assert_eq!(previous, interval);
+        assert!(schedule.compaction.unwrap() < schedule.collection);
+        let full = schedule.collection;
+        schedule.compacted(now, stalled);
+        assert_eq!(
+            schedule.collection, full,
+            "Cheap retries must not pull full scans forward"
+        );
+        schedule.collected(
+            now,
+            Some(MaintenanceOutcome {
+                progress: true,
+                ..stalled
+            }),
+        );
+        assert_eq!(schedule.collection - now, fast);
+        schedule.compacted(
+            now,
+            MaintenanceOutcome {
+                progress: true,
+                ..Default::default()
+            },
+        );
+        assert!(schedule.compaction.is_none());
+        assert_eq!(schedule.collection - now, interval);
+    }
+
+    #[test]
+    fn pressure_retries_recover_when_live_dependencies_are_released() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut app = app(cache.path(), vec![]);
+        app.cache_limits.max_bytes = 1;
+        let view = cache.path().join("unity-packages/active");
+        fs::create_dir_all(&view).unwrap();
+        fs::write(view.join("input.cs"), "class Active {}").unwrap();
+        let leases = crate::cache::views::LeaseSet::new(cache.path()).unwrap();
+        leases.retain(&view).unwrap();
+        let protected = app.maintain_disk_shared().unwrap();
+        assert!(protected.pressure && !protected.progress);
+        assert!(
+            protected.git_completed,
+            "Pressure reclamation replaces the ordinary Git pass"
+        );
+        assert!(view.exists());
+        drop(leases);
+        let released = app.maintain_disk_shared().unwrap();
+        assert!(released.progress);
+        assert!(!view.exists());
+    }
+
+    #[test]
+    fn view_collection_rechecks_ownership_published_after_snapshot() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let view = cache.path().join("unity-packages/newly-owned");
+        fs::create_dir_all(&view).unwrap();
+        let entry = cache.path().join("owner");
+        let manifest = crate::workspace::Manifest {
+            root: entry.clone(),
+            dependencies: std::collections::BTreeSet::from([view.clone()]),
+            ..Default::default()
+        };
+        assert!(
+            !app.collect_views_observed(true, || {
+                app.owners
+                    .lock()
+                    .unwrap()
+                    .observe(&entry, None, &manifest, None);
+            })
+            .unwrap()
+        );
+        assert!(view.exists());
+        app.owners.lock().unwrap().remove(&entry);
+        assert!(app.collect_views(true).unwrap());
+        assert!(!view.exists());
+    }
+
+    #[tokio::test]
+    async fn ordinary_git_cleanup_runs_unless_pressure_already_completed_it() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let orphan = cache.path().join("git").join("a".repeat(64));
+        let create = || {
+            fs::create_dir_all(&orphan).unwrap();
+            fs::File::open(&orphan)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                .unwrap();
+        };
+        create();
+        app.maintain_git(Some(MaintenanceOutcome {
+            git_completed: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(
+            orphan.exists(),
+            "A completed pressure pass must not scan Git again"
+        );
+        app.maintain_git(Some(MaintenanceOutcome::default()))
+            .await
+            .unwrap();
+        assert!(
+            !orphan.exists(),
+            "Ordinary TTL cleanup must still run without pressure"
+        );
+        create();
+        app.maintain_git(None).await.unwrap();
+        assert!(
+            !orphan.exists(),
+            "A failed disk pass must not suppress Git cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_rechecks_pressure_after_busy_retry() {
+        use crate::store::shared::{Database, Encoded, Names};
+        let cache = tempfile::tempdir().unwrap();
+        let mut app = app(cache.path(), vec![]);
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = database.workspace([1; 32], cache.path(), None).unwrap();
+        let mut files = Vec::new();
+        // Grow to the configured compaction threshold instead of asserting its value.
+        while !(crate::cache::compaction::Stats {
+            allocated: database
+                .disk_stats()
+                .unwrap()
+                .allocated
+                .saturating_sub(8 * 1024 * 1024),
+            live: 0,
+        })
+        .eligible()
+        {
+            let file = format!("temporary-{}", files.len());
+            scope
+                .install(
+                    &file,
+                    vec![1],
+                    *blake3::hash(file.as_bytes()).as_bytes(),
+                    1,
+                    || Ok(()),
+                    || {
+                        let mut records = std::collections::BTreeMap::from([(
+                            vec![1],
+                            vec![42; 8 * 1024 * 1024],
+                        )]);
+                        let names = crate::store::format::write(
+                            &[],
+                            None,
+                            true,
+                            &Names::default(),
+                            &mut records,
+                        )?;
+                        Ok(Encoded { names, records })
+                    },
+                )
+                .unwrap();
+            files.push(file);
+        }
+        for file in files {
+            scope.detach(&file, 2).unwrap();
+        }
+        database.collect_unused(3, true).unwrap();
+        let stats = database.disk_stats().unwrap();
+        assert!(stats.eligible());
+        app.cache_limits.max_bytes =
+            blobs::allocated(cache.path()).unwrap() - stats.reclaimable() / 2;
+        app.cache_limits.headroom_percent = 0;
+        drop(scope);
+        drop(database);
+        let app = Arc::new(app);
+        let active = app.activity.read().await;
+        let busy = app.retry_compaction().await.unwrap();
+        assert_eq!(busy.compaction_deferred, Some(CompactionDeferral::Busy));
+        assert!(!busy.progress && busy.pressure);
+        drop(active);
+        let finished = app.retry_compaction().await.unwrap();
+        assert!(finished.progress && !finished.pressure);
+        assert!(finished.compaction_deferred.is_none());
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn compaction_retries_skip_collection_and_stop_after_shutdown() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = Arc::new(app(cache.path(), vec![]));
+        let view = cache.path().join("unity-packages/unused");
+        fs::create_dir_all(&view).unwrap();
+        let outcome = app.retry_compaction().await.unwrap();
+        assert!(!outcome.progress && !outcome.git_completed);
+        assert!(
+            view.exists(),
+            "Cheap compaction retries must not run collection"
+        );
+        app.inspection_shutdown.cancel();
+        let outcome = app.retry_compaction().await.unwrap();
+        assert!(outcome.compaction_deferred.is_none() && !outcome.progress);
+        assert!(view.exists());
+        app.shutdown().await;
+    }
 
     #[test]
     fn background_manifests_preserve_all_workspace_dependencies() {
@@ -1263,6 +1665,91 @@ mod tests {
         assert!(kept.join("source/File.cs").is_file());
         assert!(!other.exists());
         assert!(!wildcard.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "release benchmark: retained view scans with foreground navigation"]
+    async fn retained_views_with_foreground_queries_benchmark() {
+        for count in [1_000, 10_000] {
+            let cache = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            fs::write(
+                root.path().join("README.md"),
+                "Foreground remains available",
+            )
+            .unwrap();
+            let app = Arc::new(
+                App::new(
+                    Policy::new(vec![root.path().into()]).unwrap(),
+                    cache.path().into(),
+                    1,
+                )
+                .unwrap(),
+            );
+            let selector = root.path().to_str().unwrap();
+            app.view(selector, "README.md", "exact").await.unwrap();
+            for index in 0..count {
+                let view = cache
+                    .path()
+                    .join("unity-packages")
+                    .join(format!("view-{index:05}"));
+                fs::create_dir_all(&view).unwrap();
+                fs::write(view.join("input.cs"), "class Input {}").unwrap();
+                if index % 10 != 0 {
+                    let entry = root.path().join(format!("owner-{index:05}"));
+                    let manifest = crate::workspace::Manifest {
+                        root: entry.clone(),
+                        dependencies: std::collections::BTreeSet::from([view]),
+                        ..Default::default()
+                    };
+                    app.owners
+                        .lock()
+                        .unwrap()
+                        .observe(&entry, None, &manifest, None);
+                }
+            }
+            let worker = app.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let collection = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                started.send(()).unwrap();
+                worker.collect_views(true).unwrap();
+                start.elapsed()
+            });
+            ready.await.unwrap();
+            let mut latencies = Vec::new();
+            loop {
+                let start = Instant::now();
+                assert!(
+                    app.view(selector, "README.md", "exact")
+                        .await
+                        .unwrap()
+                        .contains("Foreground")
+                );
+                latencies.push(start.elapsed());
+                if collection.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let elapsed = collection.await.unwrap();
+            latencies.sort_unstable();
+            eprintln!(
+                "views={count} collection_ms={} queries={} query_p50_us={} query_p95_us={} query_max_us={}",
+                elapsed.as_millis(),
+                latencies.len(),
+                latencies[latencies.len() / 2].as_micros(),
+                latencies[(latencies.len() - 1) * 95 / 100].as_micros(),
+                latencies.last().unwrap().as_micros()
+            );
+            assert_eq!(
+                fs::read_dir(cache.path().join("unity-packages"))
+                    .unwrap()
+                    .count(),
+                count * 9 / 10
+            );
+            app.shutdown().await;
+        }
     }
 
     #[test]

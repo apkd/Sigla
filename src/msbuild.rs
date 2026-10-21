@@ -125,13 +125,21 @@ fn payload(cache: &Path, major: &str) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Resolution is shared only within one discovery pass. Project evaluation still
-/// runs independently when recovering from a broken batch.
+/// One discovery pass, with one remote context and metadata accumulator.
+/// Discard after materialization requests; project evaluation can retry within the pass.
 #[derive(Default)]
 pub(crate) struct Session {
-    installed: Option<Vec<(String, PathBuf)>>,
-    inventory_failure: Option<std::sync::Arc<anyhow::Error>>,
+    scopes: BTreeMap<PathBuf, Scope>,
+    bootstrap: Option<Result<Bootstrap, std::sync::Arc<anyhow::Error>>>,
     resolved: BTreeMap<Scope, PathBuf>,
+}
+
+struct Bootstrap {
+    version: String,
+    root: PathBuf,
+    fxr: PathBuf,
+    roots: Vec<PathBuf>,
+    approved: BTreeMap<PathBuf, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -171,44 +179,62 @@ pub(crate) fn project_retry_can_help(error: &anyhow::Error) -> bool {
 
 /// Match hostfxr's ancestor search in the environment in which it will run.
 /// Local builds deliberately retain host inputs; remote builds see /workspace.
-pub(crate) fn scope(
-    entry: &Path,
-    remote: Option<&crate::discovery::RemoteContext>,
-    metadata: &mut BTreeSet<PathBuf>,
-) -> Result<Scope> {
-    for directory in entry
-        .parent()
-        .context("MSBuild entry has no parent")?
-        .ancestors()
-    {
-        let policy = directory.join("global.json");
-        metadata.insert(policy.clone());
-        if let Some(remote) = remote {
-            remote.require([policy.clone()])?;
-        }
-        if policy.is_file() {
-            if let Some(remote) = remote {
-                ensure!(
-                    policy
-                        .canonicalize()?
-                        .starts_with(remote.workspace.canonicalize()?),
-                    "SDK policy escapes the repository: {}",
-                    policy.display()
-                );
+impl Session {
+    pub(crate) fn scope(
+        &mut self,
+        entry: &Path,
+        remote: Option<&crate::discovery::RemoteContext>,
+        metadata: &mut BTreeSet<PathBuf>,
+    ) -> Result<Scope> {
+        let mut visited = Vec::new();
+        let mut selected = Scope {
+            policy: None,
+            contents: [0; 32],
+        };
+        for directory in entry
+            .parent()
+            .context("MSBuild entry has no parent")?
+            .ancestors()
+        {
+            if let Some(scope) = self.scopes.get(directory) {
+                selected = scope.clone();
+                break;
             }
-            return Ok(Scope {
-                contents: *blake3::hash(&fs::read(&policy)?).as_bytes(),
-                policy: Some(policy),
-            });
+            visited.push(directory.to_owned());
+            let policy = directory.join("global.json");
+            #[cfg(test)]
+            POLICY_PROBES.with(|calls| calls.set(calls.get() + 1));
+            metadata.insert(policy.clone());
+            if let Some(remote) = remote {
+                remote.require([policy.clone()])?;
+            }
+            if policy.is_file() {
+                #[cfg(test)]
+                POLICY_READS.with(|calls| calls.set(calls.get() + 1));
+                if let Some(remote) = remote {
+                    ensure!(
+                        policy
+                            .canonicalize()?
+                            .starts_with(remote.workspace.canonicalize()?),
+                        "SDK policy escapes the repository: {}",
+                        policy.display()
+                    );
+                }
+                selected = Scope {
+                    contents: *blake3::hash(&fs::read(&policy)?).as_bytes(),
+                    policy: Some(policy),
+                };
+                break;
+            }
+            if remote.is_some_and(|remote| directory == remote.workspace) {
+                break;
+            }
         }
-        if remote.is_some_and(|remote| directory == remote.workspace) {
-            break;
+        for directory in visited {
+            self.scopes.insert(directory, selected.clone());
         }
+        Ok(selected)
     }
-    Ok(Scope {
-        policy: None,
-        contents: [0; 32],
-    })
 }
 
 /// Cheap launcher identity, checked even when source watches have not changed.
@@ -259,7 +285,7 @@ pub(crate) fn discover_in(
     leases: &crate::cache::views::LeaseSet,
 ) -> Result<Snapshot> {
     leases.retain(cache)?;
-    if let Some(error) = &session.inventory_failure {
+    if let Some(Err(error)) = &session.bootstrap {
         return Err(SetupFailure(error.clone()).into());
     }
     fs::create_dir_all(cache)?;
@@ -283,25 +309,25 @@ pub(crate) fn discover_in(
         .is_none()
         .then(|| crate::cache::packages::View::local(cache, directory, leases))
         .transpose()?;
-    if session.installed.is_none() {
-        for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-            let host = root.join("dotnet");
-            if host.is_file() {
-                metadata.insert(host.clone());
-                let resolved = host.canonicalize()?;
-                let root = resolved.parent().context("dotnet host has no directory")?;
-                metadata.insert(root.to_owned());
-                if root.join("sdk").is_dir() {
-                    metadata.insert(root.join("sdk"));
+    if session.bootstrap.is_none() {
+        let bootstrap = (|| -> Result<Bootstrap> {
+            for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+                let host = root.join("dotnet");
+                if host.is_file() {
+                    metadata.insert(host.clone());
+                    let resolved = host.canonicalize()?;
+                    let root = resolved.parent().context("dotnet host has no directory")?;
+                    metadata.insert(root.to_owned());
+                    if root.join("sdk").is_dir() {
+                        metadata.insert(root.join("sdk"));
+                    }
+                    break;
                 }
-                break;
             }
-        }
-        let installed = (|| -> Result<Vec<(String, PathBuf)>> {
             #[cfg(test)]
             INVENTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
             let sdks = process::run(command(cache).arg("--list-sdks"), Duration::from_secs(30))?;
-            Ok(std::str::from_utf8(&sdks)?
+            let installed: Vec<(String, PathBuf)> = std::str::from_utf8(&sdks)?
                 .lines()
                 .filter_map(|line| {
                     let (version, location) = line.split_once(" [")?;
@@ -311,45 +337,61 @@ pub(crate) fn discover_in(
                     matches!(major, "8" | "10")
                         .then(|| (version.to_owned(), location.join(version)))
                 })
-                .collect())
-        })();
-        match installed {
-            Ok(installed) => session.installed = Some(installed),
-            Err(error) => {
-                let error = std::sync::Arc::new(error);
-                session.inventory_failure = Some(error.clone());
-                return Err(SetupFailure(error).into());
+                .collect();
+            #[cfg(test)]
+            BOOTSTRAP_CALLS.with(|calls| calls.set(calls.get() + 1));
+            let (bootstrap_version, bootstrap_sdk) = installed
+                .iter()
+                .max_by_key(|(v, _)| semver::Version::parse(v).ok())
+                .ok_or_else(|| {
+                    SdkFailure(
+                        "MSBuild discovery requires an installed .NET 8 or .NET 10 SDK".into(),
+                    )
+                })?;
+            let host_root = bootstrap_sdk.parent().unwrap().parent().unwrap();
+            let host = host_root.join("dotnet");
+            metadata.insert(host.clone());
+            metadata.insert(host_root.join("host/fxr"));
+            let fxr = fs::read_dir(host_root.join("host/fxr"))?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .max_by_key(|e| semver::Version::parse(&e.file_name().to_string_lossy()).ok())
+                .context("Installed hostfxr is missing")?
+                .path()
+                .join("libhostfxr.so");
+            metadata.insert(fxr.clone());
+            let roots = installed
+                .iter()
+                .map(|(_, p)| p.parent().unwrap().parent().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let mut approved = BTreeMap::new();
+            for (version, path) in &installed {
+                if let Ok(path) = path.canonicalize() {
+                    approved.entry(path).or_insert_with(|| version.clone());
+                }
             }
-        }
+            Ok(Bootstrap {
+                version: bootstrap_version.clone(),
+                root: host_root.to_owned(),
+                fxr,
+                roots,
+                approved,
+            })
+        })();
+        session.bootstrap = Some(bootstrap.map_err(std::sync::Arc::new));
     }
-    let installed = session.installed.as_ref().unwrap();
-    let (bootstrap_version, bootstrap_sdk) = installed
-        .iter()
-        .max_by_key(|(v, _)| semver::Version::parse(v).ok())
-        .ok_or_else(|| {
-            SdkFailure("MSBuild discovery requires an installed .NET 8 or .NET 10 SDK".into())
-        })?;
-    let host_root = bootstrap_sdk.parent().unwrap().parent().unwrap();
+    let bootstrap = session
+        .bootstrap
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .map_err(|error| SetupFailure(error.clone()))?;
+    let bootstrap_version = &bootstrap.version;
+    let host_root = &bootstrap.root;
     let host = host_root.join("dotnet");
-    metadata.insert(host.clone());
-    metadata.insert(host_root.join("host/fxr"));
-    let fxr = (|| -> Result<PathBuf> {
-        Ok(fs::read_dir(host_root.join("host/fxr"))?
-            .collect::<std::io::Result<Vec<_>>>()?
-            .into_iter()
-            .max_by_key(|e| semver::Version::parse(&e.file_name().to_string_lossy()).ok())
-            .context("Installed hostfxr is missing")?
-            .path()
-            .join("libhostfxr.so"))
-    })()
-    .map_err(|error| SetupFailure(std::sync::Arc::new(error)))?;
-    metadata.insert(fxr.clone());
-    let roots = installed
-        .iter()
-        .map(|(_, p)| p.parent().unwrap().parent().unwrap().to_owned())
-        .collect::<Vec<_>>();
+    let fxr = &bootstrap.fxr;
     let sandbox = remote
-        .map(|context| crate::sandbox::Sandbox::new(context, &roots, leases))
+        .map(|context| crate::sandbox::Sandbox::new(context, &bootstrap.roots, leases))
         .transpose()
         .map_err(|error| SetupFailure(std::sync::Arc::new(error)))?;
     let job = tempfile::Builder::new()
@@ -361,16 +403,16 @@ pub(crate) fn discover_in(
         sdk.clone()
     } else {
         let sdk = (|| -> Result<PathBuf> {
-            let bootstrap = payload(cache, bootstrap_version.split('.').next().unwrap())?;
+            let integration = payload(cache, bootstrap_version.split('.').next().unwrap())?;
             let mut resolve = match &sandbox {
                 Some(sandbox) => {
                     let mut command =
-                        sandbox.command(&host, &bootstrap, job.path(), directory, false)?;
+                        sandbox.command(&host, &integration, job.path(), directory, false)?;
                     command
                         .args(["/integration/Sigla.Discovery.dll", "--resolve-sdk"])
                         .arg(host_root)
                         .arg(sandbox.input(directory)?)
-                        .arg(&fxr)
+                        .arg(fxr)
                         .arg("/job/result.json");
                     command
                 }
@@ -384,11 +426,11 @@ pub(crate) fn discover_in(
                     )?;
                     command
                         .current_dir(directory)
-                        .arg(bootstrap.join("Sigla.Discovery.dll"))
+                        .arg(integration.join("Sigla.Discovery.dll"))
                         .arg("--resolve-sdk")
                         .arg(host_root)
                         .arg(directory)
-                        .arg(&fxr)
+                        .arg(fxr)
                         .arg(&output);
                     command
                 }
@@ -429,10 +471,7 @@ pub(crate) fn discover_in(
                     ))
                 })?
                 .canonicalize()?;
-            if !installed
-                .iter()
-                .any(|(_, path)| path.canonicalize().ok().as_ref() == Some(&sdk))
-            {
+            if !bootstrap.approved.contains_key(&sdk) {
                 return Err(SdkFailure(
                     "global.json selected a toolchain outside approved installed SDKs".into(),
                 )
@@ -444,9 +483,9 @@ pub(crate) fn discover_in(
         session.resolved.insert(scope.clone(), sdk.clone());
         sdk
     };
-    let (version, _) = installed
-        .iter()
-        .find(|(_, p)| p.canonicalize().ok().as_ref() == Some(&sdk))
+    let version = bootstrap
+        .approved
+        .get(&sdk)
         .context("global.json selected a toolchain outside approved installed SDKs")?;
     let root = payload(cache, version.split('.').next().unwrap())?;
     let mapped_entries = entries
@@ -631,6 +670,9 @@ pub(crate) fn discover_in(
 thread_local! {
     static RESOLVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INVENTORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POLICY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POLICY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOOTSTRAP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn local_artifacts(command: &mut Command, artifacts: &Path) {
@@ -779,6 +821,117 @@ fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> R
 
 #[cfg(test)]
 mod diagnostic_tests {
+    fn scope(
+        entry: &Path,
+        remote: Option<&crate::discovery::RemoteContext>,
+        metadata: &mut BTreeSet<PathBuf>,
+    ) -> Result<Scope> {
+        Session::default().scope(entry, remote, metadata)
+    }
+
+    #[test]
+    fn scope_lookup_work_depends_on_directories_not_project_count() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::write(root.path().join("global.json"), "{}").unwrap();
+        let mut session = Session::default();
+        let mut metadata = BTreeSet::new();
+        POLICY_PROBES.set(0);
+        POLICY_READS.set(0);
+        let first = session
+            .scope(
+                &root.path().join("nested/First.csproj"),
+                None,
+                &mut metadata,
+            )
+            .unwrap();
+        let work = (POLICY_PROBES.get(), POLICY_READS.get());
+        for index in 0..100 {
+            assert_eq!(
+                session
+                    .scope(
+                        &root.path().join(format!("nested/Project{index}.csproj")),
+                        None,
+                        &mut metadata
+                    )
+                    .unwrap(),
+                first
+            );
+        }
+        assert_eq!((POLICY_PROBES.get(), POLICY_READS.get()), work);
+        fs::write(root.path().join("nested/global.json"), "{}").unwrap();
+        assert_ne!(
+            Session::default()
+                .scope(
+                    &root.path().join("nested/First.csproj"),
+                    None,
+                    &mut metadata
+                )
+                .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    #[ignore = "release benchmark; requires installed SDK"]
+    fn benchmark_shared_sdk_policies() {
+        for count in [100, 1000] {
+            for nested in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let cache = tempfile::tempdir().unwrap();
+                let root = fixture.path();
+                fs::write(
+                    root.join("global.json"),
+                    r#"{"sdk":{"version":"9999.0.100","rollForward":"disable"}}"#,
+                )
+                .unwrap();
+                for index in 0..count {
+                    let directory = root.join(format!("group{}", index % 10));
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(
+                        directory.join(format!("Project{index}.csproj")),
+                        "<Project />",
+                    )
+                    .unwrap();
+                    if index < 10 {
+                        fs::write(directory.join("Source.cs"), "class Readable {}").unwrap();
+                        if nested && index % 2 == 0 {
+                            fs::copy(root.join("global.json"), directory.join("global.json"))
+                                .unwrap();
+                        }
+                    }
+                }
+                POLICY_PROBES.with(|calls| calls.set(0));
+                POLICY_READS.with(|calls| calls.set(0));
+                INVENTORY_CALLS.with(|calls| calls.set(0));
+                RESOLVER_CALLS.with(|calls| calls.set(0));
+                BOOTSTRAP_CALLS.with(|calls| calls.set(0));
+                let policy = crate::discovery::Policy::new(vec![root.into()]).unwrap();
+                let started = std::time::Instant::now();
+                let result =
+                    crate::discovery::discover_cached(root, &policy, cache.path()).unwrap();
+                eprintln!(
+                    "sdk entries={count} nested={nested} elapsed_us={} probes={} policy_reads={} inventories={} resolvers={} bootstraps={} sources={}",
+                    started.elapsed().as_micros(),
+                    POLICY_PROBES.get(),
+                    POLICY_READS.get(),
+                    INVENTORY_CALLS.get(),
+                    RESOLVER_CALLS.get(),
+                    BOOTSTRAP_CALLS.get(),
+                    result.sources.len()
+                );
+                assert_eq!(
+                    result
+                        .sources
+                        .iter()
+                        .filter(|source| source.language == crate::model::Language::CSharp)
+                        .count(),
+                    10
+                );
+            }
+        }
+    }
+
     #[test]
     fn empty_host_inventory_changes_when_an_sdk_is_installed() {
         let root = tempfile::tempdir().unwrap();
@@ -858,14 +1011,22 @@ mod diagnostic_tests {
             selection_identity: String::new(),
             tracked: std::sync::Arc::new(["nested/global.json".into()].into_iter().collect()),
         };
-        let error = scope(&entry, Some(&remote), &mut metadata).unwrap_err();
+        let mut remote_session = Session::default();
+        let error = remote_session
+            .scope(&entry, Some(&remote), &mut metadata)
+            .unwrap_err();
         assert!(
             error
                 .downcast_ref::<crate::discovery::RequiredInputs>()
                 .is_some()
         );
         fs::write(nested.join("global.json"), "{}").unwrap();
-        assert!(scope(&entry, Some(&remote), &mut metadata).is_ok());
+        assert!(remote_session.scopes.is_empty());
+        assert!(
+            Session::default()
+                .scope(&entry, Some(&remote), &mut metadata)
+                .is_ok()
+        );
         fs::remove_file(nested.join("global.json")).unwrap();
         fs::remove_file(policy).unwrap();
         fs::write(fixture.path().join("global.json"), "{}").unwrap();
@@ -925,9 +1086,11 @@ mod diagnostic_tests {
         fs::copy(root.join("global.json"), root.join("two/global.json")).unwrap();
         RESOLVER_CALLS.with(|calls| calls.set(0));
         INVENTORY_CALLS.with(|calls| calls.set(0));
+        BOOTSTRAP_CALLS.set(0);
         crate::discovery::discover_cached(root, &policy, cache.path()).unwrap();
         RESOLVER_CALLS.with(|calls| assert_eq!(calls.get(), 2));
         INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert_eq!(BOOTSTRAP_CALLS.get(), 1);
     }
 
     #[test]
