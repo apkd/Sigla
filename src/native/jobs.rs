@@ -27,8 +27,12 @@ type Outcome = std::result::Result<Arc<Snapshot>, Arc<anyhow::Error>>;
 pub struct Ticket {
     outcome: watch::Receiver<Option<Outcome>>,
     progress: Arc<Progress>,
+    telemetry_id: Option<String>,
 }
 impl Ticket {
+    pub fn telemetry_id(&self) -> Option<String> {
+        self.telemetry_id.clone()
+    }
     pub fn ready(&self) -> Option<Outcome> {
         self.outcome.borrow().clone()
     }
@@ -211,8 +215,28 @@ impl Jobs {
         let ticket = Ticket {
             outcome,
             progress: progress.clone(),
+            telemetry_id: None,
         };
         let cancel = self.shutdown.child_token();
+        let repository = branch
+            .as_ref()
+            .map(|branch| branch.repository.identity.to_string())
+            .or_else(|| Some(entry.display().to_string()));
+        let operation = crate::telemetry::operation(
+            match group {
+                Group::Native => "native_index",
+                Group::Shaders => "shader_index",
+            },
+            repository.as_deref(),
+            None,
+        );
+        if let Some(branch) = &branch {
+            operation.target(&branch.name);
+        }
+        let ticket = Ticket {
+            telemetry_id: operation.id(),
+            ..ticket
+        };
         jobs.insert(
             key,
             Job {
@@ -229,13 +253,18 @@ impl Jobs {
         tokio::spawn(async move {
             let _activity = activity;
             let outcome = async {
-                let _writer = writer.lock_owned().await;
+                operation.stage("writer_admission");
+                let _writer = {
+                    let _wait = operation.wait("writer_admission");
+                    writer.lock_owned().await
+                };
                 #[cfg(test)]
                 let _pause = tokio::select! {
                     _ = cancel.cancelled() => anyhow::bail!("Source indexing superseded"),
                     permit = pause.acquire_owned() => permit?,
                 };
                 ensure!(!cancel.is_cancelled(), "Source indexing superseded");
+                operation.stage("cache_lookup");
                 let fingerprint = *blake3::hash(&postcard::to_allocvec(&(
                     "source-group", crate::store::ANALYSIS_VERSION, &entry, group,
                     manifest.discovery_policy,
@@ -251,7 +280,10 @@ impl Jobs {
                     ..Default::default()
                 };
                 if snapshot.files.is_empty() {
-                    let state = workspace.lock().await;
+                    let state = {
+                        let _wait = operation.wait("workspace_lock");
+                        workspace.lock().await
+                    };
                     let code = state.as_ref().context("Code workspace unavailable")?;
                     ensure!(self::generation(&code.manifest, group)? == generation, "Source indexing superseded");
                     let snapshot = Arc::new(Snapshot { store: code.store.clone(), manifest: snapshot });
@@ -272,6 +304,7 @@ impl Jobs {
                 let reused = cached.is_some();
                 if let Some(cached) = cached { snapshot = cached; }
                 let batches = if reused { Vec::new() } else { crate::workspace::native_batches(&snapshot.files) };
+                operation.stage("source_indexing");
                 let mut pending = batches.into_iter();
                 let mut tasks = tokio::task::JoinSet::new();
                 let mut failure = None;
@@ -282,11 +315,14 @@ impl Jobs {
                         let manifest = manifest.clone();
                         let workers = workers.clone();
                         let cancel = cancel.clone();
+                        let operation = operation.clone();
                         tasks.spawn(async move {
+                            let _wait = operation.wait("source_worker_admission");
                             let permit = tokio::select! {
                                 _ = cancel.cancelled() => anyhow::bail!("Source indexing superseded"),
                                 permit = workers.acquire_owned() => permit?,
                             };
+                            drop(_wait);
                             tokio::task::spawn_blocking(move || {
                                 let _permit = permit;
                                 let bytes = files.values().map(|file| file.stamp.size.max(1)).sum::<u64>();
@@ -319,7 +355,11 @@ impl Jobs {
                 }
                 ensure!(!cancel.is_cancelled(), "Source indexing superseded");
                 // A completed superseded worker must never publish over its successor.
-                let state = workspace.lock_owned().await;
+                operation.stage("publication");
+                let state = {
+                    let _wait = operation.wait("workspace_lock");
+                    workspace.lock_owned().await
+                };
                 let current = state.as_ref().context("Code workspace unavailable")?;
                 ensure!(!cancel.is_cancelled(), "Source indexing superseded");
                 ensure!(
@@ -349,6 +389,11 @@ impl Jobs {
                 drop(branch);
                 Ok(snapshot)
             }.await.map_err(Arc::<anyhow::Error>::new);
+            match &outcome {
+                Ok(_) => operation.finish("success"),
+                Err(_) if cancel.is_cancelled() => operation.finish("cancelled"),
+                Err(_) => operation.finish("failure"),
+            }
             if outcome.is_err() {
                 send.send_replace(Some(outcome));
             }

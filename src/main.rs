@@ -7,7 +7,12 @@ use sigla::{
     discovery::Policy,
     service::{App, Mcp},
 };
-use std::{io::Write, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    io::{Read, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+};
 
 #[derive(Parser)]
 #[command(
@@ -38,12 +43,20 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// export monitoring history without opening the analysis cache.
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    },
     #[command(name = "__git-job", hide = true)]
     GitJob { input: PathBuf, output: PathBuf },
     #[command(name = "__git-rebuild", hide = true)]
     GitRebuild { input: PathBuf, output: PathBuf },
     /// run the shared HTTP MCP service at /mcp.
     Serve {
+        /// store monitoring history outside the analysis cache.
+        #[arg(long)]
+        monitor_dir: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:7331")]
         listen: SocketAddr,
         /// read a bearer token from this private file; required off loopback.
@@ -69,8 +82,36 @@ enum CacheCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Subcommand)]
+enum MonitorCommand {
+    /// emit one incremental page of monitoring data as JSON.
+    Export {
+        #[arg(long)]
+        monitor_dir: PathBuf,
+        #[arg(long)]
+        after: Option<String>,
+        /// read {"after": cursor} from stdin for a fixed SSH export command.
+        #[arg(long, conflicts_with = "after")]
+        request_stdin: bool,
+    },
+}
+
+fn export_cursor(input: impl Read) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ExportRequest {
+        after: Option<String>,
+    }
+    let mut bytes = Vec::new();
+    input.take(1_048_577).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 1_048_576,
+        "Monitoring request exceeds size limit"
+    );
+    Ok(serde_json::from_slice::<ExportRequest>(&bytes)?.after)
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -80,12 +121,36 @@ async fn main() -> Result<()> {
         .init();
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
+    if let Command::Monitor {
+        command:
+            MonitorCommand::Export {
+                monitor_dir,
+                after,
+                request_stdin,
+            },
+    } = &cli.command
+    {
+        let after = if *request_stdin {
+            export_cursor(std::io::stdin().lock())?
+        } else {
+            after.clone()
+        };
+        serde_json::to_writer(
+            std::io::stdout().lock(),
+            &sigla::telemetry::export(monitor_dir, after.as_deref())?,
+        )?;
+        return Ok(());
+    }
     if let Command::Licenses = cli.command {
         std::io::stdout()
             .lock()
             .write_all(include_bytes!(concat!(env!("OUT_DIR"), "/licenses.txt")))?;
         return Ok(());
     }
+    tokio::runtime::Runtime::new()?.block_on(run(cli, matches))
+}
+
+async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
     if let Command::Cache {
         command: CacheCommand::Inspect { json },
     } = &cli.command
@@ -129,6 +194,35 @@ async fn main() -> Result<()> {
     if let Command::Metadata { command } = cli.command {
         return tokio::task::spawn_blocking(move || command.run()).await?;
     }
+    let _monitor = match &cli.command {
+        Command::Serve {
+            monitor_dir: Some(directory),
+            ..
+        } => {
+            let result = (|| -> Result<_> {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::create_dir_all(&cli.options.cache_dir)?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o750)
+                    .create(directory)?;
+                ensure!(
+                    !std::fs::canonicalize(directory)?
+                        .starts_with(std::fs::canonicalize(&cli.options.cache_dir)?),
+                    "--monitor-dir must be outside --cache-dir"
+                );
+                sigla::telemetry::init(directory)
+            })();
+            match result {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    tracing::warn!(%error, "Monitoring unavailable; continuing without recording");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let remote = cli.options.validate()?;
     let cache_limits = cli.options.cache_limits();
     let mut policy = Policy::new(cli.options.local_roots())?;
@@ -155,7 +249,8 @@ async fn main() -> Result<()> {
         | Command::Metadata { .. }
         | Command::GitJob { .. }
         | Command::GitRebuild { .. }
-        | Command::Cache { .. } => {
+        | Command::Cache { .. }
+        | Command::Monitor { .. } => {
             unreachable!()
         }
         Command::Query { project, query } => {
@@ -168,6 +263,7 @@ async fn main() -> Result<()> {
             result?;
         }
         Command::Serve {
+            monitor_dir: _,
             listen,
             token_file,
             allowed_host,
@@ -247,3 +343,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 use axum::response::IntoResponse;
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[test]
+    fn forced_export_accepts_only_a_bounded_cursor_request() {
+        let cursor = "opaque \"cursor\" with spaces and Unicode λ";
+        let input = serde_json::to_vec(&serde_json::json!({"after": cursor})).unwrap();
+        assert_eq!(
+            export_cursor(input.as_slice()).unwrap().as_deref(),
+            Some(cursor)
+        );
+        assert!(
+            export_cursor(br#"{"after":null}"#.as_slice())
+                .unwrap()
+                .is_none()
+        );
+        assert!(export_cursor(br#"{"monitor_dir":"/elsewhere"}"#.as_slice()).is_err());
+        assert!(export_cursor(std::io::repeat(b' ')).is_err());
+    }
+}

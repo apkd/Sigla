@@ -27,30 +27,40 @@ enum Progress {
     Failed(Arc<anyhow::Error>, Option<Arc<Inventory>>),
 }
 #[derive(Clone)]
-pub(super) struct Ticket(watch::Receiver<Progress>, u64);
+pub(super) struct Ticket {
+    progress: watch::Receiver<Progress>,
+    id: u64,
+    telemetry_id: Option<String>,
+}
 impl Ticket {
     pub fn id(&self) -> u64 {
-        self.1
+        self.id
+    }
+    pub fn telemetry_id(&self) -> Option<String> {
+        self.telemetry_id.clone()
     }
     pub fn discovering(&self) -> bool {
-        matches!(*self.0.borrow(), Progress::Pending(_))
+        matches!(*self.progress.borrow(), Progress::Pending(_))
     }
     pub fn running(&self) -> bool {
-        matches!(*self.0.borrow(), Progress::Pending(_) | Progress::Files(_))
+        matches!(
+            *self.progress.borrow(),
+            Progress::Pending(_) | Progress::Files(_)
+        )
     }
     pub fn needs_refresh(&self) -> bool {
-        match &*self.0.borrow() {
+        match &*self.progress.borrow() {
             Progress::Ready(inventory) => inventory.watch.changed(),
             Progress::Failed(..) => true,
             Progress::Pending(_) | Progress::Files(_) => false,
         }
     }
     pub fn retained_inventory(&self) -> bool {
-        matches!(*self.0.borrow(), Progress::Failed(_, Some(_)))
+        matches!(*self.progress.borrow(), Progress::Failed(_, Some(_)))
     }
     pub async fn inventory(&mut self) -> Result<Arc<Inventory>> {
         loop {
-            match self.0.borrow().clone() {
+            match self.progress.borrow().clone() {
                 Progress::Files(files)
                 | Progress::Ready(files)
                 | Progress::Failed(_, Some(files)) => return Ok(files),
@@ -61,12 +71,12 @@ impl Ticket {
                     tracing::Span::current().record("stage", stage);
                 }
             }
-            self.0.changed().await?;
+            self.progress.changed().await?;
         }
     }
     pub async fn complete(&mut self) -> Result<()> {
         loop {
-            match self.0.borrow().clone() {
+            match self.progress.borrow().clone() {
                 Progress::Ready(_) => return Ok(()),
                 Progress::Failed(error, _) => {
                     return Err(crate::diagnostics::shared_error(error));
@@ -78,7 +88,7 @@ impl Ticket {
                     tracing::Span::current().record("stage", "source_indexing");
                 }
             }
-            self.0.changed().await?;
+            self.progress.changed().await?;
         }
     }
 }
@@ -175,10 +185,16 @@ impl App {
         query: Option<Query>,
         usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+        operation: crate::telemetry::Operation,
     ) -> Result<CallToolResult> {
         tracing::Span::current().record("stage", "query_admission");
-        let permit = self.navigation_workers.clone().acquire_owned().await?;
+        operation.stage("query_admission");
+        let permit = {
+            let _wait = operation.wait("query_admission");
+            self.navigation_workers.clone().acquire_owned().await?
+        };
         tracing::Span::current().record("stage", "evaluation");
+        operation.stage("evaluation");
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();
@@ -244,6 +260,16 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     let (send, receive) = watch::channel(Progress::Pending("preparation"));
     static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let job = NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let repository = preparing_branch
+        .as_ref()
+        .map(|branch| branch.repository.identity.to_string())
+        .or_else(|| Some(entry.display().to_string()));
+    let operation =
+        crate::telemetry::operation("workspace_preparation", repository.as_deref(), None);
+    if let Some(branch) = &preparing_branch {
+        operation.target(&branch.name);
+    }
+    let telemetry_id = operation.id();
     tokio::spawn(async move {
         tracing::debug!(shared_job = job, workspace = %entry.display(), "Workspace preparation started");
         let outcome = async {
@@ -251,14 +277,29 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             preparing_app.preparation_started.notify_one();
             // Lock order: workspace -> branch analysis -> branch state.
             // RequiredInputs releases both branch guards before acquisition.
-            let mut state = workspace.clone().lock_owned().await;
+            let mut state = {
+                let _wait = operation.wait("workspace_lock");
+                workspace.clone().lock_owned().await
+            };
             if let Some(branch) = &preparing_branch {
                 send.send_replace(Progress::Pending("acquisition"));
-                preparing_app.remote.as_ref().unwrap().ready(branch).await?;
+                operation.stage("repository_acquisition");
+                if let Some(job_id) = branch.telemetry_id() {
+                    operation.link(&job_id);
+                }
+                preparing_app
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .ready(branch, &operation)
+                    .await?;
                 send.send_replace(Progress::Pending("preparation"));
             }
             let mut branch_state = match &preparing_branch {
-                Some(branch) => Some(branch.analyze().await),
+                Some(branch) => {
+                    let _wait = operation.wait("branch_analysis");
+                    Some(branch.analyze().await)
+                }
                 None => None,
             };
             let mut policy = policy;
@@ -289,12 +330,17 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 let generation = preparing_branch
                     .as_ref()
                     .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
-                let permit = preparing_app.preparation_workers.clone().acquire_owned().await?;
+                operation.stage("discovery_admission");
+                let permit = {
+                    let _wait = operation.wait("discovery_admission");
+                    preparing_app.preparation_workers.clone().acquire_owned().await?
+                };
                 #[cfg(test)]
                 let _discovery_pause = {
                     preparing_app.discovery_started.notify_one();
                     preparing_app.discovery_pause.clone().acquire_owned().await?
                 };
+                operation.stage("discovery");
                 let (next, result) = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
                     if state.is_none() {
@@ -342,14 +388,18 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .clone();
                         drop(branch_state.take());
                         send.send_replace(Progress::Pending("acquisition"));
+                        operation.stage("required_input_acquisition");
                         preparing_app
                             .remote
                             .as_ref()
                             .unwrap()
-                            .require_inputs(branch, &revision, paths)
+                            .require_inputs(branch, &revision, paths, &operation)
                             .await?;
                         send.send_replace(Progress::Pending("preparation"));
-                        let gate = branch.analyze().await;
+                        let gate = {
+                            let _wait = operation.wait("branch_analysis");
+                            branch.analyze().await
+                        };
                         let applied = gate
                             .as_ref()
                             .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
@@ -380,10 +430,15 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     watch: prepared.watch.clone(),
                 })));
                 let queued = std::time::Instant::now();
-                let permit = preparing_app.indexing_workers.clone().acquire_owned().await?;
+                operation.stage("indexing_admission");
+                let permit = {
+                    let _wait = operation.wait("indexing_admission");
+                    preparing_app.indexing_workers.clone().acquire_owned().await?
+                };
                 tracing::debug!(workspace = %entry.display(), wait_ms = queued.elapsed().as_millis(), "indexing worker admitted");
                 #[cfg(test)]
                 let _pause = preparing_app.indexing_pause.clone().acquire_owned().await?;
+                operation.stage("workspace_indexing");
                 state = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
                     state.as_mut().unwrap().apply_plan(prepared)?;
@@ -407,7 +462,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
             drop(branch_state);
             if let Some(branch) = &preparing_branch {
-                let mut gate = branch.publish().await;
+                let mut gate = {
+                    let _wait = operation.wait("repository_publication");
+                    branch.publish().await
+                };
                 let metadata = gate.as_mut().unwrap();
                 // Publication can win the gap between releasing the read guard and
                 // acquiring the writer. Only mark the generation we actually indexed.
@@ -424,7 +482,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     }).await??;
                 }
             }
-            preparing_app.start_assets(
+            let assets = preparing_app.start_assets(
                 workspace.clone(),
                 preparing_branch.clone(),
                 &code.manifest,
@@ -435,8 +493,11 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 false,
                 preparing_activity.clone(),
             )?;
+            if let Some(job_id) = assets.telemetry_id() {
+                operation.link(&job_id);
+            }
             for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
-                preparing_app.sources.start(crate::native::jobs::Request {
+                let source = preparing_app.sources.start(crate::native::jobs::Request {
                     activity: preparing_activity.clone(),
                     workspace: workspace.clone(),
                     branch: preparing_branch.clone(),
@@ -445,6 +506,9 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     manifest: code.manifest.clone(),
                     group,
                 })?;
+                if let Some(job_id) = source.telemetry_id() {
+                    operation.link(&job_id);
+                }
             }
             preparing_app.owners.lock().unwrap().observe(
                 &entry,
@@ -456,9 +520,13 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         }
         .await;
         let progress = match outcome {
-            Ok(inventory) => Progress::Ready(inventory),
+            Ok(inventory) => {
+                operation.finish("success");
+                Progress::Ready(inventory)
+            }
             Err(error) => {
                 tracing::warn!(shared_job = job, workspace = %entry.display(), error = %format!("{error:#}"), "Workspace indexing failed");
+                operation.finish("failure");
                 let inventory = match &*send.borrow() {
                     Progress::Files(inventory) => Some(inventory.clone()),
                     _ => None,
@@ -468,5 +536,9 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         };
         send.send_replace(progress);
     });
-    Ticket(receive, job)
+    Ticket {
+        progress: receive,
+        id: job,
+        telemetry_id,
+    }
 }

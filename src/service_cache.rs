@@ -4,7 +4,24 @@ use crate::cache::{
     blobs,
     policy::{Candidate, Disk},
 };
-use std::{collections::VecDeque, fs};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fs,
+};
+
+struct MaintenanceDiskSample {
+    measured_at_ms: u64,
+    allocation: blobs::AttributedAllocation,
+}
+
+fn publish_disk_sample(sample: MaintenanceDiskSample) {
+    crate::telemetry::disk_sample_at(
+        sample.measured_at_ms,
+        sample.allocation.total_bytes,
+        sample.allocation.repositories,
+        sample.allocation.shared,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct MaintenanceOutcome {
@@ -380,7 +397,12 @@ mod startup_tests {
     }
 }
 
-fn maintenance_stage<T>(name: &str, run: impl FnOnce() -> Result<T>) -> Result<T> {
+fn maintenance_stage<T>(
+    operation: &crate::telemetry::Operation,
+    name: &str,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    operation.stage(name);
     let start = Instant::now();
     tracing::info!(stage = name, "Disk cache maintenance stage started");
     let result = run();
@@ -516,19 +538,25 @@ impl App {
                 return Ok(MaintenanceOutcome::default());
             }
             let start = Instant::now();
+            let operation = crate::telemetry::operation("cache_maintenance", None, None);
+            let mut disk_sample: Option<MaintenanceDiskSample> = None;
             tracing::info!("Disk cache maintenance started");
             started();
-            let result = app.maintain_disk_shared();
+            let result = app.maintain_disk_shared_with(&operation, &mut disk_sample);
             drop(_gate);
             let result = result.and_then(|mut outcome| {
                 if outcome.pressure && !app.inspection_shutdown.is_cancelled() {
-                    let compact = app.try_compaction()?;
+                    let compact = app.try_compaction_with(&operation, &mut disk_sample)?;
                     outcome.pressure = compact.pressure;
                     outcome.progress |= compact.progress;
                     outcome.compaction_deferred = compact.compaction_deferred;
                 }
                 Ok(outcome)
             });
+            if let Some(sample) = disk_sample {
+                publish_disk_sample(sample);
+            }
+            operation.finish(if result.is_ok() { "success" } else { "failure" });
             tracing::info!(
                 elapsed_ms = start.elapsed().as_millis(),
                 success = result.is_ok(),
@@ -542,7 +570,22 @@ impl App {
     pub(super) async fn retry_compaction(self: &Arc<Self>) -> Result<MaintenanceOutcome> {
         let app = self.clone();
         // Await the blocking worker even during shutdown: it owns the cache.
-        tokio::task::spawn_blocking(move || app.try_compaction()).await?
+        tokio::task::spawn_blocking(move || {
+            let operation = crate::telemetry::operation("cache_maintenance", None, None);
+            let mut disk_sample: Option<MaintenanceDiskSample> = None;
+            let result = app.try_compaction_with(&operation, &mut disk_sample);
+            if let Some(sample) = disk_sample {
+                publish_disk_sample(sample);
+            }
+            let status = match &result {
+                Ok(outcome) if !outcome.progress => "noop",
+                Ok(_) => "success",
+                Err(_) => "failure",
+            };
+            operation.finish(status);
+            result
+        })
+        .await?
     }
 
     pub(super) async fn maintain_git(&self, outcome: Option<MaintenanceOutcome>) -> Result<()> {
@@ -563,7 +606,12 @@ impl App {
             .await?
     }
 
-    fn try_compaction(&self) -> Result<MaintenanceOutcome> {
+    fn try_compaction_with(
+        &self,
+        operation: &crate::telemetry::Operation,
+        disk_sample: &mut Option<MaintenanceDiskSample>,
+    ) -> Result<MaintenanceOutcome> {
+        operation.stage("analysis compaction check");
         let mut outcome = MaintenanceOutcome {
             pressure: true,
             ..Default::default()
@@ -596,16 +644,77 @@ impl App {
             tracing::info!("Analysis compaction deferred while queries or indexing are active");
             return Ok(outcome);
         };
-        let reclaimed = maintenance_stage("analysis compaction", || self.compact_analysis())?;
+        let reclaimed =
+            maintenance_stage(operation, "analysis compaction", || self.compact_analysis())?;
         drop(_idle);
         outcome.progress = reclaimed > 0;
         // Full filesystem accounting is needed only after an actual copy.
         if outcome.progress {
+            let repository_roots =
+                crate::telemetry::enabled().then(|| self.repository_disk_roots_for_telemetry());
+            let (allocated, sample) = self.measure_allocated(repository_roots.as_ref())?;
+            if sample.is_some() {
+                *disk_sample = sample;
+            }
             outcome.pressure = self
                 .cache_limits
-                .pressured(blobs::allocated(&self.cache)?, Disk::read(&self.cache)?);
+                .pressured(allocated, Disk::read(&self.cache)?);
         }
         Ok(outcome)
+    }
+
+    fn repository_disk_roots(&self) -> Result<BTreeMap<std::path::PathBuf, String>> {
+        let mut roots = BTreeMap::new();
+        for (root, state) in crate::repository::retention::cached(&self.cache)? {
+            let identity = state.repository.to_string();
+            roots.insert(root, identity.clone());
+            roots.insert(
+                self.cache.join("git").join(state.repository.storage_key()),
+                identity,
+            );
+        }
+        for (history, identity, _) in crate::repository::cache::history_owners(&self.cache)? {
+            if let Some(root) = history.parent() {
+                roots.insert(root.to_owned(), identity.to_string());
+            }
+        }
+        Ok(roots)
+    }
+
+    fn repository_disk_roots_for_telemetry(&self) -> BTreeMap<std::path::PathBuf, String> {
+        match self.repository_disk_roots() {
+            Ok(roots) => roots,
+            Err(error) => {
+                tracing::warn!(%error, "Repository disk attribution unavailable; assigning cache usage to shared categories");
+                BTreeMap::new()
+            }
+        }
+    }
+
+    fn measure_allocated(
+        &self,
+        repository_roots: Option<&BTreeMap<std::path::PathBuf, String>>,
+    ) -> Result<(u64, Option<MaintenanceDiskSample>)> {
+        if let Some(repository_roots) = repository_roots {
+            match blobs::allocated_attributed(&self.cache, repository_roots) {
+                Ok(allocation) => {
+                    let measured_at_ms = crate::telemetry::now_ms();
+                    Ok((
+                        allocation.total_bytes,
+                        Some(MaintenanceDiskSample {
+                            measured_at_ms,
+                            allocation,
+                        }),
+                    ))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Attributed disk measurement failed; continuing with total disk measurement");
+                    Ok((blobs::allocated(&self.cache)?, None))
+                }
+            }
+        } else {
+            Ok((blobs::allocated(&self.cache)?, None))
+        }
     }
 
     fn seed_owners(&self) -> Result<bool> {
@@ -940,7 +1049,23 @@ impl App {
         Ok(progress)
     }
 
+    #[cfg(test)]
     fn maintain_disk_shared(&self) -> Result<MaintenanceOutcome> {
+        let operation = crate::telemetry::operation("cache_maintenance", None, None);
+        let mut disk_sample: Option<MaintenanceDiskSample> = None;
+        let result = self.maintain_disk_shared_with(&operation, &mut disk_sample);
+        if let Some(sample) = disk_sample {
+            publish_disk_sample(sample);
+        }
+        operation.finish(if result.is_ok() { "success" } else { "failure" });
+        result
+    }
+
+    fn maintain_disk_shared_with(
+        &self,
+        operation: &crate::telemetry::Operation,
+        disk_sample: &mut Option<MaintenanceDiskSample>,
+    ) -> Result<MaintenanceOutcome> {
         let mut outcome = MaintenanceOutcome::default();
         // Retry optional disposal independently of retirement and pressure relief.
         if let Err(error) = crate::cache::compaction::cleanup(&self.cache) {
@@ -953,27 +1078,40 @@ impl App {
             retired.dispose()?;
             outcome.progress = true;
         }
-        let known = maintenance_stage("ownership scan", || self.seed_owners())?;
-        let before = maintenance_stage("disk measurement", || blobs::allocated(&self.cache))?;
+        let known = maintenance_stage(operation, "ownership scan", || self.seed_owners())?;
+        let repository_roots =
+            crate::telemetry::enabled().then(|| self.repository_disk_roots_for_telemetry());
+        let before = maintenance_stage(operation, "disk measurement", || {
+            blobs::allocated(&self.cache)
+        })?;
         let disk = Disk::read(&self.cache)?;
         let pressure = self.cache_limits.pressured(before, disk);
-        let mut candidates = maintenance_stage("eviction planning", || self.candidates())?;
+        let mut candidates =
+            maintenance_stage(operation, "eviction planning", || self.candidates())?;
         for candidate in candidates.iter().filter(|candidate| candidate.expired) {
             if self.inspection_shutdown.is_cancelled() {
                 return Ok(outcome);
             }
             outcome.progress |= self.evict_candidate(candidate, false)?;
         }
+        outcome.progress |= maintenance_stage(operation, "analysis collection", || {
+            self.collect_analysis(pressure)
+        })?;
         outcome.progress |=
-            maintenance_stage("analysis collection", || self.collect_analysis(pressure))?;
-        outcome.progress |= maintenance_stage("view collection", || self.collect_views(known))?;
-        maintenance_stage("blob collection", || {
+            maintenance_stage(operation, "view collection", || self.collect_views(known))?;
+        maintenance_stage(operation, "blob collection", || {
             self.blobs.collect_with_pressure(pressure)
         })?;
-        maintenance_stage("asset record collection", || {
+        maintenance_stage(operation, "asset record collection", || {
             self.asset_records.collect(pressure)
         })?;
-        let mut after = blobs::allocated(&self.cache)?;
+        let (mut after, sample) =
+            maintenance_stage(operation, "post-collection disk measurement", || {
+                self.measure_allocated(repository_roots.as_ref())
+            })?;
+        if sample.is_some() {
+            *disk_sample = sample;
+        }
         candidates.retain(|candidate| !candidate.expired);
         let mut remaining = self.cache_limits.reclaim(after, Disk::read(&self.cache)?);
         let mut savings = if remaining > 0 {
@@ -983,7 +1121,7 @@ impl App {
         };
         if remaining > savings {
             let owners = self.owners.lock().unwrap().clone();
-            maintenance_stage("eviction ranking", || {
+            maintenance_stage(operation, "eviction ranking", || {
                 crate::cache::policy::rank(&owners, &mut candidates, crate::cache::now())
             })?;
         }
@@ -1012,25 +1150,43 @@ impl App {
             if !evicted {
                 break;
             }
+            outcome.progress |= maintenance_stage(operation, "analysis collection", || {
+                self.collect_analysis(true)
+            })?;
             outcome.progress |=
-                maintenance_stage("analysis collection", || self.collect_analysis(true))?;
-            outcome.progress |= maintenance_stage("view collection", || self.collect_views(known))?;
-            maintenance_stage("blob collection", || self.blobs.collect_with_pressure(true))?;
-            maintenance_stage("asset record collection", || {
+                maintenance_stage(operation, "view collection", || self.collect_views(known))?;
+            maintenance_stage(operation, "blob collection", || {
+                self.blobs.collect_with_pressure(true)
+            })?;
+            maintenance_stage(operation, "asset record collection", || {
                 self.asset_records.collect(true)
             })?;
-            after = blobs::allocated(&self.cache)?;
+            let (measured, sample) =
+                maintenance_stage(operation, "post-eviction disk measurement", || {
+                    self.measure_allocated(repository_roots.as_ref())
+                })?;
+            after = measured;
+            if sample.is_some() {
+                *disk_sample = sample;
+            }
             remaining = remaining.saturating_add(after).saturating_sub(allocated);
             savings = self.analysis_savings(Disk::read(&self.cache)?)?;
         }
         // Avoid repacking Git when the known compact-copy savings already meet
         // the target. Repacking is the fallback after idle victims are exhausted.
         if remaining > savings {
-            maintenance_stage("Git reclamation", || {
+            maintenance_stage(operation, "Git reclamation", || {
                 crate::repository::cache::reclaim(&self.cache)
             })?;
             outcome.git_completed = true;
-            after = blobs::allocated(&self.cache)?;
+            let (measured, sample) =
+                maintenance_stage(operation, "post-Git disk measurement", || {
+                    self.measure_allocated(repository_roots.as_ref())
+                })?;
+            after = measured;
+            if sample.is_some() {
+                *disk_sample = sample;
+            }
         }
         self.flush_owners()?;
         let disk = Disk::read(&self.cache)?;

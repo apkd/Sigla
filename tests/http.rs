@@ -11,6 +11,8 @@ use std::sync::Arc;
 async fn http_contract_and_origin_validation() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let monitoring = tempfile::tempdir().unwrap();
+    let recorder = sigla::telemetry::init(monitoring.path()).unwrap();
     std::fs::write(
         root.path().join("Cargo.toml"),
         "[package]\nname='http_fixture'\nversion='0.1.0'\n",
@@ -132,6 +134,26 @@ async fn http_contract_and_origin_validation() {
             "{called}"
         );
     }
+    for name in ["unknown_monitoring_tool", "search"] {
+        let mut request = client
+            .post(&url)
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(session) = &session {
+            request = request.header("mcp-session-id", session);
+        }
+        let failed = body(
+            request
+                .json(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":5, "method":"tools/call",
+                    "params":{"name":name,"arguments":{"codebase":root.path()}}
+                }))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(failed.get("error").is_some() || failed["result"]["isError"] == true);
+    }
     let denied = client
         .post(&url)
         .header("Origin", "https://untrusted.invalid")
@@ -142,6 +164,39 @@ async fn http_contract_and_origin_validation() {
         .unwrap();
     assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
     server.abort();
+    drop(recorder);
+    let exported = sigla::telemetry::export(monitoring.path(), None).unwrap();
+    let calls: Vec<_> = exported
+        .operations
+        .iter()
+        .filter(|record| {
+            record.repository.as_deref() == root.path().to_str()
+                && matches!(
+                    record.kind.as_str(),
+                    "search" | "browse" | "view" | "unknown_monitoring_tool"
+                )
+        })
+        .collect();
+    assert_eq!(
+        calls.len(),
+        6,
+        "Each tool call must have exactly one completion"
+    );
+    let ids: std::collections::HashSet<_> = calls.iter().map(|record| &record.id).collect();
+    assert_eq!(ids.len(), calls.len());
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|record| record.status == "failure")
+            .count(),
+        2
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|record| record.kind == "view")
+            .all(|record| record.query.is_some())
+    );
 }
 async fn body(response: reqwest::Response) -> serde_json::Value {
     let text = response.text().await.unwrap();

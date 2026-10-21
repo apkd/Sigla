@@ -15,9 +15,17 @@ impl App {
         self: &Arc<Self>,
         path: &str,
         query: &str,
+        operation: crate::telemetry::Operation,
     ) -> Result<CallToolResult> {
+        operation.stage("query_parse");
         crate::history::validate(query)?;
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
+        if let Some(repository) = &repository {
+            operation.repository(&repository.identity.to_string());
+            if let Some(selector) = &repository.selector {
+                operation.target(selector);
+            }
+        }
         let rules = if repository.is_some() {
             Some(
                 self.remote
@@ -53,20 +61,35 @@ impl App {
         } else {
             None
         };
+        if let Some((directory, selector)) = &local {
+            operation.repository(&directory.display().to_string());
+            if let Some(selector) = selector {
+                operation.target(selector);
+            }
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel = Cancel(cancel.clone());
         tracing::Span::current().record("stage", "query_admission");
-        let permit = self.workers.clone().acquire_owned().await?;
+        operation.stage("query_admission");
+        let permit = {
+            let _wait = operation.wait("query_admission");
+            self.workers.clone().acquire_owned().await?
+        };
         tracing::Span::current().record("stage", "maintenance");
-        let activity = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.activity.clone().read_owned(),
-        )
-        .await
-        .map_err(|_| crate::diagnostics::MaintenanceBusy)?;
+        operation.stage("maintenance_admission");
+        let activity = {
+            let _wait = operation.wait("maintenance_admission");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.activity.clone().read_owned(),
+            )
+            .await
+            .map_err(|_| crate::diagnostics::MaintenanceBusy)?
+        };
         let app = self.clone();
         let query = query.to_owned();
         tracing::Span::current().record("stage", "evaluation");
+        operation.stage("evaluation");
         let text = tokio::task::spawn_blocking(move || -> Result<String> {
             let (_permit, _activity) = (permit, activity);
             crate::repository::history::check(&cancel)?;

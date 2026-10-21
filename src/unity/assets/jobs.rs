@@ -12,9 +12,36 @@ use std::{
 };
 use tokio::sync::{Semaphore, watch};
 type Outcome = std::result::Result<Arc<Index>, Arc<anyhow::Error>>;
-pub type Ticket = watch::Receiver<Option<Outcome>>;
+#[derive(Clone)]
+pub struct Ticket {
+    outcome: watch::Receiver<Option<Outcome>>,
+    telemetry_id: Option<String>,
+}
+impl Ticket {
+    pub fn telemetry_id(&self) -> Option<String> {
+        self.telemetry_id.clone()
+    }
+    pub fn ready_index(&self) -> Option<Arc<Index>> {
+        self.outcome
+            .borrow()
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .cloned()
+    }
+
+    fn borrow(&self) -> watch::Ref<'_, Option<Outcome>> {
+        self.outcome.borrow()
+    }
+
+    async fn changed(&mut self) -> std::result::Result<(), watch::error::RecvError> {
+        self.outcome.changed().await
+    }
+}
 pub fn empty() -> Ticket {
-    watch::channel(Some(Ok(Arc::new(Index::default())))).1
+    Ticket {
+        outcome: watch::channel(Some(Ok(Arc::new(Index::default())))).1,
+        telemetry_id: None,
+    }
 }
 pub struct Request {
     pub activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -132,6 +159,23 @@ impl Jobs {
             (false, None)
         };
         let (sender, ticket) = watch::channel(None);
+        let repository = request
+            .branch
+            .as_ref()
+            .map(|branch| branch.repository.identity.to_string())
+            .or_else(|| Some(request.root.display().to_string()));
+        let operation = crate::telemetry::operation(
+            "unity_asset_index",
+            repository.as_deref(),
+            request.revision.as_deref(),
+        );
+        if let Some(branch) = &request.branch {
+            operation.target(&branch.name);
+        }
+        let ticket = Ticket {
+            outcome: ticket,
+            telemetry_id: operation.id(),
+        };
         let cancel = self.shutdown.child_token();
         jobs.insert(
             request.root.clone(),
@@ -146,11 +190,16 @@ impl Jobs {
         tokio::spawn(async move {
             let log_root = request.root.clone();
             let outcome = async {
+                operation.stage("worker_admission");
+                let _wait = operation.wait("worker_admission");
                 let permit = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
                     permit = workers.acquire_owned() => permit?,
                 };
+                drop(_wait);
+                operation.stage("asset_capture");
+                let _wait = operation.wait("asset_capture");
                 let (state, branch_state) = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
@@ -163,7 +212,9 @@ impl Jobs {
                         (state, branch_state)
                     } => guards,
                 };
+                drop(_wait);
                 let building_cancel = cancel.clone();
+                operation.stage("asset_indexing");
                 let completed = tokio::task::spawn_blocking(move || -> Result<Completed> {
                     let code = state.as_ref().context("Code workspace unavailable")?;
                     ensure!(
@@ -220,10 +271,17 @@ impl Jobs {
                     Ok(Completed { request, index, snapshot, started, _permit: permit, _dependencies: dependencies })
                 })
                 .await??;
-                publish(completed, &cancel, sender.clone()).await
+                publish(completed, &cancel, sender.clone(), operation.clone()).await
             }
             .await
             .map_err(Arc::new);
+            operation.finish(if outcome.is_ok() {
+                "success"
+            } else if cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "failure"
+            });
             if let Err(error) = outcome {
                 tracing::warn!(workspace = %log_root.display(), error = %format_args!("{error:#}"), "Unity asset index failed");
                 sender.send_replace(Some(Err(error)));
@@ -237,9 +295,12 @@ async fn publish(
     completed: Completed,
     cancel: &tokio_util::sync::CancellationToken,
     sender: watch::Sender<Option<Outcome>>,
+    operation: crate::telemetry::Operation,
 ) -> Result<()> {
     // Use the same workspace -> state order as the initial capture. The request
     // retains activity, dependency leases and the branch handle through publication.
+    operation.stage("publication");
+    let _wait = operation.wait("asset_publication");
     let (state, branch_state) = tokio::select! {
         biased;
         _ = cancel.cancelled() => anyhow::bail!("Asset indexing cancelled or superseded"),
@@ -252,6 +313,7 @@ async fn publish(
             (state, branch_state)
         } => guards,
     };
+    drop(_wait);
     let cancel = cancel.clone();
     tokio::task::spawn_blocking(move || {
         // Move every lifetime guard into blocking work, even if its waiter drops.
@@ -384,7 +446,16 @@ mod tests {
             let mut refreshing = branch.state.write().await;
             let cancel = tokio_util::sync::CancellationToken::new();
             let (sender, ticket) = watch::channel(None);
-            let publication = publish(completed, &cancel, sender);
+            let ticket = Ticket {
+                outcome: ticket,
+                telemetry_id: None,
+            };
+            let publication = publish(
+                completed,
+                &cancel,
+                sender,
+                crate::telemetry::Operation::default(),
+            );
             tokio::pin!(publication);
             std::future::poll_fn(|cx| {
                 assert!(publication.as_mut().poll(cx).is_pending());
@@ -487,7 +558,16 @@ mod tests {
         let _refreshing = branch.state.write().await;
         let cancel = tokio_util::sync::CancellationToken::new();
         let (sender, ticket) = watch::channel(None);
-        let publication = publish(completed, &cancel, sender);
+        let ticket = Ticket {
+            outcome: ticket,
+            telemetry_id: None,
+        };
+        let publication = publish(
+            completed,
+            &cancel,
+            sender,
+            crate::telemetry::Operation::default(),
+        );
         tokio::pin!(publication);
         std::future::poll_fn(|cx| {
             assert!(publication.as_mut().poll(cx).is_pending());
@@ -509,6 +589,10 @@ mod tests {
         ))
         .context("asset publication");
         let (sender, ticket) = watch::channel(Some(Err(Arc::new(failure))));
+        let ticket = Ticket {
+            outcome: ticket,
+            telemetry_id: None,
+        };
         let error = wait(ticket.clone()).await.err().expect("refresh must fail");
         let details = crate::diagnostics::details(&error, "asset-refresh");
         assert_eq!(details["error_code"], "UNAVAILABLE");

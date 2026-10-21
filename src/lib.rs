@@ -34,6 +34,7 @@ pub mod service;
 pub mod signature;
 pub mod store;
 mod summary;
+pub mod telemetry;
 pub mod unity;
 pub mod watch;
 pub mod workspace;

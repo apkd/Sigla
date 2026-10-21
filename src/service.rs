@@ -70,6 +70,7 @@ pub struct App {
     _ownership: Ownership,
 }
 impl App {
+    #[cfg(test)]
     async fn request_cancellable(
         self: &Arc<Self>,
         path: &str,
@@ -77,10 +78,27 @@ impl App {
         cancel: &tokio_util::sync::CancellationToken,
         upstream: Option<&crate::upstream::Upstream>,
     ) -> Result<CallToolResult> {
+        self.request_cancellable_monitored(
+            path,
+            request,
+            cancel,
+            upstream,
+            crate::telemetry::Operation::default(),
+        )
+        .await
+    }
+    async fn request_cancellable_monitored(
+        self: &Arc<Self>,
+        path: &str,
+        request: Request,
+        cancel: &tokio_util::sync::CancellationToken,
+        upstream: Option<&crate::upstream::Upstream>,
+        operation: crate::telemetry::Operation,
+    ) -> Result<CallToolResult> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(crate::diagnostics::Cancelled.into()),
-            result = self.dispatch_with_upstream(path, request, upstream) => result,
+            result = self.dispatch_with_upstream(path, request, upstream, operation) => result,
         }
     }
     fn trim_idle(&self) {
@@ -299,14 +317,19 @@ impl App {
                     if tokio::time::Instant::now() >= next_startup
                         && let Some(state) = pending.as_mut()
                     {
+                        let maintenance =
+                            crate::telemetry::operation("startup_maintenance", None, None);
+                        maintenance.stage("retiring_cached_analysis");
                         let delay = match app.maintain_startup(state).await {
                             Ok(done) => {
+                                maintenance.finish("success");
                                 if done {
                                     pending = None;
                                 }
                                 retry
                             }
                             Err(error) => {
+                                maintenance.finish("failure");
                                 tracing::warn!(%error, "Startup cache maintenance deferred");
                                 std::time::Duration::from_secs(30)
                             }
@@ -374,7 +397,13 @@ impl App {
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || -> Result<()> {
                 for version in versions {
-                    crate::unity::acquire::prefetch(&cache, version)?;
+                    let version_label = version.to_string();
+                    crate::telemetry::record(
+                        "editor_prefetch",
+                        None,
+                        Some(&version_label),
+                        || crate::unity::acquire::prefetch(&cache, version),
+                    )?;
                 }
                 Ok(())
             })
@@ -563,7 +592,12 @@ impl App {
     }
     async fn dispatch(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
         let result = self
-            .dispatch_with_upstream(path, request, self.upstream.as_ref())
+            .dispatch_with_upstream(
+                path,
+                request,
+                self.upstream.as_ref(),
+                crate::telemetry::Operation::default(),
+            )
             .await?;
         Ok(crate::summary::Session::default().present(result))
     }
@@ -572,6 +606,7 @@ impl App {
         path: &str,
         request: Request,
         upstream: Option<&crate::upstream::Upstream>,
+        operation: crate::telemetry::Operation,
     ) -> Result<CallToolResult> {
         ensure!(
             !path.trim().is_empty(),
@@ -589,7 +624,12 @@ impl App {
         if let Some(upstream) = upstream
             && let Some(repository) = crate::repository::Repository::project(path, true)?
         {
+            operation.repository(&repository.identity.to_string());
+            if let Some(selector) = &repository.selector {
+                operation.target(selector);
+            }
             tracing::Span::current().record("stage", "upstream");
+            operation.stage("upstream");
             let mut project = repository.transport;
             if let Some((_, selector)) = path.trim().split_once('#') {
                 project.push('#');
@@ -617,34 +657,54 @@ impl App {
                     }}),
                 ),
             };
+            let _wait = operation.wait("upstream");
             return upstream.call(name, args.as_object().unwrap().clone()).await;
         }
-        self.request(path, request).await
+        self.request(path, request, operation).await
     }
 
-    async fn request(self: &Arc<Self>, path: &str, request: Request) -> Result<CallToolResult> {
+    async fn request(
+        self: &Arc<Self>,
+        path: &str,
+        request: Request,
+        operation: crate::telemetry::Operation,
+    ) -> Result<CallToolResult> {
         if let Request::History(query) = &request {
-            return self.history_request(path, query).await;
+            return self.history_request(path, query, operation).await;
         }
         tracing::Span::current().record("stage", "maintenance");
-        let activity = Arc::new(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.activity.clone().read_owned(),
+        operation.stage("maintenance_admission");
+        let activity = {
+            let _wait = operation.wait("maintenance_admission");
+            Arc::new(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.activity.clone().read_owned(),
+                )
+                .await
+                .map_err(|_| crate::diagnostics::MaintenanceBusy)?,
             )
-            .await
-            .map_err(|_| crate::diagnostics::MaintenanceBusy)?,
-        );
+        };
         let query = match &request {
-            Request::Search(query) => Some(
-                Query::parse(query)
-                    .map_err(|error| anyhow::anyhow!("Invalid search query: {error}"))?,
-            ),
+            Request::Search(query) => {
+                operation.stage("query_parse");
+                Some(
+                    Query::parse(query)
+                        .map_err(|error| anyhow::anyhow!("Invalid search query: {error}"))?,
+                )
+            }
             _ => None,
         };
         self.start_setup();
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
+        if let Some(repository) = &repository {
+            operation.repository(&repository.identity.to_string());
+            if let Some(selector) = &repository.selector {
+                operation.target(selector);
+            }
+        }
         tracing::Span::current().record("stage", "acquisition");
+        operation.stage("repository_acquisition");
         if let Some(repository) = &repository {
             tracing::Span::current()
                 .record("selector", tracing::field::debug(&repository.selector));
@@ -654,13 +714,18 @@ impl App {
                 let remote = self.remote.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("Repository identifiers require --mode remote")
                 })?;
-                Some(
-                    if matches!(request, Request::Browse(_) | Request::View(..)) {
-                        remote.resolve_inventory(repository).await?
-                    } else {
-                        remote.resolve(repository).await?
-                    },
-                )
+                let _wait = operation.wait("repository_acquisition");
+                let branch = if matches!(request, Request::Browse(_) | Request::View(..)) {
+                    remote
+                        .resolve_inventory_monitored(repository, &operation)
+                        .await?
+                } else {
+                    remote.resolve_monitored(repository, &operation).await?
+                };
+                if let Some(job_id) = branch.telemetry_id() {
+                    operation.link(&job_id);
+                }
+                Some(branch)
             }
             None => None,
         };
@@ -708,9 +773,18 @@ impl App {
             }
             (entry, policy, self.cache.clone())
         };
+        if branch.is_none() {
+            let repository_path = if entry.is_dir() {
+                entry.as_path()
+            } else {
+                entry.parent().unwrap_or(entry.as_path())
+            };
+            operation.repository(&repository_path.display().to_string());
+        }
         let usage_entry = entry.clone();
         let usage_branch = branch.clone();
         tracing::Span::current().record("stage", "preparation");
+        operation.stage("workspace_preparation");
         let (workspace, mut preparation, inventory) = loop {
             let (workspace, mut preparation, retired) = {
                 let mut registry = self.workspaces.lock().unwrap();
@@ -763,23 +837,39 @@ impl App {
             };
             drop(retired);
             tracing::Span::current().record("shared_job", preparation.id());
+            if let Some(job_id) = preparation.telemetry_id() {
+                operation.link(&job_id);
+            }
             if preparation.discovering()
                 && let Some(branch) = &branch
                 && (matches!(request, Request::Browse(_))
                     || matches!(request, Request::View(..)) && indexes::source_only(&request, None))
-                && let Some(result) = self
+            {
+                operation.stage("navigation");
+                let _wait = operation.wait("navigation");
+                if let Some(result) = self
                     .navigate_repository(branch.clone(), request.clone(), activity.clone())
                     .await?
-            {
-                return Ok(result);
+                {
+                    return Ok(result);
+                }
             }
             tracing::Span::current().record("stage", "preparation");
-            let inventory = preparation.inventory().await?;
+            let inventory = {
+                let _wait = operation.wait("workspace_preparation");
+                preparation.inventory().await?
+            };
             if let Some((_, selector, revision, _)) = &inventory.context {
                 tracing::Span::current().record("selector", selector.as_str());
                 tracing::Span::current().record("revision", revision.as_str());
+                operation.target(revision);
             }
-            if inventory.current().await? {
+            operation.stage("inventory_validation");
+            let current = {
+                let _wait = operation.wait("inventory_validation");
+                inventory.current().await?
+            };
+            if current {
                 break (workspace, preparation, inventory);
             }
             // A shared job may predate this request's filesystem changes.
@@ -792,6 +882,7 @@ impl App {
                 || preparation.retained_inventory()
                 || indexes::source_only(&request, query.as_ref()))
         {
+            operation.stage("navigation");
             return self
                 .navigate_early(
                     inventory,
@@ -799,15 +890,26 @@ impl App {
                     query,
                     (usage_entry, usage_branch),
                     activity,
+                    operation.clone(),
                 )
                 .await;
         }
         tracing::Span::current().record("stage", "source_indexing");
-        preparation.complete().await?;
+        operation.stage("source_indexing");
+        {
+            let _wait = operation.wait("workspace_preparation");
+            preparation.complete().await?;
+        }
         let asset_workspace = workspace.clone();
-        let mut state = workspace.lock_owned().await;
+        let mut state = {
+            let _wait = operation.wait("workspace_lock");
+            workspace.lock_owned().await
+        };
         let mut branch_state = match &branch {
-            Some(branch) => Some(branch.analyze().await),
+            Some(branch) => {
+                let _wait = operation.wait("branch_analysis");
+                Some(branch.analyze().await)
+            }
             None => None,
         };
         let context = branch.as_ref().map(|branch| {
@@ -869,6 +971,9 @@ impl App {
             asset_request && branch.is_none(),
             activity.clone(),
         )?;
+        if let Some(job_id) = ticket.telemetry_id() {
+            operation.link(&job_id);
+        }
         let needed = indexes::groups(&request, query.as_ref(), &state.as_ref().unwrap().manifest);
         let mut source_tickets = std::collections::BTreeMap::new();
         for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
@@ -886,6 +991,11 @@ impl App {
                 })?,
             );
         }
+        for ticket in source_tickets.values() {
+            if let Some(job_id) = ticket.telemetry_id() {
+                operation.link(&job_id);
+            }
+        }
         let wait_assets = asset_request && indexes::wait_assets(&request, query.as_ref());
         if wait_assets || needed.values().any(|wait| *wait) {
             // Waiting requests own neither workspace locks nor query workers.
@@ -893,16 +1003,25 @@ impl App {
             drop(branch_state);
             for (group, wait) in &needed {
                 if *wait {
+                    let _wait = operation.wait("source_indexing");
                     source_tickets[group].clone().wait().await?;
                 }
             }
             if wait_assets {
                 tracing::Span::current().record("stage", "assets");
+                operation.stage("assets");
+                let _wait = operation.wait("assets");
                 crate::unity::assets::jobs::wait(ticket.clone()).await?;
             }
-            state = asset_workspace.clone().lock_owned().await;
+            state = {
+                let _wait = operation.wait("workspace_lock");
+                asset_workspace.clone().lock_owned().await
+            };
             branch_state = match &branch {
-                Some(branch) => Some(branch.analyze().await),
+                Some(branch) => {
+                    let _wait = operation.wait("branch_analysis");
+                    Some(branch.analyze().await)
+                }
                 None => None,
             };
             ensure!(
@@ -924,8 +1043,13 @@ impl App {
             );
         }
         tracing::Span::current().record("stage", "query_admission");
-        let permit = self.workers.clone().acquire_owned().await?;
+        operation.stage("query_admission");
+        let permit = {
+            let _wait = operation.wait("query_admission");
+            self.workers.clone().acquire_owned().await?
+        };
         tracing::Span::current().record("stage", "evaluation");
+        operation.stage("evaluation");
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();
@@ -966,11 +1090,7 @@ impl App {
                     }
                 }
                 let assets = if asset_request {
-                    ticket
-                        .borrow()
-                        .as_ref()
-                        .and_then(|r| r.as_ref().ok())
-                        .cloned()
+                    ticket.ready_index()
                 } else {
                     None
                 };
@@ -1248,9 +1368,21 @@ impl Mcp {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
         let started = Instant::now();
+        let operation = context
+            .extensions
+            .get::<crate::telemetry::Operation>()
+            .cloned()
+            .unwrap_or_default();
+        operation.stage("validation");
         let search = async {
             self.app
-                .request_cancellable(codebase, request?, &context.ct, self.upstream.as_deref())
+                .request_cancellable_monitored(
+                    codebase,
+                    request?,
+                    &context.ct,
+                    self.upstream.as_deref(),
+                    operation,
+                )
                 .await
         };
         let heartbeat = async {
@@ -1322,25 +1454,110 @@ impl ServerHandler for Mcp {
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        let tool = self.tool_router.get(&request.name).ok_or_else(|| {
-            rmcp::ErrorData::invalid_params(
-                format!(
-                    "Unknown tool `{}`. Use `tools/list` to see available tools.",
-                    request.name
-                ),
-                None,
-            )
-        })?;
-        if let Some(message) = validation::arguments(tool, request.arguments.as_ref()) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
+        let monitored = crate::telemetry::enabled();
+        let codebase = monitored
+            .then(|| {
+                request
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("codebase"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
+        let query = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("query"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                request
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("path"))
+                    .and_then(serde_json::Value::as_str)
+            });
+        let operation = crate::telemetry::operation(&request.name, None, query);
+        operation.stage("validation");
+        if monitored {
+            context.extensions.insert(operation.clone());
         }
-        self.tool_router
-            .call(rmcp::handler::server::tool::ToolCallContext::new(
-                self, request, context,
-            ))
-            .await
+        let result = async {
+            let Some(tool) = self.tool_router.get(&request.name) else {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!(
+                        "Unknown tool `{}`. Use `tools/list` to see available tools.",
+                        request.name
+                    ),
+                    None,
+                ));
+            };
+            if let Some(message) = validation::arguments(tool, request.arguments.as_ref()) {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
+            }
+            self.tool_router
+                .call(rmcp::handler::server::tool::ToolCallContext::new(
+                    self, request, context,
+                ))
+                .await
+        }
+        .await;
+        let status = match &result {
+            Err(_) => "failure",
+            Ok(rmcp::model::CallToolResponse::Complete(result))
+                if result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.get("error_code"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("CANCELLED") =>
+            {
+                "cancelled"
+            }
+            Ok(rmcp::model::CallToolResponse::Complete(result))
+                if result.is_error == Some(true) =>
+            {
+                "failure"
+            }
+            Ok(_) => "success",
+        };
+        if status != "success"
+            && let Some(codebase) = codebase.as_deref()
+        {
+            match crate::repository::Repository::project(codebase, self.app.remote.is_some()) {
+                Ok(Some(repository)) => {
+                    operation.repository(&repository.identity.to_string());
+                    if let Some(selector) = &repository.selector {
+                        operation.target(selector);
+                    }
+                }
+                Ok(None) => {
+                    let (path, selector) = if Path::new(codebase).exists() {
+                        (codebase, None)
+                    } else {
+                        codebase
+                            .rsplit_once('#')
+                            .map_or((codebase, None), |(path, selector)| (path, Some(selector)))
+                    };
+                    if let Ok(entry) = self.app.policy.canonical(Path::new(path)) {
+                        let repository = if entry.is_dir() {
+                            entry.as_path()
+                        } else {
+                            entry.parent().unwrap_or(entry.as_path())
+                        };
+                        operation.repository(&repository.display().to_string());
+                        if let Some(selector) = selector {
+                            operation.target(selector);
+                        }
+                    }
+                }
+                Err(_) => (),
+            }
+        }
+        operation.finish(status);
+        result
     }
 }
 

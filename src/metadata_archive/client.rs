@@ -13,6 +13,10 @@ type CachedCatalog = Option<(Instant, Arc<Catalog>)>;
 static CATALOG: LazyLock<Mutex<CachedCatalog>> = LazyLock::new(|| Mutex::new(None));
 
 pub(super) fn catalog(repo: &str) -> Result<Catalog> {
+    crate::telemetry::record("metadata_catalog", Some(repo), None, || fetch_catalog(repo))
+}
+
+fn fetch_catalog(repo: &str) -> Result<Catalog> {
     let url = format!("https://github.com/{repo}/releases/latest/download/catalog.bin");
     let client = acquisition::client()?;
     let mut response = client.get(acquisition::https(&url)?).send()?;
@@ -107,13 +111,15 @@ fn current(refresh: bool) -> Result<Arc<Catalog>> {
     Ok(catalog)
 }
 pub(super) fn download(repo: &str, release: &str, name: &str, output: &Path) -> Result<()> {
-    let url = format!("https://github.com/{repo}/releases/download/{release}/{name}");
-    let response = acquisition::client()?
-        .get(acquisition::https(&url)?)
-        .send()?
-        .error_for_status()?;
-    acquisition::transfer(response, &mut fs::File::create(output)?, None)?;
-    Ok(())
+    crate::telemetry::record("metadata_download", Some(repo), Some(name), || {
+        let url = format!("https://github.com/{repo}/releases/download/{release}/{name}");
+        let response = acquisition::client()?
+            .get(acquisition::https(&url)?)
+            .send()?
+            .error_for_status()?;
+        acquisition::transfer(response, &mut fs::File::create(output)?, None)?;
+        Ok(())
+    })
 }
 
 /// Cache the compressed members once, so requesting another member uses no network.
@@ -172,28 +178,30 @@ pub(super) fn materialize(
         if contents.join("manifest.bin").is_file() {
             return Ok(contents);
         }
-        fs::create_dir_all(&root)?;
-        let stage = tempfile::Builder::new()
-            .prefix("stage-")
-            .tempdir_in(&root)?;
-        let archive = if let Some(path) = packed {
-            path
-        } else {
-            let path = stage.path().join("bundle.tar.zst");
-            download(REPOSITORY, &artifact.release, &artifact.name, &path)?;
-            path
-        };
-        let output = stage.path().join("contents");
-        let manifest = bundle::unpack(&archive, &output, Some(artifact))?;
-        if manifest.origin.kind == "editor" {
-            save(
-                &output.join("Editor/Data/manifest.bin"),
-                &binary::encode(&manifest)?,
-            )?;
-        }
-        crate::cache::blobs::Store::open(cache)?.import_tree(&output)?;
-        fs::rename(output, &contents)?;
-        Ok(contents)
+        crate::telemetry::record("metadata_materialize", None, Some(&artifact.name), || {
+            fs::create_dir_all(&root)?;
+            let stage = tempfile::Builder::new()
+                .prefix("stage-")
+                .tempdir_in(&root)?;
+            let archive = if let Some(path) = packed {
+                path
+            } else {
+                let path = stage.path().join("bundle.tar.zst");
+                download(REPOSITORY, &artifact.release, &artifact.name, &path)?;
+                path
+            };
+            let output = stage.path().join("contents");
+            let manifest = bundle::unpack(&archive, &output, Some(artifact))?;
+            if manifest.origin.kind == "editor" {
+                save(
+                    &output.join("Editor/Data/manifest.bin"),
+                    &binary::encode(&manifest)?,
+                )?;
+            }
+            crate::cache::blobs::Store::open(cache)?.import_tree(&output)?;
+            fs::rename(output, &contents)?;
+            Ok(contents)
+        })
     })
 }
 fn select_editor(catalog: &Catalog, declared: UnityVersion) -> Result<&Artifact> {

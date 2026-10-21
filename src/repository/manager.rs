@@ -59,10 +59,35 @@ mod refresh_tests {
             last_use: AtomicU64::new(last_use),
             generation: AtomicU64::new(0),
             running: Mutex::new(None),
+            telemetry_id: Mutex::new(None),
             retry_after: AtomicU64::new(0),
             acquiring: AsyncMutex::new(()),
             inventory: watch::channel(None).0,
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_releases_state_before_waiting_for_publication() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let branch = branch(Target::Branch("main".into()), 0);
+        let (sender, receiver) = watch::channel(None);
+        *branch.running.lock().unwrap() = Some(receiver);
+        let operation = crate::telemetry::Operation::default();
+        let ready = manager.ready(&branch, &operation);
+        tokio::pin!(ready);
+        std::future::poll_fn(|cx| {
+            assert!(ready.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let publication = branch
+            .state
+            .try_write()
+            .expect("Readiness blocked publication");
+        sender.send_replace(Some(Ok(())));
+        drop(publication);
+        ready.await.unwrap();
     }
 
     #[test]
@@ -317,6 +342,7 @@ pub struct Branch {
     pub last_use: AtomicU64,
     pub generation: AtomicU64,
     running: Mutex<Option<Running>>,
+    telemetry_id: Mutex<Option<String>>,
     retry_after: AtomicU64,
     acquiring: AsyncMutex<()>,
     pub(crate) inventory: watch::Sender<Option<Arc<Inventory>>>,
@@ -337,6 +363,7 @@ impl Branch {
             last_use: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             running: Mutex::new(None),
+            telemetry_id: Mutex::new(None),
             retry_after: AtomicU64::new(0),
             acquiring: AsyncMutex::new(()),
             inventory: watch::channel(None).0,
@@ -352,6 +379,10 @@ impl Branch {
             state,
             _analysis: analysis,
         }
+    }
+
+    pub(crate) fn telemetry_id(&self) -> Option<String> {
+        self.telemetry_id.lock().unwrap().clone()
     }
 
     pub(crate) async fn publish(&self) -> PublicationGuard {
@@ -423,6 +454,7 @@ struct DefaultBranch {
 type DefaultOperation = (
     u64,
     watch::Receiver<Option<std::result::Result<DefaultBranch, String>>>,
+    Option<String>,
 );
 
 pub struct Manager {
@@ -632,6 +664,7 @@ impl Manager {
         self: &Arc<Self>,
         repository: &Repository,
         wait: bool,
+        parent: Option<&crate::telemetry::Operation>,
     ) -> Result<Option<String>> {
         let key = repository.identity.storage_key();
         let mut defaults = self.defaults.lock().await;
@@ -659,9 +692,9 @@ impl Manager {
         {
             return Ok(Some(saved.branch.clone()));
         }
-        let mut running = {
+        let (mut running, telemetry_id) = {
             let mut operations = self.default_running.lock().unwrap();
-            let reuse = operations.get(&key).is_some_and(|(started, receive)| {
+            let reuse = operations.get(&key).is_some_and(|(started, receive, _)| {
                 let outcome = receive.borrow();
                 outcome.is_none()
                     || outcome.as_ref().is_some_and(Result::is_ok)
@@ -669,11 +702,18 @@ impl Manager {
             });
             if !reuse {
                 let (send, receive) = watch::channel(None);
-                operations.insert(key.clone(), (now(), receive));
+                let telemetry = crate::telemetry::operation(
+                    "repository_default_lookup",
+                    Some(&repository.identity.to_string()),
+                    None,
+                );
+                let telemetry_id = telemetry.id();
+                operations.insert(key.clone(), (now(), receive, telemetry_id));
                 let manager = self.clone();
                 let repository = repository.clone();
                 let key = key.clone();
                 tokio::spawn(async move {
+                    telemetry.stage("default_branch_lookup");
                     let result = async {
                         let request = Request {
                             contents: super::materialize::Contents::All,
@@ -697,7 +737,11 @@ impl Manager {
                             subdirectory: None,
                         };
                         let cache = manager.cache.clone();
-                        let _permit = manager.acquisitions.acquire().await?;
+                        let _permit = {
+                            let _wait = telemetry.wait("acquisition_admission");
+                            manager.acquisitions.acquire().await?
+                        };
+                        telemetry.stage("default_branch_git");
                         let prepared =
                             tokio::task::spawn_blocking(move || job::execute(&request, &cache))
                                 .await??;
@@ -716,11 +760,15 @@ impl Manager {
                     }
                     .await
                     .map_err(|e| e.to_string());
+                    telemetry.finish(if result.is_ok() { "success" } else { "failure" });
                     let _ = send.send(Some(result));
                 });
             }
-            operations[&key].1.clone()
+            (operations[&key].1.clone(), operations[&key].2.clone())
         };
+        if let (Some(parent), Some(id)) = (parent, telemetry_id.as_deref()) {
+            parent.link(id);
+        }
         if let Some(cached) = cached {
             return Ok(Some(cached.branch));
         }
@@ -783,24 +831,40 @@ impl Manager {
     }
 
     pub async fn resolve(self: &Arc<Self>, repository: Repository) -> Result<Arc<Branch>> {
-        self.resolve_with(repository, false).await
+        self.resolve_with(repository, false, None).await
     }
 
-    pub(crate) async fn resolve_inventory(
+    pub async fn resolve_monitored(
         self: &Arc<Self>,
         repository: Repository,
+        operation: &crate::telemetry::Operation,
     ) -> Result<Arc<Branch>> {
-        self.resolve_with(repository, true).await
+        self.resolve_with(repository, false, Some(operation)).await
     }
 
-    pub(crate) async fn ready(&self, branch: &Branch) -> Result<()> {
-        if branch
-            .state
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|s| !s.repair)
-        {
+    pub(crate) async fn resolve_inventory_monitored(
+        self: &Arc<Self>,
+        repository: Repository,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<Arc<Branch>> {
+        self.resolve_with(repository, true, Some(operation)).await
+    }
+
+    pub(crate) async fn ready(
+        &self,
+        branch: &Branch,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<()> {
+        let ready = {
+            let _wait = telemetry.wait("branch_state");
+            branch
+                .state
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|s| !s.repair)
+        };
+        if ready {
             return Ok(());
         }
         let mut running = branch
@@ -813,6 +877,7 @@ impl Manager {
             if let Some(outcome) = running.borrow().clone() {
                 return outcome.map_err(anyhow::Error::msg);
             }
+            let _wait = telemetry.wait("repository_refresh");
             running
                 .changed()
                 .await
@@ -822,6 +887,7 @@ impl Manager {
 
     pub(crate) async fn sources_ready(&self, branch: &Branch) -> Result<()> {
         let mut inventory = branch.inventory.subscribe();
+        let telemetry = crate::telemetry::Operation::default();
         loop {
             if inventory
                 .borrow()
@@ -831,7 +897,7 @@ impl Manager {
                 return Ok(());
             }
             tokio::select! {
-                result = self.ready(branch) => return result,
+                result = self.ready(branch, &telemetry) => return result,
                 result = inventory.changed() => result.context("Repository inventory stopped")?,
             }
         }
@@ -861,6 +927,7 @@ impl Manager {
         self: &Arc<Self>,
         repository: Repository,
         inventory_only: bool,
+        operation: Option<&crate::telemetry::Operation>,
     ) -> Result<Arc<Branch>> {
         if !authorize(&self.options.rules, &repository)? {
             let repository = repository.clone();
@@ -868,7 +935,7 @@ impl Manager {
                 .await??;
         }
         let default = self
-            .default_branch(&repository, repository.selector.is_none())
+            .default_branch(&repository, repository.selector.is_none(), operation)
             .await?;
         let target = match &repository.selector {
             Some(name) => Target::selector(name)?,
@@ -927,6 +994,7 @@ impl Manager {
                     state: Arc::new(AsyncRwLock::new(state)),
                     analysis: Arc::new(AsyncRwLock::new(())),
                     running: Mutex::new(None),
+                    telemetry_id: Mutex::new(None),
                     retry_after: AtomicU64::new(0),
                     acquiring: AsyncMutex::new(()),
                     inventory: watch::channel(None).0,
@@ -977,18 +1045,30 @@ impl Manager {
     }
 
     fn schedule(self: &Arc<Self>, branch: Arc<Branch>, requested: bool) {
-        let mut operation = branch.running.lock().unwrap();
-        if operation.as_ref().is_some_and(|r| r.borrow().is_none())
+        let mut running = branch.running.lock().unwrap();
+        if running.as_ref().is_some_and(|r| r.borrow().is_none())
             || !requested && now() < branch.retry_after.load(Ordering::Relaxed)
         {
             return;
         }
+        let telemetry = crate::telemetry::operation(
+            "repository_refresh",
+            Some(&branch.repository.identity.to_string()),
+            None,
+        );
+        telemetry.target(&branch.name);
+        *branch.telemetry_id.lock().unwrap() = telemetry.id();
         let (send, receive) = watch::channel(None);
-        *operation = Some(receive);
-        drop(operation);
+        *running = Some(receive);
+        drop(running);
         let manager = self.clone();
         tokio::spawn(async move {
-            let result = manager.refresh(&branch).await.map_err(|e| e.to_string());
+            telemetry.stage("repository_refresh");
+            let result = manager
+                .refresh(&branch, &telemetry)
+                .await
+                .map_err(|e| e.to_string());
+            telemetry.finish(if result.is_ok() { "success" } else { "failure" });
             if result.is_err() {
                 branch.retry_after.store(now() + 30_000, Ordering::Relaxed);
             }
@@ -1002,22 +1082,28 @@ impl Manager {
         branch: &Branch,
         revision: &str,
         paths: Vec<String>,
+        telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
         authorize(&self.options.rules, &branch.repository)?;
         for path in &paths {
             self.options.selection.require(path)?;
         }
-        let _operation = branch.acquiring.lock().await;
-        let before = branch
-            .state
-            .read()
-            .await
-            .clone()
-            .context("Repository inputs are unavailable")?;
+        let _operation = {
+            let _wait = telemetry.wait("repository_admission");
+            branch.acquiring.lock().await
+        };
+        let before = {
+            let _wait = telemetry.wait("branch_state");
+            branch.state.read().await.clone()
+        }
+        .context("Repository inputs are unavailable")?;
         if before.prepared.revision != revision {
             return Ok(());
         }
-        let _permit = self.acquisitions.acquire().await?;
+        let _permit = {
+            let _wait = telemetry.wait("acquisition_admission");
+            self.acquisitions.acquire().await?
+        };
         let stage = tempfile::Builder::new()
             .prefix("required-")
             .tempdir_in(&branch.root)?;
@@ -1049,11 +1135,16 @@ impl Manager {
             subdirectory: None,
         };
         let cache = self.cache.clone();
+        telemetry.stage("required_input_fetch");
         let (mut prepared, _pool_pin) =
             tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
         prepared.branch = before.prepared.branch.clone();
         prepared.resolved_target = before.prepared.resolved_target.clone();
-        let mut state = branch.publish().await;
+        telemetry.stage("required_input_publication");
+        let mut state = {
+            let _wait = telemetry.wait("repository_publication");
+            branch.publish().await
+        };
         let mut next = before;
         next.additional.extend(paths);
         next.prepared = prepared;
@@ -1082,11 +1173,25 @@ impl Manager {
         Ok(())
     }
 
-    async fn refresh(&self, branch: &Branch) -> Result<()> {
+    async fn refresh(
+        &self,
+        branch: &Branch,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<()> {
         authorize(&self.options.rules, &branch.repository)?;
-        let _operation = branch.acquiring.lock().await;
-        let _permit = self.acquisitions.acquire().await?;
-        let before = branch.state.read().await.clone();
+        let _operation = {
+            let _wait = telemetry.wait("repository_admission");
+            branch.acquiring.lock().await
+        };
+        let _permit = {
+            let _wait = telemetry.wait("acquisition_admission");
+            self.acquisitions.acquire().await?
+        };
+        telemetry.stage("repository_inventory");
+        let before = {
+            let _wait = telemetry.wait("branch_state");
+            branch.state.read().await.clone()
+        };
         let stage = Arc::new(
             tempfile::Builder::new()
                 .prefix("incoming-")
@@ -1135,6 +1240,7 @@ impl Manager {
         };
         let cache = self.cache.clone();
         let inventory = if before.is_none() {
+            telemetry.stage("repository_inventory_acquisition");
             let mut inventory_request = request.clone();
             inventory_request.contents = super::materialize::Contents::Inventory;
             let cache = cache.clone();
@@ -1156,6 +1262,7 @@ impl Manager {
             None
         };
         // No publication lock is held while fetching or extracting objects.
+        telemetry.stage("git_acquisition");
         let git_request = request.clone();
         let git_cache = cache.clone();
         let (mut prepared, pin) = tokio::task::spawn_blocking(move || {
@@ -1185,10 +1292,15 @@ impl Manager {
                 _pin: _pool_pin.clone(),
             })));
         }
+        telemetry.stage("repository_materialization");
         prepared =
             tokio::task::spawn_blocking(move || super::cache::complete(&request, &cache, prepared))
                 .await??;
-        let mut state = branch.publish().await;
+        telemetry.stage("repository_publication");
+        let mut state = {
+            let _wait = telemetry.wait("repository_publication");
+            branch.publish().await
+        };
         let mut next = State {
             schema: 4,
             repository: branch.repository.identity.clone(),

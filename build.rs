@@ -531,6 +531,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Monitoring wraps metadata acquisition without changing its results.
+        (
+            "1eb8eea5c9250a83c1af0fafe95af48877fc8c78b9f9c7b14217249483853c96",
+            "41b545ea1eefd8fe8f203afb2cffb377ec9727fa9303d97e8e5f215836bd629a",
+        ),
         (
             "c817019d8f730eef42bb3f4ba0f3e544d0aef8f294914a96695dc89638822525",
             "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
@@ -548,6 +553,11 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        // Job telemetry and ticket metadata preserve asset records and publication.
+        (
+            "26a28624ba2bece70d061176d2d39dc606f13e622f677d9b30781ba4d079910f",
+            "5ad4f718fe48de00884cf4f3dbac59e18027bae0fbc56653e0e1d42c723b42e3",
+        ),
         (
             "21daf083db5802634df74c925bd21eae66fa116ae7308aa56092014bc6732de6",
             "2bd548c115a34ba087131a20b944888147f6a6847f8334c13d29dabfe3595787",
