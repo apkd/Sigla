@@ -12,7 +12,7 @@ use std::{
 };
 
 pub(super) type Key = [u8; 32];
-const MATCHING_VERSION: u32 = 1;
+const MATCHING_VERSION: u32 = 2;
 const ENTRY_BYTES: usize = 128;
 
 pub(super) fn key(scope: &Key, value: &impl Serialize) -> Key {

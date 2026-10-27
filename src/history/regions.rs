@@ -1,4 +1,7 @@
 mod java;
+mod text;
+
+pub(super) use text::{TextContext, TextEvidence, TextRange, TextTokens, paragraphs, text_range};
 
 use super::{
     cache::{self, Cache},
