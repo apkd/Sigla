@@ -1,5 +1,5 @@
 //! Network jobs run in the same executable, under a subprocess deadline.
-use super::materialize::{Prepared, Request};
+use super::materialize::{Metrics, Pinned, Prepared, Request};
 use anyhow::{Result, ensure};
 use std::{fs, path::Path, process::Command, time::Duration};
 
@@ -8,6 +8,7 @@ struct Output {
     result: std::result::Result<Prepared, Failure>,
     git_ms: u128,
     lfs_ms: u128,
+    metrics: Metrics,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -47,11 +48,22 @@ impl Failure {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Input {
     request: Request,
-    prepared: Option<Prepared>,
+    action: Action,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum Action {
+    Prepare,
+    Materialize(Pinned),
+    Hydrate(Prepared),
 }
 
 pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
-    run(request, cache, None)
+    run(request, cache, Action::Prepare)
+}
+
+pub(super) fn materialize(request: &Request, cache: &Path, pinned: Pinned) -> Result<Prepared> {
+    run(request, cache, Action::Materialize(pinned))
 }
 
 pub fn hydrate(request: &Request, cache: &Path, prepared: Prepared) -> Result<Prepared> {
@@ -60,11 +72,11 @@ pub fn hydrate(request: &Request, cache: &Path, prepared: Prepared) -> Result<Pr
     {
         return Ok(prepared);
     }
-    run(request, cache, Some(prepared))
+    run(request, cache, Action::Hydrate(prepared))
 }
 
-fn run(request: &Request, cache: &Path, prepared: Option<Prepared>) -> Result<Prepared> {
-    let lfs = prepared.is_some();
+fn run(request: &Request, cache: &Path, action: Action) -> Result<Prepared> {
+    let lfs = matches!(&action, Action::Hydrate(_));
     let started = std::time::Instant::now();
     let repository = super::Repository::parse(&request.repository)?
         .ok_or_else(|| anyhow::anyhow!("Expected a repository identifier"))?;
@@ -90,7 +102,7 @@ fn run(request: &Request, cache: &Path, prepared: Option<Prepared>) -> Result<Pr
         &input,
         serde_json::to_vec(&Input {
             request: request.clone(),
-            prepared,
+            action,
         })?,
     )?;
     let mut command = Command::new(std::env::current_exe()?);
@@ -130,6 +142,9 @@ fn run(request: &Request, cache: &Path, prepared: Option<Prepared>) -> Result<Pr
         transfer_bytes = prepared.transfer_bytes,
         files = prepared.selected.len(),
         unavailable = prepared.unavailable.len(),
+        inventory_reused = output.metrics.inventory_reused,
+        extracted_files = output.metrics.extracted_files,
+        extracted_bytes = output.metrics.extracted_bytes,
         "Repository acquisition phase completed"
     );
     if !lfs && let Some(endpoint) = &prepared.transport {
@@ -147,18 +162,21 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
         fs::metadata(input)?.len() <= 256 * 1024 * 1024,
         "Repository request exceeds size limit"
     );
-    let Input { request, prepared } = serde_json::from_slice(&fs::read(input)?)?;
+    let Input { request, action } = serde_json::from_slice(&fs::read(input)?)?;
     let started = std::time::Instant::now();
-    let lfs = prepared.is_some();
-    let result = if let Some(mut prepared) = prepared {
-        super::lfs::hydrate(
+    let lfs = matches!(&action, Action::Hydrate(_));
+    let mut metrics = Metrics::default();
+    let result = match action {
+        Action::Hydrate(mut prepared) => super::lfs::hydrate(
             &request,
             &mut prepared,
             input.parent().unwrap().parent().unwrap(),
         )
-        .map(|()| prepared)
-    } else {
-        super::materialize::prepare(&request)
+        .map(|()| prepared),
+        Action::Prepare => super::materialize::prepare(&request, None, &mut metrics),
+        Action::Materialize(pinned) => {
+            super::materialize::prepare(&request, Some(pinned), &mut metrics)
+        }
     }
     .map_err(Failure::from_error);
     let elapsed = started.elapsed().as_millis();
@@ -168,6 +186,7 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
             result,
             git_ms: if lfs { 0 } else { elapsed },
             lfs_ms: if lfs { elapsed } else { 0 },
+            metrics,
         })?,
     )?;
     Ok(())

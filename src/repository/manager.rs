@@ -1211,9 +1211,16 @@ impl Manager {
         let staged = stage.clone();
         let worker_staging = staging.clone();
         let worker_telemetry = telemetry.clone();
+        let pinned = super::materialize::Pinned {
+            repository: before.repository.clone(),
+            policy: before.policy.clone(),
+            subdirectory: None,
+            prepared: before.prepared.clone(),
+        };
         let (mut prepared, _pool_pin) = tokio::task::spawn_blocking(move || {
             let _stage = staged;
-            let (prepared, pin) = acquisition.git(&request, &cache, &worker_telemetry)?;
+            let (prepared, pin) =
+                acquisition.git(&request, &cache, Some(pinned), &worker_telemetry)?;
             drop(acquisition);
             let prepared = super::cache::complete(
                 &request,
@@ -1336,7 +1343,7 @@ impl Manager {
             let (returned, prepared, pin) = tokio::task::spawn_blocking(move || {
                 let _stage = staged;
                 let (prepared, pin) =
-                    acquisition.git(&inventory_request, &cache, &worker_telemetry)?;
+                    acquisition.git(&inventory_request, &cache, None, &worker_telemetry)?;
                 Ok::<_, anyhow::Error>((acquisition, prepared, pin))
             })
             .await??;
@@ -1360,9 +1367,17 @@ impl Manager {
         let git_cache = cache.clone();
         let staged = stage.clone();
         let worker_telemetry = telemetry.clone();
+        let pinned = inventory
+            .as_ref()
+            .map(|inventory| super::materialize::Pinned {
+                repository: branch.repository.identity.clone(),
+                policy: self.options.selection.identity.clone(),
+                subdirectory: request.subdirectory.clone(),
+                prepared: inventory.prepared.clone(),
+            });
         let (mut prepared, pin) = tokio::task::spawn_blocking(move || {
             let _stage = staged;
-            acquisition.git(&git_request, &git_cache, &worker_telemetry)
+            acquisition.git(&git_request, &git_cache, pinned, &worker_telemetry)
         })
         .await??;
         let _pool_pin = Arc::new(pin);

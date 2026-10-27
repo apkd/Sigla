@@ -415,7 +415,7 @@ pub(crate) fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin,
     let mut acquisition =
         futures_executor::block_on(Acquisition::begin(cache, &repository.identity, &telemetry))?;
     let staging = acquisition.staging.clone();
-    let (prepared, pin) = acquisition.git(request, cache, &telemetry)?;
+    let (prepared, pin) = acquisition.git(request, cache, None, &telemetry)?;
     drop(acquisition);
     Ok((
         complete(request, cache, prepared, &staging, &telemetry)?,
@@ -455,6 +455,7 @@ impl Acquisition {
         &mut self,
         request: &Request,
         cache: &Path,
+        pinned: Option<super::materialize::Pinned>,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<(Prepared, Pin)> {
         ensure!(
@@ -475,7 +476,10 @@ impl Acquisition {
         let mut request = request.clone();
         request.store = pool.root.join("current");
         // execute() is synchronous and does not return until its bounded child is stopped.
-        let prepared = super::job::execute(&request, cache)?;
+        let prepared = match pinned {
+            Some(pinned) => super::job::materialize(&request, cache, pinned)?,
+            None => super::job::execute(&request, cache)?,
+        };
         state.used = now();
         state.retained = None;
         pool.persist(&state)?;
