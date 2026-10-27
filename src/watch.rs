@@ -64,7 +64,9 @@ impl Monitor {
         if state.fallback {
             return;
         }
-        let mask = WatchMask::CLOSE_WRITE
+        // Inherited writable handles can delay CLOSE_WRITE until the child execs.
+        let mask = WatchMask::MODIFY
+            | WatchMask::CLOSE_WRITE
             | WatchMask::MOVED_FROM
             | WatchMask::MOVED_TO
             | WatchMask::CREATE
@@ -140,5 +142,29 @@ impl Monitor {
                     .any(|p| state.changed.get(p).is_some_and(|&g| g > previous)),
             state.generation,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, io::Write};
+
+    #[test]
+    fn writes_are_visible_while_an_inherited_handle_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::write(&source, b"old").unwrap();
+        let monitor = Monitor::default();
+        monitor.register(directory.path());
+        let paths = BTreeSet::from([directory.path().to_owned()]);
+        let (_, generation) = monitor.fence(&paths, 0);
+        let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
+        // A concurrent fork retains the writable file description until exec.
+        let inherited = writer.try_clone().unwrap();
+        writer.write_all(b"new").unwrap();
+        drop(writer);
+        assert!(monitor.fence(&paths, generation).0);
+        drop(inherited);
     }
 }
