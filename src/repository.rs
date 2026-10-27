@@ -3,6 +3,7 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use url::Url;
+pub(crate) mod admission;
 pub mod cache;
 mod credentials;
 mod github;

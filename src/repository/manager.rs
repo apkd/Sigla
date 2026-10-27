@@ -18,8 +18,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{
-    Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
-    Semaphore, watch,
+    Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock, watch,
 };
 
 fn now() -> u64 {
@@ -512,7 +511,7 @@ pub struct Manager {
     pub options: RemoteOptions,
     branches: Mutex<HashMap<String, Arc<Branch>>>,
     defaults: AsyncMutex<HashMap<String, DefaultBranch>>,
-    acquisitions: Arc<Semaphore>,
+    capacity: Arc<super::admission::Capacity>,
     default_running: Mutex<HashMap<String, DefaultOperation>>,
 }
 
@@ -701,11 +700,11 @@ impl Manager {
         fs::create_dir_all(cache.join("repositories"))?;
         fs::create_dir_all(cache.join("defaults"))?;
         Ok(Arc::new(Self {
+            capacity: super::admission::Capacity::open(&cache)?,
             cache,
             options,
             branches: Mutex::new(HashMap::new()),
             defaults: AsyncMutex::new(HashMap::new()),
-            acquisitions: Arc::new(Semaphore::new(2)),
             default_running: Mutex::new(HashMap::new()),
         }))
     }
@@ -787,14 +786,13 @@ impl Manager {
                             subdirectory: None,
                         };
                         let cache = manager.cache.clone();
-                        let _permit = {
-                            let _wait = telemetry.wait("acquisition_admission");
-                            manager.acquisitions.acquire().await?
-                        };
+                        let permit = manager.capacity.transfer(&telemetry).await?;
                         telemetry.stage("default_branch_git");
-                        let prepared =
-                            tokio::task::spawn_blocking(move || job::execute(&request, &cache))
-                                .await??;
+                        let prepared = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            job::execute(&request, &cache)
+                        })
+                        .await??;
                         let saved = DefaultBranch {
                             previous: manager.previous_default(
                                 &repository.identity,
@@ -1172,10 +1170,10 @@ impl Manager {
         if before.prepared.revision != revision {
             return Ok(());
         }
-        let _permit = {
-            let _wait = telemetry.wait("acquisition_admission");
-            self.acquisitions.acquire().await?
-        };
+        let mut acquisition =
+            super::cache::Acquisition::begin(&self.cache, &branch.repository.identity, telemetry)
+                .await?;
+        let staging = acquisition.staging.clone();
         let stage = Arc::new(
             tempfile::Builder::new()
                 .prefix("required-")
@@ -1211,9 +1209,20 @@ impl Manager {
         let cache = self.cache.clone();
         telemetry.stage("required_input_fetch");
         let staged = stage.clone();
+        let worker_staging = staging.clone();
+        let worker_telemetry = telemetry.clone();
         let (mut prepared, _pool_pin) = tokio::task::spawn_blocking(move || {
             let _stage = staged;
-            super::cache::acquire(&request, &cache)
+            let (prepared, pin) = acquisition.git(&request, &cache, &worker_telemetry)?;
+            drop(acquisition);
+            let prepared = super::cache::complete(
+                &request,
+                &cache,
+                prepared,
+                &worker_staging,
+                &worker_telemetry,
+            )?;
+            Ok::<_, anyhow::Error>((prepared, pin))
         })
         .await??;
         prepared.branch = before.prepared.branch.clone();
@@ -1261,10 +1270,10 @@ impl Manager {
             let _wait = telemetry.wait("repository_admission");
             branch.acquiring.lock().await
         };
-        let _permit = {
-            let _wait = telemetry.wait("acquisition_admission");
-            self.acquisitions.acquire().await?
-        };
+        let mut acquisition =
+            super::cache::Acquisition::begin(&self.cache, &branch.repository.identity, telemetry)
+                .await?;
+        let staging = acquisition.staging.clone();
         telemetry.stage("repository_inventory");
         let before = {
             let _wait = telemetry.wait("branch_state");
@@ -1323,11 +1332,15 @@ impl Manager {
             inventory_request.contents = super::materialize::Contents::Inventory;
             let cache = cache.clone();
             let staged = stage.clone();
-            let (prepared, pin) = tokio::task::spawn_blocking(move || {
+            let worker_telemetry = telemetry.clone();
+            let (returned, prepared, pin) = tokio::task::spawn_blocking(move || {
                 let _stage = staged;
-                super::cache::acquire(&inventory_request, &cache)
+                let (prepared, pin) =
+                    acquisition.git(&inventory_request, &cache, &worker_telemetry)?;
+                Ok::<_, anyhow::Error>((acquisition, prepared, pin))
             })
             .await??;
+            acquisition = returned;
             fs::create_dir_all(branch.source())?;
             let inventory = Arc::new(Inventory {
                 prepared,
@@ -1346,9 +1359,10 @@ impl Manager {
         let git_request = request.clone();
         let git_cache = cache.clone();
         let staged = stage.clone();
+        let worker_telemetry = telemetry.clone();
         let (mut prepared, pin) = tokio::task::spawn_blocking(move || {
             let _stage = staged;
-            super::cache::acquire_git(&git_request, &git_cache)
+            acquisition.git(&git_request, &git_cache, &worker_telemetry)
         })
         .await??;
         let _pool_pin = Arc::new(pin);
@@ -1362,7 +1376,9 @@ impl Manager {
         if inventory.is_some() {
             let mut sources = prepared.clone();
             let source = stage.clone();
+            let worker_staging = staging.clone();
             sources = tokio::task::spawn_blocking(move || -> Result<Prepared> {
+                let _staging = worker_staging;
                 let pending = super::lfs::pending(source.path(), &sources)?;
                 sources.unavailable.extend(pending);
                 Ok(sources)
@@ -1376,9 +1392,17 @@ impl Manager {
         }
         telemetry.stage("repository_materialization");
         let staged = stage.clone();
+        let worker_staging = staging.clone();
+        let worker_telemetry = telemetry.clone();
         prepared = tokio::task::spawn_blocking(move || {
             let _stage = staged;
-            super::cache::complete(&request, &cache, prepared)
+            super::cache::complete(
+                &request,
+                &cache,
+                prepared,
+                &worker_staging,
+                &worker_telemetry,
+            )
         })
         .await??;
         telemetry.stage("repository_publication");

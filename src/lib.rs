@@ -24,6 +24,7 @@ mod upstream;
 pub fn shutdown() {
     process::shutdown();
     acquisition::shutdown();
+    repository::admission::shutdown();
 }
 pub mod query;
 mod render;

@@ -105,7 +105,7 @@ fn acquisition_after_snapshot_cannot_lose_its_pending_objects() {
     pool.state().unwrap();
     let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
     let pending = {
-        let mut operation = pool.operation.lock().unwrap();
+        let mut operation = futures_executor::block_on(pool.operation.lock());
         *operation += 1;
         pin(&pool)
     };
@@ -130,7 +130,7 @@ fn acquisition_published_after_snapshot_survives_without_its_pin() {
     pool.state().unwrap();
     let snapshot = Snapshot::capture(pool.clone()).unwrap().unwrap();
     let pending = {
-        let mut operation = pool.operation.lock().unwrap();
+        let mut operation = futures_executor::block_on(pool.operation.lock());
         *operation += 1;
         pin(&pool)
     };
@@ -211,7 +211,7 @@ fn pressure_keeps_inflight_git_objects_and_reclaims_an_idle_pool() {
     reclaim(cache.path()).unwrap();
     assert!(pool.root.exists());
     drop(pending);
-    let operation = pool.operation.lock().unwrap();
+    let operation = futures_executor::block_on(pool.operation.lock());
     reclaim(cache.path()).unwrap();
     assert!(pool.root.exists());
     drop(operation);
@@ -413,7 +413,7 @@ fn history_reader_survives_replacement_and_can_republish_its_exact_objects() {
     )
     .unwrap();
     {
-        let _gate = pool.operation.lock().unwrap();
+        let _gate = futures_executor::block_on(pool.operation.lock());
         pool.replace(&target).unwrap();
     }
     assert!(!pool.root.join("previous").exists());
@@ -477,4 +477,41 @@ fn abandoned_reader_views_are_collected_without_disturbing_live_readers() {
         read_history_blob(recovered.path(), &oid),
         b"retained source\n"
     );
+}
+#[tokio::test]
+async fn waiting_for_a_repository_does_not_reserve_transfer_or_staging_capacity() {
+    let cache = tempfile::tempdir().unwrap();
+    let identity = identity();
+    let pool = Pool::open(cache.path(), &identity).unwrap();
+    let held = pool.operation.lock().await;
+    let telemetry = crate::telemetry::Operation::default();
+    let waiting = Acquisition::begin(cache.path(), &identity, &telemetry);
+    tokio::pin!(waiting);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    let capacity = pool.capacity.clone();
+    let transfers = tokio::time::timeout(Duration::from_secs(2), async {
+        (
+            capacity.transfer(&telemetry).await.unwrap(),
+            capacity.transfer(&telemetry).await.unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    let stages = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(capacity.staging(&telemetry).await.unwrap());
+        }
+        held
+    })
+    .await
+    .unwrap();
+    drop((transfers, stages, held));
+    let acquired = waiting.await.unwrap();
+    assert!(pool.operation.try_lock().is_err());
+    drop(acquired);
+    assert!(pool.operation.try_lock().is_ok());
 }

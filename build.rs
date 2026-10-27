@@ -520,10 +520,17 @@ fn main() {
     // Unlisted source hashes keep their own identity and invalidate old caches.
     // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
     // prefix-scan oracle tests also cover recovery, top-level code and directives.
-    let analysis_aliases: &[(&str, &str)] = &[(
-        "e96765a745ee254ff3a52072cfef53d3ae37d4418b1060000c473f5ac2a1c214",
-        "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0",
-    )];
+    let analysis_aliases: &[(&str, &str)] = &[
+        // Admission adds an existing executor dependency without changing records.
+        (
+            "10c610797834103c1b9d2b7377b57b5d8913e9f05e15e35deea5981fca8727eb",
+            "3e651c01b11bb7f42ac56fd730d4129e648006878e5b70c16e5b55b514281f28",
+        ),
+        (
+            "e96765a745ee254ff3a52072cfef53d3ae37d4418b1060000c473f5ac2a1c214",
+            "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0",
+        ),
+    ];
     // Planning reuses stamps only within a pass and retains fresh input fences.
     // Batched environment reads preserve the hash; archive changes retain valid
     // inputs and only alter publication or reject conflicting bundle paths.
@@ -531,6 +538,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Separate acquisition limits preserve Git package inputs and graphs.
+        (
+            "db0f9ad05ec046aae589a229652f4104ce9b51ae4d4a5ac02275820df4f092ac",
+            "5c379c23f178ba88af622b3fafa87083358ff8bd9b08827b6c5377849295bec7",
+        ),
         // Monitoring wraps metadata acquisition without changing its results.
         (
             "1eb8eea5c9250a83c1af0fafe95af48877fc8c78b9f9c7b14217249483853c96",
@@ -553,6 +565,10 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        (
+            "4e7023452dc7ffc227db9038c975cbe4dae139896728112ea470aedf3924b4b2",
+            "145165ef7429e83ad739ef5d2fa1a944cd40f0f5ab500a66e444414329d5d777",
+        ),
         // Job telemetry and ticket metadata preserve asset records and publication.
         (
             "26a28624ba2bece70d061176d2d39dc606f13e622f677d9b30781ba4d079910f",
@@ -569,10 +585,16 @@ fn main() {
     ];
     // Content reads skip an unused summary decode; record writers and parsers
     // are unchanged, so existing records retain their identities.
-    let asset_record_aliases: &[(&str, &str)] = &[(
-        "2a314d4f98408707b51bcc64bb3fd0bb86c1dd8315db5a79a9768b799c589f82",
-        "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",
-    )];
+    let asset_record_aliases: &[(&str, &str)] = &[
+        (
+            "a7d4ff626cdd6e550e6fe9f841794fc702e8224b08b1a630e9c743d908e57125",
+            "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",
+        ),
+        (
+            "2a314d4f98408707b51bcc64bb3fd0bb86c1dd8315db5a79a9768b799c589f82",
+            "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",
+        ),
+    ];
     for (domain, hash, aliases) in [
         ("ANALYSIS", analysis, analysis_aliases),
         ("WORKSPACE", workspace, workspace_aliases),

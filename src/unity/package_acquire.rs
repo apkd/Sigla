@@ -278,7 +278,7 @@ impl GitSource {
             .join("unity-packages")
             .join(blake3::hash(self.identity.as_bytes()).to_hex().as_str());
         leases.retain(&root)?;
-        acquisition::shared(&root.to_string_lossy(), || {
+        acquisition::serialized(&root.to_string_lossy(), || {
             if complete(&root, &self.identity) {
                 return Ok(root.join("contents"));
             }
@@ -315,7 +315,8 @@ impl GitSource {
                 previous: Default::default(),
                 subdirectory: self.subdirectory.clone(),
             };
-            let (prepared, _pool_pin) = crate::repository::cache::acquire(&request, cache)?;
+            let (prepared, _pool_pin, _staging) =
+                crate::repository::cache::acquire(&request, cache)?;
             let package = self
                 .subdirectory
                 .as_ref()

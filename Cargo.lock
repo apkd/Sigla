@@ -3454,6 +3454,7 @@ dependencies = [
  "dotscope",
  "encoding_rs",
  "flate2",
+ "futures-executor",
  "gix-features",
  "gix-hash",
  "gix-protocol",

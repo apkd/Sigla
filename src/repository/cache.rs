@@ -1,5 +1,6 @@
 //! Repository-owned Git pool. Call blocking operations on a blocking worker.
 //! No repository operation lock survives into branch/source publication.
+use super::admission::{Capacity, Staging};
 use super::{
     Identity, Repository,
     materialize::{Prepared, Request},
@@ -13,6 +14,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const REBUILD_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const RETRY_MS: u64 = 60 * 60 * 1000;
@@ -63,7 +65,8 @@ struct State {
 struct Pool {
     root: PathBuf,
     identity: Identity,
-    operation: Mutex<u64>,
+    operation: Arc<AsyncMutex<u64>>,
+    capacity: Arc<Capacity>,
     pending: Mutex<Vec<Weak<Root>>>,
     readers: Mutex<Vec<Weak<HistoryRoot>>>,
 }
@@ -153,8 +156,7 @@ impl Snapshot {
     fn capture(pool: Arc<Pool>) -> Result<Option<Self>> {
         let operation = match pool.operation.try_lock() {
             Ok(operation) => operation,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(error) => return Err(anyhow::anyhow!("Git pool operation interrupted: {error}")),
+            Err(_) => return Ok(None),
         };
         let generation = *operation;
         let roots = pool.pending_roots()?;
@@ -183,7 +185,8 @@ impl Pool {
         let pool = Arc::new(Self {
             root: root.clone(),
             identity: identity.clone(),
-            operation: Mutex::new(0),
+            operation: Arc::new(AsyncMutex::new(0)),
+            capacity: Capacity::open(cache)?,
             pending: Mutex::new(Vec::new()),
             readers: Mutex::new(Vec::new()),
         });
@@ -405,49 +408,104 @@ impl Pool {
 /// Revision resolution and acquisition hold this operation lock, so pool
 /// rebuild/replacement cannot race commit history inspection.
 /// Return the pin alongside Prepared rather than dropping it inside this function.
-pub fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
-    let (prepared, pin) = acquire_git(request, cache)?;
-    Ok((complete(request, cache, prepared)?, pin))
-}
-
-pub(super) fn acquire_git(request: &Request, cache: &Path) -> Result<(Prepared, Pin)> {
-    ensure!(
-        !matches!(request.target, super::materialize::Target::DefaultBranch),
-        "Default-branch discovery must keep using the metadata-only job"
-    );
+pub(crate) fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin, Arc<Staging>)> {
+    let telemetry = crate::telemetry::Operation::default();
     let repository =
         Repository::parse(&request.repository)?.context("Expected repository identity")?;
-    let pool = Pool::open(cache, &repository.identity)?;
-    let mut operation = pool
-        .operation
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Git pool operation interrupted"))?;
-    // Even a failed acquisition can change the pool. Invalidate earlier root snapshots.
-    *operation = operation
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("Git acquisition generation exhausted"))?;
-    private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
-    pool.recover()?;
-    let mut state = pool.state()?;
-    pool.maybe_rebuild(cache, &mut state, false, None)?;
-    let mut request = request.clone();
-    request.store = pool.root.join("current");
-    // execute() is synchronous and does not return until its bounded child is stopped.
-    let prepared = super::job::execute(&request, cache)?;
-    state.used = now();
-    state.retained = None;
-    pool.persist(&state)?;
-    let pin = pool.pin(&prepared)?; // Still under operation lock: no unprotected handoff.
-    drop(operation);
-    Ok((prepared, pin))
+    let mut acquisition =
+        futures_executor::block_on(Acquisition::begin(cache, &repository.identity, &telemetry))?;
+    let staging = acquisition.staging.clone();
+    let (prepared, pin) = acquisition.git(request, cache, &telemetry)?;
+    drop(acquisition);
+    Ok((
+        complete(request, cache, prepared, &staging, &telemetry)?,
+        pin,
+        staging,
+    ))
 }
 
-pub(super) fn complete(request: &Request, cache: &Path, prepared: Prepared) -> Result<Prepared> {
+/// Repository turn precedes global admission. Keep it across the cold inventory
+/// and extraction passes, then release it before hydration or import.
+pub(super) struct Acquisition {
+    pool: Arc<Pool>,
+    operation: OwnedMutexGuard<u64>,
+    pub staging: Arc<Staging>,
+}
+
+impl Acquisition {
+    pub async fn begin(
+        cache: &Path,
+        identity: &Identity,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<Self> {
+        let pool = Pool::open(cache, identity)?;
+        let operation = {
+            let _wait = telemetry.wait("repository_pool_admission");
+            pool.operation.clone().lock_owned().await
+        };
+        let staging = pool.capacity.staging(telemetry).await?;
+        Ok(Self {
+            pool,
+            operation,
+            staging,
+        })
+    }
+
+    pub fn git(
+        &mut self,
+        request: &Request,
+        cache: &Path,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<(Prepared, Pin)> {
+        ensure!(
+            !matches!(request.target, super::materialize::Target::DefaultBranch),
+            "Default-branch discovery must keep using the metadata-only job"
+        );
+        let pool = &self.pool;
+        let operation = &mut self.operation;
+        let _permit = futures_executor::block_on(pool.capacity.transfer(telemetry))?;
+        // Even a failed acquisition can change the pool. Invalidate earlier root snapshots.
+        **operation = operation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Git acquisition generation exhausted"))?;
+        private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
+        pool.recover()?;
+        let mut state = pool.state()?;
+        pool.maybe_rebuild(cache, &mut state, false, None)?;
+        let mut request = request.clone();
+        request.store = pool.root.join("current");
+        // execute() is synchronous and does not return until its bounded child is stopped.
+        let prepared = super::job::execute(&request, cache)?;
+        state.used = now();
+        state.retained = None;
+        pool.persist(&state)?;
+        let pin = pool.pin(&prepared)?; // Still under operation lock: no unprotected handoff.
+        Ok((prepared, pin))
+    }
+}
+
+pub(super) fn complete(
+    request: &Request,
+    cache: &Path,
+    prepared: Prepared,
+    staging: &Staging,
+    telemetry: &crate::telemetry::Operation,
+) -> Result<Prepared> {
     // Hydration only uses staged pointers and the LFS cache. It must not hold
     // the Git pool gate while downloading large objects.
-    let prepared = super::job::hydrate(request, cache, prepared)?;
-    let started = std::time::Instant::now();
-    if !matches!(request.contents, super::materialize::Contents::Inventory) {
+    let prepared = if matches!(request.contents, super::materialize::Contents::Inventory)
+        || prepared.selected.is_empty()
+    {
+        prepared
+    } else {
+        let _permit = futures_executor::block_on(staging.capacity.transfer(telemetry))?;
+        super::job::hydrate(request, cache, prepared)?
+    };
+    if !matches!(request.contents, super::materialize::Contents::Inventory)
+        && fs::read_dir(&request.staging)?.next().is_some()
+    {
+        let _permit = futures_executor::block_on(staging.capacity.import(telemetry))?;
+        let started = std::time::Instant::now();
         let stats = crate::cache::blobs::Store::open(cache)?.import_owned_tree(&request.staging)?;
         tracing::info!(
             repository = %request.repository,
@@ -467,7 +525,7 @@ pub(super) fn complete(request: &Request, cache: &Path, prepared: Prepared) -> R
         tracing::info!(
             repository = %request.repository,
             revision = %prepared.revision,
-            elapsed_ms = started.elapsed().as_millis(),
+            elapsed_ms = 0,
             "Repository files imported"
         );
     }
@@ -497,8 +555,7 @@ fn maintain_pool(
     let pool = Pool::open(cache, identity)?;
     let operation = match pool.operation.try_lock() {
         Ok(guard) => guard,
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
-        Err(error) => return Err(anyhow::anyhow!("Git pool operation interrupted: {error}")),
+        Err(_) => return Ok(()),
     };
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
@@ -739,7 +796,7 @@ fn link_objects(source: &Path, target: &Path) -> Result<()> {
 
 pub(super) fn object_lease(cache: &Path, identity: &Identity, format: &str) -> Result<ObjectLease> {
     let pool = Pool::open(cache, identity)?;
-    let operation = pool.operation.lock().unwrap();
+    let operation = futures_executor::block_on(pool.operation.lock());
     private_dir(&pool.root)?;
     pool.recover()?;
     let mut state = pool.state()?;
@@ -805,9 +862,13 @@ impl ObjectLease {
 
     /// Serialize publication with replacement, but never hold the gate while matching.
     pub fn acquire(&self, fetch: impl FnOnce(&Path, &Path) -> Result<u64>) -> Result<u64> {
-        let _operation = self.pool.operation.lock().unwrap();
+        let _operation = futures_executor::block_on(self.pool.operation.lock());
         self.pool.recover()?;
-        let bytes = fetch(&self.pool.root.join("current"), self.view.path())?;
+        let bytes = {
+            let telemetry = crate::telemetry::Operation::default();
+            let _permit = futures_executor::block_on(self.pool.capacity.transfer(&telemetry))?;
+            fetch(&self.pool.root.join("current"), self.view.path())?
+        };
         link_objects(&self.pool.root.join("current"), self.view.path())?;
         let mut state = self.pool.state()?;
         state.used = now();
@@ -821,7 +882,7 @@ impl ObjectLease {
         complete: &BTreeSet<String>,
         boundaries: &BTreeSet<String>,
     ) -> Result<()> {
-        let _operation = self.pool.operation.lock().unwrap();
+        let _operation = futures_executor::block_on(self.pool.operation.lock());
         let current = self.pool.root.join("current");
         // A replacement includes every object pinned before root capture. Readers
         // can also keep older objects: link these back before extending coverage.
@@ -907,7 +968,7 @@ pub(crate) fn evict_history(owner: &Path) -> Result<bool> {
     ensure!(history_owner(cache, owner), "Invalid history owner");
     let state: State = read_json(&root.join("pool.json"), 64 * 1024)?;
     let pool = Pool::open(cache, &state.repository)?;
-    let _operation = pool.operation.lock().unwrap();
+    let _operation = futures_executor::block_on(pool.operation.lock());
     if pool
         .readers
         .lock()

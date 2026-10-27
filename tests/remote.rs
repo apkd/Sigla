@@ -124,6 +124,24 @@ impl Server {
         live_unity: bool,
         refresh: Option<&str>,
     ) -> Result<Self> {
+        Self::launch_process(root, timeout, live_unity, refresh, None)
+    }
+    fn launch_probe(root: &Path, binary: &Path) -> Result<Self> {
+        Self::launch_process(
+            root,
+            Duration::from_secs(3600),
+            false,
+            Some("1h"),
+            Some(binary),
+        )
+    }
+    fn launch_process(
+        root: &Path,
+        timeout: Duration,
+        live_unity: bool,
+        refresh: Option<&str>,
+        probe: Option<&Path>,
+    ) -> Result<Self> {
         // The fixture uses a local SSH executable, never a public GitHub endpoint.
         let repository =
             sigla::repository::Repository::parse("git@github.com:fixture/repo.git")?.unwrap();
@@ -146,9 +164,9 @@ impl Server {
                 .arg(env!("CARGO_BIN_EXE_sigla"));
             command
         } else {
-            Command::new(env!("CARGO_BIN_EXE_sigla"))
+            Command::new(probe.unwrap_or_else(|| Path::new(env!("CARGO_BIN_EXE_sigla"))))
         };
-        let child = command
+        command
             .args([
                 "serve",
                 "--mode",
@@ -158,9 +176,17 @@ impl Server {
                 "--allow-repo-private",
                 "ssh://git@fixture.invalid/repo",
                 "--repo-ttl",
-                if live_unity { "7d" } else { "60s" },
+                if live_unity || probe.is_some() {
+                    "7d"
+                } else {
+                    "60s"
+                },
                 "--branch-ttl",
-                if live_unity { "1d" } else { "60s" },
+                if live_unity || probe.is_some() {
+                    "1d"
+                } else {
+                    "60s"
+                },
                 "--listen",
             ])
             .arg(address.to_string())
@@ -176,9 +202,21 @@ impl Server {
                 format!("{}:{}", root.join("bin").display(), std::env::var("PATH")?),
             )
             .env("SIGLA_TEST_REPOSITORY", root.join("upstream"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stdout(Stdio::null());
+        if probe.is_some() {
+            command
+                .args(["--free-disk-space-headroom-percent", "0"])
+                .env("RUST_LOG", "info")
+                .stderr(Stdio::from(
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(root.join("probe.log"))?,
+                ));
+        } else {
+            command.stderr(Stdio::inherit());
+        }
+        let child = command.spawn()?;
         let client = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .build()?;
@@ -644,8 +682,179 @@ fn main() -> Result<()> {
         );
         return unity_lifecycle(&root);
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("acquisition")) {
+        let root = PathBuf::from(
+            std::env::args_os()
+                .nth(2)
+                .context("Usage: remote acquisition WORK_DIRECTORY SIGLA_BINARY [FILE_COUNT]")?,
+        );
+        let binary = PathBuf::from(std::env::args_os().nth(3).context("Missing Sigla binary")?)
+            .canonicalize()?;
+        let count = std::env::args()
+            .nth(4)
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(30_000);
+        ensure!(count > 0, "File count must be positive");
+        return acquisition_probe(&root, &binary, count);
+    }
     lifecycle()?;
     println!("Remote lifecycle checks passed");
+    Ok(())
+}
+
+/// A local Git/SSH fixture for comparing acquisition with different binaries.
+fn acquisition_probe(directory: &Path, binary: &Path, count: usize) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    let fixture = tempfile::Builder::new()
+        .prefix("remote-acquisition-")
+        .tempdir_in(directory)?;
+    let root = fixture.path();
+    let upstream = root.join("upstream");
+    fs::create_dir_all(upstream.join("src/data"))?;
+    git(
+        &upstream,
+        &["init", "--quiet", "--initial-branch=main", "--template="],
+    )?;
+    for (key, value) in [
+        ("user.name", "Fixture"),
+        ("user.email", "fixture@example.invalid"),
+        ("uploadpack.allowFilter", "true"),
+        ("uploadpack.allowAnySHA1InWant", "true"),
+    ] {
+        git(&upstream, &["config", key, value])?;
+    }
+    let filler = "x".repeat(4096);
+    for index in 0..count {
+        fs::write(
+            upstream.join(format!("src/data/{index}.md")),
+            format!("Fixture file {index}\n{filler}\n"),
+        )?;
+    }
+    fs::write(upstream.join("src/marker.md"), "Probe marker original\n")?;
+    git(&upstream, &["add", "."])?;
+    git(&upstream, &["commit", "--quiet", "-m", "initial"])?;
+    for branch in ["repeat", "parallel-a", "parallel-b"] {
+        git(&upstream, &["branch", branch])?;
+    }
+    fs::create_dir(root.join("bin"))?;
+    std::os::unix::fs::symlink(std::env::current_exe()?, root.join("bin/ssh"))?;
+    println!(
+        "binary={} files={count} bytes_per_file≈{}",
+        binary.display(),
+        filler.len()
+    );
+    let server = Server::launch_probe(root, binary)?;
+    let mut log_offset = 0;
+    for (label, branch) in [
+        ("cold", "main"),
+        ("warm", "main"),
+        ("new selector", "repeat"),
+    ] {
+        let started = Instant::now();
+        acquisition_request(&server, branch, "original")?;
+        println!("{label}: {:?}", started.elapsed());
+        acquisition_log(root, &mut log_offset)?;
+        verify_acquisition(root, branch, count, &filler, "original")?;
+    }
+    let started = Instant::now();
+    std::thread::scope(|scope| -> Result<()> {
+        let first = scope.spawn(|| acquisition_request(&server, "parallel-a", "original"));
+        let second = scope.spawn(|| acquisition_request(&server, "parallel-b", "original"));
+        first
+            .join()
+            .map_err(|_| anyhow::anyhow!("First acquisition panicked"))??;
+        second
+            .join()
+            .map_err(|_| anyhow::anyhow!("Second acquisition panicked"))??;
+        Ok(())
+    })?;
+    println!("concurrent selectors: {:?}", started.elapsed());
+    acquisition_log(root, &mut log_offset)?;
+    for branch in ["parallel-a", "parallel-b"] {
+        verify_acquisition(root, branch, count, &filler, "original")?;
+    }
+    git(&upstream, &["switch", "--quiet", "-c", "changed"])?;
+    fs::write(upstream.join("src/marker.md"), "Probe marker changed\n")?;
+    git(&upstream, &["commit", "--quiet", "-am", "one file changed"])?;
+    let started = Instant::now();
+    acquisition_request(&server, "changed", "changed")?;
+    println!("one file changed: {:?}", started.elapsed());
+    acquisition_log(root, &mut log_offset)?;
+    verify_acquisition(root, "changed", count, &filler, "changed")?;
+    verify_acquisition(root, "main", count, &filler, "original")?;
+    drop(server);
+    let server = Server::launch_probe(root, binary)?;
+    let started = Instant::now();
+    acquisition_request(&server, "main", "original")?;
+    acquisition_request(&server, "changed", "changed")?;
+    println!("restart, two selectors: {:?}", started.elapsed());
+    acquisition_log(root, &mut log_offset)?;
+    drop(server);
+    Ok(())
+}
+
+fn acquisition_request(server: &Server, branch: &str, marker: &str) -> Result<()> {
+    let project = format!("ssh://git@fixture.invalid/repo#{branch}");
+    let (error, text) = server.query(&project, "text:\"Probe marker\" path:src/marker.md")?;
+    ensure!(
+        !error && text.contains("marker.md"),
+        "Acquisition failed: {text}"
+    );
+    let (error, text) = server.call("view", json!({"codebase":project,"path":"src/marker.md"}))?;
+    ensure!(
+        !error && text.contains(&format!("Probe marker {marker}")),
+        "Wrong source: {text}"
+    );
+    Ok(())
+}
+
+fn acquisition_log(root: &Path, offset: &mut usize) -> Result<()> {
+    let log = fs::read(root.join("probe.log"))?;
+    for line in String::from_utf8_lossy(&log[*offset..]).lines() {
+        if line.contains("Repository files imported") {
+            println!("  {line}");
+        }
+    }
+    *offset = log.len();
+    Ok(())
+}
+
+fn verify_acquisition(
+    root: &Path,
+    branch: &str,
+    count: usize,
+    filler: &str,
+    marker: &str,
+) -> Result<()> {
+    let mut source = None;
+    for entry in fs::read_dir(root.join("cache/repositories"))? {
+        let entry = entry?;
+        let Ok(bytes) = fs::read(entry.path().join("state.json")) else {
+            continue;
+        };
+        let state: Value = serde_json::from_slice(&bytes)?;
+        if state["branch"] == branch {
+            ensure!(source.is_none(), "Duplicate branch state for {branch}");
+            source = Some(entry.path().join("source/src"));
+        }
+    }
+    let source = source.context("Missing published source")?;
+    ensure!(
+        fs::read_to_string(source.join("marker.md"))? == format!("Probe marker {marker}\n"),
+        "Marker mismatch"
+    );
+    ensure!(
+        fs::read_dir(source.join("data"))?.count() == count,
+        "Selected file count mismatch"
+    );
+    for index in 0..count {
+        let contents = fs::read_to_string(source.join(format!("data/{index}.md")))?;
+        ensure!(
+            contents == format!("Fixture file {index}\n{filler}\n"),
+            "Selected file differs: {index}"
+        );
+    }
     Ok(())
 }
 

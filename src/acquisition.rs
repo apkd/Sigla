@@ -45,6 +45,32 @@ pub(crate) fn shared_versioned<T>(
     version: &str,
     prepare: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    serialized_versioned(identity, version, || {
+        let mut active = CAPACITY.0.lock().unwrap();
+        while *active >= 2 && !STOPPED.load(std::sync::atomic::Ordering::Acquire) {
+            active = CAPACITY.1.wait(active).unwrap();
+        }
+        ensure!(
+            !STOPPED.load(std::sync::atomic::Ordering::Acquire),
+            "Service is shutting down"
+        );
+        *active += 1;
+        drop(active);
+        let _permit = Permit;
+        prepare()
+    })
+}
+
+/// Serialize a destination whose preparation owns its own resource admission.
+pub(crate) fn serialized<T>(identity: &str, prepare: impl FnOnce() -> Result<T>) -> Result<T> {
+    serialized_versioned(identity, "", prepare)
+}
+
+fn serialized_versioned<T>(
+    identity: &str,
+    version: &str,
+    prepare: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let state = PREPARATIONS
         .lock()
         .unwrap()
@@ -61,17 +87,10 @@ pub(crate) fn shared_versioned<T>(
             failure.message
         );
     }
-    let mut active = CAPACITY.0.lock().unwrap();
-    while *active >= 2 && !STOPPED.load(std::sync::atomic::Ordering::Acquire) {
-        active = CAPACITY.1.wait(active).unwrap();
-    }
     ensure!(
         !STOPPED.load(std::sync::atomic::Ordering::Acquire),
         "Service is shutting down"
     );
-    *active += 1;
-    drop(active);
-    let _permit = Permit;
     let result = prepare();
     *state = result.as_ref().err().map(|error| Failure {
         at: Instant::now(),
