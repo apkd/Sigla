@@ -506,18 +506,17 @@ pub(super) fn complete(
         &prepared,
         staging,
         telemetry,
-        Some(&pin._pool.root),
+        &pin._pool.root,
     )?;
     // Hydration only uses staged pointers and the LFS cache. It must not hold
     // the Git pool gate while downloading large objects.
-    let prepared = if prepared.selected.is_empty() {
-        prepared
+    if prepared.selected.is_empty() {
+        Ok(prepared)
     } else {
         let _permit = futures_executor::block_on(staging.capacity.transfer(telemetry))?;
-        super::job::hydrate(request, cache, prepared)?
-    };
-    import_stage(request, cache, &prepared, staging, telemetry, None)?;
-    Ok(prepared)
+        // Hydration publishes canonical files and syncs only affected directories.
+        super::job::hydrate(request, cache, prepared)
+    }
 }
 
 fn import_stage(
@@ -526,24 +525,17 @@ fn import_stage(
     prepared: &Prepared,
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
-    raw_owner: Option<&Path>,
+    raw_owner: &Path,
 ) -> Result<()> {
-    let phase = if raw_owner.is_some() {
-        "git"
-    } else {
-        "hydrated"
-    };
     if fs::read_dir(&request.staging)?.next().is_some() {
         let _permit = futures_executor::block_on(staging.capacity.import(telemetry))?;
         let started = std::time::Instant::now();
         let stats = crate::cache::blobs::Store::open(cache)?.import_owned_tree(&request.staging)?;
-        if let Some(root) = raw_owner
-            && let Err(error) = super::files::record(root, cache, prepared, &request.staging)
-        {
+        if let Err(error) = super::files::record(raw_owner, cache, prepared, &request.staging) {
             tracing::warn!(%error, "Could not cache Git file aliases");
         }
         tracing::info!(
-            phase,
+            phase = "git",
             repository = %request.repository,
             revision = %prepared.revision,
             elapsed_ms = started.elapsed().as_millis(),
@@ -559,7 +551,7 @@ fn import_stage(
         );
     } else {
         tracing::info!(
-            phase,
+            phase = "git",
             repository = %request.repository,
             revision = %prepared.revision,
             elapsed_ms = 0,

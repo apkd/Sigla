@@ -9,6 +9,7 @@ struct Output {
     git_ms: u128,
     lfs_ms: u128,
     metrics: Metrics,
+    lfs_metrics: super::lfs::Metrics,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -147,6 +148,9 @@ fn run(request: &Request, cache: &Path, action: Action) -> Result<Prepared> {
         extracted_bytes = output.metrics.extracted_bytes,
         reused_files = output.metrics.reused_files,
         reused_bytes = output.metrics.reused_bytes,
+        lfs_reused_bytes = output.lfs_metrics.reused_bytes,
+        lfs_checksum_bytes = output.lfs_metrics.checksum_bytes,
+        lfs_linked_files = output.lfs_metrics.linked_files,
         "Repository acquisition phase completed"
     );
     if !lfs && let Some(endpoint) = &prepared.transport {
@@ -168,10 +172,14 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
     let started = std::time::Instant::now();
     let lfs = matches!(&action, Action::Hydrate(_));
     let mut metrics = Metrics::default();
+    let mut lfs_metrics = super::lfs::Metrics::default();
     let cache = input.parent().unwrap().parent().unwrap();
     let result = match action {
         Action::Hydrate(mut prepared) => {
-            super::lfs::hydrate(&request, &mut prepared, cache).map(|()| prepared)
+            super::lfs::hydrate(&request, &mut prepared, cache).map(|measured| {
+                lfs_metrics = measured;
+                prepared
+            })
         }
         Action::Prepare => super::materialize::prepare(&request, None, cache, &mut metrics),
         Action::Materialize(pinned) => {
@@ -187,6 +195,7 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
             git_ms: if lfs { 0 } else { elapsed },
             lfs_ms: if lfs { elapsed } else { 0 },
             metrics,
+            lfs_metrics,
         })?,
     )?;
     Ok(())

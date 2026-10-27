@@ -683,20 +683,24 @@ fn main() -> Result<()> {
         return unity_lifecycle(&root);
     }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("acquisition")) {
-        let root = PathBuf::from(
-            std::env::args_os()
-                .nth(2)
-                .context("Usage: remote acquisition WORK_DIRECTORY SIGLA_BINARY [FILE_COUNT]")?,
-        );
+        let root = PathBuf::from(std::env::args_os().nth(2).context(
+            "Usage: remote acquisition WORK_DIRECTORY SIGLA_BINARY [FILE_COUNT] [--expect-reuse]",
+        )?);
         let binary = PathBuf::from(std::env::args_os().nth(3).context("Missing Sigla binary")?)
             .canonicalize()?;
-        let count = std::env::args()
-            .nth(4)
-            .map(|value| value.parse::<usize>())
-            .transpose()?
-            .unwrap_or(30_000);
+        let mut count = None;
+        let mut expect_reuse = false;
+        for argument in std::env::args().skip(4) {
+            if argument == "--expect-reuse" {
+                expect_reuse = true;
+            } else {
+                ensure!(count.is_none(), "File count provided more than once");
+                count = Some(argument.parse::<usize>()?);
+            }
+        }
+        let count = count.unwrap_or(30_000);
         ensure!(count > 0, "File count must be positive");
-        return acquisition_probe(&root, &binary, count);
+        return acquisition_probe(&root, &binary, count, expect_reuse);
     }
     lifecycle()?;
     println!("Remote lifecycle checks passed");
@@ -704,7 +708,12 @@ fn main() -> Result<()> {
 }
 
 /// A local Git/SSH fixture for comparing acquisition with different binaries.
-fn acquisition_probe(directory: &Path, binary: &Path, count: usize) -> Result<()> {
+fn acquisition_probe(
+    directory: &Path,
+    binary: &Path,
+    count: usize,
+    expect_reuse: bool,
+) -> Result<()> {
     fs::create_dir_all(directory)?;
     let fixture = tempfile::Builder::new()
         .prefix("remote-acquisition-")
@@ -745,18 +754,22 @@ fn acquisition_probe(directory: &Path, binary: &Path, count: usize) -> Result<()
         filler.len()
     );
     let server = Server::launch_probe(root, binary)?;
-    let mut log_offset = 0;
     for (label, branch) in [
         ("cold", "main"),
         ("warm", "main"),
         ("new selector", "repeat"),
     ] {
+        let log_offset = fs::metadata(root.join("probe.log"))?.len() as usize;
         let started = Instant::now();
         acquisition_request(&server, branch, "original")?;
         println!("{label}: {:?}", started.elapsed());
-        acquisition_log(root, &mut log_offset)?;
+        let work = acquisition_log(root, log_offset)?;
+        if expect_reuse && branch == "repeat" {
+            work.check(0, 0, 1)?;
+        }
         verify_acquisition(root, branch, count, &filler, "original")?;
     }
+    let log_offset = fs::metadata(root.join("probe.log"))?.len() as usize;
     let started = Instant::now();
     std::thread::scope(|scope| -> Result<()> {
         let first = scope.spawn(|| acquisition_request(&server, "parallel-a", "original"));
@@ -770,26 +783,34 @@ fn acquisition_probe(directory: &Path, binary: &Path, count: usize) -> Result<()
         Ok(())
     })?;
     println!("concurrent selectors: {:?}", started.elapsed());
-    acquisition_log(root, &mut log_offset)?;
+    let work = acquisition_log(root, log_offset)?;
+    if expect_reuse {
+        work.check(0, 0, 2)?;
+    }
     for branch in ["parallel-a", "parallel-b"] {
         verify_acquisition(root, branch, count, &filler, "original")?;
     }
     git(&upstream, &["switch", "--quiet", "-c", "changed"])?;
     fs::write(upstream.join("src/marker.md"), "Probe marker changed\n")?;
     git(&upstream, &["commit", "--quiet", "-am", "one file changed"])?;
+    let log_offset = fs::metadata(root.join("probe.log"))?.len() as usize;
     let started = Instant::now();
     acquisition_request(&server, "changed", "changed")?;
     println!("one file changed: {:?}", started.elapsed());
-    acquisition_log(root, &mut log_offset)?;
+    let work = acquisition_log(root, log_offset)?;
+    if expect_reuse {
+        work.check(1, "Probe marker changed\n".len() as u64, 1)?;
+    }
     verify_acquisition(root, "changed", count, &filler, "changed")?;
     verify_acquisition(root, "main", count, &filler, "original")?;
     drop(server);
     let server = Server::launch_probe(root, binary)?;
+    let log_offset = fs::metadata(root.join("probe.log"))?.len() as usize;
     let started = Instant::now();
     acquisition_request(&server, "main", "original")?;
     acquisition_request(&server, "changed", "changed")?;
     println!("restart, two selectors: {:?}", started.elapsed());
-    acquisition_log(root, &mut log_offset)?;
+    acquisition_log(root, log_offset)?;
     drop(server);
     Ok(())
 }
@@ -809,15 +830,91 @@ fn acquisition_request(server: &Server, branch: &str, marker: &str) -> Result<()
     Ok(())
 }
 
-fn acquisition_log(root: &Path, offset: &mut usize) -> Result<()> {
-    let log = fs::read(root.join("probe.log"))?;
-    for line in String::from_utf8_lossy(&log[*offset..]).lines() {
-        if line.contains("Repository files imported") {
-            println!("  {line}");
+#[derive(Debug, Default)]
+struct AcquisitionWork {
+    git_records: usize,
+    reuse_records: usize,
+    import_records: usize,
+    extracted_files: u64,
+    extracted_bytes: u64,
+    hashed_bytes: u64,
+}
+
+impl AcquisitionWork {
+    fn check(&self, files: u64, bytes: u64, reuse_records: usize) -> Result<()> {
+        ensure!(
+            self.git_records > 0 && self.import_records > 0 && self.reuse_records >= reuse_records,
+            "Missing acquisition reuse or import counters: {self:?}"
+        );
+        ensure!(
+            self.extracted_files == files
+                && self.extracted_bytes == bytes
+                && self.hashed_bytes == bytes,
+            "Unexpected extraction or hashing: {self:?}"
+        );
+        Ok(())
+    }
+}
+
+fn log_counter(line: &str, name: &str) -> Option<u64> {
+    let prefix = format!("{name}=");
+    line.split_whitespace().find_map(|part| {
+        part.strip_prefix(prefix.as_str())?
+            .trim_end_matches(',')
+            .parse()
+            .ok()
+    })
+}
+
+fn plain_log(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            if chars.next() == Some('[') {
+                for code in chars.by_ref() {
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            output.push(character);
         }
     }
-    *offset = log.len();
-    Ok(())
+    output
+}
+
+fn acquisition_log(root: &Path, offset: usize) -> Result<AcquisitionWork> {
+    let log = fs::read(root.join("probe.log"))?;
+    let mut work = AcquisitionWork::default();
+    for original in String::from_utf8_lossy(&log[offset..]).lines() {
+        let line = plain_log(original);
+        // Older binaries may omit counters; the optional assertion requires them.
+        if line.contains("Repository acquisition phase completed") {
+            println!("  {line}");
+            if (line.contains("phase=\"git\"") || line.contains("phase=git"))
+                && let (Some(files), Some(bytes), Some(reused)) = (
+                    log_counter(&line, "extracted_files"),
+                    log_counter(&line, "extracted_bytes"),
+                    log_counter(&line, "reused_files"),
+                )
+            {
+                work.git_records += 1;
+                work.reuse_records += usize::from(reused > 0);
+                work.extracted_files += files;
+                work.extracted_bytes += bytes;
+            }
+        }
+        if line.contains("Repository files imported") {
+            println!("  {line}");
+            if let Some(bytes) = log_counter(&line, "hashed_bytes") {
+                work.import_records += 1;
+                work.hashed_bytes += bytes;
+            }
+        }
+    }
+    Ok(work)
 }
 
 fn verify_acquisition(

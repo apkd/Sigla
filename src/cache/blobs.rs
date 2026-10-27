@@ -305,6 +305,20 @@ impl Store {
         Ok(stats)
     }
 
+    /// Adopt a stopped, private file. Hold a store lease through its publication.
+    pub(crate) fn import_owned_file(&self, path: &Path) -> Result<ImportStats> {
+        let shards = Mutex::new(BTreeSet::new());
+        let mut stats = ImportStats::default();
+        self.import_owned(path, &mut stats, &shards)?;
+        let started = Instant::now();
+        for shard in shards.into_inner().unwrap() {
+            File::open(shard)?.sync_all()?;
+        }
+        File::open(path.parent().context("Cache input has no parent")?)?.sync_all()?;
+        stats.sync += started.elapsed();
+        Ok(stats)
+    }
+
     fn import_owned(
         &self,
         path: &Path,
@@ -1180,6 +1194,28 @@ mod tests {
             fs::metadata(other.join("copy")).unwrap().ino(),
             fs::metadata(&first).unwrap().ino()
         );
+    }
+
+    #[test]
+    fn owned_file_adoption_and_reuse_do_not_copy_contents() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let _lease = store.lease().unwrap();
+        let path = cache.path().join("download");
+        let contents = vec![7; 8192];
+        fs::write(&path, &contents).unwrap();
+        let original = fs::metadata(&path).unwrap().ino();
+        let stats = store.import_owned_file(&path).unwrap();
+        assert_eq!(stats.hashed_bytes, contents.len() as u64);
+        assert_eq!(stats.adopted, 1);
+        assert_eq!(stats.fallback, 0);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original);
+        assert!(store.file_identity(&path).unwrap().is_some());
+        let stats = store.import_owned_file(&path).unwrap();
+        assert_eq!(stats.hashed_bytes, 0);
+        assert_eq!(stats.reused, 1);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original);
+        assert_eq!(fs::read(&path).unwrap(), contents);
     }
 
     #[test]

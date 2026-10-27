@@ -11,13 +11,34 @@ use reqwest::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct Metrics {
+    pub reused_bytes: u64,
+    pub checksum_bytes: u64,
+    pub linked_files: u64,
+}
+
+struct Counted<'a, R> {
+    input: R,
+    count: &'a mut u64,
+}
+
+impl<R: Read> Read for Counted<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.input.read(bytes)?;
+        *self.count += n as u64;
+        Ok(n)
+    }
+}
 
 /// Inputs whose Git contents cannot yet be used for source navigation.
 pub(super) fn pending(staging: &Path, prepared: &Prepared) -> Result<Vec<String>> {
@@ -297,7 +318,7 @@ impl Pending {
         for path in &self.paths {
             let destination = staging.join(path);
             let temporary = tempfile::tempdir_in(destination.parent().unwrap())?;
-            fs::copy(cached, temporary.path().join("file"))?;
+            fs::hard_link(cached, temporary.path().join("file"))?;
             fs::rename(temporary.path().join("file"), destination)?;
         }
         Ok(())
@@ -319,9 +340,46 @@ impl Pending {
     }
 }
 
-fn cached(pointer: &Pointer, cache: &Path) -> bool {
-    File::open(cache.join(&pointer.oid))
-        .is_ok_and(|file| verified_copy(file, &mut std::io::sink(), pointer).is_ok())
+fn cached(
+    pointer: &Pointer,
+    cache: &Path,
+    files: &crate::cache::blobs::Store,
+    metrics: &mut Metrics,
+) -> Result<bool> {
+    let path = cache.join(&pointer.oid);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() != pointer.size {
+        return Ok(false);
+    }
+    // Only verified downloads are published under LFS object names. Canonical
+    // inode ownership proves that later readers can trust those immutable bytes.
+    if files.file_identity(&path)?.is_some() {
+        metrics.reused_bytes += pointer.size;
+        return Ok(true);
+    }
+    let input = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)?;
+    if verified_copy(
+        Counted {
+            input,
+            count: &mut metrics.checksum_bytes,
+        },
+        &mut std::io::sink(),
+        pointer,
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    // Older caches can contain verified files without canonical ownership.
+    files.import(&path)?;
+    Ok(true)
 }
 
 fn fetch(
@@ -332,7 +390,6 @@ fn fetch(
     files: &crate::cache::blobs::Store,
     transferred: &mut u64,
 ) -> Result<()> {
-    let cached = cache.join(&pointer.oid);
     let response = client
         .get(action.url()?)
         .headers(action.headers()?)
@@ -343,35 +400,40 @@ fn fetch(
         "LFS download failed ({})",
         response.status()
     );
+    store_download(
+        response.take(pointer.size),
+        pointer,
+        cache,
+        files,
+        transferred,
+    )
+}
+
+fn store_download(
+    input: impl Read,
+    pointer: &Pointer,
+    cache: &Path,
+    files: &crate::cache::blobs::Store,
+    transferred: &mut u64,
+) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(cache)?;
-    struct Counted<'a, R> {
-        input: R,
-        count: &'a mut u64,
-    }
-    impl<R: Read> Read for Counted<'_, R> {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            let n = self.input.read(bytes)?;
-            *self.count += n as u64;
-            Ok(n)
-        }
-    }
     verified_copy(
         Counted {
-            input: response.take(pointer.size),
+            input,
             count: transferred,
         },
         &mut temporary,
         pointer,
     )?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(&cached)?;
-    files.import(&cached)?;
+    files.import_owned_file(temporary.path())?;
+    temporary.persist(cache.join(&pointer.oid))?;
+    File::open(cache)?.sync_all()?;
     Ok(())
 }
 
-pub fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Result<()> {
+pub(super) fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Result<Metrics> {
     if prepared.selected.is_empty() {
-        return Ok(());
+        return Ok(Metrics::default());
     }
     let repository = Repository::parse(&request.repository)?.context("Missing repository")?;
     let client = std::sync::LazyLock::new(|| {
@@ -425,8 +487,10 @@ fn hydrate_with(
     mut acquire: impl FnMut(&[&Pointer]) -> Result<BTreeMap<String, Object>>,
     download: impl Fn(&Action, &Pointer, &Path, &crate::cache::blobs::Store, &mut u64) -> Result<()>
     + Sync,
-) -> Result<()> {
+) -> Result<Metrics> {
     let objects = cache.join("lfs");
+    let mut metrics = Metrics::default();
+    let mut directories = BTreeSet::new();
     // Leave time for Git preparation and publication under the worker deadline.
     // Later preparations retry unavailable inputs and reuse verified objects.
     let started = Instant::now();
@@ -439,6 +503,9 @@ fn hydrate_with(
         let result = (|| -> Result<()> {
             let mut bytes = Vec::new();
             File::open(&target)?.take(8192).read_to_end(&mut bytes)?;
+            if bytes.starts_with(b"version https://git-lfs.github.com/spec/") {
+                directories.insert(target.parent().unwrap().to_owned());
+            }
             let Some(pointer) = Pointer::parse(&bytes)? else {
                 return Ok(());
             };
@@ -493,11 +560,12 @@ fn hydrate_with(
         .selected
         .retain(|path, _| !prepared.omitted.contains_key(path));
     if pending.is_empty() {
-        return Ok(());
+        sync_directories(&directories)?;
+        return Ok(metrics);
     }
     fs::create_dir_all(&objects)?;
     let files = crate::cache::blobs::Store::open(cache)?;
-    // Protect cached objects and new downloads until every staged copy is published.
+    // Protect cached objects and new downloads until every staged link is published.
     let _lease = files.lease()?;
     let jobs: Vec<_> = pending.into_values().collect();
     // Each batch reserves its full declared size before concurrent transfers start.
@@ -505,16 +573,17 @@ fn hydrate_with(
     for group in jobs.chunks(4) {
         let mut missing = Vec::new();
         for job in group {
-            if cached(&job.pointer, &objects) {
-                let cached = objects.join(&job.pointer.oid);
-                let result = files
-                    .import(&cached)
-                    .and_then(|_| job.publish(&cached, &request.staging));
-                if let Err(error) = result {
-                    job.unavailable(&error, request, prepared)?;
+            match cached(&job.pointer, &objects, &files, &mut metrics) {
+                Ok(true) => {
+                    let result = job.publish(&objects.join(&job.pointer.oid), &request.staging);
+                    if let Err(error) = result {
+                        job.unavailable(&error, request, prepared)?;
+                    } else {
+                        metrics.linked_files += job.paths.len() as u64;
+                    }
                 }
-            } else {
-                missing.push(job);
+                Ok(false) => missing.push(job),
+                Err(error) => job.unavailable(&error, request, prepared)?,
             }
         }
         if missing.is_empty() {
@@ -590,10 +659,21 @@ fn hydrate_with(
         })?;
         for (job, transferred, result) in results {
             prepared.transfer_bytes += transferred;
+            metrics.checksum_bytes += transferred;
             if let Err(error) = result {
                 job.unavailable(&error, request, prepared)?;
+            } else {
+                metrics.linked_files += job.paths.len() as u64;
             }
         }
+    }
+    sync_directories(&directories)?;
+    Ok(metrics)
+}
+
+fn sync_directories(directories: &BTreeSet<PathBuf>) -> Result<()> {
+    for directory in directories {
+        File::open(directory)?.sync_all()?;
     }
     Ok(())
 }
@@ -731,7 +811,7 @@ mod tests {
                 assert_eq!(pointers.len(), contents.len());
                 actions(pointers)
             },
-            |_, pointer, cache, _, transferred| {
+            |_, pointer, cache, files, transferred| {
                 let mut count = entered.0.lock().unwrap();
                 *count += 1;
                 entered.1.notify_all();
@@ -744,8 +824,7 @@ mod tests {
                 ensure!(*count == contents.len(), "Downloads did not overlap");
                 drop(count);
                 let bytes = contents[&pointer.oid];
-                *transferred += bytes.len() as u64;
-                verified_copy(bytes, &mut File::create(cache.join(&pointer.oid))?, pointer)
+                store_download(bytes, pointer, cache, files, transferred)
             },
         )
         .unwrap();
@@ -757,9 +836,56 @@ mod tests {
                 .map(|bytes| bytes.len() as u64)
                 .sum::<u64>()
         );
+        let files = crate::cache::blobs::Store::open(root.path()).unwrap();
         for (path, bytes) in inputs {
             assert_eq!(fs::read(request.staging.join(path)).unwrap(), *bytes);
+            assert!(
+                files
+                    .file_identity(&request.staging.join(path))
+                    .unwrap()
+                    .is_some()
+            );
         }
+    }
+
+    #[test]
+    fn failed_download_cannot_publish_or_replace_verified_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("lfs");
+        fs::create_dir(&objects).unwrap();
+        let files = crate::cache::blobs::Store::open(root.path()).unwrap();
+        let _lease = files.lease().unwrap();
+        let bytes = b"verified";
+        let pointer = Pointer {
+            oid: format!("{:x}", Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        };
+        let mut transferred = 0;
+        assert!(store_download(&bytes[..3], &pointer, &objects, &files, &mut transferred).is_err());
+        assert_eq!(transferred, 3);
+        let path = objects.join(&pointer.oid);
+        assert!(!path.exists());
+        store_download(
+            bytes.as_slice(),
+            &pointer,
+            &objects,
+            &files,
+            &mut transferred,
+        )
+        .unwrap();
+        let identity = files.file_identity(&path).unwrap().unwrap();
+        assert!(
+            store_download(
+                b"tampered".as_slice(),
+                &pointer,
+                &objects,
+                &files,
+                &mut transferred
+            )
+            .is_err()
+        );
+        assert_eq!(files.file_identity(&path).unwrap(), Some(identity));
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
@@ -822,6 +948,7 @@ mod tests {
 
     #[test]
     fn verified_cache_hits_require_no_remote_access() {
+        use std::os::unix::fs::MetadataExt;
         let root = tempfile::tempdir().unwrap();
         let contents = b"class Cached {}";
         let (request, mut prepared) = preparation(root.path(), &[("cached.cs", contents)]);
@@ -838,7 +965,7 @@ mod tests {
             contents,
         )
         .unwrap();
-        hydrate_with(
+        let metrics = hydrate_with(
             &request,
             &mut prepared,
             root.path(),
@@ -853,6 +980,78 @@ mod tests {
             contents
         );
         assert_eq!(prepared.transfer_bytes, 0);
+        assert_eq!(metrics.checksum_bytes, contents.len() as u64);
+        assert_eq!(metrics.reused_bytes, 0);
+        assert_eq!(metrics.linked_files, 1);
+        let first = request.staging.join("cached.cs");
+        assert_eq!(
+            files
+                .import_owned_tree(&request.staging)
+                .unwrap()
+                .hashed_bytes,
+            0
+        );
+
+        let (request, mut prepared) = preparation(
+            &root.path().join("another-branch"),
+            &[("renamed.cs", contents)],
+        );
+        files.import_owned_tree(&request.staging).unwrap();
+        let metrics = hydrate_with(
+            &request,
+            &mut prepared,
+            root.path(),
+            |_| panic!("Shared LFS object must not require authentication"),
+            |_, _, _, _, _| panic!("Shared LFS object must not be downloaded"),
+        )
+        .unwrap();
+        assert_eq!(metrics.checksum_bytes, 0);
+        assert_eq!(metrics.reused_bytes, contents.len() as u64);
+        assert_eq!(metrics.linked_files, 1);
+        assert_eq!(prepared.transfer_bytes, 0);
+        let second = request.staging.join("renamed.cs");
+        assert_eq!(fs::read(&second).unwrap(), contents);
+        assert_eq!(
+            fs::metadata(&first).unwrap().ino(),
+            fs::metadata(&second).unwrap().ino()
+        );
+        assert_eq!(
+            files
+                .import_owned_tree(&request.staging)
+                .unwrap()
+                .hashed_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn cache_validation_rejects_unverified_and_wrong_sized_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("lfs");
+        fs::create_dir(&objects).unwrap();
+        let files = crate::cache::blobs::Store::open(root.path()).unwrap();
+        let _lease = files.lease().unwrap();
+        let bytes = b"verified";
+        let mut pointer = Pointer {
+            oid: format!("{:x}", Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        };
+        let path = objects.join(&pointer.oid);
+        fs::write(&path, b"tampered").unwrap();
+        let mut metrics = Metrics::default();
+        assert!(!cached(&pointer, &objects, &files, &mut metrics).unwrap());
+        assert!(files.file_identity(&path).unwrap().is_none());
+        assert_eq!(metrics.checksum_bytes, bytes.len() as u64);
+        fs::write(&path, bytes).unwrap();
+        assert!(cached(&pointer, &objects, &files, &mut metrics).unwrap());
+        assert!(files.file_identity(&path).unwrap().is_some());
+        pointer.size += 1;
+        assert!(!cached(&pointer, &objects, &files, &mut metrics).unwrap());
+        pointer.size -= 1;
+        let target = root.path().join("target");
+        fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(!cached(&pointer, &objects, &files, &mut metrics).unwrap());
     }
 
     #[test]
