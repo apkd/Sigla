@@ -614,7 +614,7 @@ impl Tracker {
             .iter()
             .filter(|(_, e)| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
             .collect();
-        if !exact.is_empty() {
+        if !exact.is_empty() && (region.kind != "text" || !to.contains_key(&region.path)) {
             return Ok(exact
                 .iter()
                 .map(|(path, _)| {
@@ -645,6 +645,9 @@ impl Tracker {
                 uncertain: false,
                 reason: "path continuity",
             }]);
+        }
+        if region.kind == "text" {
+            return self.text_region(from, to, region, work);
         }
         let mut search = CandidateSearch::default();
         let mut assignment = Assignment::default();
@@ -678,6 +681,245 @@ impl Tracker {
             );
         }
         Ok(assignment.links)
+    }
+
+    fn text_region(
+        &mut self,
+        from: &Tree,
+        to: &Tree,
+        region: &Region,
+        work: &mut usize,
+    ) -> Result<Vec<Link>> {
+        let source = self
+            .sources
+            .get(&mut self.store, &region.path, &region.blob)?;
+        if let Some(entry) = to
+            .get(&region.path)
+            .filter(|entry| matches!(entry.mode, 0o100644 | 0o100755))
+        {
+            let other = self.sources.get(&mut self.store, &region.path, &entry.id)?;
+            // The unchanged prefix pins this occurrence when its end remains
+            // a line boundary in both files.
+            if !region.span.is_empty()
+                && other.text.get(..region.span.end) == Some(&source.text[..region.span.end])
+                && (source.text.as_bytes()[region.span.end - 1] == b'\n'
+                    || other.text.len() == region.span.end && source.text.len() == region.span.end)
+            {
+                return Ok(vec![Link {
+                    from: region.clone(),
+                    to: Region::passage(&region.path, &entry.id, region.span.clone()),
+                    relation: Relation::Continue,
+                    uncertain: region.weak,
+                    reason: "unchanged text prefix",
+                }]);
+            }
+        }
+        let needle = &source.text[region.span.clone()];
+        let tokens = regions::TextTokens::new(&source.text, region.span.clone());
+        let neighbours = regions::TextContext::new(&source.text, &region.span);
+        let distinctive = tokens.distinctive();
+        let meaningful = tokens.meaningful();
+        let whole_lines = |text: &str, range: &Range<usize>| {
+            (range.start == 0 || text[..range.start].ends_with('\n'))
+                && (range.end == text.len() || text[..range.end].ends_with('\n'))
+        };
+        let source_count = tokens
+            .occurrences(&source.text, &self.store.cancel)?
+            .iter()
+            .filter(|r| distinctive || whole_lines(&source.text, r))
+            .count();
+        let paragraphs = regions::paragraphs(&source.text);
+        let paragraph_count = paragraphs
+            .iter()
+            .position(|p| p.start == region.span.start)
+            .and_then(|start| {
+                paragraphs
+                    .iter()
+                    .position(|p| p.end == region.span.end)
+                    .filter(|&end| start <= end)
+                    .map(|end| end + 1 - start)
+            });
+        let mut links = Vec::new();
+        let mut unresolved = false;
+        let mut absent = !to.contains_key(&region.path);
+        let mut local_supported = false;
+        let deferred = |path: &String| {
+            to[path].id.as_ref() != region.blob
+                && from.get(path).is_some_and(|e| e.id == to[path].id)
+        };
+        let mut paths: Vec<_> = to
+            .iter()
+            .filter(|(path, entry)| {
+                matches!(entry.mode, 0o100644 | 0o100755) && regions::compatible(path, &region.path)
+            })
+            .map(|(path, _)| path)
+            .collect();
+        paths.sort_by_key(|path| (*path != &region.path, deferred(path), *path));
+        let mut prepared = self.sources.pending();
+        for (index, path) in paths.iter().enumerate() {
+            check(&self.store.cancel)?;
+            let entry = &to[*path];
+            let same_path = *path == &region.path;
+            // Supported local continuations close the changed neighbourhood;
+            // unrelated unchanged origins cannot displace that continuity.
+            if !same_path && local_supported && deferred(path) {
+                break;
+            }
+            let other = if same_path {
+                self.sources.get(&mut self.store, path, &entry.id)?
+            } else {
+                prepared.get(
+                    &mut self.store,
+                    path,
+                    paths[index..]
+                        .iter()
+                        .take_while(|path| !local_supported || !deferred(path))
+                        .map(|path| (path.as_str(), to[*path].id.as_ref())),
+                )?
+            };
+            let mut ranges = tokens.occurrences(&other.text, &self.store.cancel)?;
+            ranges.retain(|r| {
+                let keep = distinctive || whole_lines(&other.text, r);
+                unresolved |= !keep && meaningful;
+                keep
+            });
+            ranges.sort_unstable_by_key(|r| (r.start, r.end));
+            ranges.dedup();
+            let exact = ranges.clone();
+            let mut projected = None;
+            let mut moved_context = None;
+            if same_path {
+                match regions::text_range(&source.text, &other.text, region.span.clone()) {
+                    regions::TextRange::Present(range) => {
+                        // The diff establishes both cuts, including edited edges.
+                        // Equal names/owners and trigram scores say nothing here.
+                        // A token match inside a projected whole line is a
+                        // fragment of that line, not another predecessor.
+                        ranges.retain(|r| {
+                            !(range.start <= r.start
+                                && r.end <= range.end
+                                && (whole_lines(&source.text, &region.span)
+                                    || other.text[range.start..r.start].trim().is_empty()
+                                        && other.text[r.end..range.end].trim().is_empty()))
+                        });
+                        // Edited duplicates cannot be found by the current
+                        // passage's exact tokens. The proposed predecessor must
+                        // not acquire a unique identity from diff tie-breaking.
+                        if other.text[range.clone()] != *needle {
+                            let previous = regions::TextTokens::new(&other.text, range.clone());
+                            let distinctive = previous.distinctive();
+                            ranges.extend(
+                                previous
+                                    .occurrences(&other.text, &self.store.cancel)?
+                                    .into_iter()
+                                    .filter(|r| distinctive || whole_lines(&other.text, r)),
+                            );
+                        }
+                        projected = Some(range.clone());
+                        ranges.push(range);
+                    }
+                    regions::TextRange::Absent => absent = true,
+                    regions::TextRange::Unresolved => {
+                        unresolved |= exact.len() != 1 || source_count != 1;
+                    }
+                }
+            } else if let Some(bounds) = neighbours.as_ref().and_then(|n| n.range(&other.text)) {
+                match regions::text_range(&source.text, &other.text, region.span.clone()) {
+                    regions::TextRange::Present(range)
+                        if bounds.start <= range.start && range.end <= bounds.end =>
+                    {
+                        moved_context = Some(range.clone());
+                        ranges.push(range);
+                    }
+                    regions::TextRange::Absent => {}
+                    _ => unresolved = true,
+                }
+            }
+            // A complete paragraph supplies independently defined boundaries
+            // for an edited move. Arbitrary line subsets get only weak evidence.
+            // Never turn a surviving fragment into a complete text occurrence.
+            if ranges.is_empty() || paragraph_count.is_some() && exact.is_empty() {
+                let paragraphs = regions::paragraphs(&other.text);
+                for parts in paragraphs.windows(paragraph_count.unwrap_or(1)) {
+                    candidate_work(work, &self.store.cancel)?;
+                    let range = parts[0].start..parts.last().unwrap().end;
+                    if projected.as_ref() == Some(&range) {
+                        continue;
+                    }
+                    match tokens.evidence(&other.text[range.clone()]) {
+                        regions::TextEvidence::Exact | regions::TextEvidence::Edited
+                            if paragraph_count.is_some() =>
+                        {
+                            ranges.push(range)
+                        }
+                        regions::TextEvidence::None => {}
+                        _ => unresolved = true,
+                    }
+                }
+            }
+            ranges.sort_unstable_by_key(|r| (r.start, r.end));
+            ranges.dedup();
+            let local_exact = same_path
+                && ranges.len() == 1
+                && exact.len() == 1
+                && source_count == 1
+                && other.text[ranges[0].clone()] == *needle;
+            for range in ranges {
+                candidate_work(work, &self.store.cancel)?;
+                let context = same_path
+                    && source_count <= 1
+                    && (projected.as_ref() == Some(&range)
+                        || exact.len() == 1 && exact[0] == range);
+                local_supported |= context
+                    && matches!(
+                        tokens.evidence(&other.text[range.clone()]),
+                        regions::TextEvidence::Exact | regions::TextEvidence::Edited
+                    );
+                let reason = if projected.as_ref() == Some(&range) {
+                    "text edit boundaries"
+                } else if moved_context.as_ref() == Some(&range) {
+                    "text neighbouring anchors"
+                } else if exact
+                    .binary_search_by_key(&(range.start, range.end), |r| (r.start, r.end))
+                    .is_ok()
+                {
+                    "complete passage tokens"
+                } else {
+                    "whole paragraph continuity"
+                };
+                links.push(Link {
+                    from: region.clone(),
+                    to: Region::passage(path, &entry.id, range),
+                    relation: if same_path {
+                        Relation::Continue
+                    } else {
+                        Relation::Text
+                    },
+                    uncertain: region.weak || !context,
+                    reason,
+                });
+            }
+            // A unique retained occurrence has local continuity even if another
+            // file contains a copy. Edited or deleted slots still search moves.
+            if local_exact {
+                break;
+            }
+        }
+        ensure!(
+            !links.is_empty() || absent && !unresolved && !region.weak,
+            "unresolved target: text passage boundaries or predecessor are unavailable"
+        );
+        if links.len() > 1 {
+            for link in &mut links {
+                link.uncertain = true;
+                link.reason = "competing text passages";
+            }
+        } else if unresolved {
+            for link in &mut links {
+                link.uncertain = true;
+            }
+        }
+        Ok(links)
     }
 
     fn assign(
@@ -1039,14 +1281,6 @@ impl Tracker {
                 .flatten();
             let candidates = if region.kind == "file" {
                 vec![Region::whole(path, &entry.id, 0)]
-            } else if region.kind == "text" {
-                text_candidates(
-                    &source.text[source_range.clone()],
-                    &other,
-                    path,
-                    &entry.id,
-                    mapped.clone(),
-                )
             } else {
                 other
                     .declarations
@@ -1164,10 +1398,6 @@ impl Tracker {
                 if region.kind == "file" {
                     score = sim + usize::from(same_path) * 60;
                     reason = "file content+path";
-                }
-                if region.kind == "text" {
-                    score = sim + usize::from(same_path) * 15;
-                    reason = "tokens+neighbours";
                 }
                 if region.fragment {
                     if let Some(range) = mapped
@@ -1416,57 +1646,6 @@ fn fragments(needle: &str, haystack: &str, offset: usize) -> Vec<Range<usize>> {
         i += 1;
     }
     result
-}
-fn text_candidates(
-    needle: &str,
-    source: &Source,
-    path: &str,
-    blob: &str,
-    mapped: Option<Range<usize>>,
-) -> Vec<Region> {
-    if let Some(range) = &mapped {
-        let leading = needle.len() - needle.trim_start().len();
-        let trailing = needle.len() - needle.trim_end().len();
-        if let Some(start) = range.start.checked_sub(leading)
-            && let Some(end) = range.end.checked_add(trailing)
-            && source.text.get(start..end) == Some(needle)
-        {
-            return vec![Region::passage(path, blob, start..end)];
-        }
-    }
-    let mut ranges = fragments(needle, &source.text, 0);
-    if ranges.is_empty() {
-        ranges.extend(mapped);
-    }
-    if ranges.is_empty() {
-        let mut start = 0;
-        for (end, _) in source
-            .text
-            .match_indices("\n\n")
-            .chain(std::iter::once((source.text.len(), "")))
-        {
-            if end > start {
-                ranges.push(start..end);
-            }
-            start = end + 2;
-        }
-    }
-    // Preserve a line-range selection's ending newline when its matched tokens
-    // end a source line. Token alignment must not invent whitespace-only edits.
-    if needle.ends_with('\n') {
-        for range in &mut ranges {
-            if let Some(end) = source.text[range.end..].find('\n') {
-                let suffix = &source.text[range.end..range.end + end];
-                if suffix.chars().all(char::is_whitespace) {
-                    range.end += end + 1;
-                }
-            }
-        }
-    }
-    ranges
-        .into_iter()
-        .map(|r| Region::passage(path, blob, r))
-        .collect()
 }
 pub(super) fn directory_prefix(pattern: &str) -> &str {
     let end = pattern.find(['*', '?', '[', '{']).unwrap_or(pattern.len());

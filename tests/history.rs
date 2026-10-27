@@ -137,6 +137,95 @@ fn next(page: &str) -> Option<usize> {
     })
 }
 
+// These fixtures fit in one hunk, so both rendered sides must contain the
+// complete selected passage, including whitespace and the final newline.
+fn selected_hunk_content(patch: &str) -> (String, String) {
+    assert_eq!(
+        patch.lines().filter(|line| line.starts_with("@@ ")).count(),
+        1,
+        "{patch}"
+    );
+    let (mut old, mut new) = (String::new(), String::new());
+    let (mut hunk, mut previous) = (false, b' ');
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("@@ ") {
+            hunk = true;
+            continue;
+        }
+        if !hunk {
+            continue;
+        }
+        let prefix = line.as_bytes()[0];
+        if prefix == b'\\' {
+            assert_eq!(line, "\\ No newline at end of file\n", "{patch}");
+            if previous != b'+' {
+                assert_eq!(old.pop(), Some('\n'), "{patch}");
+            }
+            if previous != b'-' {
+                assert_eq!(new.pop(), Some('\n'), "{patch}");
+            }
+            continue;
+        }
+        assert!(matches!(prefix, b' ' | b'-' | b'+'), "{patch}");
+        if prefix != b'+' {
+            old.push_str(&line[1..]);
+        }
+        if prefix != b'-' {
+            new.push_str(&line[1..]);
+        }
+        previous = prefix;
+    }
+    (old, new)
+}
+
+fn assert_selected_content(page: &str, expected_old: &str, expected_new: &str) {
+    let (old, new) = selected_hunk_content(body(page));
+    assert_eq!(old, expected_old, "old selected content: {page}");
+    assert_eq!(new, expected_new, "new selected content: {page}");
+}
+
+fn assert_unresolved_history(error: &str) {
+    assert!(
+        error.contains("unresolved target") || error.starts_with("unfinished "),
+        "{error}"
+    );
+}
+
+async fn selected_content_or_unresolved(
+    fixture: &Fixture,
+    root: &str,
+    tip: &str,
+    selector: &str,
+    expected_old: &str,
+    expected_new: &str,
+) -> Option<String> {
+    let history = fixture.history(tip, &format!("log {selector}")).await;
+    let comparison = fixture
+        .app
+        .history(
+            &format!("{}#{tip}", fixture.root.path().display()),
+            &format!("show {tip} {selector}"),
+        )
+        .await;
+    match comparison {
+        Ok(page) => {
+            assert_selected_content(&page, expected_old, expected_new);
+            assert!(!page.contains("/dev/null"), "{page}");
+            assert_eq!(ids(&history), [tip, root], "{history}");
+            Some(page)
+        }
+        Err(error) => {
+            assert_unresolved_history(&error.to_string());
+            assert!(
+                history.contains("incomplete:") && !history.ends_with("end\n"),
+                "{history}"
+            );
+            assert!(ids(&history).is_empty(), "{history}");
+            None
+        }
+    }
+}
+
 #[tokio::test]
 async fn committed_objects_ignore_worktree_index_and_invalid_build_graph() {
     let fixture = Fixture::new();
@@ -290,8 +379,872 @@ async fn text_passage_follows_reflow_and_move_without_adjacent_sections() {
     let diff = f
         .history(&tip, &format!("show {tip} @notes/new.md:3-4"))
         .await;
+    let selected_old =
+        "Selected passage preserves distinctive ordered words across reflow and file movement.\n";
+    let selected_new =
+        "Selected passage preserves distinctive ordered words\nacross reflow and file movement.\n";
+    assert_selected_content(&diff, selected_old, selected_new);
     assert!(
-        body(&diff).contains("Selected passage") && !body(&diff).contains("Unrelated section"),
+        body(&diff).contains("# move docs/old.md → notes/new.md"),
+        "{diff}"
+    );
+    let forward = f
+        .history(&root, &format!("diff {root}..{tip} @docs/old.md:3-3"))
+        .await;
+    assert_selected_content(&forward, selected_old, selected_new);
+    let reverse = f
+        .history(&tip, &format!("diff {tip}..{root} @notes/new.md:3-4"))
+        .await;
+    assert_selected_content(&reverse, selected_new, selected_old);
+}
+
+#[tokio::test]
+async fn edited_text_ranges_preserve_the_complete_selected_content() {
+    for (selected_after, tail_after) in [
+        ("Selected after.", "Tail after."),
+        ("Selected after.", "Tail before."),
+        ("Selected before!", "Tail before."),
+    ] {
+        let f = Fixture::new();
+        let old = "Intro stays.\nSelected before.\nContext stays.\nTail before.\n";
+        let new = format!("Intro stays.\n{selected_after}\nContext stays.\n{tail_after}\n");
+        let root = f.commit(&[("docs/range.md", old)], &[], "introduce range");
+        let tip = f.commit(&[("docs/range.md", &new)], &[&root], "edit range");
+        for (range, selected_old, selected_new, changes) in [
+            (
+                "2-2",
+                "Selected before.\n".to_owned(),
+                format!("{selected_after}\n"),
+                1,
+            ),
+            (
+                "2-3",
+                "Selected before.\nContext stays.\n".to_owned(),
+                format!("{selected_after}\nContext stays.\n"),
+                1,
+            ),
+            (
+                "1-4",
+                old.to_owned(),
+                new.clone(),
+                if tail_after == "Tail before." { 1 } else { 2 },
+            ),
+        ] {
+            let selector = format!("@docs/range.md:{range}");
+            let history = f.history(&tip, &format!("log {selector}")).await;
+            assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+            assert!(
+                history.contains(&format!("edit +{changes} -{changes}")),
+                "{history}"
+            );
+            assert!(
+                !history.contains('~') && history.ends_with("end\n"),
+                "{history}"
+            );
+            for (at, query) in [
+                (&tip, format!("show {tip} {selector}")),
+                (&tip, format!("diff {root}..{tip} {selector}")),
+                (&root, format!("diff {root}..{tip} {selector}")),
+            ] {
+                let comparison = f.history(at, &query).await;
+                assert_selected_content(&comparison, &selected_old, &selected_new);
+                assert!(
+                    !comparison.contains("/dev/null") && !comparison.contains('~'),
+                    "{comparison}"
+                );
+            }
+            let reverse = f
+                .history(&tip, &format!("diff {tip}..{root} {selector}"))
+                .await;
+            assert_selected_content(&reverse, &selected_new, &selected_old);
+        }
+    }
+}
+
+#[tokio::test]
+async fn edited_terminal_text_ranges_preserve_written_bytes() {
+    for (before, after) in [
+        ("    Selected before.\n", "    Selected after.\n"),
+        ("Selected λ 🦀.\r\n", "Selected λ 🦀!\r\n"),
+        ("Selected before.", "Selected after."),
+        ("Selected before.\n", "Selected after."),
+    ] {
+        let f = Fixture::new();
+        let old = format!("Intro stays.\n{before}");
+        let new = format!("Intro stays.\n{after}");
+        let root = f.commit(&[("range.md", &old)], &[], "introduce range");
+        let tip = f.commit(&[("range.md", &new)], &[&root], "edit last line");
+        let history = f.history(&tip, "log @range.md:2-2").await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+        assert!(
+            history.contains("edit +1 -1") && history.ends_with("end\n"),
+            "{history}"
+        );
+        let comparison = f.history(&tip, &format!("show {tip} @range.md:2-2")).await;
+        assert_selected_content(&comparison, before, after);
+        let reverse = f
+            .history(&root, &format!("diff {tip}..{root} @range.md:2-2"))
+            .await;
+        assert_selected_content(&reverse, after, before);
+    }
+}
+
+#[tokio::test]
+async fn an_unresolved_text_boundary_does_not_become_an_addition() {
+    for (old, new, range) in [
+        (
+            "Intro stays.\nAlpha before.\nBeta before.\nTail stays.\n",
+            "Intro stays.\nGamma after!\nDelta after!\nTail stays.\n",
+            "2-2",
+        ),
+        (
+            "Completely unrelated old material.\n",
+            "Wholly distinct new information!\n",
+            "1-1",
+        ),
+    ] {
+        let f = Fixture::new();
+        let root = f.commit(&[("range.md", old)], &[], "old passage");
+        let tip = f.commit(&[("range.md", new)], &[&root], "replace passage");
+        let selector = format!("@range.md:{range}");
+        let history = f.history(&tip, &format!("log {selector}")).await;
+        assert!(ids(&history).is_empty(), "{history}");
+        assert!(
+            history.contains("incomplete:") && !history.ends_with("end\n"),
+            "{history}"
+        );
+        for (at, query) in [
+            (&tip, format!("show {tip} {selector}")),
+            (&tip, format!("diff {root}..{tip} {selector}")),
+            (&root, format!("diff {root}..{tip} {selector}")),
+        ] {
+            let error = f.error(at, &query).await;
+            assert_unresolved_history(&error);
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_range_absence_is_proven_by_an_insertion_or_deletion() {
+    let f = Fixture::new();
+    let old = "Intro stays.\nContext stays.\nTail stays.\n";
+    let selected = "Selected newly introduced passage.\n";
+    let new = format!("Intro stays.\n{selected}Context stays.\nTail stays.\n");
+    let root = f.commit(&[("range.md", old)], &[], "surrounding text");
+    let tip = f.commit(&[("range.md", &new)], &[&root], "insert selected passage");
+    let deletion = f.commit(&[("range.md", old)], &[&tip], "delete selected passage");
+    let history = f.history(&tip, "log @range.md:2-2").await;
+    assert_eq!(ids(&history), [tip.as_str()], "{history}");
+    assert!(
+        history.contains("add +1 -0") && history.ends_with("end\n"),
+        "{history}"
+    );
+    assert!(!history.contains('~'), "{history}");
+    let addition = f.history(&tip, &format!("show {tip} @range.md:2-2")).await;
+    assert_selected_content(&addition, "", selected);
+    assert!(body(&addition).contains("--- /dev/null\n"), "{addition}");
+    let removed = f
+        .history(&tip, &format!("show {deletion} @range.md:2-2"))
+        .await;
+    assert_selected_content(&removed, selected, "");
+    assert!(body(&removed).contains("+++ /dev/null\n"), "{removed}");
+    let reverse = f
+        .history(&tip, &format!("diff {tip}..{root} @range.md:2-2"))
+        .await;
+    assert_selected_content(&reverse, selected, "");
+}
+
+#[tokio::test]
+async fn competing_text_passages_preserve_complete_alternatives() {
+    let f = Fixture::new();
+    let selected =
+        "Selected passage preserves distinctive ordered words across reflow and file movement.\n";
+    let first = format!("First heading.\n\n{selected}\nUnrelated first suffix.\n");
+    let second = format!("Second heading.\n\n{selected}\nUnrelated second suffix.\n");
+    let after = "New heading.\n\nSelected passage preserves distinctive ordered words\nacross reflow and file movement.\n\nUnrelated new suffix.\n";
+    let root = f.commit(
+        &[("a.md", &first), ("z.md", &second)],
+        &[],
+        "two possible origins",
+    );
+    let tip = f.commit(&[("new.md", after)], &[&root], "move one passage");
+    let history = f.history(&tip, "log @new.md:3-4").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    assert!(
+        history.contains('~') && history.contains("competing"),
+        "{history}"
+    );
+    let comparison = f.history(&tip, &format!("show {tip} @new.md:3-4")).await;
+    let patch = body(&comparison);
+    assert!(
+        patch.contains("~alternative or inferred region ancestry"),
+        "{comparison}"
+    );
+    for path in ["a.md", "z.md"] {
+        assert!(patch.contains(&format!("--- a/{path}\n")), "{comparison}");
+    }
+    assert_eq!(
+        patch.matches(&format!("-{selected}")).count(),
+        2,
+        "{comparison}"
+    );
+    assert!(patch.contains("+Selected passage preserves distinctive ordered words\n+across reflow and file movement.\n"), "{comparison}");
+    assert!(
+        !patch.contains("heading") && !patch.contains("suffix"),
+        "{comparison}"
+    );
+}
+
+#[tokio::test]
+async fn a_text_passage_moved_within_a_file_is_not_an_insertion() {
+    let selected =
+        "Selected passage preserves distinctive ordered words across reflow and file movement.\n";
+    let reflowed =
+        "Selected passage preserves distinctive ordered words\nacross reflow and file movement.\n";
+    let context = "An unrelated alpha section discusses independent topics with separate examples.\nAnother unrelated beta section contains additional material and unique descriptions.\n";
+    for (moved, end) in [(selected, 6), (reflowed, 7)] {
+        let f = Fixture::new();
+        let old = format!("# Design\n\n{selected}\n{context}");
+        let new = format!("# Design\n\n{context}\n{moved}");
+        let root = f.commit(&[("range.md", &old)], &[], "introduce passage");
+        let tip = f.commit(&[("range.md", &new)], &[&root], "reorder sections");
+        let selector = format!("@range.md:6-{end}");
+        let history = f.history(&tip, &format!("log {selector}")).await;
+        let comparison = f.history(&tip, &format!("show {tip} {selector}")).await;
+        let forward = f
+            .history(&root, &format!("diff {root}..{tip} @range.md:3-3"))
+            .await;
+        if moved == selected {
+            assert_eq!(ids(&history), [root.as_str()], "{history}");
+            assert_eq!(body(&comparison), "No changes.\n", "{comparison}");
+            assert_eq!(body(&forward), "No changes.\n", "{forward}");
+        } else {
+            assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+            assert_selected_content(&comparison, selected, moved);
+            assert_selected_content(&forward, selected, moved);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unchanged_duplicated_passage_ignores_a_later_edit() {
+    let f = Fixture::new();
+    let before = "Intro.\nSelected phrase here.\nMiddle.\nSelected phrase here.\nTail before.\n";
+    let after = "Intro.\nSelected phrase here.\nMiddle.\nSelected phrase here.\nTail after.\n";
+    let root = f.commit(&[("range.md", before)], &[], "introduce passage");
+    let tip = f.commit(&[("range.md", after)], &[&root], "edit tail");
+    let history = f.history(&tip, "log @range.md:2-2").await;
+    assert_eq!(ids(&history), [root.as_str()], "{history}");
+    let comparison = f.history(&tip, &format!("show {tip} @range.md:2-2")).await;
+    assert_eq!(body(&comparison), "No changes.\n", "{comparison}");
+}
+
+#[tokio::test]
+async fn an_unterminated_selected_line_tracks_a_removed_suffix() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[("range.md", "Intro.\nSelected phrase extended")],
+        &[],
+        "long line",
+    );
+    let tip = f.commit(
+        &[("range.md", "Intro.\nSelected phrase")],
+        &[&root],
+        "short line",
+    );
+    let history = f.history(&tip, "log @range.md:2-2").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    let comparison = f.history(&tip, &format!("show {tip} @range.md:2-2")).await;
+    assert_selected_content(&comparison, "Selected phrase extended", "Selected phrase");
+    assert!(
+        !comparison.contains("inferred region ancestry"),
+        "{comparison}"
+    );
+
+    let f = Fixture::new();
+    let root = f.commit(
+        &[("range.md", "Intro.\nSelected phrase\nOther line.\n")],
+        &[],
+        "terminated line",
+    );
+    let tip = f.commit(
+        &[("range.md", "Intro.\nSelected phrase")],
+        &[&root],
+        "unterminated line",
+    );
+    let history = f.history(&tip, "log @range.md:2-2").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    let comparison = f.history(&tip, &format!("show {tip} @range.md:2-2")).await;
+    assert_selected_content(&comparison, "Selected phrase\n", "Selected phrase");
+}
+
+#[tokio::test]
+async fn duplicated_text_passages_in_one_file_remain_alternatives() {
+    let f = Fixture::new();
+    let selected =
+        "Selected passage preserves distinctive ordered words across reflow and file movement.\n";
+    let before =
+        format!("First section.\n\n{selected}\nSecond section.\n\n{selected}\nTail stays.\n");
+    let after = "First section.\n\nSelected passage preserves distinctive ordered words\nacross reflow and file movement.\n\nSecond section.\n\nTail stays.\n";
+    let root = f.commit(&[("range.md", &before)], &[], "duplicate passages");
+    let tip = f.commit(&[("range.md", after)], &[&root], "retain one passage");
+    let history = f.history(&tip, "log @range.md:3-4").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    assert!(
+        history.contains('~') && history.contains("competing"),
+        "{history}"
+    );
+    let comparison = f.history(&tip, &format!("show {tip} @range.md:3-4")).await;
+    let patch = body(&comparison);
+    assert!(
+        patch.contains("~alternative or inferred region ancestry"),
+        "{comparison}"
+    );
+    assert_eq!(
+        patch.matches(&format!("-{selected}")).count(),
+        2,
+        "{comparison}"
+    );
+    assert!(patch.contains("+Selected passage preserves distinctive ordered words\n+across reflow and file movement.\n"), "{comparison}");
+    assert!(
+        !patch.contains("section.") && !patch.contains("Tail stays."),
+        "{comparison}"
+    );
+}
+
+#[tokio::test]
+async fn text_range_insertions_respect_selected_boundaries() {
+    let selected = "First selected line.\nLast selected line.\n";
+    for (inside, end) in [("", 4), ("Inserted inside.\n", 5)] {
+        let f = Fixture::new();
+        let old = format!("Intro stays.\n{selected}Tail stays.\n");
+        let selected_after = format!("First selected line.\n{inside}Last selected line.\n");
+        let new = format!(
+            "Intro stays.\nInserted before.\n{selected_after}Inserted after.\nTail stays.\n"
+        );
+        let root = f.commit(&[("range.md", &old)], &[], "selected passage");
+        let tip = f.commit(&[("range.md", &new)], &[&root], "insert neighboring lines");
+        let selector = format!("@range.md:3-{end}");
+        let history = f.history(&tip, &format!("log {selector}")).await;
+        let backward = f.history(&tip, &format!("show {tip} {selector}")).await;
+        let forward = f
+            .history(&root, &format!("diff {root}..{tip} @range.md:2-3"))
+            .await;
+        if inside.is_empty() {
+            assert_eq!(ids(&history), [root.as_str()], "{history}");
+            assert_eq!(body(&backward), "No changes.\n", "{backward}");
+            assert_eq!(body(&forward), "No changes.\n", "{forward}");
+        } else {
+            assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+            assert!(history.contains("edit +1 -0"), "{history}");
+            assert_selected_content(&backward, selected, &selected_after);
+            assert_selected_content(&forward, selected, &selected_after);
+            let reverse = f
+                .history(&root, &format!("diff {tip}..{root} @range.md:2-3"))
+                .await;
+            assert_selected_content(&reverse, &selected_after, selected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_range_boundaries_support_punctuation_and_whitespace_edits() {
+    for (before, after) in [("!!!\n", "???\n"), (" \t\n", "\t \n"), ("\n", "    \n")] {
+        let f = Fixture::new();
+        let old = format!("Intro stays.\n{before}Tail stays.\n");
+        let new = format!("Intro stays.\n{after}Tail stays.\n");
+        let root = f.commit(&[("range.md", &old)], &[], "selected line");
+        let tip = f.commit(&[("range.md", &new)], &[&root], "edit selected line");
+        let history = f.history(&tip, "log @range.md:2-2").await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+        assert!(
+            history.contains("edit +1 -1") && !history.contains('~'),
+            "{history}"
+        );
+        let comparison = f.history(&tip, &format!("show {tip} @range.md:2-2")).await;
+        assert_selected_content(&comparison, before, after);
+        let forward = f
+            .history(&root, &format!("diff {root}..{tip} @range.md:2-2"))
+            .await;
+        assert_selected_content(&forward, before, after);
+    }
+}
+
+#[tokio::test]
+async fn edited_moved_passage_uses_complete_paragraph_boundaries() {
+    let f = Fixture::new();
+    let selected = "Selected passage has a long ordered sequence of distinctive words describing careful history tracking.\n";
+    let edited = "Selected passage has a long ordered sequence of distinctive words\ndescribing accurate history tracking.\n";
+    let old = format!("Intro stays.\n\n{selected}\nTail stays.\n");
+    let new = format!("Intro stays.\n\n{edited}\nTail stays.\n");
+    let root = f.commit(&[("old.md", &old)], &[], "old passage");
+    let tip = f.commit(&[("new.md", &new)], &[&root], "move and edit passage");
+    let history = f.history(&tip, "log @new.md:3-4").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    let comparison = f.history(&tip, &format!("show {tip} @new.md:3-4")).await;
+    assert_selected_content(&comparison, selected, edited);
+    let forward = f
+        .history(&root, &format!("diff {root}..{tip} @old.md:3-3"))
+        .await;
+    assert_selected_content(&forward, selected, edited);
+}
+
+#[tokio::test]
+async fn weak_moved_text_evidence_does_not_prove_an_addition() {
+    let f = Fixture::new();
+    let selected = "The selected passage describes careful detailed history tracking with several distinct contextual markers.\n";
+    let edited = "The selected passage now explains fast robust revision mapping using completely different semantic details.\n";
+    let old = format!(
+        "# Passage history\n\n{selected}\nThe remaining documentation remains unchanged.\n"
+    );
+    let new =
+        format!("# Passage history\n\n{edited}\nThe remaining documentation remains unchanged.\n");
+    let root = f.commit(&[("old.md", &old)], &[], "old passage");
+    let tip = f.commit(
+        &[("new.md", &new)],
+        &[&root],
+        "move and substantially edit passage",
+    );
+    let _ = selected_content_or_unresolved(&f, &root, &tip, "@new.md:3-3", selected, edited).await;
+}
+
+#[tokio::test]
+async fn a_local_replacement_does_not_hide_a_moved_text_passage() {
+    let f = Fixture::new();
+    let selected = "Selected passage preserves distinctive ordered words across file movement.\n";
+    let edited = "Selected passage preserves distinctive ordered words\nacross file movement.\n";
+    let origin = format!("Intro stays.\n{selected}Tail stays.\n");
+    let unrelated =
+        "Intro stays.\nA completely unrelated previous paragraph belongs here.\nTail stays.\n";
+    let after = format!("Intro stays.\n{edited}Tail stays.\n");
+    let root = f.commit(
+        &[("old.md", &origin), ("new.md", unrelated)],
+        &[],
+        "distinct passages",
+    );
+    let tip = f.commit(&[("new.md", &after)], &[&root], "move over another passage");
+    let history = f.history(&tip, "log @new.md:2-3").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    let comparison = f.history(&tip, &format!("show {tip} @new.md:2-3")).await;
+    let patch = body(&comparison);
+    assert!(patch.contains(&format!("-{selected}")), "{comparison}");
+    assert!(patch.contains("--- a/old.md\n"), "{comparison}");
+    assert!(
+        patch.contains(
+            "+Selected passage preserves distinctive ordered words\n+across file movement.\n"
+        ),
+        "{comparison}"
+    );
+    if patch.contains("unrelated previous paragraph") {
+        assert!(history.contains('~'), "{history}");
+        assert!(
+            patch.contains("~alternative or inferred region ancestry"),
+            "{comparison}"
+        );
+    }
+    assert!(
+        !patch.contains("Intro stays.") && !patch.contains("Tail stays."),
+        "{comparison}"
+    );
+}
+
+#[tokio::test]
+async fn a_moved_single_word_line_is_not_proven_absent() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[("old.md", "alpha beta gamma delta epsilon.\n")],
+        &[],
+        "original paragraph",
+    );
+    let tip = f.commit(
+        &[("new.md", "alpha\nbeta gamma delta epsilon.\n")],
+        &[&root],
+        "move and reflow",
+    );
+    if let Some(page) =
+        selected_content_or_unresolved(&f, &root, &tip, "@new.md:1-1", "alpha", "alpha\n").await
+    {
+        assert!(
+            body(&page).contains("~alternative or inferred region ancestry"),
+            "{page}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_small_edited_passage_inside_a_moved_paragraph_is_not_proven_absent() {
+    let f = Fixture::new();
+    let prefix = (0..48)
+        .map(|i| format!("prefix{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = (0..47)
+        .map(|i| format!("suffix{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let before = "alpha beta gamma delta epsilon";
+    let after = "alpha beta revised delta epsilon\n";
+    let old = format!("{prefix} {before} {suffix}\n");
+    let new = format!("{prefix}\n{after}{suffix}\n");
+    let root = f.commit(&[("old.md", &old)], &[], "long paragraph");
+    let tip = f.commit(
+        &[("new.md", &new)],
+        &[&root],
+        "move reflow and edit selection",
+    );
+    let _ = selected_content_or_unresolved(&f, &root, &tip, "@new.md:2-2", before, after).await;
+}
+
+#[tokio::test]
+async fn moved_text_passages_preserve_selected_edge_blank_lines() {
+    let f = Fixture::new();
+    let before = "\nSelected passage preserves distinctive ordered words across reflow and file movement.\n\n";
+    let after = "\nSelected passage preserves distinctive ordered words\nacross reflow and file movement.\n\n";
+    let old = format!("# Old heading\n{before}Unrelated old suffix.\n");
+    let new = format!("# New heading\n{after}Unrelated new suffix.\n");
+    let root = f.commit(
+        &[("old.md", &old)],
+        &[],
+        "passage with surrounding blank lines",
+    );
+    let tip = f.commit(&[("new.md", &new)], &[&root], "move and reflow passage");
+    let history = f.history(&tip, "log @new.md:2-5").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    let backward = f.history(&tip, &format!("show {tip} @new.md:2-5")).await;
+    assert_selected_content(&backward, before, after);
+    let forward = f
+        .history(&root, &format!("diff {root}..{tip} @old.md:2-4"))
+        .await;
+    assert_selected_content(&forward, before, after);
+}
+
+#[tokio::test]
+async fn duplicated_blank_line_origins_remain_uncertain() {
+    let f = Fixture::new();
+    let before = "First old paragraph.\n\nSecond old paragraph.\n\nThird old paragraph.\n";
+    let after = "Updated first paragraph.\n\nUpdated last paragraph.\n";
+    let root = f.commit(
+        &[("range.md", before)],
+        &[],
+        "two possible blank line origins",
+    );
+    let tip = f.commit(&[("range.md", after)], &[&root], "retain one blank line");
+    let history = f.history(&tip, "log @range.md:2-2").await;
+    assert!(
+        history.contains('~') || history.contains("incomplete:"),
+        "{history}"
+    );
+    let comparison = f
+        .app
+        .history(
+            &format!("{}#{tip}", f.root.path().display()),
+            &format!("show {tip} @range.md:2-2"),
+        )
+        .await;
+    match comparison {
+        Ok(page) => {
+            assert!(
+                body(&page).contains("~alternative or inferred region ancestry"),
+                "{page}"
+            );
+            assert!(!body(&page).contains("paragraph."), "{page}");
+        }
+        Err(error) => {
+            assert_unresolved_history(&error.to_string());
+            assert!(history.contains("incomplete:"), "{history}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn edited_duplicate_text_passages_do_not_invent_a_definite_predecessor() {
+    for (before, after) in [
+        (
+            "head\nSelected before.\nSelected before.\ntail\n",
+            "head\nSelected after.\ntail\n",
+        ),
+        (
+            "head\nSelected before.\n\nSelected before.\ntail\n",
+            "head\nSelected after.\n\nSelected before.\ntail\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        let root = f.commit(&[("range.md", before)], &[], "duplicate old passages");
+        let tip = f.commit(&[("range.md", after)], &[&root], "edit one passage");
+        let history = f.history(&tip, "log @range.md:2-2").await;
+        let comparison = f
+            .app
+            .history(
+                &format!("{}#{tip}", f.root.path().display()),
+                &format!("show {tip} @range.md:2-2"),
+            )
+            .await;
+        match comparison {
+            Ok(page) => {
+                assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+                assert!(history.contains('~'), "{history}");
+                let patch = body(&page);
+                assert!(
+                    patch.contains("~alternative or inferred region ancestry"),
+                    "{page}"
+                );
+                let candidates: Vec<_> = patch
+                    .split("diff --git ")
+                    .skip(1)
+                    .map(selected_hunk_content)
+                    .collect();
+                assert!(!candidates.is_empty(), "{page}");
+                for (old, new) in &candidates {
+                    assert_eq!(old, "Selected before.\n", "{page}");
+                    assert!(new.is_empty() || new == "Selected after.\n", "{page}");
+                }
+                assert_eq!(
+                    candidates.iter().filter(|(_, new)| !new.is_empty()).count(),
+                    1,
+                    "{page}"
+                );
+            }
+            Err(error) => {
+                assert_unresolved_history(&error.to_string());
+                assert!(
+                    history.contains("incomplete:") && !history.ends_with("end\n"),
+                    "{history}"
+                );
+                assert!(ids(&history).is_empty(), "{history}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_identical_file_origin_does_not_hide_local_text_edits() {
+    let f = Fixture::new();
+    let before = "Intro stays.\nSelected before.\nContext stays.\nTail stays.\n";
+    let after = "Intro stays.\nSelected after.\nContext stays.\nTail stays.\n";
+    let root = f.commit(
+        &[("docs/range.md", before), ("docs/origin.md", after)],
+        &[],
+        "local passage and identical file origin",
+    );
+    let tip = f.commit(
+        &[("docs/range.md", after), ("docs/origin.md", after)],
+        &[&root],
+        "edit local passage while retaining origin",
+    );
+    let history = f.history(&tip, "log @docs/range.md:2-2").await;
+    assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    assert!(history.contains('~'), "{history}");
+    let comparison = f
+        .history(&tip, &format!("show {tip} @docs/range.md:2-2"))
+        .await;
+    let patch = body(&comparison);
+    assert!(
+        patch.contains("~alternative or inferred region ancestry"),
+        "{comparison}"
+    );
+    for path in ["docs/range.md", "docs/origin.md"] {
+        assert!(patch.contains(&format!("--- a/{path}\n")), "{comparison}");
+    }
+    let candidates: Vec<_> = patch
+        .split("diff --git ")
+        .skip(1)
+        .map(selected_hunk_content)
+        .collect();
+    let mut predecessors: Vec<_> = candidates.iter().map(|(old, _)| old.as_str()).collect();
+    predecessors.sort_unstable();
+    assert_eq!(
+        predecessors,
+        ["Selected after.\n", "Selected before.\n"],
+        "{comparison}"
+    );
+    let selected: Vec<_> = candidates
+        .iter()
+        .filter_map(|(_, new)| (!new.is_empty()).then_some(new.as_str()))
+        .collect();
+    assert_eq!(selected, ["Selected after.\n"], "{comparison}");
+}
+
+#[tokio::test]
+async fn a_reflowed_text_passage_reaches_its_inline_introduction() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[("range.md", "Intro stays.\nPrefix suffix.\nTail stays.\n")],
+        &[],
+        "surrounding text",
+    );
+    let introduced = f.commit(
+        &[(
+            "range.md",
+            "Intro stays.\nPrefix selected passage suffix.\nTail stays.\n",
+        )],
+        &[&root],
+        "introduce inline passage",
+    );
+    let tip = f.commit(
+        &[(
+            "range.md",
+            "Intro stays.\nPrefix\nselected passage\nsuffix.\nTail stays.\n",
+        )],
+        &[&introduced],
+        "reflow selected passage",
+    );
+    let history = f.history(&tip, "log @range.md:3-3").await;
+    assert_eq!(
+        ids(&history),
+        [tip.as_str(), introduced.as_str()],
+        "{history}"
+    );
+    assert!(
+        history.ends_with("end\n") && !history.contains("incomplete:"),
+        "{history}"
+    );
+    let reflow = f.history(&tip, &format!("show {tip} @range.md:3-3")).await;
+    assert_selected_content(&reflow, "selected passage", "selected passage\n");
+    let addition = f
+        .history(&tip, &format!("show {introduced} @range.md:3-3"))
+        .await;
+    assert_selected_content(&addition, "", "selected passage");
+    assert!(body(&addition).contains("--- /dev/null\n"), "{addition}");
+    let comparison = f
+        .history(&tip, &format!("diff {root}..{introduced} @range.md:3-3"))
+        .await;
+    assert_selected_content(&comparison, "", "selected passage");
+}
+
+#[tokio::test]
+async fn an_edited_one_line_text_file_retains_its_complete_predecessor() {
+    for after in ["Selected after.\n", "Selected before!\n"] {
+        let f = Fixture::new();
+        let before = "Selected before.\n";
+        let root = f.commit(&[("range.md", before)], &[], "original one-line passage");
+        let tip = f.commit(&[("range.md", after)], &[&root], "edit one-line passage");
+        let history = f.history(&tip, "log @range.md:1-1").await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+        assert!(history.ends_with("end\n"), "{history}");
+        for (at, query, old, new) in [
+            (&tip, format!("show {tip} @range.md:1-1"), before, after),
+            (
+                &root,
+                format!("diff {root}..{tip} @range.md:1-1"),
+                before,
+                after,
+            ),
+            (
+                &tip,
+                format!("diff {tip}..{root} @range.md:1-1"),
+                after,
+                before,
+            ),
+        ] {
+            let comparison = f.history(at, &query).await;
+            assert_selected_content(&comparison, old, new);
+            assert!(!comparison.contains("/dev/null"), "{comparison}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_passage_tracks_edits_without_losing_its_boundaries() {
+    let f = Fixture::new();
+    let old = "Intro stays.\nSelected before.\nContext stays.\nTail before.\n";
+    let new = "Intro stays.\nSelected after.\nContext stays.\nTail after.\n";
+    let root = f.commit(&[("docs/range.md", old)], &[], "introduce text");
+    let tip = f.commit(&[("docs/range.md", new)], &[&root], "edit text");
+
+    let log = f.history(&tip, "log @docs/range.md:2-2").await;
+    assert_eq!(ids(&log), [tip.as_str(), root.as_str()], "{log}");
+    assert!(log.ends_with("end\n"), "{log}");
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with(&tip) && line.contains(" edit ")),
+        "{log}"
+    );
+    for query in [
+        format!("show {tip} @docs/range.md:2-2"),
+        format!("diff {root}..{tip} @docs/range.md:2-2"),
+    ] {
+        let diff = f.history(&tip, &query).await;
+        let patch = body(&diff);
+        assert!(patch.contains("-Selected before."), "{diff}");
+        assert!(patch.contains("+Selected after."), "{diff}");
+        assert!(
+            !patch.contains("Tail before.") && !patch.contains("Tail after."),
+            "{diff}"
+        );
+    }
+
+    let whole = f
+        .history(&tip, &format!("show {tip} @docs/range.md:1-4"))
+        .await;
+    let patch = body(&whole);
+    assert!(
+        patch.contains("-Selected before.") && patch.contains("+Selected after."),
+        "{whole}"
+    );
+    assert!(
+        patch.contains("-Tail before.") && patch.contains("+Tail after."),
+        "{whole}"
+    );
+    assert!(
+        !patch.contains("-Intro stays.") && !patch.contains("+Intro stays."),
+        "{whole}"
+    );
+    assert!(
+        !patch.contains("-Context stays.") && !patch.contains("+Context stays."),
+        "{whole}"
+    );
+}
+
+#[tokio::test]
+async fn text_passage_tracks_punctuation_changes() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[("docs/punctuation.md", "Before.\nValue.\nAfter.\n")],
+        &[],
+        "introduce text",
+    );
+    let tip = f.commit(
+        &[("docs/punctuation.md", "Before.\nValue!\nAfter.\n")],
+        &[&root],
+        "edit punctuation",
+    );
+
+    let log = f.history(&tip, "log @docs/punctuation.md:2-2").await;
+    assert_eq!(ids(&log), [tip.as_str(), root.as_str()], "{log}");
+    let diff = f
+        .history(&tip, &format!("show {tip} @docs/punctuation.md:2-2"))
+        .await;
+    assert!(
+        body(&diff).contains("-Value.") && body(&diff).contains("+Value!"),
+        "{diff}"
+    );
+}
+
+#[tokio::test]
+async fn text_passage_tracks_a_complete_line_replacement() {
+    let f = Fixture::new();
+    let root = f.commit(
+        &[(
+            "docs/replacement.md",
+            "Before boundary.\nCopper stars.\nAfter boundary.\n",
+        )],
+        &[],
+        "introduce text",
+    );
+    let tip = f.commit(
+        &[(
+            "docs/replacement.md",
+            "Before boundary.\nSilver lakes.\nAfter boundary.\n",
+        )],
+        &[&root],
+        "replace text",
+    );
+
+    let diff = f
+        .history(&tip, &format!("show {tip} @docs/replacement.md:2-2"))
+        .await;
+    assert!(
+        body(&diff).contains("-Copper stars.") && body(&diff).contains("+Silver lakes."),
         "{diff}"
     );
 }
