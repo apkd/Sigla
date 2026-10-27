@@ -231,7 +231,7 @@ pub(crate) fn build(
     for (root, state) in &states {
         owners.seed(&root.join("source"), Some(root), state.last_use);
     }
-    let mut notes = vec!["Eviction uses the maintenance policy's age limits and frequency/recency ranking. Byte estimates are approximate: shared data can remain after a workspace is removed. Cleanup chooses evictions before rewriting retained data, so it can remove more idle workspaces to finish faster.".into()];
+    let mut notes = vec!["Eviction uses age limits, then favors workspaces used in the last 15 minutes and those used more often. Size breaks ties. Priority reports decayed use frequency; recent use is ranked separately. Byte estimates are approximate: shared data can remain after a workspace is removed. Cleanup chooses evictions before rewriting retained data, so it can remove more idle workspaces to finish faster.".into()];
     if let Some(analysis) = &analysis {
         for entry in &analysis.unknown {
             notes.push(format!(
@@ -283,7 +283,7 @@ pub(crate) fn build(
                     }),
                 attributed_bytes: candidate.bytes,
                 last_used_ms: candidate.owner.usage.last_use,
-                priority: candidate.owner.usage.priority(now, candidate.bytes),
+                priority: candidate.owner.usage.priority(now),
                 protection,
                 dependencies: candidate
                     .owner

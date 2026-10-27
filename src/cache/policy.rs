@@ -10,6 +10,7 @@ use std::{
 };
 
 const HALF_LIFE_MS: f64 = 86_400_000.0;
+const RECENT_MS: u64 = 15 * 60_000;
 
 pub(crate) struct Candidate {
     pub owner: super::owners::Owner,
@@ -98,14 +99,21 @@ pub(crate) fn rank(
     for candidate in candidates.iter_mut() {
         candidate.bytes = costs[&candidate.owner.entry];
     }
-    candidates.sort_by(|a, b| {
-        a.owner
-            .usage
-            .priority(now, a.bytes)
-            .total_cmp(&b.owner.usage.priority(now, b.bytes))
-            .then_with(|| a.owner.usage.last_use.cmp(&b.owner.usage.last_use))
-    });
+    sort_candidates(candidates, now);
     Ok(())
+}
+
+fn sort_candidates(candidates: &mut [Candidate], now: u64) {
+    candidates.sort_by(|a, b| {
+        let a = (&a.owner.usage, a.bytes);
+        let b = (&b.owner.usage, b.bytes);
+        let recent = |usage: &Usage| now.saturating_sub(usage.last_use) < RECENT_MS;
+        recent(a.0)
+            .cmp(&recent(b.0))
+            .then_with(|| a.0.priority(now).total_cmp(&b.0.priority(now)))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.last_use.cmp(&b.0.last_use))
+    });
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -132,8 +140,8 @@ impl Usage {
     fn frequency(&self, now: u64) -> f64 {
         self.heat * (-(now.saturating_sub(self.at) as f64) / HALF_LIFE_MS).exp2()
     }
-    pub fn priority(&self, now: u64, bytes: u64) -> f64 {
-        self.frequency(now) / bytes.max(1024 * 1024) as f64
+    pub fn priority(&self, now: u64) -> f64 {
+        self.frequency(now)
     }
 }
 
@@ -273,12 +281,67 @@ mod tests {
         }
         assert_eq!(burst.frequency(60_000), Usage::new(0).frequency(60_000));
         frequent.record(60_000);
-        assert!(frequent.priority(60_000, 1) > burst.priority(60_000, 1));
+        assert!(frequent.priority(60_000) > burst.priority(60_000));
         assert!(
-            frequent.priority(10 * HALF_LIFE_MS as u64, 1)
-                < Usage::new(10 * HALF_LIFE_MS as u64).priority(10 * HALF_LIFE_MS as u64, 1)
+            frequent.priority(10 * HALF_LIFE_MS as u64)
+                < Usage::new(10 * HALF_LIFE_MS as u64).priority(10 * HALF_LIFE_MS as u64)
         );
-        assert!(frequent.priority(60_000, 1) > frequent.priority(60_000, 100_000_000));
+    }
+
+    fn candidate(name: &str, usage: Usage, bytes: u64) -> Candidate {
+        Candidate {
+            owner: super::super::owners::Owner {
+                entry: name.into(),
+                repository: None,
+                usage,
+                dependencies: BTreeSet::new(),
+            },
+            pinned: false,
+            protection: None,
+            expired: false,
+            bytes,
+            git: None,
+        }
+    }
+
+    #[test]
+    fn recent_and_repeated_use_outweigh_size_but_do_not_prevent_eviction() {
+        let now = 2 * RECENT_MS;
+        let mut old_hot = Usage::new(0);
+        old_hot.record(60_000);
+        old_hot.record(120_000);
+        let mut recent_hot = Usage::new(now - 120_000);
+        recent_hot.record(now - 60_000);
+        let mut candidates = vec![
+            candidate("recent-hot-large", recent_hot, 1_000_000_000),
+            candidate("recent-cold-small", Usage::new(now - 60_000), 1),
+            candidate("old-hot", old_hot, 1),
+        ];
+        sort_candidates(&mut candidates, now);
+        let names: Vec<_> = candidates.iter().map(|c| c.owner.entry.as_path()).collect();
+        assert_eq!(
+            names,
+            [
+                Path::new("old-hot"),
+                Path::new("recent-cold-small"),
+                Path::new("recent-hot-large")
+            ]
+        );
+
+        // Once the recent window expires, frequency still orders the candidates.
+        sort_candidates(&mut candidates, now + RECENT_MS);
+        assert_eq!(candidates[0].owner.entry, Path::new("recent-cold-small"));
+        assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn size_breaks_equal_usage_ties() {
+        let mut candidates = vec![
+            candidate("small", Usage::new(0), 1),
+            candidate("large", Usage::new(0), 1_000_000_000),
+        ];
+        sort_candidates(&mut candidates, 60_000);
+        assert_eq!(candidates[0].owner.entry, Path::new("large"));
     }
     #[test]
     fn either_limit_triggers_reclamation_with_hysteresis() {
