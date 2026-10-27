@@ -448,12 +448,29 @@ pub(super) fn complete(request: &Request, cache: &Path, prepared: Prepared) -> R
     let prepared = super::job::hydrate(request, cache, prepared)?;
     let started = std::time::Instant::now();
     if !matches!(request.contents, super::materialize::Contents::Inventory) {
-        crate::cache::blobs::Store::open(cache)?.import_tree(&request.staging)?;
+        let stats = crate::cache::blobs::Store::open(cache)?.import_owned_tree(&request.staging)?;
+        tracing::info!(
+            repository = %request.repository,
+            revision = %prepared.revision,
+            elapsed_ms = started.elapsed().as_millis(),
+            files = stats.files,
+            hashed_bytes = stats.hashed_bytes,
+            adopted = stats.adopted,
+            reused = stats.reused,
+            fallback = stats.fallback,
+            read_hash_worker_ms = stats.read_hash.as_millis(),
+            publication_worker_ms = stats.publication.as_millis(),
+            sync_work_ms = stats.sync.as_millis(),
+            "Repository files imported"
+        );
+    } else {
+        tracing::info!(
+            repository = %request.repository,
+            revision = %prepared.revision,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Repository files imported"
+        );
     }
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis(),
-        "Repository files imported"
-    );
     Ok(prepared)
 }
 

@@ -11,6 +11,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
+    time::{Duration, Instant},
 };
 
 pub type Id = [u8; 32];
@@ -25,6 +26,31 @@ pub struct Store {
 /// The shared filesystem lock also covers helper processes and incomplete views.
 pub struct Lease {
     _file: File,
+}
+
+#[derive(Default)]
+pub(crate) struct ImportStats {
+    pub files: u64,
+    pub hashed_bytes: u64,
+    pub adopted: u64,
+    pub reused: u64,
+    pub fallback: u64,
+    pub read_hash: Duration,
+    pub publication: Duration,
+    pub sync: Duration,
+}
+
+impl ImportStats {
+    fn add(&mut self, other: Self) {
+        self.files += other.files;
+        self.hashed_bytes += other.hashed_bytes;
+        self.adopted += other.adopted;
+        self.reused += other.reused;
+        self.fallback += other.fallback;
+        self.read_hash += other.read_hash;
+        self.publication += other.publication;
+        self.sync += other.sync;
+    }
 }
 
 /// A physical cache snapshot split between repository owners and shared roots.
@@ -169,6 +195,138 @@ impl Store {
         for directory in directories {
             File::open(directory)?.sync_all()?;
         }
+        Ok(())
+    }
+
+    /// Import a private, fully hydrated stage. Its files must no longer be writable.
+    pub(crate) fn import_owned_tree(&self, root: &Path) -> Result<ImportStats> {
+        let _lease = self.lease()?;
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        Self::inventory(root, &mut files, &mut directories)?;
+        let shards = Mutex::new(BTreeSet::new());
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+            .min(files.len());
+        let mut stats = std::thread::scope(|scope| -> Result<ImportStats> {
+            let jobs: Vec<_> = (0..workers)
+                .map(|worker| {
+                    let files = &files;
+                    let shards = &shards;
+                    scope.spawn(move || -> Result<ImportStats> {
+                        let mut stats = ImportStats::default();
+                        for path in files.iter().skip(worker).step_by(workers) {
+                            self.import_owned(path, &mut stats, shards)?;
+                        }
+                        Ok(stats)
+                    })
+                })
+                .collect();
+            let mut stats = ImportStats::default();
+            for job in jobs {
+                stats.add(
+                    job.join()
+                        .map_err(|_| anyhow::anyhow!("Cache import worker panicked"))??,
+                );
+            }
+            Ok(stats)
+        })?;
+        let started = Instant::now();
+        for shard in shards.into_inner().unwrap() {
+            File::open(shard)?.sync_all()?;
+        }
+        for directory in directories {
+            File::open(directory)?.sync_all()?;
+        }
+        stats.sync += started.elapsed();
+        Ok(stats)
+    }
+
+    fn import_owned(
+        &self,
+        path: &Path,
+        stats: &mut ImportStats,
+        shards: &Mutex<BTreeSet<PathBuf>>,
+    ) -> Result<()> {
+        let mut input = regular(path)?;
+        let metadata = input.metadata()?;
+        stats.files += 1;
+        // A shared inode can still be modified by its other owner.
+        if metadata.nlink() != 1 {
+            let started = Instant::now();
+            self.import(path)?;
+            stats.fallback += 1;
+            stats.publication += started.elapsed();
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let mode = metadata.mode() & 0o777;
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"sigla-file-1\0");
+        hash.update(&mode.to_le_bytes());
+        let mut bytes = [0; 128 * 1024];
+        loop {
+            let n = input.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&bytes[..n]);
+            stats.hashed_bytes += n as u64;
+        }
+        let id = *hash.finalize().as_bytes();
+        stats.read_hash += started.elapsed();
+        let started = Instant::now();
+        let destination = self.path(&id);
+        let parent = destination.parent().unwrap();
+        let mut sync = Duration::ZERO;
+        {
+            let mut ready = shards.lock().unwrap();
+            if !ready.contains(parent) {
+                fs::create_dir_all(parent)?;
+                let before = Instant::now();
+                File::open(&self.root)?.sync_all()?;
+                sync += before.elapsed();
+                ready.insert(parent.to_owned());
+            }
+        }
+        let mut adopted = false;
+        if !destination.try_exists()? {
+            input.set_permissions(fs::Permissions::from_mode(mode))?;
+            ensure!(
+                unsafe {
+                    libc::fsetxattr(
+                        std::os::fd::AsRawFd::as_raw_fd(&input),
+                        ATTRIBUTE.as_ptr(),
+                        id.as_ptr().cast(),
+                        id.len(),
+                        0,
+                    )
+                } == 0,
+                "Cannot mark immutable cache input: {}",
+                std::io::Error::last_os_error()
+            );
+            let before = Instant::now();
+            input.sync_all()?;
+            sync += before.elapsed();
+            match fs::hard_link(path, &destination) {
+                Ok(()) => adopted = true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if adopted {
+            stats.adopted += 1;
+        } else {
+            let parent = path.parent().context("Cache input has no parent")?;
+            let temporary = tempfile::tempdir_in(parent)?;
+            fs::hard_link(&destination, temporary.path().join("file"))?;
+            fs::rename(temporary.path().join("file"), path)?;
+            stats.reused += 1;
+        }
+        stats.sync += sync;
+        stats.publication += started.elapsed().saturating_sub(sync);
         Ok(())
     }
     pub fn link_tree(&self, source: &Path, destination: &Path) -> Result<()> {
@@ -793,6 +951,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "compares imports of files already in the blob cache"]
+    fn owned_import_performance_probe() {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&target).unwrap();
+        let cache = tempfile::Builder::new()
+            .prefix("blob-import-probe-")
+            .tempdir_in(target)
+            .unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let stages: Vec<_> = ["seed", "copy", "owned"]
+            .map(|name| cache.path().join(name))
+            .into_iter()
+            .collect();
+        for stage in &stages {
+            fs::create_dir(stage).unwrap();
+        }
+        let count = 8_000u64;
+        let mut bytes = [0u8; 8 * 1024];
+        for index in 0..count {
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            for stage in &stages {
+                fs::write(stage.join(index.to_string()), bytes).unwrap();
+            }
+        }
+        store.import_owned_tree(&stages[0]).unwrap();
+        let start = Instant::now();
+        store.import_tree(&stages[1]).unwrap();
+        let copy = start.elapsed();
+        let start = Instant::now();
+        let stats = store.import_owned_tree(&stages[2]).unwrap();
+        let owned = start.elapsed();
+        eprintln!(
+            "{count} files, {} bytes: copy={copy:?}, owned={owned:?}, reused={}",
+            count * bytes.len() as u64,
+            stats.reused
+        );
+    }
+
+    #[test]
     fn tree_import_preserves_files_and_shares_duplicates() {
         let cache = tempfile::tempdir().unwrap();
         let store = Store::open(cache.path()).unwrap();
@@ -825,6 +1022,104 @@ mod tests {
         assert!(root.join("empty/nested").is_dir());
         store.import_tree(&root).unwrap();
         assert_eq!(store.collect().unwrap(), 0);
+    }
+
+    #[test]
+    fn owned_tree_adopts_files_and_reuses_existing_content_by_mode() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let root = cache.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first");
+        let duplicate = root.join("duplicate");
+        let executable = root.join("executable");
+        let special = root.join("special");
+        for path in [&first, &duplicate, &executable, &special] {
+            fs::write(path, b"same contents").unwrap();
+        }
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&special, fs::Permissions::from_mode(0o4755)).unwrap();
+        let original_plain = [
+            fs::metadata(&first).unwrap().ino(),
+            fs::metadata(&duplicate).unwrap().ino(),
+        ];
+        let original_executable = [
+            fs::metadata(&executable).unwrap().ino(),
+            fs::metadata(&special).unwrap().ino(),
+        ];
+        let stats = store.import_owned_tree(&root).unwrap();
+        assert_eq!(stats.files, 4);
+        assert_eq!(stats.adopted, 2);
+        assert_eq!(stats.reused, 2);
+        assert_eq!(stats.fallback, 0);
+        assert_eq!(fs::read(&duplicate).unwrap(), b"same contents");
+        assert_eq!(
+            fs::metadata(&first).unwrap().ino(),
+            fs::metadata(&duplicate).unwrap().ino()
+        );
+        assert_ne!(
+            fs::metadata(&first).unwrap().ino(),
+            fs::metadata(&executable).unwrap().ino()
+        );
+        assert!(original_plain.contains(&fs::metadata(&first).unwrap().ino()));
+        assert!(original_executable.contains(&fs::metadata(&executable).unwrap().ino()));
+        assert_eq!(fs::metadata(&special).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(store.collect().unwrap(), 0);
+
+        let other = cache.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("copy"), b"same contents").unwrap();
+        let stats = store.import_owned_tree(&other).unwrap();
+        assert_eq!(stats.adopted, 0);
+        assert_eq!(stats.reused, 1);
+        assert_eq!(
+            fs::metadata(other.join("copy")).unwrap().ino(),
+            fs::metadata(&first).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn owned_tree_copies_shared_inputs_and_rejects_invalid_entries() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let external = cache.path().join("external");
+        fs::write(&external, b"original").unwrap();
+        let root = cache.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let staged = root.join("file");
+        fs::hard_link(&external, &staged).unwrap();
+        let stats = store.import_owned_tree(&root).unwrap();
+        assert_eq!(stats.fallback, 1);
+        assert_ne!(
+            fs::metadata(&external).unwrap().ino(),
+            fs::metadata(&staged).unwrap().ino()
+        );
+        fs::write(&external, b"changed").unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"original");
+
+        let invalid = root.join("invalid");
+        std::os::unix::fs::symlink(&external, &invalid).unwrap();
+        assert!(store.import_owned_tree(&root).is_err());
+        assert_eq!(fs::read(&staged).unwrap(), b"original");
+    }
+
+    #[test]
+    fn owned_tree_leaves_input_intact_if_publication_fails() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let root = cache.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let staged = root.join("file");
+        fs::write(&staged, b"original").unwrap();
+        let seed = cache.path().join("seed");
+        fs::write(&seed, b"original").unwrap();
+        let _lease = store.lease().unwrap();
+        let destination = store.path(&store.import(&seed).unwrap());
+        fs::remove_file(&destination).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        assert!(store.import_owned_tree(&root).is_err());
+        assert_eq!(fs::read(staged).unwrap(), b"original");
+        assert!(destination.is_dir());
     }
 
     #[test]
