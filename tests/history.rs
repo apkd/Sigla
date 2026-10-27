@@ -1,6 +1,8 @@
 //! Public-service regressions. Fixtures contain committed objects, not checked-out
 //! source trees; reaching any workspace preparation path is therefore a failure.
 mod real;
+mod smoke_regressions;
+mod weak_files;
 
 use sigla::{discovery::Policy, service::App};
 use std::{
@@ -66,20 +68,32 @@ impl Fixture {
         Self { root, cache, app }
     }
     fn commit(&self, files: &[(&str, &str)], parents: &[&str], subject: &str) -> String {
+        self.commit_modes(
+            &files
+                .iter()
+                .map(|&(path, text)| (path, text, 0o100644))
+                .collect::<Vec<_>>(),
+            parents,
+            subject,
+        )
+    }
+    fn commit_modes(&self, files: &[(&str, &str, u32)], parents: &[&str], subject: &str) -> String {
         git(self.root.path(), &["read-tree", "--empty"], b"");
-        for (path, text) in files {
+        for (path, text, mode) in files {
             let blob = git(
                 self.root.path(),
                 &["hash-object", "-w", "--stdin"],
                 text.as_bytes(),
             );
+            // Set committed modes in the index, independently of the worktree
+            // and core.filemode (fixtures do not check out their sources).
             git(
                 self.root.path(),
                 &[
                     "update-index",
                     "--add",
                     "--cacheinfo",
-                    &format!("100644,{blob},{path}"),
+                    &format!("{mode:06o},{blob},{path}"),
                 ],
                 b"",
             );
@@ -135,6 +149,81 @@ fn next(page: &str) -> Option<usize> {
         line.strip_prefix("more offset:")
             .map(|n| n.parse().unwrap())
     })
+}
+
+#[tokio::test]
+async fn file_selectors_treat_glob_characters_as_literal_names() {
+    let f = Fixture::new();
+    let files = [
+        ("docs/Version[1].md", "bracket literal\n"),
+        ("docs/Version1.md", "bracket match\n"),
+        ("docs/Star*.md", "star literal\n"),
+        ("docs/StarA.md", "star match\n"),
+        ("docs/Question?.md", "question literal\n"),
+        ("docs/QuestionA.md", "question match\n"),
+        ("docs/Unclosed[.md", "unclosed bracket\n"),
+        ("docs/With Space*.md", "space and star\n"),
+        ("docs/Quote\".md", "quoted name\n"),
+        ("docs/Unclosed(.md", "unclosed parenthesis\n"),
+    ];
+    let root = f.commit(&files, &[], "add files");
+    for (selector, content, other) in [
+        (
+            "file:docs/Version[1].md",
+            "bracket literal",
+            "bracket match",
+        ),
+        ("file:docs/Star*.md", "star literal", "star match"),
+        (
+            "file:docs/Question?.md",
+            "question literal",
+            "question match",
+        ),
+        (
+            "file:docs/Unclosed[.md",
+            "unclosed bracket",
+            "bracket match",
+        ),
+        (
+            r#"file:"docs/With Space*.md""#,
+            "space and star",
+            "star match",
+        ),
+        (r#"file:"docs/Quote\".md""#, "quoted name", "star match"),
+        (
+            "file:docs/Unclosed(.md",
+            "unclosed parenthesis",
+            "bracket match",
+        ),
+    ] {
+        let shown = f.history(&root, &format!("show {root} {selector}")).await;
+        assert!(shown.contains(content), "{shown}");
+        assert!(!shown.contains(other), "{shown}");
+        let log = f.history(&root, &format!("log {selector}")).await;
+        assert_eq!(ids(&log), vec![root.as_str()], "{log}");
+    }
+    let glob = f
+        .history(&root, &format!("show {root} path:docs/Version[1].md"))
+        .await;
+    assert!(glob.contains("bracket match"), "{glob}");
+    assert!(glob.contains("bracket literal"), "{glob}");
+    assert!(
+        f.error(&root, "log file:../outside.md")
+            .await
+            .contains("path")
+    );
+
+    let mut changed = files;
+    changed[0].1 = "bracket literal edited\n";
+    changed[1].1 = "bracket match edited\n";
+    let tip = f.commit(&changed, &[&root], "edit both files");
+    let log = f.history(&tip, "log file:docs/Version[1].md").await;
+    assert_eq!(ids(&log), vec![tip.as_str(), root.as_str()], "{log}");
+    let diff = f
+        .history(&tip, &format!("diff {root}..{tip} file:docs/Version[1].md"))
+        .await;
+    assert!(diff.contains("bracket literal edited"), "{diff}");
+    assert!(!diff.contains("bracket match edited"), "{diff}");
 }
 
 // These fixtures fit in one hunk, so both rendered sides must contain the
@@ -223,6 +312,983 @@ async fn selected_content_or_unresolved(
             assert!(ids(&history).is_empty(), "{history}");
             None
         }
+    }
+}
+
+#[tokio::test]
+async fn mode_only_history_does_not_read_unchanged_contents() {
+    let f = Fixture::new();
+    let source = "pub fn run() {}\n";
+    let root = f.commit_modes(&[("run.rs", source, 0o100644)], &[], "initial file");
+    let tip = f.commit_modes(&[("run.rs", source, 0o100755)], &[&root], "make executable");
+    let blob = git(f.root.path(), &["rev-parse", &format!("{tip}:run.rs")], b"");
+    std::fs::remove_file(
+        f.root
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+
+    for selector in ["file:run.rs", "path:run.rs"] {
+        let history = f.history(&tip, &format!("log {selector} limit:1")).await;
+        assert_eq!(ids(&history), [tip.as_str()], "{history}");
+        assert!(history.contains("mode run.rs"), "{history}");
+        assert!(!history.contains("incomplete:"), "{history}");
+        for query in [format!("show {tip}"), format!("diff {root}..{tip}")] {
+            let comparison = f.history(&tip, &format!("{query} {selector}")).await;
+            assert!(body(&comparison).contains("mode run.rs"), "{comparison}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn executable_mode_only_changes_are_selected_file_history() {
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let edited = "pub fn value() -> i32 { 2 }\n";
+    for (old_mode, new_mode) in [(0o100644, 0o100755), (0o100755, 0o100644)] {
+        let f = Fixture::new();
+        let root = f.commit_modes(
+            &[
+                ("src/lib.rs", source, old_mode),
+                ("other.rs", "const OTHER: i32 = 1;\n", old_mode),
+            ],
+            &[],
+            "introduce files",
+        );
+        let mode = f.commit_modes(
+            &[
+                ("src/lib.rs", source, new_mode),
+                ("other.rs", "const OTHER: i32 = 1;\n", old_mode),
+            ],
+            &[&root],
+            "change selected mode",
+        );
+        let unchanged = f.commit_modes(
+            &[
+                ("src/lib.rs", source, new_mode),
+                ("other.rs", "const OTHER: i32 = 1;\n", old_mode),
+            ],
+            &[&mode],
+            "unchanged tree",
+        );
+        let unrelated = f.commit_modes(
+            &[
+                ("src/lib.rs", source, new_mode),
+                ("other.rs", "const OTHER: i32 = 2;\n", new_mode),
+            ],
+            &[&unchanged],
+            "edit unrelated content and mode",
+        );
+        let tip = f.commit_modes(
+            &[
+                ("src/lib.rs", edited, new_mode),
+                ("other.rs", "const OTHER: i32 = 2;\n", new_mode),
+            ],
+            &[&unrelated],
+            "ordinary selected edit",
+        );
+        assert_eq!(
+            git(
+                f.root.path(),
+                &["rev-parse", &format!("{root}:src/lib.rs")],
+                b""
+            ),
+            git(
+                f.root.path(),
+                &["rev-parse", &format!("{mode}:src/lib.rs")],
+                b""
+            ),
+        );
+        let expected = [&tip, &mode, &root].map(String::as_str);
+        let git_history = git(
+            f.root.path(),
+            &["log", "--format=%H", &tip, "--", "src/lib.rs"],
+            b"",
+        );
+        assert_eq!(ids(&git_history), expected);
+        for selector in ["file:src/lib.rs", "path:src/lib.rs", "path:src/**"] {
+            let history = f.history(&tip, &format!("log {selector}")).await;
+            assert_eq!(ids(&history), expected, "{history}");
+            let record = history
+                .lines()
+                .find(|line| line.starts_with(&mode))
+                .unwrap();
+            assert!(
+                record.contains(&format!("{old_mode:06o}→{new_mode:06o}")),
+                "{history}"
+            );
+            assert!(record.contains("+0 -0"), "{history}");
+            assert!(history.ends_with("end\n"), "{history}");
+            for (query, before, after) in [
+                (format!("show {mode}"), old_mode, new_mode),
+                (format!("diff {root}..{mode}"), old_mode, new_mode),
+                (format!("diff {mode}..{root}"), new_mode, old_mode),
+            ] {
+                for at in [&root, &tip] {
+                    let shown = f.history(at, &format!("{query} {selector}")).await;
+                    let patch = body(&shown);
+                    assert!(
+                        patch.contains(&format!("# mode src/lib.rs {before:06o}→{after:06o}")),
+                        "{shown}"
+                    );
+                    assert_eq!(patch.matches("# mode ").count(), 1, "{shown}");
+                    assert!(
+                        !patch.contains("@@ ")
+                            && !patch.contains("--- ")
+                            && !patch.contains("+++ "),
+                        "{shown}"
+                    );
+                    assert!(
+                        !patch.contains("other.rs") && !patch.contains("No changes."),
+                        "{shown}"
+                    );
+                }
+            }
+            for query in [
+                format!("show {unchanged}"),
+                format!("show {unrelated}"),
+                format!("diff {mode}..{unrelated}"),
+                format!("diff {unrelated}..{mode}"),
+                format!("diff {tip}..{tip}"),
+            ] {
+                let shown = f.history(&tip, &format!("{query} {selector}")).await;
+                assert_eq!(body(&shown), "No changes.\n", "{shown}");
+            }
+            let shown = f.history(&tip, &format!("show {tip} {selector}")).await;
+            assert_selected_content(&shown, source, edited);
+            assert!(!body(&shown).contains("# mode "), "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn repository_comparisons_keep_modes_for_unsupported_files() {
+    let f = Fixture::new();
+    let root = f.commit_modes(
+        &[
+            ("payload.bin", "same", 0o100644),
+            ("link.cs", "target", 0o100644),
+        ],
+        &[],
+        "source",
+    );
+    let tip = f.commit_modes(
+        &[
+            ("payload.bin", "same", 0o100755),
+            ("link.cs", "target", 0o120000),
+        ],
+        &[&root],
+        "mode",
+    );
+    let shown = f.history(&tip, &format!("show {tip}")).await;
+    assert!(
+        body(&shown).contains("mode payload.bin 100644→100755"),
+        "{shown}"
+    );
+    assert!(
+        body(&shown).contains("mode link.cs 100644→120000"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn rejected_merge_mode_does_not_remain_in_file_history() {
+    for (base, changed_mode) in [(0o100644, 0o100755), (0o100755, 0o100644)] {
+        for reverse in [false, true] {
+            let f = Fixture::new();
+            let source = "const VALUE: i32 = 1;\n";
+            let root = f.commit_modes(&[("src/lib.rs", source, base)], &[], "source");
+            let changed = f.commit_modes(&[("src/lib.rs", source, changed_mode)], &[&root], "mode");
+            let other = f.commit_modes(
+                &[
+                    ("src/lib.rs", source, base),
+                    ("other.txt", "other\n", 0o100644),
+                ],
+                &[&root],
+                "other",
+            );
+            let parents = if reverse {
+                [&other, &changed]
+            } else {
+                [&changed, &other]
+            };
+            let merge = f.commit_modes(
+                &[
+                    ("src/lib.rs", source, base),
+                    ("other.txt", "other\n", 0o100644),
+                ],
+                &[parents[0], parents[1]],
+                "merge",
+            );
+            let history = f.history(&merge, "log file:src/lib.rs limit:10").await;
+            assert!(!ids(&history).contains(&changed.as_str()), "{history}");
+            assert!(ids(&history).contains(&root.as_str()), "{history}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_merge_mode_preserves_accepted_content() {
+    let f = Fixture::new();
+    let old = "const VALUE: i32 = 1;\n";
+    let new = "const VALUE: i32 = 2;\n";
+    let root = f.commit_modes(&[("src/lib.rs", old, 0o100644)], &[], "source");
+    let changed = f.commit_modes(&[("src/lib.rs", new, 0o100755)], &[&root], "edit and mode");
+    let other = f.commit_modes(
+        &[
+            ("src/lib.rs", old, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&root],
+        "other",
+    );
+    let merge = f.commit_modes(
+        &[
+            ("src/lib.rs", new, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&changed, &other],
+        "merge",
+    );
+    let history = f.history(&merge, "log file:src/lib.rs limit:10").await;
+    let record = history
+        .lines()
+        .find(|line| line.starts_with(&changed))
+        .unwrap();
+    assert!(!record.contains("100644→100755"), "{history}");
+    assert!(record.contains("+1 -1"), "{history}");
+}
+
+#[tokio::test]
+async fn rejected_merge_mode_preserves_completed_mode_cycles() {
+    let f = Fixture::new();
+    let source = "const VALUE: i32 = 1;\n";
+    let root = f.commit_modes(&[("src/lib.rs", source, 0o100644)], &[], "source");
+    let first = f.commit_modes(&[("src/lib.rs", source, 0o100755)], &[&root], "first");
+    let revert = f.commit_modes(&[("src/lib.rs", source, 0o100644)], &[&first], "revert");
+    let changed = f.commit_modes(&[("src/lib.rs", source, 0o100755)], &[&revert], "mode");
+    let other = f.commit_modes(
+        &[
+            ("src/lib.rs", source, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&root],
+        "other",
+    );
+    let merge = f.commit_modes(
+        &[
+            ("src/lib.rs", source, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&changed, &other],
+        "merge",
+    );
+    let history = f.history(&merge, "log file:src/lib.rs limit:10").await;
+    assert!(!ids(&history).contains(&changed.as_str()), "{history}");
+    assert!(ids(&history).contains(&first.as_str()), "{history}");
+    assert!(ids(&history).contains(&revert.as_str()), "{history}");
+}
+
+#[tokio::test]
+async fn rejected_mode_with_ambiguous_path_scope_is_marked_uncertain() {
+    let f = Fixture::new();
+    let source = "const VALUE: i32 = 1;\n";
+    let root = f.commit_modes(&[("src/lib.rs", source, 0o100644)], &[], "source");
+    let changed = f.commit_modes(&[("src/lib.rs", source, 0o100755)], &[&root], "mode");
+    let extra = f.commit_modes(
+        &[
+            ("src/lib.rs", source, 0o100755),
+            ("src/temp.rs", "const TEMP: bool = true;\n", 0o100644),
+        ],
+        &[&changed],
+        "add temp",
+    );
+    let tip = f.commit_modes(
+        &[("src/lib.rs", source, 0o100755)],
+        &[&extra],
+        "delete temp",
+    );
+    let other = f.commit_modes(
+        &[
+            ("src/lib.rs", source, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&root],
+        "other",
+    );
+    let merge = f.commit_modes(
+        &[
+            ("src/lib.rs", source, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&tip, &other],
+        "merge",
+    );
+    let history = f.history(&merge, "log path:src/** limit:20").await;
+    let record = history
+        .lines()
+        .find(|line| line.starts_with(&changed))
+        .expect("the ambiguous mode change should remain visible");
+    assert!(record.contains("mode attribution unresolved"), "{history}");
+}
+
+#[tokio::test]
+async fn rejected_move_and_mode_do_not_appear_as_a_definite_change() {
+    let f = Fixture::new();
+    let source = "const VALUE: i32 = 1;\n";
+    let root = f.commit_modes(&[("src/old.rs", source, 0o100644)], &[], "source");
+    let moved = f.commit_modes(
+        &[("src/new.rs", source, 0o100755)],
+        &[&root],
+        "move and mode",
+    );
+    let other = f.commit_modes(
+        &[
+            ("src/old.rs", source, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&root],
+        "other",
+    );
+    let merge = f.commit_modes(
+        &[
+            ("src/old.rs", source, 0o100644),
+            ("other.txt", "other\n", 0o100644),
+        ],
+        &[&moved, &other],
+        "merge",
+    );
+    let history = f.history(&merge, "log file:src/old.rs limit:10").await;
+    let record = history
+        .lines()
+        .find(|line| line.starts_with(&moved))
+        .expect("the unresolved move should remain visible");
+    assert!(record.contains("unresolved"), "{history}");
+}
+
+#[tokio::test]
+async fn accepted_move_survives_a_rejected_mode() {
+    for two_moves in [false, true] {
+        let f = Fixture::new();
+        let source = "const VALUE: i32 = 1;\n";
+        let root = f.commit_modes(&[("src/old.rs", source, 0o100644)], &[], "source");
+        let first_path = if two_moves {
+            "src/mid.rs"
+        } else {
+            "src/new.rs"
+        };
+        let moved = f.commit_modes(&[(first_path, source, 0o100755)], &[&root], "move and mode");
+        let tip = if two_moves {
+            f.commit_modes(&[("src/new.rs", source, 0o100755)], &[&moved], "move again")
+        } else {
+            moved.clone()
+        };
+        let other = f.commit_modes(
+            &[
+                ("src/old.rs", source, 0o100644),
+                ("other.txt", "other\n", 0o100644),
+            ],
+            &[&root],
+            "other",
+        );
+        let merge = f.commit_modes(
+            &[
+                ("src/new.rs", source, 0o100644),
+                ("other.txt", "other\n", 0o100644),
+            ],
+            &[&tip, &other],
+            "merge",
+        );
+        let history = f.history(&merge, "log file:src/new.rs limit:10").await;
+        let record = history
+            .lines()
+            .find(|line| line.starts_with(&moved))
+            .expect("move should remain visible");
+        assert!(
+            record.contains(&format!("src/old.rs→{first_path}")),
+            "{history}"
+        );
+        assert!(!record.contains("100644→100755"), "{history}");
+        assert!(!record.contains("attribution unresolved"), "{history}");
+    }
+}
+
+#[tokio::test]
+async fn executable_modes_and_content_edits_stay_with_selected_files() {
+    let f = Fixture::new();
+    let old = "pub fn calculate() -> i32 { 10 }\n";
+    let new = "pub fn calculate() -> i32 { 11 }\n";
+    let root = f.commit_modes(
+        &[
+            ("src/mode.rs", "const MODE: bool = true;\n", 0o100644),
+            ("src/edit.rs", old, 0o100755),
+            ("src/steady.rs", "const STEADY: bool = true;\n", 0o100644),
+            ("src/private.rs", "const PRIVATE: i32 = 1;\n", 0o100644),
+            ("other.rs", "const OTHER: i32 = 1;\n", 0o100644),
+        ],
+        &[],
+        "initial sources",
+    );
+    let tip = f.commit_modes(
+        &[
+            ("src/mode.rs", "const MODE: bool = true;\n", 0o100755),
+            ("src/edit.rs", new, 0o100644),
+            ("src/steady.rs", "const STEADY: bool = true;\n", 0o100644),
+            ("src/private.rs", "const PRIVATE: i32 = 2;\n", 0o100755),
+            ("other.rs", "const OTHER: i32 = 2;\n", 0o100755),
+        ],
+        &[&root],
+        "change multiple modes and contents",
+    );
+    let repository = f.history(&tip, &format!("show {tip}")).await;
+    let patch = body(&repository);
+    assert_eq!(patch.matches("# mode ").count(), 4, "{repository}");
+    for note in [
+        "# mode src/mode.rs 100644→100755",
+        "# mode src/edit.rs 100755→100644",
+        "# mode src/private.rs 100644→100755",
+        "# mode other.rs 100644→100755",
+    ] {
+        assert_eq!(
+            patch.lines().filter(|line| *line == note).count(),
+            1,
+            "{repository}"
+        );
+    }
+    assert!(!patch.contains("steady.rs"), "{repository}");
+    for selector in [
+        "path:src/mode.rs path:src/edit.rs",
+        "path:src/** -path:src/private.rs",
+    ] {
+        let history = f.history(&tip, &format!("log {selector}")).await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+        let record = history.lines().find(|line| line.starts_with(&tip)).unwrap();
+        assert!(record.contains("+1 -1"), "{history}");
+        assert!(
+            record.contains("mode src/mode.rs 100644→100755"),
+            "{history}"
+        );
+        assert!(
+            record.contains("mode src/edit.rs 100755→100644"),
+            "{history}"
+        );
+        for (query, reverse) in [
+            (format!("show {tip}"), false),
+            (format!("diff {root}..{tip}"), false),
+            (format!("diff {tip}..{root}"), true),
+        ] {
+            let shown = f.history(&tip, &format!("{query} {selector}")).await;
+            let patch = body(&shown);
+            let (before, after) = if reverse {
+                (0o100755, 0o100644)
+            } else {
+                (0o100644, 0o100755)
+            };
+            assert!(
+                patch.contains(&format!("# mode src/mode.rs {before:06o}→{after:06o}")),
+                "{shown}"
+            );
+            assert!(
+                patch.contains(&format!("# mode src/edit.rs {after:06o}→{before:06o}")),
+                "{shown}"
+            );
+            assert_eq!(patch.matches("# mode ").count(), 2, "{shown}");
+            let (old_source, new_source) = if reverse { (new, old) } else { (old, new) };
+            let edit = patch
+                .split_once("diff --git a/src/edit.rs b/src/edit.rs\n")
+                .unwrap()
+                .1
+                .split("diff --git ")
+                .next()
+                .unwrap();
+            let (old_content, new_content) = selected_hunk_content(edit);
+            assert_eq!(old_content, old_source, "{shown}");
+            assert_eq!(new_content, new_source, "{shown}");
+            for excluded in ["steady.rs", "private.rs", "other.rs", "const MODE"] {
+                assert!(!patch.contains(excluded), "{shown}");
+            }
+        }
+    }
+    for (selector, mode_only) in [("file:src/mode.rs", true), ("file:src/edit.rs", false)] {
+        let shown = f.history(&tip, &format!("show {tip} {selector}")).await;
+        assert_eq!(body(&shown).matches("# mode ").count(), 1, "{shown}");
+        if mode_only {
+            assert!(
+                !body(&shown).contains("@@ ") && !body(&shown).contains("edit.rs"),
+                "{shown}"
+            );
+        } else {
+            assert_selected_content(&shown, old, new);
+            assert!(!body(&shown).contains("mode.rs"), "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn executable_modes_follow_file_moves_with_or_without_content_edits() {
+    let original = continuation_member("old.rs", "calculate");
+    for (old_mode, new_mode) in [(0o100644, 0o100755), (0o100755, 0o100644)] {
+        for edited in [false, true] {
+            let f = Fixture::new();
+            let moved = if edited {
+                original.replace("+ 10", "+ 11")
+            } else {
+                original.clone()
+            };
+            let root = f.commit_modes(
+                &[
+                    ("src/old.rs", &original, old_mode),
+                    ("src/steady.rs", "const STEADY: bool = true;\n", old_mode),
+                    ("other.rs", "const OTHER: i32 = 1;\n", old_mode),
+                ],
+                &[],
+                "initial sources",
+            );
+            let tip = f.commit_modes(
+                &[
+                    ("src/new.rs", &moved, new_mode),
+                    ("src/steady.rs", "const STEADY: bool = true;\n", old_mode),
+                    ("other.rs", "const OTHER: i32 = 2;\n", new_mode),
+                ],
+                &[&root],
+                "move source and change executable mode",
+            );
+            for selector in ["file:src/new.rs", "path:src/new.rs", "path:src/**"] {
+                let history = f.history(&tip, &format!("log {selector}")).await;
+                assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+                let record = history.lines().find(|line| line.starts_with(&tip)).unwrap();
+                assert!(
+                    record.contains(&format!("{old_mode:06o}→{new_mode:06o}")),
+                    "{history}"
+                );
+                // Path scopes can retain unresolved directory ancestry even
+                // when this individual file move is supported.
+                if !edited && selector.starts_with("file:") {
+                    assert!(record.contains("+0 -0"), "{history}");
+                }
+            }
+            for (at, selector) in [
+                (&root, "file:src/old.rs"),
+                (&root, "path:src/old.rs"),
+                (&tip, "file:src/new.rs"),
+                (&tip, "path:src/new.rs"),
+                (&tip, "path:src/**"),
+            ] {
+                for (query, reverse) in [
+                    (format!("show {tip}"), false),
+                    (format!("diff {root}..{tip}"), false),
+                    (format!("diff {tip}..{root}"), true),
+                ] {
+                    let shown = f.history(at, &format!("{query} {selector}")).await;
+                    let patch = body(&shown);
+                    let (before, after, old_path, new_path) = if reverse {
+                        (new_mode, old_mode, "src/new.rs", "src/old.rs")
+                    } else {
+                        (old_mode, new_mode, "src/old.rs", "src/new.rs")
+                    };
+                    assert!(
+                        patch.contains(&format!("diff --git a/{old_path} b/{new_path}")),
+                        "{shown}"
+                    );
+                    assert!(
+                        patch.contains(&format!("move {old_path} → {new_path}")),
+                        "{shown}"
+                    );
+                    assert!(
+                        patch.contains(&format!("{before:06o}→{after:06o}")),
+                        "{shown}"
+                    );
+                    assert_eq!(patch.matches("# mode ").count(), 1, "{shown}");
+                    assert_eq!(patch.matches("diff --git ").count(), 1, "{shown}");
+                    assert!(
+                        !patch.contains("/dev/null") && !patch.contains("copy "),
+                        "{shown}"
+                    );
+                    assert!(
+                        !patch.contains("other.rs") && !patch.contains("steady.rs"),
+                        "{shown}"
+                    );
+                    if edited {
+                        let (before, after) = if reverse {
+                            (&moved, &original)
+                        } else {
+                            (&original, &moved)
+                        };
+                        assert_selected_content(&shown, before, after);
+                    } else {
+                        assert!(
+                            !patch.contains("@@ ")
+                                && !patch.contains("--- ")
+                                && !patch.contains("+++ "),
+                            "{shown}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn executable_modes_do_not_expand_declaration_or_text_history() {
+    let f = Fixture::new();
+    let source = "pub fn selected(value: i32) -> i32 {\n    let doubled = value * 2;\n    doubled + 1\n}\n\npub fn sibling() -> i32 { 1 }\n";
+    let sibling_edit = source.replace("sibling() -> i32 { 1 }", "sibling() -> i32 { 2 }");
+    let selected_edit = sibling_edit.replace("doubled + 1", "doubled + 3");
+    let root = f.commit_modes(&[("lib.rs", source, 0o100644)], &[], "introduce source");
+    let mode = f.commit_modes(&[("lib.rs", source, 0o100755)], &[&root], "mode only");
+    let sibling = f.commit_modes(
+        &[("lib.rs", &sibling_edit, 0o100644)],
+        &[&mode],
+        "mode and sibling edit",
+    );
+    let tip = f.commit_modes(
+        &[("lib.rs", &selected_edit, 0o100755)],
+        &[&sibling],
+        "mode and selected edit",
+    );
+    for selector in ["function:selected", "@lib.rs:1-4"] {
+        let history = f.history(&tip, &format!("log {selector}")).await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+        assert!(!history.contains("mode lib.rs"), "{history}");
+        for query in [
+            format!("show {mode}"),
+            format!("show {sibling}"),
+            format!("diff {root}..{sibling}"),
+            format!("diff {sibling}..{root}"),
+        ] {
+            // Keep the unchanged passage as the anchor; tracing backward through
+            // its later edit can independently introduce ancestry diagnostics.
+            let shown = f.history(&sibling, &format!("{query} {selector}")).await;
+            assert_eq!(body(&shown), "No changes.\n", "{shown}");
+        }
+        for (query, reverse) in [
+            (format!("show {tip}"), false),
+            (format!("diff {root}..{tip}"), false),
+            (format!("diff {tip}..{root}"), true),
+        ] {
+            let shown = f.history(&tip, &format!("{query} {selector}")).await;
+            let patch = body(&shown);
+            let (before, after) = if reverse { (3, 1) } else { (1, 3) };
+            assert!(
+                patch.contains(&format!("-    doubled + {before}\n")),
+                "{shown}"
+            );
+            assert!(
+                patch.contains(&format!("+    doubled + {after}\n")),
+                "{shown}"
+            );
+            assert!(
+                !patch.contains("# mode ") && !patch.contains("sibling"),
+                "{shown}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn executable_mode_authored_by_merge_is_not_a_clean_source_combination() {
+    let source = "pub fn selected(value: i32) -> i32 { value * 2 + 1 }\n";
+    for (old_mode, new_mode) in [(0o100644, 0o100755), (0o100755, 0o100644)] {
+        let f = Fixture::new();
+        let root = f.commit_modes(&[("lib.rs", source, old_mode)], &[], "base");
+        let left = f.commit_modes(&[("lib.rs", source, old_mode)], &[&root], "left branch");
+        let right = f.commit_modes(&[("lib.rs", source, old_mode)], &[&root], "right branch");
+        let merge = f.commit_modes(
+            &[("lib.rs", source, new_mode)],
+            &[&left, &right],
+            "mode authored at merge",
+        );
+        for selector in ["file:lib.rs", "path:lib.rs"] {
+            let history = f.history(&merge, &format!("log {selector}")).await;
+            assert_eq!(ids(&history), [merge.as_str(), root.as_str()], "{history}");
+            let record = history
+                .lines()
+                .find(|line| line.starts_with(&merge))
+                .unwrap();
+            assert!(
+                record.contains(&format!("mode lib.rs {old_mode:06o}→{new_mode:06o}")),
+                "{history}"
+            );
+            for parent in [1, 2] {
+                let shown = f
+                    .history(&merge, &format!("show {merge} parent:{parent} {selector}"))
+                    .await;
+                assert!(
+                    body(&shown).contains(&format!("# mode lib.rs {old_mode:06o}→{new_mode:06o}")),
+                    "{shown}"
+                );
+                assert!(!body(&shown).contains("@@ "), "{shown}");
+            }
+        }
+        for selector in ["function:selected", "@lib.rs:1-1"] {
+            let history = f.history(&merge, &format!("log {selector}")).await;
+            assert_eq!(ids(&history), [root.as_str()], "{history}");
+            let shown = f.history(&merge, &format!("show {merge} {selector}")).await;
+            assert_eq!(body(&shown), "No changes.\n", "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn executable_mode_survives_rejected_content_in_partial_history() {
+    let source = "pub fn selected(value: i32) -> i32 { value * 2 + 1 }\n";
+    let edited = source.replace("+ 1", "+ 3");
+    for (old_mode, new_mode) in [(0o100644, 0o100755), (0o100755, 0o100644)] {
+        let f = Fixture::new();
+        let root = f.commit_modes(&[("lib.rs", source, old_mode)], &[], "base");
+        let branch = f.commit_modes(
+            &[("lib.rs", &edited, new_mode)],
+            &[&root],
+            "content and mode",
+        );
+        let main = f.commit_modes(&[("lib.rs", source, old_mode)], &[&root], "unchanged main");
+        for parents in [
+            [main.as_str(), branch.as_str()],
+            [branch.as_str(), main.as_str()],
+        ] {
+            let merge = f.commit_modes(
+                &[("lib.rs", source, new_mode)],
+                &parents,
+                "accept mode but reject source edit",
+            );
+            for selector in ["file:lib.rs", "path:lib.rs"] {
+                let history = f.history(&merge, &format!("log {selector}")).await;
+                assert_eq!(ids(&history), [branch.as_str(), root.as_str()], "{history}");
+                let record = history
+                    .lines()
+                    .find(|line| line.starts_with(&branch))
+                    .unwrap();
+                assert!(
+                    record.contains("partial") && record.contains("+0 -0"),
+                    "{history}"
+                );
+                assert!(
+                    record.contains(&format!("mode lib.rs {old_mode:06o}→{new_mode:06o}")),
+                    "{history}"
+                );
+                assert!(history.ends_with("end\n"), "{history}");
+            }
+            for selector in ["function:selected", "@lib.rs:1-1"] {
+                let history = f.history(&merge, &format!("log {selector}")).await;
+                assert_eq!(ids(&history), [root.as_str()], "{history}");
+                assert!(!history.contains("mode lib.rs"), "{history}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_regular_tree_entries_do_not_extend_selected_file_history() {
+    let source = "pub fn selected(value: i32) -> i32 { value * 2 + 1 }\n";
+    for mode in [0o100644, 0o100755] {
+        let f = Fixture::new();
+        // The symlink deliberately reuses the regular file's exact blob, so a
+        // blob-only fast path would incorrectly carry its source history back.
+        let symlink = f.commit_modes(&[("lib.rs", source, 0o120000)], &[], "symlink payload");
+        git(f.root.path(), &["read-tree", "--empty"], b"");
+        git(
+            f.root.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{symlink},lib.rs"),
+            ],
+            b"",
+        );
+        let tree = git(f.root.path(), &["write-tree"], b"");
+        let submodule = git(
+            f.root.path(),
+            &["commit-tree", &tree, "-m", "gitlink to an actual commit"],
+            b"",
+        );
+        for excluded in [&symlink, &submodule] {
+            let regular = f.commit_modes(
+                &[("lib.rs", source, mode)],
+                &[excluded],
+                "introduce regular source",
+            );
+            assert!(
+                f.error(excluded, "log file:lib.rs")
+                    .await
+                    .contains("absent or excluded")
+            );
+            for selector in ["file:lib.rs", "path:lib.rs"] {
+                let history = f.history(&regular, &format!("log {selector}")).await;
+                assert_eq!(ids(&history), [regular.as_str()], "{history}");
+                assert!(history.ends_with("end\n"), "{history}");
+                let shown = f
+                    .history(&regular, &format!("show {excluded} {selector}"))
+                    .await;
+                assert_eq!(body(&shown), "No changes.\n", "{shown}");
+                for (query, old, new) in [
+                    (format!("show {regular}"), "", source),
+                    (format!("diff {excluded}..{regular}"), "", source),
+                    (format!("diff {regular}..{excluded}"), source, ""),
+                ] {
+                    let shown = f.history(&regular, &format!("{query} {selector}")).await;
+                    assert_selected_content(&shown, old, new);
+                    let patch = body(&shown);
+                    assert!(patch.contains("/dev/null"), "{shown}");
+                    assert!(!patch.contains("# mode "), "{shown}");
+                    assert!(
+                        !patch.contains("120000") && !patch.contains("160000"),
+                        "{shown}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn attribute_only_visibility_changes_do_not_create_file_changes() {
+    let f = Fixture::new();
+    let source = "class Target { int Value() => 1; }\n";
+    let rule = "Target.cs -diff\n";
+    let root = f.commit(&[("Target.cs", source)], &[], "source");
+    let hidden = f.commit(
+        &[("Target.cs", source), (".gitattributes", rule)],
+        &[&root],
+        "hide source",
+    );
+    let visible = f.commit(&[("Target.cs", source)], &[&hidden], "show source");
+    for commit in [&hidden, &visible] {
+        let shown = f.history(&visible, &format!("show {commit}")).await;
+        let patch = body(&shown);
+        assert!(patch.contains(".gitattributes"), "{shown}");
+        assert!(
+            !patch.contains("a/Target.cs") && !patch.contains("b/Target.cs"),
+            "{shown}"
+        );
+        assert!(!patch.contains("move "), "{shown}");
+        let selected = f
+            .error(&visible, &format!("show {commit} file:Target.cs"))
+            .await;
+        assert_unresolved_history(&selected);
+    }
+    let history = f.history(&visible, "log file:Target.cs").await;
+    assert!(history.contains("incomplete:"), "{history}");
+}
+
+#[tokio::test]
+async fn visibility_changes_do_not_read_excluded_file_contents() {
+    let f = Fixture::new();
+    let source = "class Target { int Value() => 1; }\n";
+    let root = f.commit(&[("Target.cs", source)], &[], "source");
+    let hidden = f.commit(
+        &[
+            ("Target.cs", source),
+            (".gitattributes", "Target.cs -diff\n"),
+            ("Added.cs", "class Added {}\n"),
+        ],
+        &[&root],
+        "hide source",
+    );
+    let blob = git(
+        f.root.path(),
+        &["rev-parse", &format!("{hidden}:Target.cs")],
+        b"",
+    );
+    std::fs::remove_file(
+        f.root
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    let shown = f.history(&hidden, &format!("show {hidden}")).await;
+    assert!(body(&shown).contains(".gitattributes"), "{shown}");
+    assert!(!body(&shown).contains("Target.cs b/Target.cs"), "{shown}");
+    assert!(body(&shown).contains("+++ b/Added.cs"), "{shown}");
+}
+
+#[tokio::test]
+async fn edits_across_an_attribute_exclusion_are_reported_without_source_content() {
+    let f = Fixture::new();
+    let old = "class Target { int Value() => 1; }\n";
+    let new = "class Target { int Value() => 2; }\n";
+    let other_old = "class Other { int Value() => 1; }\n";
+    let other_new = "class Other { int Value() => 2; }\n";
+    let root = f.commit(
+        &[("Target.cs", old), ("Other.cs", other_old)],
+        &[],
+        "source",
+    );
+    let hidden = f.commit(
+        &[
+            ("Target.cs", new),
+            ("Other.cs", other_new),
+            (".gitattributes", "Target.cs -diff\n"),
+        ],
+        &[&root],
+        "edit and hide",
+    );
+    let visible = f.commit(
+        &[("Target.cs", new), ("Other.cs", other_new)],
+        &[&hidden],
+        "show source",
+    );
+    for query in [
+        format!("diff {root}..{hidden}"),
+        format!("diff {hidden}..{root}"),
+    ] {
+        let shown = f.history(&visible, &query).await;
+        let patch = body(&shown);
+        assert!(
+            patch.contains("diff --git a/Target.cs b/Target.cs"),
+            "{shown}"
+        );
+        assert!(
+            patch.contains("excluded by committed attributes"),
+            "{shown}"
+        );
+        assert!(!patch.contains("class Target"), "{shown}");
+        assert!(patch.contains("class Other"), "{shown}");
+    }
+    let selected = f
+        .error(&visible, &format!("show {hidden} file:Target.cs"))
+        .await;
+    assert_unresolved_history(&selected);
+}
+
+#[tokio::test]
+async fn nested_attributes_use_each_committed_tree() {
+    let f = Fixture::new();
+    let source = "class Target { int Value() => 1; }\n";
+    let root_rule = "*.cs diff\n";
+    let nested_rule = "Target.cs -diff\n";
+    let root = f.commit(
+        &[("src/Target.cs", source), (".gitattributes", root_rule)],
+        &[],
+        "source",
+    );
+    let hidden = f.commit(
+        &[
+            ("src/Target.cs", source),
+            (".gitattributes", root_rule),
+            ("src/.gitattributes", nested_rule),
+        ],
+        &[&root],
+        "nested exclusion",
+    );
+    let visible = f.commit(
+        &[("src/Target.cs", source), (".gitattributes", root_rule)],
+        &[&hidden],
+        "remove exclusion",
+    );
+    for commit in [&hidden, &visible] {
+        let shown = f.history(&visible, &format!("show {commit}")).await;
+        let patch = body(&shown);
+        assert!(patch.contains("src/.gitattributes"), "{shown}");
+        assert!(
+            !patch.contains("a/src/Target.cs") && !patch.contains("b/src/Target.cs"),
+            "{shown}"
+        );
     }
 }
 
@@ -319,6 +1385,596 @@ async fn copying_from_an_unchanged_file_retains_uncertain_origin() {
     let text = f.history(&tip, "log function:copied").await;
     assert_eq!(ids(&text), [tip.as_str(), root.as_str()], "{text}");
     assert!(text.contains("~copy"), "{text}");
+}
+
+#[tokio::test]
+async fn unrelated_file_replacements_remain_separate_additions_and_deletions() {
+    let removed = "pub struct Record {\n    pub label: String,\n    pub count: u64,\n}\n";
+    let added =
+        "pub fn classify(input: &[u8]) -> bool {\n    input.iter().any(|value| *value > 128)\n}\n";
+    for unchanged in [false, true] {
+        let f = Fixture::new();
+        let mut before = vec![("old.rs", removed)];
+        let mut after = vec![("new.rs", added)];
+        if unchanged {
+            before.push(("unchanged.rs", "const UNCHANGED: bool = true;\n"));
+            after.push(("unchanged.rs", "const UNCHANGED: bool = true;\n"));
+        }
+        let root = f.commit(&before, &[], "initial source");
+        let tip = f.commit(&after, &[&root], "replace source");
+        let status = git(
+            f.root.path(),
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-M",
+                &root,
+                &tip,
+            ],
+            b"",
+        );
+        assert_eq!(status, "A\tnew.rs\nD\told.rs");
+        if unchanged {
+            let blob = git(
+                f.root.path(),
+                &["rev-parse", &format!("{tip}:unchanged.rs")],
+                b"",
+            );
+            std::fs::remove_file(
+                f.root
+                    .path()
+                    .join(".git/objects")
+                    .join(&blob[..2])
+                    .join(&blob[2..]),
+            )
+            .unwrap();
+        }
+        for (query, old_path, old_source, new_path, new_source) in [
+            (format!("show {tip}"), "old.rs", removed, "new.rs", added),
+            (
+                format!("diff {root}..{tip}"),
+                "old.rs",
+                removed,
+                "new.rs",
+                added,
+            ),
+            (
+                format!("diff {tip}..{root}"),
+                "new.rs",
+                added,
+                "old.rs",
+                removed,
+            ),
+        ] {
+            let shown = f.history(&tip, &query).await;
+            let patch = body(&shown);
+            assert!(
+                patch.contains(&format!("--- a/{old_path}\n+++ /dev/null")),
+                "{shown}"
+            );
+            assert!(
+                patch.contains(&format!("--- /dev/null\n+++ b/{new_path}")),
+                "{shown}"
+            );
+            assert_eq!(patch.matches("diff --git ").count(), 2, "{shown}");
+            assert!(
+                !patch.contains("move ") && !patch.contains("copy "),
+                "{shown}"
+            );
+            for (prefix, source) in [('-', old_source), ('+', new_source)] {
+                for line in source.lines() {
+                    assert!(patch.contains(&format!("{prefix}{line}\n")), "{shown}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_retained_identical_file_prevents_a_false_move() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(
+        &[("origin.rs", source), ("stale.rs", source)],
+        &[],
+        "identical files",
+    );
+    let tip = f.commit(
+        &[("origin.rs", source), ("copied.rs", source)],
+        &[&root],
+        "replace one copy",
+    );
+    for (query, old_path, new_path) in [
+        (format!("show {tip}"), "stale.rs", "copied.rs"),
+        (format!("diff {tip}..{root}"), "copied.rs", "stale.rs"),
+    ] {
+        let shown = f.history(&tip, &query).await;
+        let patch = body(&shown);
+        assert!(
+            patch.contains(&format!("--- a/{old_path}\n+++ /dev/null")),
+            "{shown}"
+        );
+        assert!(
+            patch.contains(&format!("--- /dev/null\n+++ b/{new_path}")),
+            "{shown}"
+        );
+        assert!(
+            !patch.contains("move ") && !patch.contains("copy "),
+            "{shown}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sibling_renames_do_not_claim_a_directional_move() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(&[("origin.rs", source)], &[], "original");
+    let left = f.commit(&[("left.rs", source)], &[&root], "left rename");
+    let right = f.commit(&[("right.rs", source)], &[&root], "right rename");
+    let shown = f.history(&right, &format!("diff {left}..{right}")).await;
+    let patch = body(&shown);
+    assert!(patch.contains("--- a/left.rs\n+++ /dev/null"), "{shown}");
+    assert!(patch.contains("--- /dev/null\n+++ b/right.rs"), "{shown}");
+    assert!(
+        !patch.contains("move ") && !patch.contains("copy "),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn independent_identical_additions_do_not_become_a_move() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(&[], &[], "empty root");
+    let left = f.commit(&[("left.rs", source)], &[&root], "left addition");
+    let right = f.commit(&[("right.rs", source)], &[&root], "right addition");
+    std::fs::create_dir_all(f.root.path().join(".git/info")).unwrap();
+    std::fs::write(
+        f.root.path().join(".git/info/grafts"),
+        format!("{right} {left}\n"),
+    )
+    .unwrap();
+    let shown = f.history(&right, &format!("diff {left}..{right}")).await;
+    let patch = body(&shown);
+    assert!(patch.contains("--- a/left.rs\n+++ /dev/null"), "{shown}");
+    assert!(patch.contains("--- /dev/null\n+++ b/right.rs"), "{shown}");
+    assert!(
+        !patch.contains("move ") && !patch.contains("copy "),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn file_moves_across_multiple_commits_remain_visible() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(&[("old.rs", source)], &[], "original");
+    let moved = f.commit(&[("new.rs", source)], &[&root], "move file");
+    let tip = f.commit(
+        &[("new.rs", source), ("other.rs", "pub fn other() {}\n")],
+        &[&moved],
+        "another change",
+    );
+    let shown = f.history(&tip, &format!("diff {root}..{tip}")).await;
+    assert!(body(&shown).contains("# ~move old.rs → new.rs"), "{shown}");
+}
+
+#[tokio::test]
+async fn file_comparisons_distinguish_copies_from_moves_and_preserve_edits() {
+    let original = continuation_member("origin.rs", "calculate");
+    for edit_origin in [false, true] {
+        for edit_copy in [false, true] {
+            let f = Fixture::new();
+            let origin = if edit_origin {
+                original.replace("* 3", "* 5")
+            } else {
+                original.clone()
+            };
+            let copied = if edit_copy {
+                original.replace("+ 10", "+ 11")
+            } else {
+                original.clone()
+            };
+            let root = f.commit(&[("origin.rs", &original)], &[], "initial source");
+            let tip = f.commit(
+                &[("origin.rs", &origin), ("copied.rs", &copied)],
+                &[&root],
+                "add destination",
+            );
+            if !edit_origin {
+                let history = f.history(&tip, "log file:copied.rs").await;
+                assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+                assert!(history.contains("copy"), "{history}");
+            }
+            for query in [format!("show {tip}"), format!("diff {root}..{tip}")] {
+                let shown = f.history(&tip, &format!("{query} file:copied.rs")).await;
+                let patch = body(&shown);
+                assert!(
+                    patch.contains("diff --git a/origin.rs b/copied.rs"),
+                    "{shown}"
+                );
+                assert_eq!(patch.matches("diff --git ").count(), 1, "{shown}");
+                assert!(patch.contains("copy origin.rs → copied.rs"), "{shown}");
+                assert!(!patch.contains("move "), "{shown}");
+                assert!(!patch.contains("/dev/null"), "{shown}");
+                if edit_copy {
+                    assert!(patch.contains("-    let adjusted = value + 10;"), "{shown}");
+                    assert!(patch.contains("+    let adjusted = value + 11;"), "{shown}");
+                }
+                assert!(!patch.contains("* 5"), "{shown}");
+                let repository = f.history(&tip, &query).await;
+                let patch = body(&repository);
+                assert!(patch.contains("b/copied.rs"), "{repository}");
+                assert!(!patch.contains("move "), "{repository}");
+                if edit_origin {
+                    assert!(
+                        patch.contains("--- a/origin.rs\n+++ b/origin.rs"),
+                        "{repository}"
+                    );
+                    assert!(
+                        patch.contains("-    let scaled = adjusted * 3;"),
+                        "{repository}"
+                    );
+                    assert!(
+                        patch.contains("+    let scaled = adjusted * 5;"),
+                        "{repository}"
+                    );
+                }
+            }
+            let reversed = f
+                .history(&tip, &format!("diff {tip}..{root} file:copied.rs"))
+                .await;
+            let patch = body(&reversed);
+            assert!(
+                patch.contains("diff --git a/copied.rs b/origin.rs"),
+                "{reversed}"
+            );
+            assert!(
+                patch.contains("copy origin.rs → copied.rs (reverse comparison)"),
+                "{reversed}"
+            );
+            assert!(!patch.contains("move "), "{reversed}");
+            if edit_copy {
+                assert!(
+                    patch.contains("-    let adjusted = value + 11;"),
+                    "{reversed}"
+                );
+                assert!(
+                    patch.contains("+    let adjusted = value + 10;"),
+                    "{reversed}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn indistinguishable_file_origins_remain_independent_changes() {
+    let left = continuation_member("left.rs", "calculate");
+    for edited in [false, true] {
+        let f = Fixture::new();
+        let right = if edited {
+            left.replace("calculate", "compute")
+        } else {
+            left.clone()
+        };
+        let destination = if edited {
+            left.replace("calculate", "updated").replace("+ 10", "+ 11")
+        } else {
+            left.clone()
+        };
+        let before = [("left.rs", left.as_str()), ("right.rs", right.as_str())];
+        let after = [("destination.rs", destination.as_str())];
+        let root = f.commit(&before, &[], "two possible origins");
+        let tip = f.commit(&after, &[&root], "new location");
+        for (query, removed, added) in [
+            (format!("show {tip}"), before.as_slice(), after.as_slice()),
+            (
+                format!("diff {tip}..{root}"),
+                after.as_slice(),
+                before.as_slice(),
+            ),
+        ] {
+            let shown = f.history(&tip, &query).await;
+            let patch = body(&shown);
+            assert_eq!(patch.matches("diff --git ").count(), 3, "{shown}");
+            assert!(
+                !patch.contains("move ") && !patch.contains("copy "),
+                "{shown}"
+            );
+            for (prefix, files) in [('-', removed), ('+', added)] {
+                for &(path, source) in files {
+                    let (old, new) = if prefix == '-' {
+                        (format!("a/{path}"), "/dev/null".into())
+                    } else {
+                        ("/dev/null".into(), format!("b/{path}"))
+                    };
+                    assert!(patch.contains(&format!("--- {old}\n+++ {new}")), "{shown}");
+                    let content = source
+                        .split_inclusive('\n')
+                        .map(|line| format!("{prefix}{line}"))
+                        .collect::<String>();
+                    assert_eq!(
+                        patch.matches(&content).count(),
+                        files.iter().filter(|(_, text)| *text == source).count(),
+                        "{shown}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_directory_replacing_the_old_file_path_does_not_turn_a_move_into_a_copy() {
+    let f = Fixture::new();
+    let source = continuation_member("old.rs", "calculate");
+    let root = f.commit(&[("old.rs", &source)], &[], "initial source");
+    let tip = f.commit(
+        &[
+            ("new.rs", &source),
+            ("old.rs/child.rs", "pub const CHILD: bool = true;\n"),
+        ],
+        &[&root],
+        "relocate and add directory",
+    );
+    for selector in ["", " file:new.rs"] {
+        for (query, old, new) in [
+            (format!("show {tip}"), "old.rs", "new.rs"),
+            (format!("diff {tip}..{root}"), "new.rs", "old.rs"),
+        ] {
+            let shown = f.history(&tip, &format!("{query}{selector}")).await;
+            let patch = body(&shown);
+            assert!(
+                patch.contains(&format!("diff --git a/{old} b/{new}")),
+                "{shown}"
+            );
+            assert!(patch.contains(&format!("move {old} → {new}")), "{shown}");
+            assert!(!patch.contains("copy "), "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_file_lineage_preserves_a_move_followed_by_a_complete_rewrite() {
+    let f = Fixture::new();
+    let original = continuation_member("old.rs", "calculate");
+    let replacement = "pub struct Replacement {\n    pub text: String,\n}\n";
+    let root = f.commit(&[("old.rs", &original)], &[], "initial source");
+    let moved = f.commit(&[("new.rs", &original)], &[&root], "relocate");
+    let tip = f.commit(&[("new.rs", replacement)], &[&moved], "replace contents");
+    for (at, selector) in [(&root, "file:old.rs"), (&tip, "file:new.rs")] {
+        let shown = f
+            .history(at, &format!("diff {root}..{tip} {selector}"))
+            .await;
+        let patch = body(&shown);
+        assert!(patch.contains("--- a/old.rs\n+++ b/new.rs"), "{shown}");
+        assert!(patch.contains("move old.rs → new.rs"), "{shown}");
+        assert!(!patch.contains("/dev/null"), "{shown}");
+        assert!(
+            patch.contains("-fn calculate(value: i32) -> i32 {"),
+            "{shown}"
+        );
+        assert!(patch.contains("+pub struct Replacement {"), "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn selected_file_moves_can_overwrite_an_unrelated_destination() {
+    let f = Fixture::new();
+    let original = continuation_member("origin.rs", "calculate");
+    let edited = original.replace("+ 10", "+ 11");
+    let root = f.commit(
+        &[
+            ("origin.rs", &original),
+            ("destination.rs", "pub struct Unrelated;\n"),
+        ],
+        &[],
+        "initial files",
+    );
+    let moved = f.commit(
+        &[("destination.rs", &original)],
+        &[&root],
+        "overwrite destination",
+    );
+    let tip = f.commit(
+        &[("destination.rs", &edited)],
+        &[&moved],
+        "edit relocated source",
+    );
+    for (at, selector) in [(&root, "file:origin.rs"), (&tip, "file:destination.rs")] {
+        for (query, reverse, changed) in [
+            (format!("show {moved}"), false, false),
+            (format!("diff {root}..{tip}"), false, true),
+            (format!("diff {tip}..{root}"), true, true),
+        ] {
+            let shown = f.history(at, &format!("{query} {selector}")).await;
+            let patch = body(&shown);
+            let (old, new, removed, added) = if reverse {
+                ("destination.rs", "origin.rs", 11, 10)
+            } else {
+                ("origin.rs", "destination.rs", 10, 11)
+            };
+            assert!(
+                patch.contains(&format!("diff --git a/{old} b/{new}")),
+                "{shown}"
+            );
+            assert!(patch.contains(&format!("move {old} → {new}")), "{shown}");
+            assert!(
+                !patch.contains("copy ") && !patch.contains("/dev/null"),
+                "{shown}"
+            );
+            assert!(!patch.contains("Unrelated"), "{shown}");
+            if changed {
+                assert!(
+                    patch.contains(&format!("-    let adjusted = value + {removed};")),
+                    "{shown}"
+                );
+                assert!(
+                    patch.contains(&format!("+    let adjusted = value + {added};")),
+                    "{shown}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sibling_file_comparisons_do_not_invent_directional_copy_events() {
+    let f = Fixture::new();
+    let original = continuation_member("origin.rs", "calculate");
+    let edited = original.replace("+ 10", "+ 11");
+    let root = f.commit(&[("origin.rs", &original)], &[], "initial source");
+    let left = f.commit(
+        &[("origin.rs", &original), ("copied.rs", &original)],
+        &[&root],
+        "add destination",
+    );
+    let right = f.commit(
+        &[("origin.rs", &edited)],
+        &[&root],
+        "edit source on sibling",
+    );
+    for (from, to, old, new, old_text, new_text) in [
+        (&left, &right, "copied.rs", "origin.rs", &original, &edited),
+        (&right, &left, "origin.rs", "copied.rs", &edited, &original),
+    ] {
+        let shown = f
+            .history(&left, &format!("diff {from}..{to} file:copied.rs"))
+            .await;
+        let patch = body(&shown);
+        assert!(
+            patch.contains(&format!("--- a/{old}\n+++ /dev/null")),
+            "{shown}"
+        );
+        assert!(
+            patch.contains(&format!("--- /dev/null\n+++ b/{new}")),
+            "{shown}"
+        );
+        assert_eq!(patch.matches("diff --git ").count(), 2, "{shown}");
+        assert!(
+            !patch.contains("move ") && !patch.contains("copy "),
+            "{shown}"
+        );
+        for (prefix, source) in [('-', old_text), ('+', new_text)] {
+            let content = source
+                .split_inclusive('\n')
+                .map(|line| format!("{prefix}{line}"))
+                .collect::<String>();
+            assert!(patch.contains(&content), "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_moves_with_other_edits_keep_supported_pairs_in_both_directions() {
+    let original = continuation_member("old.rs", "calculate");
+    for edited in [false, true] {
+        let f = Fixture::new();
+        let moved = if edited {
+            original.replace("+ 10", "+ 11")
+        } else {
+            original.clone()
+        };
+        let root = f.commit(
+            &[
+                ("old.rs", &original),
+                ("other.rs", "const COUNT: usize = 1;\n"),
+            ],
+            &[],
+            "initial sources",
+        );
+        let tip = f.commit(
+            &[
+                ("new.rs", &moved),
+                ("other.rs", "const COUNT: usize = 2;\n"),
+            ],
+            &[&root],
+            "relocate and edit",
+        );
+        for (at, selector) in [(&tip, ""), (&tip, " file:new.rs"), (&root, " file:old.rs")] {
+            for (query, reverse) in [
+                (format!("show {tip}"), false),
+                (format!("diff {root}..{tip}"), false),
+                (format!("diff {tip}..{root}"), true),
+            ] {
+                let shown = f.history(at, &format!("{query}{selector}")).await;
+                let patch = body(&shown);
+                let (old_path, new_path, old_value, new_value) = if reverse {
+                    ("new.rs", "old.rs", 11, 10)
+                } else {
+                    ("old.rs", "new.rs", 10, 11)
+                };
+                assert!(
+                    patch.contains(&format!("diff --git a/{old_path} b/{new_path}")),
+                    "{shown}"
+                );
+                assert!(
+                    patch.contains(&format!("move {old_path} → {new_path}")),
+                    "{shown}"
+                );
+                assert!(
+                    !patch.contains("/dev/null") && !patch.contains("copy "),
+                    "{shown}"
+                );
+                if edited {
+                    assert!(
+                        patch.contains(&format!("-    let adjusted = value + {old_value};")),
+                        "{shown}"
+                    );
+                    assert!(
+                        patch.contains(&format!("+    let adjusted = value + {new_value};")),
+                        "{shown}"
+                    );
+                }
+                assert_eq!(
+                    patch.matches("diff --git ").count(),
+                    if selector.is_empty() { 2 } else { 1 },
+                    "{shown}"
+                );
+                if selector.is_empty() {
+                    let (old_count, new_count) = if reverse { (2, 1) } else { (1, 2) };
+                    assert!(
+                        patch.contains(&format!("-const COUNT: usize = {old_count};")),
+                        "{shown}"
+                    );
+                    assert!(
+                        patch.contains(&format!("+const COUNT: usize = {new_count};")),
+                        "{shown}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn complete_same_path_replacements_remain_one_file_edit() {
+    let f = Fixture::new();
+    let original = "pub struct Record {\n    pub label: String,\n}\n";
+    let replacement = "pub fn enabled() -> bool { true }\n";
+    let root = f.commit(&[("lib.rs", original)], &[], "initial source");
+    let tip = f.commit(&[("lib.rs", replacement)], &[&root], "replace contents");
+    for selector in ["", " file:lib.rs"] {
+        for query in [format!("show {tip}"), format!("diff {root}..{tip}")] {
+            let shown = f.history(&tip, &format!("{query}{selector}")).await;
+            let patch = body(&shown);
+            assert!(patch.contains("--- a/lib.rs\n+++ b/lib.rs"), "{shown}");
+            assert_eq!(patch.matches("diff --git ").count(), 1, "{shown}");
+            assert!(
+                !patch.contains("/dev/null") && !patch.contains("# move"),
+                "{shown}"
+            );
+            for (prefix, source) in [('-', original), ('+', replacement)] {
+                for line in source.lines() {
+                    assert!(patch.contains(&format!("{prefix}{line}\n")), "{shown}");
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -2516,6 +4172,105 @@ async fn nested_rejection_stays_uncertain_inside_a_bounded_interval() {
     assert!(page.ends_with("more skip:2\n"), "{page}");
 }
 #[tokio::test]
+async fn file_based_app_directives_do_not_poison_unrelated_histories() {
+    let f = Fixture::new();
+    let script = "#:project ../src/App.csproj\r\n#:property TargetFramework=net10.0\r\nConsole.WriteLine(ConsentScript.Check());\r\nclass ConsentScript { public static int Check() { return 7; } }\r\n";
+    let script_path = "scripts/verify-tool-consent.cs";
+    let selected_path = "tests/Tools/McpContextTests.cs";
+    let root = f.commit(&[(script_path, script)], &[], "build script");
+    let source = "class Worker { int Target() { return 1; } }\n";
+    let added = f.commit(
+        &[(script_path, script), (selected_path, source)],
+        &[&root],
+        "introduce unrelated source",
+    );
+    let edited = source.replace("return 1;", "return 2;");
+    let changed = f.commit(
+        &[(script_path, script), (selected_path, &edited)],
+        &[&added],
+        "first edit",
+    );
+    let edited = source.replace("return 1;", "return 3;");
+    let tip = f.commit(
+        &[(script_path, script), (selected_path, &edited)],
+        &[&changed],
+        "second edit",
+    );
+
+    // Proving the introduction requires analyzing the unrelated script as a
+    // possible predecessor. File history reaches the same search after two edits.
+    for (at, query, expected) in [
+        (
+            &root,
+            "log method:ConsentScript.Check() limit:1",
+            vec![root.as_str()],
+        ),
+        (
+            &added,
+            "log method:Worker.Target() limit:1",
+            vec![added.as_str()],
+        ),
+        (
+            &tip,
+            "log file:tests/Tools/McpContextTests.cs limit:3",
+            vec![tip.as_str(), changed.as_str(), added.as_str()],
+        ),
+        (
+            &tip,
+            "log method:Worker.Target() limit:3",
+            vec![tip.as_str(), changed.as_str(), added.as_str()],
+        ),
+    ] {
+        let history = f.history(at, query).await;
+        assert_eq!(ids(&history), expected, "{query}: {history}");
+        assert!(!history.contains("incomplete:"), "{query}: {history}");
+        assert!(history.ends_with("end\n"), "{query}: {history}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_csharp_conditionals_in_candidates_do_not_prove_absence() {
+    for (directive, reason) in [
+        (
+            "#if FEATURE & OTHER\n#endif",
+            "unsupported historical C# condition",
+        ),
+        (
+            "#elifdef FEATURE",
+            "unsupported historical C# directive #elifdef",
+        ),
+    ] {
+        let f = Fixture::new();
+        let script = format!(
+            "#:project ../src/App.csproj\n#:property TargetFramework=net10.0\n{directive}\nclass ConsentScript {{}}\n"
+        );
+        let root = f.commit(
+            &[("scripts/verify-tool-consent.cs", &script)],
+            &[],
+            "unanalyzable possible predecessor",
+        );
+        let tip = f.commit(
+            &[("Worker.cs", "class Worker { int Target() { return 1; } }\n")],
+            &[&root],
+            "selected source",
+        );
+        // A repeated query must not turn incomplete candidate analysis into a
+        // cached absence and falsely claim that the selected source was added.
+        for _ in 0..2 {
+            for query in ["log method:Worker.Target()", "log file:Worker.cs"] {
+                let history = f.history(&tip, query).await;
+                assert!(ids(&history).is_empty(), "{query}: {history}");
+                assert!(
+                    history.contains("incomplete:") && history.contains(reason),
+                    "{query}: {history}"
+                );
+                assert!(!history.ends_with("end\n"), "{query}: {history}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn directive_text_inside_a_csharp_string_does_not_hide_an_introduction() {
     let f = Fixture::new();
     let original = r#"class Worker {
@@ -3276,6 +5031,48 @@ async fn equal_renamed_continuations_remain_uncertain_in_either_file_order() {
                 "{history}"
             );
             assert!(!history.contains("copy"), "{history}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_edited_competition_keeps_identical_blobs_at_distinct_paths() {
+    for (extension, kind) in [("cs", "method:Worker."), ("rs", "function:")] {
+        let original = format!("original.{extension}");
+        let paths = [format!("a.{extension}"), format!("z.{extension}")];
+        let before = continuation_source(&original, &continuation_member(&original, "original"));
+        let after = continuation_source(&original, &continuation_member(&original, "continued"))
+            .replace("+ 10", "+ 11");
+        let f = Fixture::new();
+        let root = f.commit(&[(&original, &before)], &[], "initial implementation");
+        let tip = f.commit(
+            &[(&paths[0], &after), (&paths[1], &after)],
+            &[&root],
+            "two edited destinations",
+        );
+        let mut expected = Vec::new();
+        for path in &paths {
+            let query = format!("log {kind}continued path:{path}");
+            let history = f.history(&tip, &query).await;
+            assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+            assert!(
+                history.contains(&format!("~move {original}→{path}")),
+                "{history}"
+            );
+            assert!(
+                history.contains("competing direct continuations"),
+                "{history}"
+            );
+            assert!(!history.contains("copy"), "{history}");
+            expected.push((query, history));
+        }
+        // Uncertain mappings are deliberately not cached. Replaying per-file
+        // scores must still distinguish both the selected and candidate paths,
+        // even though their blobs, declaration ranges, and signatures coincide.
+        for _ in 0..2 {
+            for (query, history) in expected.iter().rev() {
+                assert_eq!(f.history(&tip, query).await, *history);
+            }
         }
     }
 }

@@ -1,12 +1,11 @@
 //! Bounded, disposable history facts. Keys include repository and policy identity.
 use super::{
-    matching::{Mapping, State},
+    matching::{FileCandidates, Mapping, State},
     regions::{Body, Source},
 };
 use crate::repository::history::Tree;
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -32,7 +31,7 @@ pub(super) fn key(scope: &Key, value: &impl Serialize) -> Key {
 
 pub(super) struct SourceTree {
     pub entries: Tree,
-    pub excluded: BTreeSet<String>,
+    pub excluded: Tree,
 }
 impl Deref for SourceTree {
     type Target = Tree;
@@ -42,17 +41,12 @@ impl Deref for SourceTree {
 }
 impl SourceTree {
     fn heap_bytes(&self) -> usize {
+        fn tree_bytes(tree: &Tree) -> usize {
+            tree.keys().map(|path| path.capacity() + 160).sum()
+        }
         // Charge shared object IDs in each snapshot: they can outlive the
         // decoded directories that originally allocated them.
-        self.entries
-            .keys()
-            .map(|p| p.capacity() + 160)
-            .sum::<usize>()
-            + self
-                .excluded
-                .iter()
-                .map(|p| p.capacity() + 80)
-                .sum::<usize>()
+        tree_bytes(&self.entries) + tree_bytes(&self.excluded)
     }
 }
 
@@ -66,6 +60,7 @@ enum Evidence {
 enum Match {
     Anchor(Arc<State>),
     Mapping(Arc<Mapping>),
+    CandidateFile(Arc<FileCandidates>),
 }
 
 struct Entry<V> {
@@ -224,6 +219,34 @@ impl Cache {
             );
         }
     }
+    pub(super) fn candidate_file(&self, key: &Key) -> Option<Arc<FileCandidates>> {
+        self.matches.lock().unwrap().get(key).map(|value| {
+            let Match::CandidateFile(facts) = value else {
+                unreachable!()
+            };
+            facts
+        })
+    }
+    pub(super) fn candidate_file_fits(&self, bytes: usize) -> bool {
+        // Let callers avoid allocating a cloned scoring result that cannot be
+        // retained. Insertion still accounts the actual owned allocation.
+        bytes.saturating_add(ENTRY_BYTES) <= self.matches.lock().unwrap().limit
+    }
+    pub(super) fn put_candidate_file(
+        &self,
+        key: Key,
+        facts: Arc<FileCandidates>,
+    ) -> Arc<FileCandidates> {
+        // Completed scoring of immutable source facts can retain parse
+        // uncertainty. It is not a completed mapping or evidence of absence.
+        let cost = facts.heap_bytes();
+        let Match::CandidateFile(facts) =
+            insert(&self.matches, key, Match::CandidateFile(facts), cost)
+        else {
+            unreachable!()
+        };
+        facts
+    }
     pub(super) fn body(&self, key: Key, compute: impl FnOnce() -> Body) -> Body {
         if let Some(value) = self.evidence.lock().unwrap().get(&key) {
             let Evidence::Body(body) = value else {
@@ -306,12 +329,15 @@ mod tests {
         commit_file(root, parent, "code.rs", text)
     }
     fn commit_file(root: &Path, parent: Option<&str>, path: &str, text: &str) -> String {
-        let blob = git(root, &["hash-object", "-w", "--stdin"], text.as_bytes());
-        let tree = git(
-            root,
-            &["mktree"],
-            format!("100644 blob {blob}\t{path}\n").as_bytes(),
-        );
+        commit_files(root, parent, &[(path, text)])
+    }
+    fn commit_files(root: &Path, parent: Option<&str>, files: &[(&str, &str)]) -> String {
+        let mut entries = String::new();
+        for (path, text) in files {
+            let blob = git(root, &["hash-object", "-w", "--stdin"], text.as_bytes());
+            entries.push_str(&format!("100644 blob {blob}\t{path}\n"));
+        }
+        let tree = git(root, &["mktree"], entries.as_bytes());
         let mut args = vec!["commit-tree", &tree, "-m", "Fixture"];
         if let Some(parent) = parent {
             args.extend(["-p", parent]);
@@ -321,6 +347,15 @@ mod tests {
     fn history(root: &Path, at: &str, query: &str, cache: &Arc<Cache>) -> anyhow::Result<String> {
         let store = Store::local(root, Arc::new(AtomicBool::new(false)))?;
         super::super::run_cached(store, Some(at), query, cache.clone())
+    }
+
+    fn discard_sources_and_evidence(cache: &Cache) {
+        let mut sources = cache.sources.lock().unwrap();
+        sources.entries.clear();
+        sources.bytes = 0;
+        let mut evidence = cache.evidence.lock().unwrap();
+        evidence.entries.clear();
+        evidence.bytes = 0;
     }
 
     #[test]
@@ -593,10 +628,10 @@ mod tests {
                 .all(|(_, entry)| {
                     match &entry.value {
                         Match::Mapping(mapping) => !mapping.state.uncertain,
-                        Match::Anchor(_) => true,
+                        Match::Anchor(_) | Match::CandidateFile(_) => true,
                     }
                 }),
-            "Uncertain matches were retained"
+            "Uncertain mappings were retained"
         );
         assert_eq!(
             history(root.path(), &tip, &query, &Arc::new(Cache::new(0))).unwrap(),
@@ -638,6 +673,126 @@ mod tests {
     }
 
     #[test]
+    fn scored_candidate_files_survive_source_and_evidence_eviction() {
+        let root = repository();
+        let selected = "class Worker { public int Target(int seed) { var initialized = seed * 17; var combined = initialized + 31; var checkedValue = Normalize(combined); var finalized = checkedValue * 43; return Complete(finalized, seed); } }";
+        let mut files = vec![("Origin.cs".to_owned(), selected.to_owned())];
+        for index in 0..4 {
+            files.push((
+                format!("Noise{index}.cs"),
+                format!("class Noise{index} {{ public string Process(string input) {{ var suffix = input.Trim(); var result = string.Concat(\"noise{index}\", suffix); return result.ToUpperInvariant(); }} }}"),
+            ));
+        }
+        fn borrowed(files: &[(String, String)]) -> Vec<(&str, &str)> {
+            files
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str()))
+                .collect()
+        }
+        let base = commit_files(root.path(), None, &borrowed(&files));
+        files[0] = ("Target.cs".into(), selected.replace("+ 31", "+ 37"));
+        for (_, text) in &mut files[1..] {
+            text.push_str(" // changed");
+        }
+        let tip = commit_files(root.path(), Some(&base), &borrowed(&files));
+        let query = "log method:Worker.Target(int) path:Target.cs limit:1";
+        let cache = Arc::new(Cache::new(4 * 1024 * 1024));
+        let cold = history(root.path(), &tip, query, &cache).unwrap();
+        assert!(cold.contains("~move"), "{cold}");
+        assert!(
+            cache
+                .matches
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|(_, entry)| { !matches!(&entry.value, Match::Mapping(_)) }),
+            "The regression must replay scoring, not a completed mapping"
+        );
+        let before = cache.stats();
+        discard_sources_and_evidence(&cache);
+        assert_eq!(history(root.path(), &tip, query, &cache).unwrap(), cold);
+        let after = cache.stats();
+        assert!(
+            after.misses[0] - before.misses[0] < before.misses[0],
+            "Replayed candidate files reparsed the whole candidate neighbourhood"
+        );
+        assert_eq!(after.misses[3], before.misses[3]);
+
+        // Mix memo hits and source-worker misses in both scoring directions.
+        // Consumption must keep the same order even when only some files need
+        // parsing and comparison after bounded cache eviction.
+        {
+            let mut matches = cache.matches.lock().unwrap();
+            let keys = matches
+                .entries
+                .iter()
+                .filter(|(_, entry)| matches!(&entry.value, Match::CandidateFile(_)))
+                .map(|(key, _)| *key)
+                .step_by(2)
+                .collect::<Vec<_>>();
+            assert!(keys.len() >= 2);
+            for key in keys {
+                let retired = matches.entries.pop(&key).unwrap();
+                matches.bytes -= retired.bytes;
+            }
+        }
+        discard_sources_and_evidence(&cache);
+        assert_eq!(history(root.path(), &tip, query, &cache).unwrap(), cold);
+        assert!(cache.stats().misses[3] > after.misses[3]);
+        assert_eq!(
+            history(root.path(), &tip, query, &Arc::new(Cache::new(0))).unwrap(),
+            cold
+        );
+    }
+
+    #[test]
+    fn zero_candidate_files_replay_incomplete_parse_evidence() {
+        let root = repository();
+        let selected = "class Worker { public int Target(int seed) { var initialized = seed * 17; var combined = initialized + 31; var checkedValue = Normalize(combined); var finalized = checkedValue * 43; return Complete(finalized, seed); } }";
+        let base = commit_files(
+            root.path(),
+            None,
+            &[("Origin.cs", selected), ("Broken.cs", "class Broken {")],
+        );
+        let edited = selected.replace("+ 31", "+ 37");
+        let tip = commit_files(
+            root.path(),
+            Some(&base),
+            &[
+                ("Target.cs", &edited),
+                ("Broken.cs", "class Broken { class Nested {"),
+            ],
+        );
+        let query = "log method:Worker.Target(int) path:Target.cs limit:1";
+        let cache = Arc::new(Cache::new(4 * 1024 * 1024));
+        let cold = history(root.path(), &tip, query, &cache).unwrap();
+        assert!(cold.contains("competing direct continuations"), "{cold}");
+        assert!(
+            cache
+                .matches
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|(_, entry)| {
+                    matches!(&entry.value, Match::CandidateFile(facts)
+                if facts.comparisons == 0 && facts.incomplete.is_some())
+                })
+        );
+        let before = cache.stats();
+        discard_sources_and_evidence(&cache);
+        assert_eq!(history(root.path(), &tip, query, &cache).unwrap(), cold);
+        let after = cache.stats();
+        assert!(after.misses[0] - before.misses[0] < before.misses[0]);
+        assert_eq!(after.misses[3], before.misses[3]);
+        assert_eq!(
+            history(root.path(), &tip, query, &Arc::new(Cache::new(0))).unwrap(),
+            cold
+        );
+    }
+
+    #[test]
     fn cached_sources_still_honor_cancellation() {
         let root = repository();
         let blob = git(
@@ -665,6 +820,95 @@ mod tests {
         mapping.state.uncertain = true;
         cache.put_mapping([1; 32], &mapping);
         assert!(cache.mapping(&[1; 32]).is_none());
+    }
+
+    #[test]
+    fn candidate_facts_share_the_existing_budget_and_preserve_active_values() {
+        let facts = Arc::new(FileCandidates::default());
+        let cost = facts.heap_bytes() + ENTRY_BYTES;
+        let cache = Cache::new(4 * cost);
+        let first = cache.put_candidate_file([1; 32], facts.clone());
+        assert!(Arc::ptr_eq(&first, &facts));
+        assert_eq!(cache.stats().bytes, cost);
+
+        let second = Arc::new(FileCandidates::default());
+        cache.put_candidate_file([2; 32], second.clone());
+        assert!(cache.candidate_file(&[1; 32]).is_none());
+        assert!(Arc::ptr_eq(
+            &second,
+            &cache.candidate_file(&[2; 32]).unwrap()
+        ));
+        assert_eq!(first.heap_bytes() + ENTRY_BYTES, cost);
+        assert_eq!(cache.stats().bytes, cost);
+
+        // Candidate facts use the existing match partition, rather than an
+        // independently growing cache beside it.
+        let mapping = Mapping::absent();
+        let mapping_cost = mapping.heap_bytes() + ENTRY_BYTES;
+        let shared = Cache::new(4 * mapping_cost.max(cost));
+        shared.put_candidate_file([1; 32], first);
+        shared.put_mapping([3; 32], &mapping);
+        assert!(shared.candidate_file(&[1; 32]).is_none());
+        assert!(shared.mapping(&[3; 32]).is_some());
+        assert_eq!(shared.stats().bytes, mapping_cost);
+    }
+
+    #[test]
+    fn oversized_and_disabled_candidate_facts_are_returned_without_retention() {
+        let facts = Arc::new(FileCandidates::default());
+        let cost = facts.heap_bytes() + ENTRY_BYTES;
+        for budget in [0, 4 * (cost - 1)] {
+            let cache = Cache::new(budget);
+            assert!(!cache.candidate_file_fits(facts.heap_bytes()));
+            let actual = cache.put_candidate_file([1; 32], facts.clone());
+            assert!(Arc::ptr_eq(&actual, &facts));
+            assert!(cache.candidate_file(&[1; 32]).is_none());
+            assert_eq!(cache.stats().bytes, 0);
+            assert_eq!(cache.stats().entries, 0);
+        }
+        let cache = Cache::new(4 * cost);
+        assert!(cache.candidate_file_fits(facts.heap_bytes()));
+        assert!(!cache.candidate_file_fits(facts.heap_bytes() + 1));
+        assert!(!cache.candidate_file_fits(usize::MAX));
+        cache.put_candidate_file([1; 32], facts);
+        let mut oversized = FileCandidates::default();
+        oversized.incomplete = Some("parse recovery".repeat(cost));
+        let oversized = Arc::new(oversized);
+        assert!(Arc::ptr_eq(
+            &cache.put_candidate_file([2; 32], oversized.clone()),
+            &oversized
+        ));
+        assert!(cache.candidate_file(&[2; 32]).is_none());
+        assert!(cache.candidate_file(&[1; 32]).is_some());
+        assert_eq!(cache.stats().bytes, cost);
+    }
+
+    #[test]
+    fn concurrent_candidate_fact_publications_reuse_one_value() {
+        let cost = FileCandidates::default().heap_bytes() + ENTRY_BYTES;
+        let cache = Cache::new(4 * cost);
+        let barrier = std::sync::Barrier::new(4);
+        let published = std::thread::scope(|threads| {
+            (0..4)
+                .map(|_| {
+                    threads.spawn(|| {
+                        let facts = Arc::new(FileCandidates::default());
+                        barrier.wait();
+                        cache.put_candidate_file([1; 32], facts)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            published
+                .iter()
+                .all(|value| Arc::ptr_eq(value, &published[0]))
+        );
+        assert_eq!(cache.stats().bytes, cost);
+        assert_eq!(cache.stats().entries, 1);
     }
 
     #[test]

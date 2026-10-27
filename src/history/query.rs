@@ -54,7 +54,7 @@ fn quote(value: &str) -> String {
 impl Request {
     pub fn parse(input: &str) -> Result<Self> {
         ensure!(input.len() <= 16 * 1024, "Query exceeds request size limit");
-        let tokens = crate::query::lex(input)?;
+        let tokens = crate::query::lex_history(input)?;
         let mut tokens = tokens.into_iter();
         let verb = tokens
             .next()
@@ -148,10 +148,6 @@ impl Request {
         } else if selected.len() == 1 && selected[0].starts_with("file:") {
             let value = selected[0].strip_prefix("file:").unwrap();
             path(value)?;
-            ensure!(
-                !value.contains(['*', '?', '[']),
-                "file: selects one literal path; use path: for patterns"
-            );
             Selector::File(value.into())
         } else if selected.len() == 1
             && selected[0].starts_with('@')

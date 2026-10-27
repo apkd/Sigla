@@ -10,7 +10,7 @@ use super::{
 use crate::repository::history::{Commit, Store, Tree, check};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -22,8 +22,11 @@ pub(super) struct State {
     pub scope_exclusions: Vec<paths::Exclusion>,
     // File lineage may be known without a whole historical directory location.
     pub scope_unresolved: bool,
-    // A completed match proved this occurrence absent. An empty default state
-    // carries no such evidence. Absence alongside regions is an alternative.
+    // A completed whole-file search found only possible identities. Keep
+    // this provenance even after candidates converge or disappear.
+    pub file_ancestry_unresolved: bool,
+    // Absence from a completed search, alone or as an alternative alongside
+    // regions. An empty default state carries no such evidence.
     pub absent: bool,
     pub uncertain: bool,
 }
@@ -65,6 +68,7 @@ impl State {
         self.regions.sort_by(|a, b| {
             a.key()
                 .cmp(&b.key())
+                .then_with(|| a.file_mode.cmp(&b.file_mode))
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.kind.cmp(&b.kind))
                 .then_with(|| a.parameters.cmp(&b.parameters))
@@ -86,6 +90,7 @@ impl State {
         self.scope_exclusions.sort();
         self.scope_exclusions.dedup();
         self.uncertain |= self.scope_unresolved
+            || self.file_ancestry_unresolved
             || self.regions.iter().any(|r| r.weak)
             || self.absent && (!self.regions.is_empty() || !self.paths.is_empty());
     }
@@ -96,6 +101,7 @@ impl State {
             .extend(other.scope_exclusions.iter().cloned());
         self.absent |= other.absent;
         self.scope_unresolved |= other.scope_unresolved;
+        self.file_ancestry_unresolved |= other.file_ancestry_unresolved;
         self.uncertain |= other.uncertain;
         self.normalize();
     }
@@ -116,6 +122,8 @@ pub(super) struct Link {
     pub to: Region,
     pub relation: Relation,
     pub uncertain: bool,
+    // Weak whole-file evidence also permits no identity link at this edge.
+    pub absence_alternative: bool,
     pub reason: &'static str,
 }
 impl Link {
@@ -165,10 +173,12 @@ impl Mapping {
         }
     }
 }
-const SCORE_MARGIN: usize = 6;
-// Includes reciprocal searches, not just the selected occurrence. Exhaustion
-// is unresolved evidence, never absence or an arbitrary assignment.
-const CANDIDATE_WORK: usize = 65_536;
+pub(super) const SCORE_MARGIN: usize = 6;
+pub(super) const MIN_SCORE: usize = 60;
+// Includes whole-file alternatives and reciprocal searches, not just the
+// selected occurrence. Exhaustion is unresolved evidence, never absence or an
+// arbitrary assignment.
+pub(super) const CANDIDATE_WORK: usize = 65_536;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Competition {
@@ -177,6 +187,7 @@ enum Competition {
     Stronger,
 }
 
+#[derive(Clone)]
 struct Candidate {
     score: usize,
     region: Region,
@@ -194,6 +205,43 @@ impl Candidate {
             && !self.region.fragment
             && (self.exact || region.kind == "closure" || self.region.name == region.name)
             && self.region.parameters == region.parameters
+    }
+}
+
+/// Complete scoring facts for one ordered source occurrence/file pair. This
+/// includes negative and incomplete results, never a partially consumed scan.
+#[derive(Default)]
+pub(super) struct FileCandidates {
+    scored: Vec<Candidate>,
+    pub(super) incomplete: Option<String>,
+    pub(super) comparisons: usize,
+}
+impl FileCandidates {
+    pub(super) fn heap_bytes(&self) -> usize {
+        Self::copy_bytes(&self.scored, self.incomplete.as_ref())
+            + (self.scored.capacity() - self.scored.len()) * std::mem::size_of::<Candidate>()
+    }
+
+    fn copy_bytes(scored: &[Candidate], incomplete: Option<&String>) -> usize {
+        // Cloning strings/vectors cannot need more capacity than the originals.
+        // Check this upper bound before allocating a disposable memo copy.
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(scored)
+            + scored
+                .iter()
+                .map(|candidate| candidate.region.heap_bytes())
+                .sum::<usize>()
+            + incomplete.map_or(0, String::capacity)
+    }
+
+    fn replay_work(&self, work: &mut usize, cancel: &AtomicBool) -> Result<()> {
+        // The budget measures logical competition, even when its evidence is
+        // cached. Cache warmth must not change exhaustion into a settled result.
+        check(cancel)?;
+        for _ in 0..self.comparisons {
+            candidate_work(work, cancel)?;
+        }
+        Ok(())
     }
 }
 
@@ -250,9 +298,13 @@ impl Tracker {
             })
             .map(|(p, _)| p.as_str())
             .collect();
-        let excluded = self.store.source_exclusions(&commit.tree, &tree, &paths)?;
-        if !excluded.is_empty() {
-            tree.retain(|p, _| !excluded.contains(p));
+        let exclusions = self.store.source_exclusions(&commit.tree, &tree, &paths)?;
+        let mut excluded = Tree::new();
+        for path in exclusions {
+            let entry = tree
+                .remove(&path)
+                .with_context(|| format!("source exclusion is absent from tree: {path}"))?;
+            excluded.insert(path, entry);
         }
         check(&self.store.cancel)?;
         Ok(self.cache.put_tree(
@@ -305,7 +357,7 @@ impl Tracker {
                         &source,
                     )
                 } else {
-                    Region::whole(path, &entry.id, 0)
+                    Region::whole(path, &entry.id, entry.mode)
                 };
                 state.regions.push(region);
             }
@@ -323,7 +375,9 @@ impl Tracker {
                     .iter()
                     .filter(|(path, entry)| {
                         matches!(entry.mode, 0o100644 | 0o100755)
-                            && regions::language(path).is_some_and(|l| !l.document())
+                            && regions::language(path).is_some_and(|language| {
+                                !language.document() && regions::anchor_language(query, language)
+                            })
                             && filters.iter().all(|(p, negate)| p.matches(path) != *negate)
                             && query
                                 .target
@@ -483,6 +537,7 @@ impl Tracker {
                 absent: state.absent,
                 uncertain: state.uncertain,
                 scope_unresolved: state.scope_unresolved,
+                file_ancestry_unresolved: state.file_ancestry_unresolved,
                 ..State::default()
             },
             links: Vec::new(),
@@ -491,16 +546,30 @@ impl Tracker {
         let mut work = 0;
         for region in &state.regions {
             ensure!(
-                !b.excluded.contains(&region.path),
+                !b.excluded.contains_key(&region.path),
                 "unresolved target at {}: {} is excluded by committed source attributes",
                 to.id,
                 region.path
             );
-            let mapped = self.region(&a, &b, region, forward, &mut work)?;
-            if mapped.is_empty() && state.paths.is_empty() {
+            let mapped = self.region(
+                &a,
+                &b,
+                region,
+                forward,
+                state.file_ancestry_unresolved,
+                &mut work,
+            )?;
+            let optional = mapped.iter().any(|link| link.absence_alternative);
+            if (mapped.is_empty() || optional) && state.paths.is_empty() {
                 result.state.absent = true;
             }
+            result.state.file_ancestry_unresolved |= optional;
             for link in mapped {
+                if state.file_ancestry_unresolved {
+                    // Exact matches of inherited alternatives can multiply
+                    // without scoring. Bound retained relations as well.
+                    candidate_work(&mut work, &self.store.cancel)?;
+                }
                 result.state.uncertain |= link.uncertain;
                 result.state.regions.push(link.to.clone());
                 result.links.push(link);
@@ -585,6 +654,7 @@ impl Tracker {
                     to: region.clone(),
                     relation: Relation::Continue,
                     uncertain: region.weak,
+                    absence_alternative: false,
                     reason: "object+context",
                 })
                 .collect(),
@@ -596,37 +666,50 @@ impl Tracker {
         to: &Tree,
         region: &Region,
         forward: bool,
+        bounded_alternatives: bool,
         work: &mut usize,
     ) -> Result<Vec<Link>> {
-        if to
+        if let Some(entry) = to
             .get(&region.path)
-            .is_some_and(|e| e.id.as_ref() == region.blob)
+            .filter(|e| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
         {
+            let mut previous = region.clone();
+            previous.file_mode = region.file_mode.map(|_| entry.mode);
             return Ok(vec![Link {
                 from: region.clone(),
-                to: region.clone(),
+                to: previous,
                 relation: Relation::Continue,
                 uncertain: region.weak,
+                absence_alternative: false,
                 reason: "object+context",
             }]);
         }
         // A whole unchanged file carries even tiny members across a file move.
-        let exact: Vec<_> = to
-            .iter()
-            .filter(|(_, e)| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
-            .collect();
+        let mut exact = Vec::new();
+        for (path, entry) in to {
+            if bounded_alternatives {
+                // Many possible identities must not each scan an unbounded
+                // inventory, even when every scan finds just one exact match.
+                candidate_work(work, &self.store.cancel)?;
+            }
+            if entry.id.as_ref() == region.blob && matches!(entry.mode, 0o100644 | 0o100755) {
+                exact.push((path, entry));
+            }
+        }
         if !exact.is_empty() && (region.kind != "text" || !to.contains_key(&region.path)) {
             return Ok(exact
                 .iter()
-                .map(|(path, _)| {
+                .map(|(path, entry)| {
                     let mut old = region.clone();
                     old.path = (*path).clone();
+                    old.file_mode = region.file_mode.map(|_| entry.mode);
                     let copy = from.get(*path).is_some_and(|e| e.id.as_ref() == old.blob);
                     Link {
                         from: region.clone(),
                         to: old,
                         relation: if copy { Relation::Copy } else { Relation::Move },
                         uncertain: exact.len() > 1 || copy || region.weak,
+                        absence_alternative: false,
                         reason: "identical file object",
                     }
                 })
@@ -639,11 +722,13 @@ impl Tracker {
         {
             let mut previous = region.clone();
             previous.blob = entry.id.to_string();
+            previous.file_mode = Some(entry.mode);
             return Ok(vec![Link {
                 from: region.clone(),
                 to: previous,
                 relation: Relation::Continue,
                 uncertain: false,
+                absence_alternative: false,
                 reason: "path continuity",
             }]);
         }
@@ -666,6 +751,36 @@ impl Tracker {
             if assignment.settled {
                 break;
             }
+        }
+        if assignment.links.is_empty()
+            && assignment.weak
+            && region.kind == "file"
+            && search.incomplete.is_none()
+            && !search.remaining
+            && !region.weak
+        {
+            // A completed weak search establishes alternatives, not a move or
+            // an introduction. Keep every retained candidate: score ordering
+            // in this band cannot settle identity, including ties. Wider exact
+            // and strong origins have already had their normal opportunity.
+            let mut links = Vec::new();
+            for candidate in search.scored {
+                check(&self.store.cancel)?;
+                let old = candidate.region;
+                let copy = !forward
+                    && from
+                        .get(&old.path)
+                        .is_some_and(|e| e.id.as_ref() == old.blob);
+                links.push(Link {
+                    from: region.clone(),
+                    to: old,
+                    relation: if copy { Relation::Copy } else { Relation::Move },
+                    uncertain: true,
+                    absence_alternative: true,
+                    reason: "weak file content; absence also possible",
+                });
+            }
+            return Ok(links);
         }
         if assignment.links.is_empty() {
             ensure!(
@@ -711,6 +826,7 @@ impl Tracker {
                     to: Region::passage(&region.path, &entry.id, region.span.clone()),
                     relation: Relation::Continue,
                     uncertain: region.weak,
+                    absence_alternative: false,
                     reason: "unchanged text prefix",
                 }]);
             }
@@ -897,6 +1013,7 @@ impl Tracker {
                         Relation::Text
                     },
                     uncertain: region.weak || !context,
+                    absence_alternative: false,
                     reason,
                 });
             }
@@ -942,7 +1059,7 @@ impl Tracker {
             if direct.is_some_and(|score| candidate.score + SCORE_MARGIN < score) {
                 break;
             }
-            if candidate.score < 60 {
+            if candidate.score < MIN_SCORE {
                 // A narrow weak result must reach wider origins before it can
                 // report unresolved evidence; it never proves absence.
                 weak = selected.is_empty();
@@ -1061,6 +1178,7 @@ impl Tracker {
                     || relation == Relation::Copy && candidate.similarity < 70,
                 to: candidate.region.clone(),
                 relation,
+                absence_alternative: false,
                 reason: if alternatives {
                     "competing predecessors"
                 } else if competition == Competition::Uncertain {
@@ -1109,7 +1227,7 @@ impl Tracker {
         let Some(rival) = claims.iter().find(|c| {
             !c.region.fragment
                 && !overlapping(&c.region, region)
-                && c.score >= 60
+                && c.score >= MIN_SCORE
                 && c.score + SCORE_MARGIN >= score
         }) else {
             return Ok(if search.incomplete.is_some() {
@@ -1160,7 +1278,7 @@ impl Tracker {
             return Ok(Competition::None);
         }
         if search.incomplete.is_some()
-            || claim.score < 60
+            || claim.score < MIN_SCORE
             || predecessors.iter().any(|c| {
                 !c.region.fragment
                     && !c.region.same_alternative(old)
@@ -1232,6 +1350,37 @@ impl Tracker {
         let mut remaining = paths.iter().enumerate();
         let mut expanded = false;
         let mut prepared = self.sources.pending();
+        let cache_candidates = !matches!(region.kind.as_str(), "file" | "text");
+        let cache_scope = *self.store.cache_scope();
+        let file_key = |path: &str| {
+            if !cache_candidates {
+                return [0; 32];
+            }
+            let entry = &to[path];
+            cache::key(
+                &cache_scope,
+                &(
+                    "candidate-file",
+                    region,
+                    path,
+                    entry.id.as_ref(),
+                    entry.mode,
+                ),
+            )
+        };
+        let local_complete = |search: &CandidateSearch| {
+            matches!(scope, CandidateScope::Local(_))
+                && required.is_none_or(|p| search.visited.contains(p) || !to.contains_key(p))
+                && search.scored.iter().any(|c| c.exact && c.local(region))
+        };
+        // Keep the miss sequence stable while PendingSources parses ahead.
+        // Looking up the cache again during consumption could turn a queued
+        // miss into a hit (or an evicted hit into a miss) and desynchronize it.
+        // At most four facts are pinned, matching the source worker bound. Keep
+        // their combined size within the cache partition even if concurrent
+        // requests evict facts while this lookahead holds them.
+        let mut files = VecDeque::<(usize, cache::Key, Option<Arc<FileCandidates>>)>::new();
+        let mut next_file = local_count;
         for (index, path) in remaining.by_ref() {
             check(&self.store.cancel)?;
             if index == local_count {
@@ -1258,22 +1407,78 @@ impl Tracker {
                 continue;
             }
             expanded = true;
+            let (key, cached) = if index >= local_count {
+                while files.len() < 4 && next_file < paths.len() {
+                    let at = next_file;
+                    next_file += 1;
+                    let p = &paths[at];
+                    if (*p != *path && search.visited.contains(p))
+                        || !matches!(to[p].mode, 0o100644 | 0o100755)
+                        || !regions::compatible(p, &region.path)
+                    {
+                        continue;
+                    }
+                    let key = file_key(p);
+                    let mut cached = cache_candidates
+                        .then(|| self.cache.candidate_file(&key))
+                        .flatten();
+                    if let Some(facts) = &cached {
+                        let pinned = files
+                            .iter()
+                            .filter_map(|(_, _, facts)| facts.as_ref())
+                            .fold(facts.heap_bytes(), |total, facts| {
+                                total.saturating_add(facts.heap_bytes())
+                            });
+                        if !self.cache.candidate_file_fits(pinned) {
+                            cached = None;
+                        }
+                    }
+                    files.push_back((at, key, cached));
+                }
+                let (at, key, cached) = files.front().expect("queued candidate file");
+                assert_eq!(*at, index, "candidate facts must be consumed in order");
+                (*key, cached.clone())
+            } else {
+                let key = file_key(path);
+                let cached = cache_candidates
+                    .then(|| self.cache.candidate_file(&key))
+                    .flatten();
+                (key, cached)
+            };
+            if let Some(facts) = cached {
+                if index >= local_count {
+                    files.pop_front();
+                }
+                facts.replay_work(work, &self.store.cancel)?;
+                if facts.incomplete.is_some() {
+                    search.incomplete = facts.incomplete.clone();
+                }
+                search.scored.extend(facts.scored.iter().cloned());
+                if local_complete(search) {
+                    break;
+                }
+                continue;
+            }
             let other = if index >= local_count {
                 prepared.get(
                     &mut self.store,
                     path,
-                    paths[index..]
+                    files
                         .iter()
-                        .filter(|p| {
-                            (*p == path || !search.visited.contains(*p))
-                                && matches!(to[*p].mode, 0o100644 | 0o100755)
-                                && regions::compatible(p, &region.path)
-                        })
-                        .map(|p| (p.as_str(), to[p].id.as_ref())),
+                        .filter(|(_, _, cached)| cached.is_none())
+                        .map(|(at, _, _)| {
+                            let p = &paths[*at];
+                            (p.as_str(), to[p].id.as_ref())
+                        }),
                 )?
             } else {
                 self.sources.get(&mut self.store, path, &entry.id)?
             };
+            if index >= local_count {
+                files.pop_front();
+            }
+            let scored_start = search.scored.len();
+            let work_start = *work;
             if other.incomplete.is_some() {
                 search.incomplete = other.incomplete.clone();
             }
@@ -1281,7 +1486,7 @@ impl Tracker {
                 .then(|| regions::map_range(&source.text, &other.text, source_range.clone()))
                 .flatten();
             let candidates = if region.kind == "file" {
-                vec![Region::whole(path, &entry.id, 0)]
+                vec![Region::whole(path, &entry.id, entry.mode)]
             } else {
                 other
                     .declarations
@@ -1299,7 +1504,7 @@ impl Tracker {
                     .collect()
             };
             for mut candidate in candidates {
-                if matches!(region.kind.as_str(), "file" | "text") {
+                if region.kind == "text" {
                     check(&self.store.cancel)?;
                 } else {
                     candidate_work(work, &self.store.cancel)?;
@@ -1454,13 +1659,29 @@ impl Tracker {
                     });
                 }
             }
+            if cache_candidates {
+                // Publish only after the complete file has been scored. Errors,
+                // cancellation and work exhaustion cannot cache partial absence.
+                check(&self.store.cancel)?;
+                let scored = &search.scored[scored_start..];
+                if self.cache.candidate_file_fits(FileCandidates::copy_bytes(
+                    scored,
+                    other.incomplete.as_ref(),
+                )) {
+                    self.cache.put_candidate_file(
+                        key,
+                        Arc::new(FileCandidates {
+                            scored: scored.to_vec(),
+                            incomplete: other.incomplete.clone(),
+                            comparisons: *work - work_start,
+                        }),
+                    );
+                }
+            }
             // Competition must inspect changed files, not stop at an edited
             // namesake. A distinctive exact local match already exceeds every
             // non-local score by more than the margin, so it can still settle here.
-            if matches!(scope, CandidateScope::Local(_))
-                && required.is_none_or(|p| search.visited.contains(p) || !to.contains_key(p))
-                && search.scored.iter().any(|c| c.exact && c.local(region))
-            {
+            if local_complete(search) {
                 break;
             }
         }
@@ -1484,7 +1705,7 @@ fn candidate_work(work: &mut usize, cancel: &AtomicBool) -> Result<()> {
     check(cancel)?;
     ensure!(
         *work < CANDIDATE_WORK,
-        "unresolved target: direct-continuation competition work limit reached"
+        "unresolved target: candidate comparison work limit reached"
     );
     *work += 1;
     Ok(())
@@ -1664,7 +1885,7 @@ pub(super) fn members(tree: &Tree, selection: paths::CompiledSelection<'_>) -> V
                 && regions::language(path).is_some()
                 && selection.matches(path)
         })
-        .map(|(path, entry)| Region::whole(path, &entry.id, 0))
+        .map(|(path, entry)| Region::whole(path, &entry.id, entry.mode))
         .collect()
 }
 
@@ -1687,8 +1908,155 @@ mod tests {
     }
 
     #[test]
+    fn cached_candidate_files_replay_the_same_work_and_cancellation() {
+        let cancel = AtomicBool::new(false);
+        let facts = FileCandidates {
+            comparisons: 3,
+            ..FileCandidates::default()
+        };
+        for initial in [0, CANDIDATE_WORK - 3, CANDIDATE_WORK - 2, CANDIDATE_WORK] {
+            let mut cold = initial;
+            let cold_result =
+                (0..facts.comparisons).try_for_each(|_| candidate_work(&mut cold, &cancel));
+            let mut warm = initial;
+            let warm_result = facts.replay_work(&mut warm, &cancel);
+            assert_eq!(cold, warm);
+            assert_eq!(
+                cold_result.err().map(|error| error.to_string()),
+                warm_result.err().map(|error| error.to_string())
+            );
+        }
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        for facts in [facts, FileCandidates::default()] {
+            let mut work = 0;
+            let error = facts.replay_work(&mut work, &cancel).unwrap_err();
+            assert!(error.to_string().contains("history cancelled"));
+            assert_eq!(work, 0);
+        }
+    }
+
+    #[test]
+    fn partial_candidate_file_is_not_cached_and_warm_scans_keep_the_work_limit() {
+        use crate::repository::history::Entry;
+        use std::{process::Command, time::Duration};
+
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], input: &[u8]| {
+            let output = crate::process::capture(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(root.path())
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1"),
+                Duration::from_secs(20),
+                Some(input.to_vec()),
+                None,
+            )
+            .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        };
+        git(&["init", "--bare", "--quiet", "--template="], b"");
+        let current = git(
+            &["hash-object", "-w", "--stdin"],
+            b"fn selected(x: i32) -> i32 { let y = x + 2; transform(y) + delta(y) }",
+        );
+        let previous = git(
+            &["hash-object", "-w", "--stdin"],
+            b"fn earlier(x: i32) -> i32 { let y = x + 1; transform(y) + delta(y) }\n\
+              fn neighbour(x: i32) -> i32 { decode(x) + offset(x) }\n\
+              fn another(x: i32) -> i32 { encode(x) - adjustment(x) }",
+        );
+        let cache = Arc::new(Cache::new(1024 * 1024));
+        let store = Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        let mut tracker = Tracker::new(store, cache.clone());
+        let source = tracker
+            .sources
+            .get(&mut tracker.store, "Current.rs", &current)
+            .unwrap();
+        let declaration = source
+            .declarations
+            .iter()
+            .find(|d| d.name == "selected")
+            .unwrap();
+        let region = Region::declaration("Current.rs", &current, declaration, &source);
+        let from = Tree::from([(
+            "Current.rs".into(),
+            Entry {
+                id: current.into(),
+                mode: 0o100644,
+            },
+        )]);
+        let to = Tree::from([(
+            "Prior.rs".into(),
+            Entry {
+                id: previous.clone().into(),
+                mode: 0o100644,
+            },
+        )]);
+        let key = cache::key(
+            tracker.store.cache_scope(),
+            &(
+                "candidate-file",
+                &region,
+                "Prior.rs",
+                &previous,
+                0o100644u32,
+            ),
+        );
+        let mut work = CANDIDATE_WORK - 2;
+        let cold_error = tracker
+            .candidates(
+                &from,
+                &to,
+                &region,
+                &mut work,
+                CandidateScope::Changed,
+                &mut CandidateSearch::default(),
+            )
+            .unwrap_err();
+        assert_eq!(work, CANDIDATE_WORK);
+        assert!(
+            cache.candidate_file(&key).is_none(),
+            "a partial file must not publish facts"
+        );
+
+        let mut work = 0;
+        tracker
+            .candidates(
+                &from,
+                &to,
+                &region,
+                &mut work,
+                CandidateScope::Changed,
+                &mut CandidateSearch::default(),
+            )
+            .unwrap();
+        assert_eq!(work, 3);
+        assert_eq!(cache.candidate_file(&key).unwrap().comparisons, 3);
+
+        let mut work = CANDIDATE_WORK - 2;
+        let warm_error = tracker
+            .candidates(
+                &from,
+                &to,
+                &region,
+                &mut work,
+                CandidateScope::Changed,
+                &mut CandidateSearch::default(),
+            )
+            .unwrap_err();
+        assert_eq!(work, CANDIDATE_WORK);
+        assert_eq!(cold_error.to_string(), warm_error.to_string());
+    }
+
+    #[test]
     fn normalization_preserves_written_alternatives_and_uncertainty() {
-        let mut first = Region::whole("Worker.cs", "blob", 100);
+        let mut first = Region::passage("Worker.cs", "blob", 0..100);
         first.kind = "method".into();
         first.name = "Worker.Target".into();
         first.written = "int Target ( int value )".into();
@@ -1734,7 +2102,7 @@ mod tests {
         assert!(!joined.uncertain);
         for live in [
             State {
-                regions: vec![Region::whole("empty.rs", "blob", 0)],
+                regions: vec![Region::whole("empty.rs", "blob", 0o100644)],
                 ..State::default()
             },
             State {

@@ -2003,6 +2003,7 @@ export default grammar({
       'notnull',
       'on',
       'orderby',
+      'required',
       'scoped',
       'select',
       'unmanaged',

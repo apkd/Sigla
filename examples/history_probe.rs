@@ -13,6 +13,9 @@ struct ProbeOptions {
     query: Vec<String>,
     #[arg(long, default_value_t = 2)]
     repeat: usize,
+    /// Service admission workers and Tokio runtime workers.
+    #[arg(long, default_value_t = 2)]
+    workers: usize,
 }
 
 fn allocated(path: &Path) -> Result<u64> {
@@ -34,8 +37,8 @@ async fn run(options: ProbeOptions) -> Result<()> {
     let policy = Policy::new(options.service.local_roots())?;
     let cache = options.service.cache_dir;
     let app = Arc::new(match remote {
-        Some(remote) => App::remote(policy, cache.clone(), 2, remote)?,
-        None => App::new(policy, cache.clone(), 2)?,
+        Some(remote) => App::remote(policy, cache.clone(), options.workers, remote)?,
+        None => App::new(policy, cache.clone(), options.workers)?,
     });
     let mut failed = false;
     for query in options.query {
@@ -49,6 +52,7 @@ async fn run(options: ProbeOptions) -> Result<()> {
                 "{}",
                 serde_json::json!({
                     "query": query, "sample": sample, "seconds": seconds,
+                    "workers": options.workers,
                     "before_bytes": before, "allocated_bytes": allocated(&cache)?,
                     "result": result.as_ref().ok(),
                     "error": result.as_ref().err().map(|e| format!("{e:#}")),
@@ -66,9 +70,11 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+    let options = ProbeOptions::parse();
+    ensure!(options.workers > 0, "Use at least one worker");
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(options.workers)
         .enable_all()
         .build()?
-        .block_on(run(ProbeOptions::parse()))
+        .block_on(run(options))
 }

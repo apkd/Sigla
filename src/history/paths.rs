@@ -175,6 +175,7 @@ fn consistent(
             return Ok(false);
         };
         if link.relation != Relation::Move
+            || link.absence_alternative
             || link.from.kind != "file"
             || link.to.kind != "file"
             || link.from.weak
@@ -381,10 +382,11 @@ mod tests {
     }
     fn link(from: &str, before: &str, to: &str, after: &str) -> Link {
         Link {
-            from: Region::whole(from, before, 0),
-            to: Region::whole(to, after, 0),
+            from: Region::whole(from, before, 0o100644),
+            to: Region::whole(to, after, 0o100644),
             relation: Relation::Move,
             uncertain: before != after,
+            absence_alternative: false,
             reason: "file content+path",
         }
     }
@@ -476,7 +478,14 @@ mod tests {
     fn scope_proofs_require_independent_unambiguous_and_complete_membership() {
         let patterns = ["path:new/**".into()];
         let cancel = AtomicBool::new(false);
-        for kind in ["split", "retained", "ambiguous", "one object", "one member"] {
+        for kind in [
+            "split",
+            "retained",
+            "ambiguous",
+            "optional",
+            "one object",
+            "one member",
+        ] {
             let mut a = tree("new", "edited", &[("a.rs", "a2"), ("b.rs", "b")]);
             let mut b = tree("old", "original", &[("a.rs", "a1"), ("b.rs", "b")]);
             let mut links = vec![
@@ -493,6 +502,9 @@ mod tests {
                 "ambiguous" => {
                     b.extend(tree("other", "other", &[("a.rs", "a1")]));
                     links.push(link("new/a.rs", "a2", "other/a.rs", "a1"));
+                }
+                "optional" => {
+                    links[0].absence_alternative = true;
                 }
                 "one object" => {
                     a.get_mut("new/b.rs").unwrap().id = "a2".into();

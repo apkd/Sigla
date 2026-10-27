@@ -554,6 +554,31 @@ fn occurrence<'tree>(n: Node<'tree>, mut parents: &[Node<'tree>], s: &str, facts
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_modifier_and_identifier_preserve_indexed_facts() {
+        let facts = extract(
+            "class Worker { public required string Name { get; init; } int required; void Run(int required) { this.required = required; } }",
+            &[],
+        )
+        .unwrap();
+        assert!(!facts.errors);
+        assert!(facts.declarations.iter().any(|d| d.name == "Name"
+            && d.kind == "property"
+            && d.modifiers.iter().any(|m| m == "required")));
+        assert!(
+            facts
+                .declarations
+                .iter()
+                .any(|d| d.name == "required" && d.kind == "field")
+        );
+        assert!(
+            facts.occurrences.iter().any(|o| o.name == "required"
+                && o.receiver == "this"
+                && o.write == WriteKind::Direct)
+        );
+    }
+
     #[test]
     fn nested_receivers_keep_calls_and_write_roles() {
         let source = r#"class Reader { void Read() {

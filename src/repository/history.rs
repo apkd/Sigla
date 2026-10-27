@@ -285,6 +285,28 @@ pub(crate) struct Store {
     pub reads: usize,
 }
 impl Store {
+    /// Confirm ancestry using locally available Git objects. Failure to prove
+    /// it leaves optional comparison inference unresolved.
+    pub fn confirms_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        id(ancestor)?;
+        id(descendant)?;
+        check(&self.cancel)?;
+        let output = crate::process::capture_cancellable(
+            git(&self.path).env("GIT_GRAFT_FILE", "/dev/null").args([
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ]),
+            Duration::from_millis(250),
+            None,
+            None,
+            Some(&self.cancel),
+        );
+        check(&self.cancel)?;
+        Ok(output.is_ok_and(|result| result.status.success()))
+    }
+
     pub fn local(path: &Path, cancel: Arc<AtomicBool>) -> Result<Self> {
         let output = run(Command::new("git")
             .arg("-C")

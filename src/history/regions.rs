@@ -1,4 +1,6 @@
 mod java;
+#[cfg(test)]
+mod smoke_tests;
 mod text;
 
 pub(super) use text::{TextContext, TextEvidence, TextRange, TextTokens, paragraphs, text_range};
@@ -24,12 +26,14 @@ use std::{
     },
 };
 
-pub(super) const ADAPTER_VERSION: u32 = 6;
+pub(super) const ADAPTER_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Region {
     pub path: String,
     pub blob: String,
+    // Tree metadata belongs only to whole-file occurrences, never selected source.
+    pub file_mode: Option<u32>,
     pub span: Range<usize>,
     pub body: Range<usize>,
     pub name: String,
@@ -72,6 +76,7 @@ impl Region {
     }
     pub fn same_alternative(&self, other: &Self) -> bool {
         self.key() == other.key()
+            && self.file_mode == other.file_mode
             && self.body == other.body
             && self.name == other.name
             && self.kind == other.kind
@@ -89,28 +94,29 @@ impl Region {
             self.name.clone()
         }
     }
-    pub fn whole(path: &str, blob: &str, size: usize) -> Self {
+    pub fn whole(path: &str, blob: &str, mode: u32) -> Self {
+        Self {
+            file_mode: Some(mode),
+            kind: "file".into(),
+            ..Self::passage(path, blob, 0..0)
+        }
+    }
+    pub fn passage(path: &str, blob: &str, span: Range<usize>) -> Self {
         Self {
             path: path.into(),
             blob: blob.into(),
-            span: 0..size,
-            body: 0..size,
+            file_mode: None,
+            body: span.clone(),
+            span,
             name: String::new(),
             owner: String::new(),
-            kind: "file".into(),
+            kind: "text".into(),
             parameters: Vec::new(),
             written: String::new(),
             guard: 1,
             weak: false,
             fragment: false,
         }
-    }
-    pub fn passage(path: &str, blob: &str, span: Range<usize>) -> Self {
-        let mut region = Self::whole(path, blob, span.end);
-        region.kind = "text".into();
-        region.body = span.clone();
-        region.span = span;
-        region
     }
     /// Enrich only a complete implementation's exact line range. A containing
     /// declaration is not permission to widen an explicitly selected passage.
@@ -142,6 +148,7 @@ impl Region {
         Self {
             path: path.into(),
             blob: blob.into(),
+            file_mode: None,
             span: if java::path(path) {
                 java::lines(&source.text, declaration.span.clone())
             } else {
@@ -491,6 +498,14 @@ impl Sources {
     }
 }
 
+/// Exclude languages that cannot match the selector's written qualification.
+pub(super) fn anchor_language(query: &crate::query::Query, language: Language) -> bool {
+    query.loose
+        || query.target.location.is_some()
+        || language != Language::CSharp
+        || !query.target.name.contains("::")
+}
+
 /// A necessary spelling check, never evidence that a matching declaration exists.
 fn may_declare(query: &crate::query::Query, text: &str) -> bool {
     if query.loose
@@ -505,7 +520,12 @@ fn may_declare(query: &crate::query::Query, text: &str) -> bool {
     {
         return true;
     }
-    let parts: Vec<_> = query.target.name.split('.').collect();
+    let separator = if query.target.name.contains("::") {
+        "::"
+    } else {
+        "."
+    };
+    let parts: Vec<_> = query.target.name.split(separator).collect();
     if parts.iter().any(|part| {
         part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
     }) {

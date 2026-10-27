@@ -145,6 +145,13 @@ impl<'a> Document<'a> {
                     .then(|| trimmed.strip_prefix('#'))
                     .flatten();
                 if let Some(directive) = directive {
+                    // File-based app metadata and shebangs are compiler-opaque.
+                    // Check the exact prefixes before trimming; `#:` is extensible,
+                    // so its payload is not a preprocessing directive keyword.
+                    if directive.starts_with([':', '!']) {
+                        next.push(state);
+                        continue;
+                    }
                     let directive = directive.trim_start();
                     let end = directive
                         .find(|c: char| !c.is_alphanumeric() && c != '_')
