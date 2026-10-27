@@ -28,7 +28,7 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-type Outcome = std::result::Result<(), String>;
+type Outcome = std::result::Result<(), Arc<anyhow::Error>>;
 type Running = watch::Receiver<Option<Outcome>>;
 
 #[cfg(test)]
@@ -88,6 +88,60 @@ mod refresh_tests {
         sender.send_replace(Some(Ok(())));
         drop(publication);
         ready.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_acquisition_links_the_refresh_it_waited_for() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut options = options();
+        options
+            .rules
+            .push(crate::repository::Rule::parse_private("https://github.com/owner/*").unwrap());
+        let manager = Manager::new(cache.path().into(), options).unwrap();
+        let repository = Repository::parse("https://github.com/owner/repo#refs/heads/main")
+            .unwrap()
+            .unwrap();
+        manager.defaults.lock().await.insert(
+            repository.identity.storage_key(),
+            DefaultBranch {
+                repository: repository.identity.clone(),
+                branch: "main".into(),
+                refreshed: now(),
+                previous: None,
+            },
+        );
+        let branch = Arc::new(branch(Target::Branch("main".into()), 0));
+        let (sender, receiver) = watch::channel(None);
+        *branch.running.lock().unwrap() = Some(receiver);
+        *branch.telemetry_id.lock().unwrap() = Some("refresh-running".into());
+        let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, "main")).unwrap())
+            .to_hex()
+            .to_string();
+        manager.branches.lock().unwrap().insert(key, branch.clone());
+        let (operation, recorder) = crate::telemetry::test_operation();
+        let mut resolve = Box::pin(manager.resolve_monitored(repository, &operation));
+        std::future::poll_fn(|cx| {
+            assert!(resolve.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(resolve);
+        operation.finish("cancelled");
+        let records = recorder.completed();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].links, ["refresh-running"]);
+
+        sender.send_replace(Some(Err(Arc::new(
+            crate::diagnostics::RepositoryTransfer::new(std::io::Error::other("finished")).into(),
+        ))));
+        let (operation, recorder) = crate::telemetry::test_operation();
+        let error = manager.ready(&branch, &operation).await.unwrap_err();
+        assert_eq!(
+            crate::diagnostics::monitoring(&error),
+            Some(crate::telemetry::Diagnostic::RepositoryTransfer)
+        );
+        operation.finish("failure");
+        assert!(recorder.completed()[0].links.is_empty());
     }
 
     #[test]
@@ -381,10 +435,6 @@ impl Branch {
         }
     }
 
-    pub(crate) fn telemetry_id(&self) -> Option<String> {
-        self.telemetry_id.lock().unwrap().clone()
-    }
-
     pub(crate) async fn publish(&self) -> PublicationGuard {
         let analysis = self.analysis.clone().write_owned().await;
         let state = self.state.clone().write_owned().await;
@@ -453,7 +503,7 @@ struct DefaultBranch {
 }
 type DefaultOperation = (
     u64,
-    watch::Receiver<Option<std::result::Result<DefaultBranch, String>>>,
+    watch::Receiver<Option<std::result::Result<DefaultBranch, Arc<anyhow::Error>>>>,
     Option<String>,
 );
 
@@ -758,10 +808,15 @@ impl Manager {
                         manager.defaults.lock().await.insert(key, saved.clone());
                         Ok::<_, anyhow::Error>(saved)
                     }
-                    .await
-                    .map_err(|e| e.to_string());
+                    .await;
+                    if let Err(error) = &result {
+                        tracing::warn!(error = %format!("{error:#}"), "Default branch lookup failed");
+                        if let Some(diagnostic) = crate::diagnostics::monitoring(error) {
+                            telemetry.diagnose(diagnostic);
+                        }
+                    }
                     telemetry.finish(if result.is_ok() { "success" } else { "failure" });
-                    let _ = send.send(Some(result));
+                    let _ = send.send(Some(result.map_err(Arc::new)));
                 });
             }
             (operations[&key].1.clone(), operations[&key].2.clone())
@@ -777,7 +832,9 @@ impl Manager {
         }
         loop {
             if let Some(result) = running.borrow().clone() {
-                return result.map(|r| Some(r.branch)).map_err(anyhow::Error::msg);
+                return result
+                    .map(|r| Some(r.branch))
+                    .map_err(crate::diagnostics::shared_error);
             }
             running.changed().await?;
         }
@@ -867,15 +924,21 @@ impl Manager {
         if ready {
             return Ok(());
         }
-        let mut running = branch
-            .running
-            .lock()
-            .unwrap()
-            .clone()
-            .context("Repository preparation was not scheduled")?;
+        let (mut running, mut job_id) = {
+            let running = branch.running.lock().unwrap();
+            (
+                running
+                    .clone()
+                    .context("Repository preparation was not scheduled")?,
+                branch.telemetry_id.lock().unwrap().clone(),
+            )
+        };
         loop {
             if let Some(outcome) = running.borrow().clone() {
-                return outcome.map_err(anyhow::Error::msg);
+                return outcome.map_err(crate::diagnostics::shared_error);
+            }
+            if let Some(job_id) = job_id.take() {
+                telemetry.link(&job_id);
             }
             let _wait = telemetry.wait("repository_refresh");
             running
@@ -1021,19 +1084,25 @@ impl Manager {
         }
         if !usable {
             let mut inventory = branch.inventory.subscribe();
-            let mut running = branch
-                .running
-                .lock()
-                .unwrap()
-                .clone()
-                .context("Repository preparation was not scheduled")?;
+            let (mut running, mut job_id) = {
+                let running = branch.running.lock().unwrap();
+                (
+                    running
+                        .clone()
+                        .context("Repository preparation was not scheduled")?,
+                    branch.telemetry_id.lock().unwrap().clone(),
+                )
+            };
             loop {
                 if inventory_only && inventory.borrow().is_some() {
                     break;
                 }
                 if let Some(outcome) = running.borrow().clone() {
-                    outcome.map_err(anyhow::Error::msg)?;
+                    outcome.map_err(crate::diagnostics::shared_error)?;
                     break;
+                }
+                if let (Some(operation), Some(job_id)) = (operation, job_id.take()) {
+                    operation.link(&job_id);
                 }
                 tokio::select! {
                     result = running.changed() => result.context("Repository preparation stopped")?,
@@ -1064,15 +1133,18 @@ impl Manager {
         let manager = self.clone();
         tokio::spawn(async move {
             telemetry.stage("repository_refresh");
-            let result = manager
-                .refresh(&branch, &telemetry)
-                .await
-                .map_err(|e| e.to_string());
+            let result = manager.refresh(&branch, &telemetry).await;
+            if let Err(error) = &result {
+                tracing::warn!(error = %format!("{error:#}"), "Repository refresh failed");
+                if let Some(diagnostic) = crate::diagnostics::monitoring(error) {
+                    telemetry.diagnose(diagnostic);
+                }
+            }
             telemetry.finish(if result.is_ok() { "success" } else { "failure" });
             if result.is_err() {
                 branch.retry_after.store(now() + 30_000, Ordering::Relaxed);
             }
-            let _ = send.send(Some(result));
+            let _ = send.send(Some(result.map_err(Arc::new)));
         });
     }
 
@@ -1104,9 +1176,11 @@ impl Manager {
             let _wait = telemetry.wait("acquisition_admission");
             self.acquisitions.acquire().await?
         };
-        let stage = tempfile::Builder::new()
-            .prefix("required-")
-            .tempdir_in(&branch.root)?;
+        let stage = Arc::new(
+            tempfile::Builder::new()
+                .prefix("required-")
+                .tempdir_in(&branch.root)?,
+        );
         let request = Request {
             transfer_used: before.prepared.transfer_bytes,
             contents: super::materialize::Contents::All,
@@ -1136,8 +1210,12 @@ impl Manager {
         };
         let cache = self.cache.clone();
         telemetry.stage("required_input_fetch");
-        let (mut prepared, _pool_pin) =
-            tokio::task::spawn_blocking(move || super::cache::acquire(&request, &cache)).await??;
+        let staged = stage.clone();
+        let (mut prepared, _pool_pin) = tokio::task::spawn_blocking(move || {
+            let _stage = staged;
+            super::cache::acquire(&request, &cache)
+        })
+        .await??;
         prepared.branch = before.prepared.branch.clone();
         prepared.resolved_target = before.prepared.resolved_target.clone();
         telemetry.stage("required_input_publication");
@@ -1244,7 +1322,9 @@ impl Manager {
             let mut inventory_request = request.clone();
             inventory_request.contents = super::materialize::Contents::Inventory;
             let cache = cache.clone();
+            let staged = stage.clone();
             let (prepared, pin) = tokio::task::spawn_blocking(move || {
+                let _stage = staged;
                 super::cache::acquire(&inventory_request, &cache)
             })
             .await??;
@@ -1265,7 +1345,9 @@ impl Manager {
         telemetry.stage("git_acquisition");
         let git_request = request.clone();
         let git_cache = cache.clone();
+        let staged = stage.clone();
         let (mut prepared, pin) = tokio::task::spawn_blocking(move || {
+            let _stage = staged;
             super::cache::acquire_git(&git_request, &git_cache)
         })
         .await??;
@@ -1293,9 +1375,12 @@ impl Manager {
             })));
         }
         telemetry.stage("repository_materialization");
-        prepared =
-            tokio::task::spawn_blocking(move || super::cache::complete(&request, &cache, prepared))
-                .await??;
+        let staged = stage.clone();
+        prepared = tokio::task::spawn_blocking(move || {
+            let _stage = staged;
+            super::cache::complete(&request, &cache, prepared)
+        })
+        .await??;
         telemetry.stage("repository_publication");
         let mut state = {
             let _wait = telemetry.wait("repository_publication");

@@ -19,13 +19,62 @@ impl fmt::Display for MaintenanceBusy {
 }
 impl Error for MaintenanceBusy {}
 
+#[derive(Debug)]
+pub(crate) struct WorkspaceRetired;
+impl fmt::Display for WorkspaceRetired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Workspace is being retired")
+    }
+}
+impl Error for WorkspaceRetired {}
+
+#[derive(Debug)]
+pub(crate) struct RepositoryTransfer(Box<dyn Error + Send + Sync>);
+impl RepositoryTransfer {
+    pub(crate) fn new(error: impl Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+impl fmt::Display for RepositoryTransfer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Filtered repository transfer failed")
+    }
+}
+impl Error for RepositoryTransfer {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+pub(crate) fn monitoring(error: &anyhow::Error) -> Option<crate::telemetry::Diagnostic> {
+    use crate::telemetry::Diagnostic;
+    for cause in error.chain() {
+        if cause.is::<Cancelled>() {
+            return Some(Diagnostic::RequestCancelled);
+        }
+        if cause.is::<MaintenanceBusy>() {
+            return Some(Diagnostic::MaintenanceBusy);
+        }
+        if cause.is::<RefreshRequired>() {
+            return Some(Diagnostic::RefreshRequired);
+        }
+        if cause.is::<WorkspaceRetired>() {
+            return Some(Diagnostic::WorkspaceRetired);
+        }
+        if cause.is::<RepositoryTransfer>() {
+            return Some(Diagnostic::RepositoryTransfer);
+        }
+    }
+    None
+}
+
 // Watch channels need cloneable outcomes. Keep the original error chain so a
 // background failure has the same classification as a direct request failure.
 #[derive(Debug)]
 struct SharedError(Arc<anyhow::Error>);
 impl fmt::Display for SharedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Background indexing failed")
+        f.write_str("Background operation failed")
     }
 }
 impl Error for SharedError {
@@ -176,6 +225,29 @@ mod tests {
         assert_eq!(
             details(&cancelled, "shared-cancel")["error_code"],
             "CANCELLED"
+        );
+    }
+
+    #[test]
+    fn monitoring_uses_typed_causes_across_shared_job_boundaries() {
+        use crate::telemetry::Diagnostic;
+        let error = anyhow::Error::new(RepositoryTransfer::new(std::io::Error::other(
+            "private transfer details",
+        )));
+        let shared = shared_error(Arc::new(error));
+        assert_eq!(monitoring(&shared), Some(Diagnostic::RepositoryTransfer));
+        assert!(format!("{shared:#}").contains("private transfer details"));
+        assert_eq!(
+            monitoring(&Cancelled.into()),
+            Some(Diagnostic::RequestCancelled)
+        );
+        assert_eq!(
+            monitoring(&MaintenanceBusy.into()),
+            Some(Diagnostic::MaintenanceBusy)
+        );
+        assert_eq!(
+            monitoring(&anyhow::anyhow!("Filtered repository transfer failed")),
+            None
         );
     }
 }

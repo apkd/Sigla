@@ -23,7 +23,7 @@ impl Inventory {
 enum Progress {
     Pending(&'static str),
     Files(Arc<Inventory>),
-    Ready(Arc<Inventory>),
+    Ready(Arc<Inventory>, Option<u64>),
     Failed(Arc<anyhow::Error>, Option<Arc<Inventory>>),
 }
 #[derive(Clone)]
@@ -48,9 +48,11 @@ impl Ticket {
             Progress::Pending(_) | Progress::Files(_)
         )
     }
-    pub fn needs_refresh(&self) -> bool {
+    pub fn needs_refresh(&self, generation: Option<u64>) -> bool {
         match &*self.progress.borrow() {
-            Progress::Ready(inventory) => inventory.watch.changed(),
+            Progress::Ready(inventory, prepared) => {
+                *prepared != generation || inventory.watch.changed()
+            }
             Progress::Failed(..) => true,
             Progress::Pending(_) | Progress::Files(_) => false,
         }
@@ -62,7 +64,7 @@ impl Ticket {
         loop {
             match self.progress.borrow().clone() {
                 Progress::Files(files)
-                | Progress::Ready(files)
+                | Progress::Ready(files, _)
                 | Progress::Failed(_, Some(files)) => return Ok(files),
                 Progress::Failed(error, None) => {
                     return Err(crate::diagnostics::shared_error(error));
@@ -77,7 +79,7 @@ impl Ticket {
     pub async fn complete(&mut self) -> Result<()> {
         loop {
             match self.progress.borrow().clone() {
-                Progress::Ready(_) => return Ok(()),
+                Progress::Ready(..) => return Ok(()),
                 Progress::Failed(error, _) => {
                     return Err(crate::diagnostics::shared_error(error));
                 }
@@ -284,9 +286,6 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             if let Some(branch) = &preparing_branch {
                 send.send_replace(Progress::Pending("acquisition"));
                 operation.stage("repository_acquisition");
-                if let Some(job_id) = branch.telemetry_id() {
-                    operation.link(&job_id);
-                }
                 preparing_app
                     .remote
                     .as_ref()
@@ -516,16 +515,19 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 &code.manifest,
                 None,
             );
-            Ok::<_, anyhow::Error>(inventory)
+            Ok::<_, anyhow::Error>((inventory, generation))
         }
         .await;
         let progress = match outcome {
-            Ok(inventory) => {
+            Ok((inventory, generation)) => {
                 operation.finish("success");
-                Progress::Ready(inventory)
+                Progress::Ready(inventory, generation)
             }
             Err(error) => {
                 tracing::warn!(shared_job = job, workspace = %entry.display(), error = %format!("{error:#}"), "Workspace indexing failed");
+                if let Some(diagnostic) = crate::diagnostics::monitoring(&error) {
+                    operation.diagnose(diagnostic);
+                }
                 operation.finish("failure");
                 let inventory = match &*send.borrow() {
                     Progress::Files(inventory) => Some(inventory.clone()),

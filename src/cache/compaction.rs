@@ -6,7 +6,8 @@ use heed::{
 };
 use std::{
     fs::{self, File},
-    path::Path,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
 };
 
 const PENDING: &str = "data.mdb.compacting";
@@ -155,30 +156,70 @@ pub fn cleanup(cache: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Consumes the last environment handle. Callers must exclude work for the full operation.
-pub fn run(env: Env, cache: &Path) -> Result<u64> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Generation {
+    transaction: usize,
+    device: u64,
+    inode: u64,
+}
+impl Generation {
+    fn read(env: &Env, root: &Path) -> Result<Self> {
+        let metadata = fs::metadata(root.join("data.mdb"))?;
+        Ok(Self {
+            transaction: env.info().last_txn_id,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// The serial maintenance worker owns this copy until publication or disposal.
+pub(crate) struct Candidate {
+    root: PathBuf,
+    generation: Generation,
+    before: u64,
+}
+pub(crate) enum Preparation {
+    Ready(Candidate),
+    Changed,
+    InsufficientSpace,
+}
+impl Candidate {
+    pub(crate) fn current(&self, env: &Env) -> Result<bool> {
+        Ok(self.generation == Generation::read(env, &self.root)?)
+    }
+}
+impl Drop for Candidate {
+    fn drop(&mut self) {
+        for name in [PENDING, "data.mdb.compacting-lock"] {
+            if let Err(error) = remove(&self.root.join(name)) {
+                tracing::warn!(%error, "Cannot discard analysis compaction copy");
+            }
+        }
+    }
+}
+
+/// Copy under shared service activity. A concurrent commit invalidates the copy.
+pub(crate) fn prepare(env: &Env, cache: &Path) -> Result<Preparation> {
     let root = cache.join("analysis");
     ensure!(
         !root.join(PREVIOUS).try_exists()?,
         "Analysis compaction requires recovery"
     );
     cleanup(cache)?;
+    let generation = Generation::read(env, &root)?;
     let before = env.real_disk_size()?;
     let live = env.compacted_size()?;
     let available = super::policy::Disk::read(cache)?.available;
-    ensure!(
-        available
-            >= Stats {
-                allocated: before,
-                live
-            }
-            .temporary_bytes(),
-        "Insufficient temporary space for analysis compaction"
-    );
-    let pending = root.join(PENDING);
-    let file = env.copy_to_path(&pending, heed::CompactionOption::Enabled)?;
-    file.sync_all()?;
-    drop(file);
+    if available
+        < (Stats {
+            allocated: before,
+            live,
+        })
+        .temporary_bytes()
+    {
+        return Ok(Preparation::InsufficientSpace);
+    }
     let expected = {
         let tx = env.read_txn()?;
         let mut counts = Vec::new();
@@ -200,25 +241,66 @@ pub fn run(env: Env, cache: &Path) -> Result<u64> {
         }
         counts
     };
+    let candidate = Candidate {
+        root,
+        generation,
+        before,
+    };
+    let pending = candidate.root.join(PENDING);
+    let start = std::time::Instant::now();
+    let file = env.copy_to_path(&pending, heed::CompactionOption::Enabled)?;
+    file.sync_all()?;
+    drop(file);
+    let current = candidate.current(env)?;
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis(),
+        copied_bytes = fs::metadata(&pending)?.len(),
+        source_growth_bytes = env.real_disk_size()?.saturating_sub(before),
+        current,
+        "Analysis compaction copy finished"
+    );
+    if !current {
+        return Ok(Preparation::Changed);
+    }
     ensure!(
         validate(&pending)? == expected,
         "Compacted analysis validation failed"
     );
+    Ok(Preparation::Ready(candidate))
+}
+
+/// Consume the last environment handle under exclusive service activity.
+pub(crate) fn publish(env: Env, candidate: Candidate, cache: &Path) -> Result<u64> {
+    ensure!(
+        candidate.current(&env)?,
+        "Analysis changed during compaction"
+    );
+    let root = &candidate.root;
+    let pending = root.join(PENDING);
     env.prepare_for_closing().wait();
     fs::hard_link(root.join("data.mdb"), root.join(PREVIOUS))?;
-    File::open(&root)?.sync_all()?;
+    File::open(root)?.sync_all()?;
     fs::rename(&pending, root.join("data.mdb"))?;
-    File::open(&root)?.sync_all()?;
+    File::open(root)?.sync_all()?;
     remove(&root.join("lock.mdb"))?;
     if let Err(error) = validate(&root.join("data.mdb")) {
         fs::rename(root.join(PREVIOUS), root.join("data.mdb"))?;
-        File::open(&root)?.sync_all()?;
+        File::open(root)?.sync_all()?;
         return Err(error);
     }
     let after = fs::metadata(root.join("data.mdb"))?.len();
     recover(cache)?;
+    Ok(candidate.before.saturating_sub(after))
+}
+
+#[cfg(test)]
+pub(crate) fn run(env: Env, cache: &Path) -> Result<u64> {
+    let Preparation::Ready(candidate) = prepare(&env, cache)? else {
+        anyhow::bail!("Exclusive compaction could not prepare a copy");
+    };
+    let reclaimed = publish(env, candidate, cache)?;
     cleanup(cache)?;
-    Ok(before.saturating_sub(after))
+    Ok(reclaimed)
 }
 
 #[cfg(test)]
@@ -285,6 +367,53 @@ mod tests {
             expected.live
         );
         readable(cache.path());
+    }
+    #[test]
+    fn concurrent_commit_discards_copy_and_preserves_new_records() {
+        let cache = tempfile::tempdir().unwrap();
+        let database = populated(cache.path());
+        let Preparation::Ready(candidate) = database.prepare_compaction(cache.path()).unwrap()
+        else {
+            panic!("Could not prepare compaction");
+        };
+        let scope = database
+            .workspace([1; 32], Path::new("/example"), None)
+            .unwrap();
+        scope
+            .install(
+                "new",
+                vec![1],
+                [99; 32],
+                4,
+                || Ok(()),
+                || {
+                    let mut records = BTreeMap::from([(vec![1], vec![99])]);
+                    let names = crate::store::format::write(
+                        &[],
+                        None,
+                        true,
+                        &crate::store::shared::Names::default(),
+                        &mut records,
+                    )?;
+                    Ok(Encoded { names, records })
+                },
+            )
+            .unwrap();
+        drop(scope);
+        assert!(!database.compaction_current(&candidate).unwrap());
+        assert!(
+            database
+                .publish_compaction(cache.path(), candidate)
+                .is_err()
+        );
+        assert!(!cache.path().join("analysis").join(PENDING).exists());
+        readable(cache.path());
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let scope = database
+            .workspace([1; 32], Path::new("/example"), None)
+            .unwrap();
+        let tx = scope.read().unwrap();
+        assert_eq!(scope.record(&tx, "new", &[1]).unwrap(), Some(&[99][..]));
     }
     #[test]
     fn interrupted_replacement_restores_a_valid_backup() {

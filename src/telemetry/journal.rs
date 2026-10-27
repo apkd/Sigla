@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAGIC: &[u8; 8] = b"SGMON001";
+const MAGIC: &[u8; 8] = b"SGMON002";
+const LEGACY_MAGIC: &[u8; 8] = b"SGMON001";
+// Ten continuation bytes cannot begin a valid Postcard u64 timestamp.
+const SNAPSHOT_MAGIC: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffSGACT002";
 const HEADER_BYTES: u64 = 16;
 const FRAME_HEADER_BYTES: u64 = 20;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -29,6 +32,52 @@ struct Snapshot {
     measured_ms: u64,
     gaps: u64,
     active: BTreeMap<String, Record>,
+}
+
+// The old snapshot used Postcard records without a version. Keep its exact field order.
+#[derive(Serialize, Deserialize)]
+struct LegacyRecord {
+    id: String,
+    kind: String,
+    repository: Option<String>,
+    target: Option<String>,
+    query: Option<String>,
+    start_ms: u64,
+    end_ms: Option<u64>,
+    status: String,
+    detailed: bool,
+    stages: Vec<super::Stage>,
+    links: Vec<String>,
+    current_stage: Option<String>,
+    waiting: Vec<String>,
+}
+
+impl From<LegacyRecord> for Record {
+    fn from(record: LegacyRecord) -> Self {
+        Self {
+            id: record.id,
+            kind: record.kind,
+            repository: record.repository,
+            target: record.target,
+            query: record.query,
+            start_ms: record.start_ms,
+            end_ms: record.end_ms,
+            status: record.status,
+            detailed: record.detailed,
+            stages: record.stages,
+            links: record.links,
+            current_stage: record.current_stage,
+            waiting: record.waiting,
+            diagnostic: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacySnapshot {
+    measured_ms: u64,
+    gaps: u64,
+    active: BTreeMap<String, LegacyRecord>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -95,7 +144,20 @@ fn read_snapshot(directory: &Path) -> Result<Snapshot> {
                 decoded.len() <= MAX_FRAME_BYTES,
                 "monitor snapshot exceeds decoded size limit"
             );
-            Ok(postcard::from_bytes(&decoded)?)
+            if let Some(bytes) = decoded.strip_prefix(SNAPSHOT_MAGIC) {
+                Ok(serde_json::from_slice(bytes)?)
+            } else {
+                let legacy: LegacySnapshot = postcard::from_bytes(&decoded)?;
+                Ok(Snapshot {
+                    measured_ms: legacy.measured_ms,
+                    gaps: legacy.gaps,
+                    active: legacy
+                        .active
+                        .into_iter()
+                        .map(|(id, record)| (id, record.into()))
+                        .collect(),
+                })
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Snapshot::default()),
         Err(error) => Err(error.into()),
@@ -123,11 +185,15 @@ fn days(directory: &Path) -> Result<Vec<u64>> {
     Ok(days)
 }
 
-fn header(file: &mut File) -> Result<u64> {
+fn header(file: &mut File) -> Result<(u64, bool)> {
     let mut bytes = [0; HEADER_BYTES as usize];
     file.read_exact(&mut bytes)?;
-    ensure!(&bytes[..8] == MAGIC, "unsupported monitor journal format");
-    Ok(u64::from_le_bytes(bytes[8..].try_into().unwrap()))
+    let legacy = &bytes[..8] == LEGACY_MAGIC;
+    ensure!(
+        legacy || &bytes[..8] == MAGIC,
+        "unsupported monitor journal format"
+    );
+    Ok((u64::from_le_bytes(bytes[8..].try_into().unwrap()), legacy))
 }
 
 fn create_day(path: &Path, generation: u64) -> Result<File> {
@@ -144,7 +210,7 @@ fn create_day(path: &Path, generation: u64) -> Result<File> {
 }
 
 /// A partially written last frame is invisible until it is complete.
-fn read_frame(file: &mut File) -> Result<Option<(Vec<Event>, u64, usize)>> {
+fn read_frame(file: &mut File, legacy: bool) -> Result<Option<(Vec<Event>, u64, usize)>> {
     let start = file.stream_position()?;
     let length = file.metadata()?.len();
     if length.saturating_sub(start) < FRAME_HEADER_BYTES {
@@ -176,7 +242,7 @@ fn read_frame(file: &mut File) -> Result<Option<(Vec<Event>, u64, usize)>> {
         decoded.len() <= MAX_FRAME_BYTES,
         "monitor frame exceeds decoded size limit"
     );
-    let events = super::wire::decode(&decoded)?;
+    let events = super::wire::decode(&decoded, legacy)?;
     let expanded_bytes = postcard::experimental::serialized_size(&events)?;
     ensure!(
         expanded_bytes <= MAX_FRAME_BYTES,
@@ -291,8 +357,8 @@ impl Writer {
                 continue;
             }
             let mut file = File::open(path)?;
-            header(&mut file)?;
-            while let Some((events, _, _)) = read_frame(&mut file)? {
+            let (_, legacy) = header(&mut file)?;
+            while let Some((events, _, _)) = read_frame(&mut file, legacy)? {
                 for event in events {
                     if let Event::Operation(record) = event {
                         active.remove(&record.id);
@@ -334,13 +400,12 @@ impl Writer {
                 if let Some(previous) = self.snapshot.active.get(&record.id) {
                     record.query = previous.query.clone();
                 }
-                let bytes =
-                    postcard::experimental::serialized_size(record).unwrap_or(MAX_FRAME_BYTES);
+                let bytes = serde_json::to_vec(record).map_or(MAX_FRAME_BYTES, |bytes| bytes.len());
                 let previous = self
                     .snapshot
                     .active
                     .get(&record.id)
-                    .and_then(|record| postcard::experimental::serialized_size(record).ok())
+                    .and_then(|record| serde_json::to_vec(record).ok().map(|bytes| bytes.len()))
                     .unwrap_or(0);
                 let mut total = self
                     .active_bytes
@@ -361,8 +426,7 @@ impl Writer {
                         break;
                     };
                     let removed = self.snapshot.active.remove(&id).unwrap();
-                    let removed_bytes =
-                        postcard::experimental::serialized_size(&removed).unwrap_or(0);
+                    let removed_bytes = serde_json::to_vec(&removed).map_or(0, |bytes| bytes.len());
                     self.active_bytes = self.active_bytes.saturating_sub(removed_bytes);
                     total = self
                         .active_bytes
@@ -383,7 +447,7 @@ impl Writer {
             Event::Operation(record) => {
                 if let Some(previous) = self.snapshot.active.remove(&record.id) {
                     self.active_bytes = self.active_bytes.saturating_sub(
-                        postcard::experimental::serialized_size(&previous).unwrap_or(0),
+                        serde_json::to_vec(&previous).map_or(0, |bytes| bytes.len()),
                     );
                 }
                 let day = record.start_ms / DAY_MS;
@@ -423,9 +487,18 @@ impl Writer {
         };
         if let std::collections::btree_map::Entry::Vacant(entry) = self.prepared.entry(day) {
             file.seek(SeekFrom::Start(0))?;
-            let generation = header(&mut file)?;
+            let (mut generation, legacy) = header(&mut file)?;
+            if legacy {
+                let next = (generation & !3).saturating_add(4);
+                let discarded_tail = compact(&path, day, file, next, false, true, || Ok(()))?;
+                if discarded_tail {
+                    self.snapshot.gaps = self.snapshot.gaps.saturating_add(1);
+                }
+                file = OpenOptions::new().read(true).write(true).open(&path)?;
+                (generation, _) = header(&mut file)?;
+            }
             let mut complete = HEADER_BYTES;
-            while let Some((_, bytes, _)) = read_frame(&mut file)? {
+            while let Some((_, bytes, _)) = read_frame(&mut file, false)? {
                 complete += bytes;
             }
             // Late completions must make a packed day eligible for retention again.
@@ -468,8 +541,13 @@ impl Writer {
         }
         if self.dirty {
             self.snapshot.measured_ms = now_ms();
-            let encoded =
-                zstd::stream::encode_all(postcard::to_allocvec(&self.snapshot)?.as_slice(), 3)?;
+            let mut decoded = SNAPSHOT_MAGIC.to_vec();
+            serde_json::to_writer(&mut decoded, &self.snapshot)?;
+            ensure!(
+                decoded.len() <= MAX_FRAME_BYTES,
+                "monitor snapshot exceeds decoded size limit"
+            );
+            let encoded = zstd::stream::encode_all(decoded.as_slice(), 3)?;
             atomic_write(&self.directory.join("active.bin"), &encoded)?;
             self.dirty = false;
         }
@@ -589,7 +667,7 @@ impl Writer {
             }
             let path = day_path(&self.directory, day);
             let mut file = File::open(&path)?;
-            let generation = header(&mut file)?;
+            let (generation, legacy) = header(&mut file)?;
             let rollup = day.saturating_add(RETAIN_DAYS) < today;
             if generation & 3 >= if rollup { 2 } else { 1 } {
                 continue;
@@ -600,6 +678,7 @@ impl Writer {
                 file,
                 (generation & !3) | if rollup { 2 } else { 1 },
                 rollup,
+                legacy,
                 || yield_work(self),
             )?;
             if discarded_tail {
@@ -619,6 +698,7 @@ fn compact(
     mut input: File,
     generation: u64,
     rollup: bool,
+    legacy: bool,
     mut yield_work: impl FnMut() -> Result<()>,
 ) -> Result<bool> {
     let temporary = path.with_extension("compact");
@@ -634,7 +714,7 @@ fn compact(
     loop {
         yield_work()?;
         let start = input.stream_position()?;
-        let Some((events, _, _)) = read_frame(&mut input)? else {
+        let Some((events, _, _)) = read_frame(&mut input, legacy)? else {
             discarded_tail = start < input.metadata()?.len();
             break;
         };
@@ -738,7 +818,7 @@ pub fn export(directory: &Path, after: Option<&str>) -> Result<Export> {
     let mut decoded_bytes = 0;
     for day in days(directory)? {
         let mut file = File::open(day_path(directory, day))?;
-        let generation = header(&mut file)?;
+        let (generation, legacy) = header(&mut file)?;
         let old = cursor.days.get(&day).copied();
         let position = match old {
             Some(position) if position.generation == generation => position,
@@ -761,7 +841,7 @@ pub fn export(directory: &Path, after: Option<&str>) -> Result<Export> {
         );
         file.seek(SeekFrom::Start(position.offset))?;
         let mut offset = position.offset;
-        while let Some((events, bytes, decoded)) = read_frame(&mut file)? {
+        while let Some((events, bytes, decoded)) = read_frame(&mut file, legacy)? {
             for event in events {
                 match event {
                     Event::Operation(record) => result.operations.push(record),
@@ -815,7 +895,109 @@ mod tests {
             links: Vec::new(),
             current_stage: None,
             waiting: Vec::new(),
+            diagnostic: None,
         }
+    }
+
+    #[test]
+    fn legacy_journal_and_snapshot_survive_upgrade_and_cursor_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(directory.path()).unwrap();
+        let path = day_path(directory.path(), 1);
+        let mut file = create_day(&path, 0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(LEGACY_MAGIC).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        write_frame(
+            &mut file,
+            &[Event::Operation(record("old", 1, "failure", true))],
+        )
+        .unwrap();
+        let old = export(directory.path(), None).unwrap();
+        assert_eq!(old.operations.len(), 1);
+        assert_eq!(old.operations[0].diagnostic, None);
+
+        let legacy = LegacySnapshot {
+            measured_ms: 42,
+            gaps: 0,
+            active: BTreeMap::from([(
+                "active".into(),
+                LegacyRecord {
+                    id: "active".into(),
+                    kind: "search".into(),
+                    repository: None,
+                    target: None,
+                    query: None,
+                    start_ms: 1,
+                    end_ms: None,
+                    status: "running".into(),
+                    detailed: false,
+                    stages: Vec::new(),
+                    links: Vec::new(),
+                    current_stage: None,
+                    waiting: Vec::new(),
+                },
+            )]),
+        };
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let encoded = zstd::stream::encode_all(bytes.as_slice(), 3).unwrap();
+        atomic_write(&directory.path().join("active.bin"), &encoded).unwrap();
+        assert_eq!(
+            read_snapshot(directory.path()).unwrap().active["active"].diagnostic,
+            None
+        );
+
+        let mut new = record("new", 1, "failure", true);
+        new.diagnostic = Some(super::super::Diagnostic::MaintenanceBusy);
+        writer.accept(Event::Operation(new));
+        writer.flush().unwrap();
+        let result = export(directory.path(), Some(&old.cursor)).unwrap();
+        assert_eq!(result.replace_days, vec![1]);
+        assert_eq!(result.operations.len(), 2);
+        assert_eq!(
+            result.operations[1].diagnostic,
+            Some(super::super::Diagnostic::MaintenanceBusy)
+        );
+        assert_eq!(result.version, 1);
+    }
+
+    #[test]
+    fn restarted_writer_recovers_legacy_active_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(Writer::open(directory.path()).unwrap());
+        let legacy = LegacySnapshot {
+            measured_ms: DAY_MS + 200,
+            gaps: 0,
+            active: BTreeMap::from([(
+                "active".into(),
+                LegacyRecord {
+                    id: "active".into(),
+                    kind: "search".into(),
+                    repository: None,
+                    target: None,
+                    query: None,
+                    start_ms: DAY_MS + 100,
+                    end_ms: None,
+                    status: "running".into(),
+                    detailed: false,
+                    stages: Vec::new(),
+                    links: Vec::new(),
+                    current_stage: None,
+                    waiting: Vec::new(),
+                },
+            )]),
+        };
+        let encoded =
+            zstd::stream::encode_all(postcard::to_allocvec(&legacy).unwrap().as_slice(), 3)
+                .unwrap();
+        atomic_write(&directory.path().join("active.bin"), &encoded).unwrap();
+        let mut writer = Writer::open(directory.path()).unwrap();
+        writer.flush().unwrap();
+        let exported = export(directory.path(), None).unwrap();
+        assert!(exported.active.is_empty());
+        assert_eq!(exported.operations.len(), 1);
+        assert_eq!(exported.operations[0].status, "unfinished");
+        assert_eq!(exported.operations[0].diagnostic, None);
     }
 
     #[test]
@@ -1068,9 +1250,9 @@ mod tests {
         }
         writer.retain_one(2, |_| Ok(())).unwrap();
         let mut file = File::open(day_path(directory.path(), 1)).unwrap();
-        header(&mut file).unwrap();
+        let (_, legacy) = header(&mut file).unwrap();
         let mut count = 0;
-        while let Some((events, _, expanded)) = read_frame(&mut file).unwrap() {
+        while let Some((events, _, expanded)) = read_frame(&mut file, legacy).unwrap() {
             count += events.len();
             // A batch may cross its target by one record and a collection prefix.
             assert!(expanded <= BATCH_BYTES + largest + 10);

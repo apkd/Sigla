@@ -352,14 +352,12 @@ fn deleting_namespace_resumes_and_never_reuses_numeric_id() {
         assert!(!a.delete_batch(100, 1).unwrap());
     }
     let db = Database::open(dir.path()).unwrap();
-    assert!(
-        db.workspace([1; 32], Path::new("/workspace/1"), None)
-            .is_err()
-    );
-    let old = db.existing([1; 32]).unwrap().unwrap();
-    while !old.delete_batch(100, 1).unwrap() {}
     let new = scope(&db, 1);
     assert_ne!(old_id, new.id);
+    put(&new, "replacement", 1, 7, "Name");
+    clean(&new, &["replacement"]);
+    let old = db.namespace([1; 32], old_id).unwrap().unwrap();
+    while !old.delete_batch(100, 1).unwrap() {}
     assert!(
         old.install(
             "file",
@@ -372,7 +370,52 @@ fn deleting_namespace_resumes_and_never_reuses_numeric_id() {
         .is_err()
     );
     let tx = new.read().unwrap();
-    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(0));
+    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
+    assert!(new.binding(&tx, "replacement").unwrap().is_some());
+    drop(tx);
+    assert_eq!(db.existing([1; 32]).unwrap().unwrap().id, new.id);
+}
+
+#[test]
+fn legacy_retirement_and_replacement_survive_restart_between_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old_id, new_id) = {
+        let db = Database::open(dir.path()).unwrap();
+        let old = scope(&db, 1);
+        put(&old, "one", 1, 7, "Shared");
+        put(&old, "two", 1, 7, "Shared");
+        let mut tx = db.write().unwrap();
+        let mut info = old.info(&tx).unwrap();
+        info.phase = Phase::Deleting;
+        db.spaces
+            .put(&mut tx, &[1; 32], &encode(&info).unwrap())
+            .unwrap();
+        tx.commit().unwrap();
+        let new = scope(&db, 1);
+        put(&new, "replacement", 1, 7, "Shared");
+        clean(&new, &["replacement"]);
+        assert_ne!(old.id, new.id);
+        assert!(old.query_read().is_err());
+        (old.id, new.id)
+    };
+    loop {
+        let db = Database::open(dir.path()).unwrap();
+        let old = db.namespace([1; 32], old_id).unwrap().unwrap();
+        let done = old.delete_batch(100, 1).unwrap();
+        let new = scope(&db, 1);
+        assert_eq!(new.id, new_id);
+        let tx = new.query_read().unwrap();
+        assert!(new.binding(&tx, "replacement").unwrap().is_some());
+        if done {
+            break;
+        }
+    }
+    let db = Database::open(dir.path()).unwrap();
+    db.collect_unused(100, true).unwrap();
+    assert!(db.namespace([1; 32], old_id).unwrap().is_none());
+    let new = scope(&db, 1);
+    let tx = new.query_read().unwrap();
+    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
 }
 
 #[test]
@@ -396,7 +439,7 @@ fn retirement_preserves_shared_objects_and_other_workspace_indexes() {
     // Reopen between every batch, including the transition to binding removal.
     loop {
         let db = Database::open(dir.path()).unwrap();
-        let retiring = db.existing([1; 32]).unwrap().unwrap();
+        let retiring = db.namespace([1; 32], retiring_id).unwrap().unwrap();
         if retiring.delete_batch(100, 1).unwrap() {
             break;
         }

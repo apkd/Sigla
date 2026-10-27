@@ -370,7 +370,7 @@ impl Session {
         {
             return Err(TreeFilterRejected.into());
         }
-        result.map_err(|_| anyhow::anyhow!("Filtered repository transfer failed"))?;
+        result.map_err(crate::diagnostics::RepositoryTransfer::new)?;
         Ok(())
     }
 }

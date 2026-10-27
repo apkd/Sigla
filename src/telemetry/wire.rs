@@ -1,5 +1,5 @@
 //! Frame-local dictionaries and timestamp deltas keep records independent and compact.
-use super::{DiskSample, Event, Record, Stage, Summary};
+use super::{Diagnostic, DiskSample, Event, Record, Stage, Summary};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +16,7 @@ enum PackedEvent {
     Operation(PackedRecord),
     Disk(u64, u64, Vec<(u32, u64)>, Vec<(u32, u64)>),
     Summary(u64, u32, Option<u32>, u64, u64),
+    OperationWithDiagnostic(PackedRecord, Diagnostic),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,7 +90,7 @@ pub(super) fn encode(events: &[Event]) -> Result<Vec<u8>> {
                             .map(|counter| (prefix, Some(counter)))
                     })
                     .unwrap_or((&record.id, None));
-                PackedEvent::Operation(PackedRecord {
+                let packed = PackedRecord {
                     id: (strings.id(prefix), counter),
                     kind: strings.id(&record.kind),
                     repository: strings.optional(&record.repository),
@@ -115,7 +116,11 @@ pub(super) fn encode(events: &[Event]) -> Result<Vec<u8>> {
                     links: record.links.iter().map(|link| strings.id(link)).collect(),
                     current_stage: strings.optional(&record.current_stage),
                     waiting: record.waiting.iter().map(|name| strings.id(name)).collect(),
-                })
+                };
+                match record.diagnostic {
+                    Some(diagnostic) => PackedEvent::OperationWithDiagnostic(packed, diagnostic),
+                    None => PackedEvent::Operation(packed),
+                }
             }
             Event::Disk(sample) => PackedEvent::Disk(
                 sample.timestamp_ms.saturating_sub(epoch),
@@ -147,7 +152,7 @@ pub(super) fn encode(events: &[Event]) -> Result<Vec<u8>> {
     })?)
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<Vec<Event>> {
+pub(super) fn decode(bytes: &[u8], legacy: bool) -> Result<Vec<Event>> {
     let batch: Batch = postcard::from_bytes(bytes)?;
     let remaining = std::cell::Cell::new(8 * 1024 * 1024usize);
     let string = |id: u32| {
@@ -173,6 +178,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Vec<Event>> {
         .events
         .into_iter()
         .map(|event| {
+            let (event, diagnostic) = match event {
+                PackedEvent::OperationWithDiagnostic(record, diagnostic) => {
+                    anyhow::ensure!(!legacy, "invalid event in legacy monitor journal");
+                    (PackedEvent::Operation(record), Some(diagnostic))
+                }
+                event => (event, None),
+            };
             Ok(match event {
                 PackedEvent::Operation(record) => Event::Operation(Record {
                     id: match record.id {
@@ -211,7 +223,9 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Vec<Event>> {
                         .into_iter()
                         .map(string)
                         .collect::<Result<_>>()?,
+                    diagnostic,
                 }),
+                PackedEvent::OperationWithDiagnostic(..) => unreachable!(),
                 PackedEvent::Disk(time, total_bytes, repositories, shared) => {
                     Event::Disk(DiskSample {
                         timestamp_ms: timestamp(time)?,
@@ -267,6 +281,7 @@ mod tests {
                 links: vec!["run-41".into()],
                 current_stage: None,
                 waiting: Vec::new(),
+                diagnostic: None,
             }),
             Event::Disk(DiskSample {
                 timestamp_ms: 12_000,
@@ -282,7 +297,7 @@ mod tests {
                 total_duration_ms: 900,
             }),
         ];
-        let decoded = decode(&encode(&events).unwrap()).unwrap();
+        let decoded = decode(&encode(&events).unwrap(), false).unwrap();
         assert_eq!(
             serde_json::to_value(&events).unwrap(),
             serde_json::to_value(decoded).unwrap()
@@ -296,12 +311,42 @@ mod tests {
             strings: Vec::new(),
             events: vec![PackedEvent::Summary(0, 1, None, 1, 1)],
         };
-        assert!(decode(&postcard::to_allocvec(&bad_id).unwrap()).is_err());
+        assert!(decode(&postcard::to_allocvec(&bad_id).unwrap(), false).is_err());
         let overflow = Batch {
             epoch: u64::MAX,
             strings: Vec::new(),
             events: vec![PackedEvent::Disk(1, 0, Vec::new(), Vec::new())],
         };
-        assert!(decode(&postcard::to_allocvec(&overflow).unwrap()).is_err());
+        assert!(decode(&postcard::to_allocvec(&overflow).unwrap(), false).is_err());
+    }
+
+    #[test]
+    fn diagnostic_events_require_the_new_journal_format() {
+        let mut record = Record {
+            id: "run-1".into(),
+            kind: "search".into(),
+            repository: None,
+            target: None,
+            query: None,
+            start_ms: 1,
+            end_ms: Some(2),
+            status: "failure".into(),
+            detailed: true,
+            stages: Vec::new(),
+            links: Vec::new(),
+            current_stage: None,
+            waiting: Vec::new(),
+            diagnostic: Some(Diagnostic::WorkspaceRetired),
+        };
+        let bytes = encode(&[Event::Operation(record.clone())]).unwrap();
+        assert!(decode(&bytes, true).is_err());
+        let decoded = decode(&bytes, false).unwrap();
+        let Event::Operation(decoded) = &decoded[0] else {
+            panic!()
+        };
+        assert_eq!(decoded.diagnostic, record.diagnostic);
+        record.diagnostic = None;
+        let legacy = encode(&[Event::Operation(record)]).unwrap();
+        assert!(decode(&legacy, true).is_ok());
     }
 }

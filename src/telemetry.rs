@@ -33,6 +33,19 @@ pub struct Stage {
     pub duration_ms: u64,
 }
 
+/// A known cause, suitable for public monitoring exports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Diagnostic {
+    MaintenanceBusy,
+    WorkspaceRetired,
+    RefreshRequired,
+    RepositoryTransfer,
+    RequestCancelled,
+    Shutdown,
+    Superseded,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub id: String,
@@ -48,6 +61,8 @@ pub struct Record {
     pub links: Vec<String>,
     pub current_stage: Option<String>,
     pub waiting: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<Diagnostic>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -354,6 +369,7 @@ fn operation_using(
         links: Vec::new(),
         current_stage: None,
         waiting: Vec::new(),
+        diagnostic: None,
     };
     recorder.send(Event::Operation(record.clone()));
     record.query = query.as_deref().map(preview::summarize);
@@ -401,6 +417,13 @@ fn push_stage(state: &mut Running, stage: Stage, recorder: &Weak<Recorder>) {
 }
 
 impl Operation {
+    /// Record a verified cause without exposing error messages to monitoring clients.
+    pub fn diagnose(&self, diagnostic: Diagnostic) {
+        if let Some(inner) = &self.0 {
+            inner.update(|state| state.record.diagnostic = Some(diagnostic));
+        }
+    }
+
     pub fn repository(&self, value: &str) {
         if let Some(inner) = &self.0
             && let Some(recorder) = inner.recorder.upgrade()
@@ -598,6 +621,47 @@ pub fn record<T, E>(
 }
 
 #[cfg(test)]
+pub(crate) struct TestRecorder {
+    _recorder: Arc<Recorder>,
+    receiver: mpsc::Receiver<Message>,
+}
+
+#[cfg(test)]
+impl TestRecorder {
+    pub(crate) fn completed(&self) -> Vec<Record> {
+        self.receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Message::Event(Event::Operation(record), _) if record.end_ms.is_some() => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_operation() -> (Operation, TestRecorder) {
+    let (sender, receiver) = mpsc::sync_channel(32);
+    let recorder = Arc::new(Recorder {
+        sender,
+        queued_bytes: AtomicU64::new(0),
+        gaps: AtomicU64::new(0),
+        next_id: AtomicU64::new(1),
+        run_id: "test".into(),
+    });
+    let operation = operation_using(recorder.clone(), "search", None, None);
+    (
+        operation,
+        TestRecorder {
+            _recorder: recorder,
+            receiver,
+        },
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -625,6 +689,18 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn known_diagnostic_is_exported_without_a_message() {
+        let (recorder, receiver) = recorder(32);
+        let operation = operation_using(recorder.clone(), "search", None, None);
+        operation.diagnose(Diagnostic::MaintenanceBusy);
+        operation.finish("failure");
+        let records = completed(&receiver);
+        let json = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(json["diagnostic"], "maintenance_busy");
+        assert!(json.get("error").is_none());
     }
 
     #[test]
@@ -672,6 +748,12 @@ mod tests {
         let records = completed(&receiver);
         assert_eq!(records.len(), 1);
         assert!(records[0].detailed);
+        assert!(
+            serde_json::to_value(&records[0])
+                .unwrap()
+                .get("diagnostic")
+                .is_none()
+        );
         assert!(records[0].stages.iter().any(|stage| stage.waiting));
         assert!(records[0].waiting.is_empty());
     }

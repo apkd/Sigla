@@ -34,6 +34,7 @@ pub(super) struct MaintenanceOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompactionDeferral {
     Busy,
+    Changed,
     InsufficientSpace,
     Ineligible,
 }
@@ -193,7 +194,7 @@ mod startup_tests {
         );
         assert!(!app.maintain_startup(&mut pending).await.unwrap());
         assert!(database.existing([4; 32]).unwrap().is_none());
-        assert!(database.existing([1; 32]).unwrap().is_some());
+        assert!(database.namespace([1; 32], retiring.id).unwrap().is_some());
         let retired_id = retiring.id;
         app.shutdown().await;
         drop(app);
@@ -267,6 +268,46 @@ mod startup_tests {
     }
 
     #[tokio::test]
+    async fn pressure_drains_retired_namespace_while_replacement_is_active() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let app = make_app(root.path(), cache.path());
+        let database = Database::open(&cache.path().join("analysis")).unwrap();
+        let old = database.workspace([1; 32], root.path(), None).unwrap();
+        for i in 0..300 {
+            install(&old, &format!("old-{i}"), [7; 32]);
+        }
+        old.mark_deleting().unwrap();
+        let replacement = database.workspace([1; 32], root.path(), None).unwrap();
+        install(&replacement, "replacement", [7; 32]);
+        let active = Arc::new(tokio::sync::Mutex::new(None));
+        app.workspaces.lock().unwrap().insert(
+            root.path().to_owned(),
+            WorkspaceSlot {
+                state: active.clone(),
+                preparing: None,
+                used: Instant::now(),
+            },
+        );
+        assert!(app.maintain_analysis(true).unwrap());
+        assert!(database.namespace([1; 32], old.id).unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            &app.workspaces.lock().unwrap()[root.path()].state,
+            &active
+        ));
+        let tx = replacement.read().unwrap();
+        assert_eq!(database.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
+        assert!(
+            replacement
+                .record(&tx, "replacement", &[1])
+                .unwrap()
+                .is_some()
+        );
+        drop(tx);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn valid_search_does_not_wait_for_retirement_or_optional_disposal() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -324,10 +365,10 @@ mod startup_tests {
         let scope = database.workspace([1; 32], root.path(), None).unwrap();
         scope.mark_deleting().unwrap();
         let app = make_app(root.path(), cache.path());
-        assert!(database.existing([1; 32]).unwrap().is_some());
+        assert!(database.namespace([1; 32], scope.id).unwrap().is_some());
         app.start_setup();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while database.existing([1; 32]).unwrap().is_some() {
+            while database.namespace([1; 32], scope.id).unwrap().is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -359,7 +400,7 @@ mod startup_tests {
                 .await
                 .unwrap()
         );
-        assert!(database.existing([1; 32]).unwrap().is_some());
+        assert!(database.namespace([1; 32], scope.id).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -627,7 +668,8 @@ impl App {
             outcome.compaction_deferred = Some(CompactionDeferral::Ineligible);
             return Ok(outcome);
         }
-        let stats = crate::store::Database::open(&self.cache.join("analysis"))?.disk_stats()?;
+        let database = crate::store::Database::open(&self.cache.join("analysis"))?;
+        let stats = database.disk_stats()?;
         if !stats.eligible() {
             outcome.compaction_deferred = Some(CompactionDeferral::Ineligible);
             tracing::debug!(reason = ?outcome.compaction_deferred, "Analysis compaction deferred");
@@ -638,15 +680,61 @@ impl App {
             tracing::info!(reason = ?outcome.compaction_deferred, temporary_bytes = stats.temporary_bytes(), "Analysis compaction deferred");
             return Ok(outcome);
         }
+        let prepared = maintenance_stage(operation, "analysis compaction copy", || {
+            database.prepare_compaction(&self.cache)
+        })?;
+        let candidate = match prepared {
+            crate::cache::compaction::Preparation::Ready(candidate) => candidate,
+            other => {
+                outcome.compaction_deferred = Some(match other {
+                    crate::cache::compaction::Preparation::InsufficientSpace => {
+                        CompactionDeferral::InsufficientSpace
+                    }
+                    _ => CompactionDeferral::Changed,
+                });
+                return Ok(outcome);
+            }
+        };
         drop(read);
-        let Ok(_idle) = self.activity.clone().try_write_owned() else {
-            outcome.compaction_deferred = Some(CompactionDeferral::Busy);
-            tracing::info!("Analysis compaction deferred while queries or indexing are active");
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(outcome);
+        }
+        let Ok(idle) = self.activity.clone().try_write_owned() else {
+            // A full copy already ran. Use collection backoff rather than
+            // repeatedly copying under sustained foreground activity.
+            outcome.compaction_deferred = Some(CompactionDeferral::Changed);
+            tracing::info!("Analysis compaction copy discarded while requests are active");
             return Ok(outcome);
         };
-        let reclaimed =
-            maintenance_stage(operation, "analysis compaction", || self.compact_analysis())?;
-        drop(_idle);
+        if !database.compaction_current(&candidate)? {
+            outcome.compaction_deferred = Some(CompactionDeferral::Changed);
+            return Ok(outcome);
+        }
+        self.assets.trim_completed();
+        self.sources.trim_completed();
+        self.workspaces.lock().unwrap().clear();
+        if Arc::strong_count(&database) != 1 {
+            outcome.compaction_deferred = Some(CompactionDeferral::Changed);
+            return Ok(outcome);
+        }
+        let start = Instant::now();
+        let result = maintenance_stage(operation, "analysis compaction publish", || {
+            database.publish_compaction(&self.cache, candidate)
+        });
+        if result.is_err() {
+            crate::cache::compaction::recover(&self.cache)?;
+        }
+        tracing::info!(
+            pause_ms = start.elapsed().as_millis(),
+            "Analysis compaction publication finished"
+        );
+        drop(idle);
+        let reclaimed = result?;
+        tracing::info!(reclaimed_bytes = reclaimed, "Compacted analysis storage");
+        // Unlink the old database after requests can resume.
+        if let Ok(_read) = self.activity.clone().try_read_owned() {
+            crate::cache::compaction::cleanup(&self.cache)?;
+        }
         outcome.progress = reclaimed > 0;
         // Full filesystem accounting is needed only after an actual copy.
         if outcome.progress {
@@ -946,6 +1034,7 @@ impl App {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn compact_analysis(&self) -> Result<u64> {
         if !self.cache.join("analysis").is_dir() {
             return Ok(0);
@@ -1268,6 +1357,17 @@ mod tests {
         );
         assert!(schedule.compaction.is_none());
         assert_eq!(schedule.collection - now, interval);
+        schedule.collected(
+            now,
+            Some(MaintenanceOutcome {
+                compaction_deferred: Some(CompactionDeferral::Changed),
+                ..stalled
+            }),
+        );
+        assert!(
+            schedule.compaction.is_none(),
+            "Discarded copies must use collection backoff"
+        );
     }
 
     #[test]
@@ -1417,8 +1517,10 @@ mod tests {
         let app = Arc::new(app);
         let active = app.activity.read().await;
         let busy = app.retry_compaction().await.unwrap();
-        assert_eq!(busy.compaction_deferred, Some(CompactionDeferral::Busy));
+        assert_eq!(busy.compaction_deferred, Some(CompactionDeferral::Changed));
         assert!(!busy.progress && busy.pressure);
+        assert!(app.activity.try_read().is_ok());
+        assert!(!cache.path().join("analysis/data.mdb.compacting").exists());
         drop(active);
         let finished = app.retry_compaction().await.unwrap();
         assert!(finished.progress && !finished.pressure);

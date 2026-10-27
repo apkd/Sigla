@@ -26,6 +26,7 @@ pub const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const BATCH: usize = 128;
 pub(crate) const PRESSURE_BATCH: usize = 4096;
 const UNUSED: &[u8] = b"unused:";
+const RETIRED: &[u8] = b"retired-workspace:";
 static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Database>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -129,6 +130,10 @@ pub struct WorkspaceInfo {
     pub owner: Option<PathBuf>,
     pub phase: Phase,
 }
+
+fn retired_key(id: u64) -> Vec<u8> {
+    [RETIRED, &id.to_be_bytes()].concat()
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Installed {
     pub built: bool,
@@ -166,6 +171,10 @@ fn inspect_env(
     for row in spaces.iter(&tx)? {
         let (_, value) = row?;
         let info: WorkspaceInfo = decode(value)?;
+        visit(&info, control.get(&tx, &manifest_key(info.id))?)?;
+    }
+    for row in control.prefix_iter(&tx, RETIRED)? {
+        let (_, info): ([u8; 32], WorkspaceInfo) = decode(row?.1)?;
         visit(&info, control.get(&tx, &manifest_key(info.id))?)?;
     }
     Ok(stats)
@@ -517,22 +526,32 @@ impl Database {
         // Reopening a completed workspace must not queue behind the writer.
         if let Some(scope) = self.existing(fingerprint)? {
             let tx = scope.read()?;
-            let info = scope.writable(&tx)?;
+            let info = scope.info(&tx)?;
             ensure!(
                 info.entry == entry && info.owner.as_deref() == owner,
                 "Workspace identity does not match persisted owner"
             );
-            drop(tx);
-            return Ok(scope);
+            if info.phase != Phase::Deleting {
+                drop(tx);
+                return Ok(scope);
+            }
         }
         let mut tx = self.write()?;
-        let info: WorkspaceInfo = match self.spaces.get(&tx, &fingerprint)? {
-            Some(value) => {
-                let info: WorkspaceInfo = decode(value)?;
-                ensure!(
-                    info.phase != Phase::Deleting,
-                    "Workspace retirement is incomplete"
-                );
+        let mut existing = self
+            .spaces
+            .get(&tx, &fingerprint)?
+            .map(decode::<WorkspaceInfo>)
+            .transpose()?;
+        if let Some(info) = &existing
+            && info.phase == Phase::Deleting
+        {
+            // Upgrade an interrupted retirement written before retired metadata
+            // was separated from the live fingerprint map.
+            self.retire(&mut tx, fingerprint, info.clone())?;
+            existing = None;
+        }
+        let info: WorkspaceInfo = match existing {
+            Some(info) => {
                 ensure!(
                     info.entry == entry && info.owner.as_deref() == owner,
                     "Workspace identity does not match persisted owner"
@@ -576,13 +595,61 @@ impl Database {
 
     pub fn workspaces(&self) -> Result<Vec<([u8; 32], WorkspaceInfo)>> {
         let tx = self.env.read_txn()?;
-        self.spaces
+        let mut result = self
+            .spaces
             .iter(&tx)?
             .map(|row| {
                 let (key, value) = row?;
                 Ok((key.try_into()?, decode(value)?))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        for row in self.control.prefix_iter(&tx, RETIRED)? {
+            result.push(decode(row?.1)?);
+        }
+        Ok(result)
+    }
+
+    fn retire(
+        &self,
+        tx: &mut RwTxn<'_>,
+        fingerprint: [u8; 32],
+        mut info: WorkspaceInfo,
+    ) -> Result<()> {
+        info.phase = Phase::Deleting;
+        self.control
+            .put(tx, &retired_key(info.id), &encode(&(fingerprint, info))?)?;
+        self.spaces.delete(tx, &fingerprint)?;
+        Ok(())
+    }
+
+    /// Resume a specific namespace, even after its fingerprint has been reopened.
+    pub(crate) fn namespace(
+        self: &Arc<Self>,
+        fingerprint: [u8; 32],
+        id: u64,
+    ) -> Result<Option<Scope>> {
+        let tx = self.env.read_txn()?;
+        let live = self
+            .spaces
+            .get(&tx, &fingerprint)?
+            .map(decode::<WorkspaceInfo>)
+            .transpose()?;
+        let found = if live.is_some_and(|info| info.id == id) {
+            true
+        } else if let Some(bytes) = self.control.get(&tx, &retired_key(id))? {
+            let (key, info): ([u8; 32], WorkspaceInfo) = decode(bytes)?;
+            key == fingerprint && info.id == id
+        } else {
+            false
+        };
+        Ok(found.then(|| Scope {
+            database: self.clone(),
+            fingerprint,
+            id,
+            snapshot: None,
+            partitions: Default::default(),
+            previous: Vec::new(),
+        }))
     }
 
     /// Used by lifecycle maintenance, under the owning workspace/selector gate.
@@ -852,6 +919,28 @@ impl Database {
             live: self.env.compacted_size()?,
         })
     }
+    pub(crate) fn prepare_compaction(
+        &self,
+        cache: &Path,
+    ) -> Result<crate::cache::compaction::Preparation> {
+        crate::cache::compaction::prepare(&self.env, cache)
+    }
+    pub(crate) fn compaction_current(
+        &self,
+        candidate: &crate::cache::compaction::Candidate,
+    ) -> Result<bool> {
+        candidate.current(&self.env)
+    }
+    pub(crate) fn publish_compaction(
+        self: Arc<Self>,
+        cache: &Path,
+        candidate: crate::cache::compaction::Candidate,
+    ) -> Result<u64> {
+        let database =
+            Arc::try_unwrap(self).map_err(|_| anyhow::anyhow!("Analysis is still in use"))?;
+        crate::cache::compaction::publish(database.env, candidate, cache)
+    }
+    #[cfg(test)]
     pub fn compact(self: Arc<Self>, cache: &Path) -> Result<u64> {
         let database =
             Arc::try_unwrap(self).map_err(|_| anyhow::anyhow!("Analysis is still in use"))?;
@@ -942,17 +1031,37 @@ impl Scope {
         Ok(self.database.live(&tx, &id)?.map(|_| id))
     }
     fn info(&self, tx: &RoTxn<'_>) -> Result<WorkspaceInfo> {
-        let bytes = self
+        let live = self
             .database
             .spaces
             .get(tx, &self.fingerprint)?
-            .context("Workspace was retired")?;
-        let info: WorkspaceInfo = decode(bytes)?;
+            .map(decode::<WorkspaceInfo>)
+            .transpose()?;
+        let info = match live {
+            Some(info) if info.id == self.id => info,
+            _ => {
+                let bytes = self
+                    .database
+                    .control
+                    .get(tx, &retired_key(self.id))?
+                    .context("Workspace was retired")?;
+                let (key, info): ([u8; 32], WorkspaceInfo) = decode(bytes)?;
+                ensure!(
+                    key == self.fingerprint,
+                    "Retired workspace identity does not match"
+                );
+                info
+            }
+        };
         ensure!(
             info.id > 0 && info.id < u64::MAX && info.id == self.id,
             "Workspace handle belongs to an invalid or retired namespace"
         );
         Ok(info)
+    }
+    pub(crate) fn is_retiring(&self) -> Result<bool> {
+        let tx = self.read()?;
+        Ok(self.info(&tx)?.phase == Phase::Deleting)
     }
     fn writable(&self, tx: &RoTxn<'_>) -> Result<WorkspaceInfo> {
         ensure!(
@@ -960,7 +1069,10 @@ impl Scope {
             "Cannot write through an immutable snapshot"
         );
         let info = self.info(tx)?;
-        ensure!(info.phase != Phase::Deleting, "Workspace is being retired");
+        ensure!(
+            info.phase != Phase::Deleting,
+            crate::diagnostics::WorkspaceRetired
+        );
         Ok(info)
     }
     fn dirty_in(&self, tx: &mut RwTxn<'_>) -> Result<()> {
@@ -996,7 +1108,7 @@ impl Scope {
             phase != Phase::Dirty,
             crate::diagnostics::RefreshRequired("Workspace needs a completed refresh")
         );
-        ensure!(phase == Phase::Clean, "Workspace is being retired");
+        ensure!(phase == Phase::Clean, crate::diagnostics::WorkspaceRetired);
         Ok(())
     }
     pub fn begin_refresh(&self) -> Result<()> {
@@ -1682,7 +1794,7 @@ impl Scope {
                         self.database.control.get(&tx, &manifest_key(info.id))?
                     && equivalent(manifest)?
                 {
-                    keys.push(key.to_vec());
+                    keys.push((<[u8; 32]>::try_from(key)?, info.id));
                 }
             }
             keys
@@ -1695,11 +1807,12 @@ impl Scope {
             self.writable(&tx)?.phase == Phase::Clean,
             "Replacement workspace is incomplete"
         );
-        for key in keys {
+        for (key, id) in keys {
             if let Some(bytes) = self.database.spaces.get(&tx, &key)? {
-                let mut info: WorkspaceInfo = decode(bytes)?;
-                info.phase = Phase::Deleting;
-                self.database.spaces.put(&mut tx, &key, &encode(&info)?)?;
+                let info: WorkspaceInfo = decode(bytes)?;
+                if info.id == id {
+                    self.database.retire(&mut tx, key, info)?;
+                }
             }
         }
         tx.commit()?;
@@ -1707,14 +1820,16 @@ impl Scope {
     }
     pub fn mark_deleting(&self) -> Result<()> {
         let mut tx = self.database.write()?;
-        let mut info = self.info(&tx)?;
-        if info.phase == Phase::Deleting {
+        let info = self.info(&tx)?;
+        if self
+            .database
+            .control
+            .get(&tx, &retired_key(self.id))?
+            .is_some()
+        {
             return Ok(());
         }
-        info.phase = Phase::Deleting;
-        self.database
-            .spaces
-            .put(&mut tx, &self.fingerprint, &encode(&info)?)?;
+        self.database.retire(&mut tx, self.fingerprint, info)?;
         tx.commit()?;
         Ok(())
     }
@@ -1770,7 +1885,14 @@ impl Scope {
             self.database
                 .control
                 .delete(&mut tx, &manifest_key(self.id))?;
-            self.database.spaces.delete(&mut tx, &self.fingerprint)?;
+            // A replacement may already own the same fingerprint.
+            if !self
+                .database
+                .control
+                .delete(&mut tx, &retired_key(self.id))?
+            {
+                self.database.spaces.delete(&mut tx, &self.fingerprint)?;
+            }
         }
         tx.commit()?;
         Ok(done)

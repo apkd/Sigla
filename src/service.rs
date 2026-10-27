@@ -25,7 +25,6 @@ mod disk;
 struct WorkspaceSlot {
     state: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     preparing: Option<preparation::Ticket>,
-    materialized: Option<u64>,
     used: Instant,
 }
 #[derive(Clone, Debug)]
@@ -95,11 +94,17 @@ impl App {
         upstream: Option<&crate::upstream::Upstream>,
         operation: crate::telemetry::Operation,
     ) -> Result<CallToolResult> {
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(crate::diagnostics::Cancelled.into()),
-            result = self.dispatch_with_upstream(path, request, upstream, operation) => result,
+            result = self.dispatch_with_upstream(path, request, upstream, operation.clone()) => result,
+        };
+        if let Err(error) = &result
+            && let Some(diagnostic) = crate::diagnostics::monitoring(error)
+        {
+            operation.diagnose(diagnostic);
         }
+        result
     }
     fn trim_idle(&self) {
         crate::memory::reclaim();
@@ -497,15 +502,7 @@ impl App {
             }
             let retired = self.retire_analysis_scope(&database, key, &info, now)?;
             progress |= retired.progress;
-            if !retired.done
-                && drain
-                && self
-                    .workspaces
-                    .lock()
-                    .unwrap()
-                    .get(&info.entry)
-                    .is_none_or(|slot| Arc::strong_count(&slot.state) == 1)
-            {
+            if !retired.done && drain && retired.progress {
                 pending.push_back((key, info));
             }
             // Release the registry between batches and rotate large scopes.
@@ -530,6 +527,18 @@ impl App {
         info: &crate::store::shared::WorkspaceInfo,
         now: u64,
     ) -> Result<disk::Retirement> {
+        let Some(scope) = database.namespace(key, info.id)? else {
+            return Ok(disk::Retirement {
+                done: true,
+                progress: false,
+            });
+        };
+        if scope.is_retiring()? {
+            return Ok(disk::Retirement {
+                done: scope.delete_batch(now, 128)?,
+                progress: true,
+            });
+        }
         let mut registry = self.workspaces.lock().unwrap();
         if registry
             .get(&info.entry)
@@ -660,7 +669,16 @@ impl App {
             let _wait = operation.wait("upstream");
             return upstream.call(name, args.as_object().unwrap().clone()).await;
         }
-        self.request(path, request, operation).await
+        match self.request(path, request.clone(), operation.clone()).await {
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<crate::diagnostics::RefreshRequired>()) =>
+            {
+                self.request(path, request, operation).await
+            }
+            result => result,
+        }
     }
 
     async fn request(
@@ -722,9 +740,6 @@ impl App {
                 } else {
                     remote.resolve_monitored(repository, &operation).await?
                 };
-                if let Some(job_id) = branch.telemetry_id() {
-                    operation.link(&job_id);
-                }
                 Some(branch)
             }
             None => None,
@@ -794,20 +809,17 @@ impl App {
                     .or_insert_with(|| WorkspaceSlot {
                         state: Arc::new(tokio::sync::Mutex::new(None)),
                         preparing: None,
-                        materialized: None,
                         used: Instant::now(),
                     });
                 slot.used = Instant::now();
                 let generation = branch
                     .as_ref()
                     .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
-                if slot.materialized != generation
-                    || slot
-                        .preparing
-                        .as_ref()
-                        .is_none_or(|ticket| ticket.needs_refresh())
+                if slot
+                    .preparing
+                    .as_ref()
+                    .is_none_or(|ticket| ticket.needs_refresh(generation))
                 {
-                    slot.materialized = generation;
                     slot.preparing = Some(preparation::start(
                         self.clone(),
                         preparation::Request {
@@ -1438,8 +1450,14 @@ impl Mcp {
                 } else {
                     tracing::error!(codebase, error = %format!("{e:#}"), "Tool request failed");
                 }
-                let mut result =
-                    CallToolResult::error(vec![ContentBlock::text(crate::render::error(&e))]);
+                let message = if crate::diagnostics::monitoring(&e)
+                    == Some(crate::telemetry::Diagnostic::RepositoryTransfer)
+                {
+                    "> Filtered repository transfer failed.".into()
+                } else {
+                    crate::render::error(&e)
+                };
+                let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
                 result.structured_content = Some(crate::diagnostics::details(
                     &e,
                     &format!("{:?}", context.id),
@@ -2013,6 +2031,90 @@ mod tests {
             .unwrap();
         app.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn asset_query_retries_when_workspace_changes_before_indexing() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Assets")).unwrap();
+        std::fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+        std::fs::write(
+            root.path().join("ProjectSettings/ProjectVersion.txt"),
+            "m_EditorVersion: 6000.0.1f1\n",
+        )
+        .unwrap();
+        let source = root.path().join("code.rs");
+        std::fs::write(&source, "pub struct Initial;").unwrap();
+        let prefab = root.path().join("Assets/Camera.prefab");
+        std::fs::write(
+            &prefab,
+            "--- !u!1 &1\nGameObject:\n  m_Name: Initial\n--- !u!20 &2\nCamera:\n  m_GameObject: {fileID: 1}\n",
+        )
+        .unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let pause = app.assets.pause().await;
+        let waiting = app.search(root.path().to_str().unwrap(), "instance:UnityEngine.Camera");
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), app.preparation_started.notified())
+            .await
+            .unwrap();
+        let (workspace, mut preparation) = {
+            let registry = app.workspaces.lock().unwrap();
+            let slot = registry.values().next().unwrap();
+            (slot.state.clone(), slot.preparing.clone().unwrap())
+        };
+        tokio::time::timeout(Duration::from_secs(10), preparation.complete())
+            .await
+            .unwrap()
+            .unwrap();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // Publish another workspace generation while the first asset job is queued.
+        let mut state = workspace
+            .try_lock()
+            .expect("query should be waiting for assets");
+        let code = state.as_mut().unwrap();
+        let previous = crate::unity::assets::jobs::generation(&code.manifest).unwrap();
+        std::fs::write(&source, "pub struct ChangedGeneration;").unwrap();
+        std::fs::write(
+            &prefab,
+            "--- !u!1 &1\nGameObject:\n  m_Name: Changed\n--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n",
+        )
+        .unwrap();
+        let prepared = code.prepare().unwrap().unwrap();
+        code.apply(prepared).unwrap();
+        assert_ne!(
+            crate::unity::assets::jobs::generation(&code.manifest).unwrap(),
+            previous
+        );
+        drop(state);
+        drop(pause);
+        let result = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("#3"), "{result}");
+        assert!(!result.contains("#2"), "{result}");
+        app.shutdown().await;
+    }
+
     #[tokio::test]
     async fn remote_navigation_does_not_wait_for_indexing_or_retain_queued_branch_guards() {
         use crate::repository::{Repository, Rule, materialize::Target};
@@ -2079,7 +2181,6 @@ mod tests {
             WorkspaceSlot {
                 state: workspace.clone(),
                 preparing: None,
-                materialized: None,
                 used: Instant::now(),
             },
         );
@@ -2095,12 +2196,31 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), app.preparation_started.notified())
             .await
             .unwrap();
+        let job = || {
+            app.workspaces
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .preparing
+                .as_ref()
+                .unwrap()
+                .id()
+        };
+        let original_job = job();
+        // Required input publication can advance the generation while the
+        // same preparation is still discovering additional inputs.
+        branch
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         let reacquired = branch.state.try_write().is_ok();
         let tree = tokio::time::timeout(Duration::from_secs(5), app.browse(project, "src"))
             .await
             .unwrap()
             .unwrap();
         assert!(tree.contains("lib.rs"), "{tree}");
+        assert_eq!(job(), original_job);
         let source = tokio::time::timeout(
             Duration::from_secs(5),
             app.view(project, "src/lib.rs", "exact"),
@@ -2144,6 +2264,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(ticket.running());
+        assert!(!ticket.needs_refresh(Some(
+            branch.generation.load(std::sync::atomic::Ordering::Acquire) + 1
+        )));
         let mut publication = Box::pin(branch.publish());
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
@@ -2183,6 +2307,22 @@ mod tests {
             .unwrap();
         assert!(reacquired, "Queued preparation retained branch state");
         assert!(result.contains("Prepared"), "{result}");
+        let generation = branch.generation.load(std::sync::atomic::Ordering::Acquire);
+        assert!(ticket.needs_refresh(Some(generation + 1)));
+        let repeated = app.search(project, "Prepared").await.unwrap();
+        assert!(repeated.contains("Prepared"), "{repeated}");
+        assert_eq!(job(), original_job);
+        branch
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let refreshed = app.search(project, "Prepared").await.unwrap();
+        assert!(refreshed.contains("Prepared"), "{refreshed}");
+        assert_ne!(job(), original_job);
+        let refreshed_job = job();
+        std::fs::write(owner.join("source/src/lib.rs"), "pub struct Changed;").unwrap();
+        let changed = app.search(project, "Changed").await.unwrap();
+        assert!(changed.contains("Changed"), "{changed}");
+        assert_ne!(job(), refreshed_job);
         branch
             .last_use
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2262,7 +2402,7 @@ mod tests {
         let workspaces = database.workspaces().unwrap();
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].1.phase, crate::store::shared::Phase::Deleting);
-        assert!(database.workspace([1; 32], root.path(), None).is_err());
+        assert!(database.workspace([1; 32], root.path(), None).is_ok());
     }
 
     #[tokio::test]

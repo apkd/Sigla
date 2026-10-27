@@ -5,9 +5,43 @@ use std::{fs, path::Path, process::Command, time::Duration};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Output {
-    result: std::result::Result<Prepared, String>,
+    result: std::result::Result<Prepared, Failure>,
     git_ms: u128,
     lfs_ms: u128,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum FailureKind {
+    RepositoryTransfer,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Failure {
+    message: String,
+    kind: Option<FailureKind>,
+}
+
+impl Failure {
+    fn from_error(error: anyhow::Error) -> Self {
+        let kind = error
+            .chain()
+            .any(|cause| cause.is::<crate::diagnostics::RepositoryTransfer>())
+            .then_some(FailureKind::RepositoryTransfer);
+        Self {
+            message: format!("{error:#}"),
+            kind,
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self.kind {
+            Some(FailureKind::RepositoryTransfer) => {
+                crate::diagnostics::RepositoryTransfer::new(std::io::Error::other(self.message))
+                    .into()
+            }
+            None => anyhow::Error::msg(self.message),
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -85,7 +119,7 @@ fn run(request: &Request, cache: &Path, prepared: Option<Prepared>) -> Result<Pr
         "Repository inventory exceeds size limit"
     );
     let output: Output = serde_json::from_slice(&fs::read(output)?)?;
-    let prepared = output.result.map_err(anyhow::Error::msg)?;
+    let prepared = output.result.map_err(Failure::into_error)?;
     tracing::info!(
         repository = %repository.identity,
         phase = if lfs { "lfs" } else { "git" },
@@ -126,7 +160,7 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
     } else {
         super::materialize::prepare(&request)
     }
-    .map_err(|error| format!("{error:#}"));
+    .map_err(Failure::from_error);
     let elapsed = started.elapsed().as_millis();
     fs::write(
         output,
@@ -137,4 +171,30 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
         })?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_failure_remains_typed_across_worker_serialization() {
+        let error = anyhow::Error::new(crate::diagnostics::RepositoryTransfer::new(
+            std::io::Error::other("private transfer cause"),
+        ))
+        .context("repository acquisition");
+        let bytes = serde_json::to_vec(&Failure::from_error(error)).unwrap();
+        let failure: Failure = serde_json::from_slice(&bytes).unwrap();
+        let error = failure.into_error();
+        assert_eq!(
+            crate::diagnostics::monitoring(&error),
+            Some(crate::telemetry::Diagnostic::RepositoryTransfer)
+        );
+        assert!(format!("{error:#}").contains("private transfer cause"));
+
+        let unknown = Failure::from_error(anyhow::anyhow!("ordinary failure"));
+        let bytes = serde_json::to_vec(&unknown).unwrap();
+        let error: Failure = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(crate::diagnostics::monitoring(&error.into_error()), None);
+    }
 }
