@@ -18,13 +18,47 @@ pub fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 pub fn yaml(path: &Path) -> Result<Value> {
+    read_yaml(path, false)
+}
+
+pub fn plugin_metadata(path: &Path) -> Result<Value> {
+    read_yaml(path, true)
+}
+
+fn read_yaml(path: &Path, plugin: bool) -> Result<Value> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Missing Unity input {}", path.display()))?;
+    let mut importer = false;
+    let mut platform_data = false;
+    let mut first = false;
     let text = text
         .trim_start_matches('\u{feff}')
         .lines()
         .filter(|l| !l.starts_with('%'))
         .map(|l| {
+            if plugin {
+                if !l.starts_with(' ') && !l.is_empty() {
+                    importer = l == "PluginImporter:";
+                    platform_data = false;
+                } else if importer && l.starts_with("  ") && !l.starts_with("    ") {
+                    if l == "  platformData:" {
+                        platform_data = true;
+                    } else if !l.starts_with("  - ") {
+                        platform_data = false;
+                    }
+                }
+                let anonymous = if platform_data && first {
+                    l.strip_prefix("      :")
+                        .filter(|value| value.is_empty() || value.starts_with(' '))
+                } else {
+                    None
+                };
+                first = platform_data && l == "  - first:";
+                if let Some(value) = anonymous {
+                    // Unity writes this anonymous platform key without a YAML key.
+                    return format!("      '':{value}");
+                }
+            }
             if l.starts_with("--- !u!") {
                 return "---".to_owned();
             }
@@ -136,6 +170,23 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_metadata_preserves_unity_anonymous_platform_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Plugin.dll.meta");
+        std::fs::write(
+            &path,
+            "PluginImporter:\n  platformData:\n  - first:\n      : OSXIntel64\n    second:\n      enabled: 1\n  - first:\n      : \n    second:\n      enabled: 0\n",
+        )
+        .unwrap();
+        let metadata = super::plugin_metadata(&path).unwrap();
+        let entries = metadata["PluginImporter"]["platformData"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(entries[0]["first"][""].as_str(), Some("OSXIntel64"));
+        assert!(entries[1]["first"][""].is_null());
+    }
+
     #[test]
     fn metadata_accepts_utf8_bom_and_numeric_guids() {
         let root = tempfile::tempdir().unwrap();

@@ -197,7 +197,7 @@ fn discover_with_editor(
             let meta = PathBuf::from(format!("{}.meta", meta_path.display()));
             let settings = if meta.is_file() {
                 result.metadata.insert(meta.clone());
-                match super::settings::yaml(&meta) {
+                match super::settings::plugin_metadata(&meta) {
                     Ok(settings) => Some(settings),
                     Err(error) => {
                         result
@@ -475,6 +475,9 @@ fn discover_with_editor(
                 }
             }
             for define in &descriptor.version_defines {
+                if define.expression.is_empty() && define.define.is_empty() {
+                    continue;
+                }
                 if let Some(version) = versions.get(&define.name) {
                     match version_matches(version, &define.expression, define.name == "Unity") {
                         Ok(true) => {
@@ -851,6 +854,9 @@ fn version(value: &str, unity: bool) -> Result<Version> {
     }
 }
 fn version_matches(actual: &str, expression: &str, unity: bool) -> Result<bool> {
+    if expression.is_empty() {
+        return Ok(true);
+    }
     let actual = version(actual, unity)?;
     if expression.starts_with(['[', '(']) {
         ensure!(
@@ -949,6 +955,67 @@ fn response_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plugin_metadata_accepts_unity_anonymous_platform_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Plugin.dll.meta");
+        std::fs::write(
+            &path,
+            "fileFormatVersion: 2
+PluginImporter:
+  defineConstraints: []
+  platformData:
+  - first:
+      : Any
+    second:
+      enabled: 0
+      settings:
+        Exclude Linux64: 1
+  - first:
+      Any:
+    second:
+      enabled: 0
+      settings: {}
+  - first:
+      Editor: Editor
+    second:
+      enabled: 1
+      settings:
+        CPU: AnyCPU
+        OS: AnyOS
+  - first:
+      Standalone: Linux64
+    second:
+      enabled: 0
+      settings: {}
+",
+        )
+        .unwrap();
+        let metadata = super::super::settings::plugin_metadata(&path).unwrap();
+        assert!(plugin_enabled(Some(&metadata), Platform::EditorLinux, &BTreeSet::new()).unwrap());
+        assert!(
+            !plugin_enabled(Some(&metadata), Platform::StandaloneLinux, &BTreeSet::new()).unwrap()
+        );
+        std::fs::write(
+            &path,
+            "PluginImporter:\n  defineConstraints: [REQUIRED]\n  platformData:\n  - first:\n      Any:\n    second:\n      enabled: 1\n      settings:\n        Exclude Linux64: 1\n",
+        )
+        .unwrap();
+        let metadata = super::super::settings::plugin_metadata(&path).unwrap();
+        let defines = BTreeSet::from(["REQUIRED".to_owned()]);
+        assert!(!plugin_enabled(Some(&metadata), Platform::EditorLinux, &BTreeSet::new()).unwrap());
+        assert!(plugin_enabled(Some(&metadata), Platform::EditorLinux, &defines).unwrap());
+        assert!(!plugin_enabled(Some(&metadata), Platform::StandaloneLinux, &defines).unwrap());
+        std::fs::write(&path, "Other:\n  - first:\n      : Any\n").unwrap();
+        assert!(super::super::settings::plugin_metadata(&path).is_err());
+    }
+
+    #[test]
+    fn empty_version_expression_accepts_any_present_resource() {
+        assert!(version_matches("not-a-version", "", false).unwrap());
+        assert!(version_matches("not-a-version", "", true).unwrap());
+        assert!(version_matches("1.0.0", "*", false).is_err());
+    }
     #[test]
     fn source_scan_skips_nested_worktrees_and_accepts_selected_roots() {
         let fixture = tempfile::tempdir().unwrap();
