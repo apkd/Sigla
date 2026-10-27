@@ -322,6 +322,596 @@ async fn copying_from_an_unchanged_file_retains_uncertain_origin() {
 }
 
 #[tokio::test]
+async fn unrelated_file_replacements_remain_separate_additions_and_deletions() {
+    let removed = "pub struct Record {\n    pub label: String,\n    pub count: u64,\n}\n";
+    let added =
+        "pub fn classify(input: &[u8]) -> bool {\n    input.iter().any(|value| *value > 128)\n}\n";
+    for unchanged in [false, true] {
+        let f = Fixture::new();
+        let mut before = vec![("old.rs", removed)];
+        let mut after = vec![("new.rs", added)];
+        if unchanged {
+            before.push(("unchanged.rs", "const UNCHANGED: bool = true;\n"));
+            after.push(("unchanged.rs", "const UNCHANGED: bool = true;\n"));
+        }
+        let root = f.commit(&before, &[], "initial source");
+        let tip = f.commit(&after, &[&root], "replace source");
+        let status = git(
+            f.root.path(),
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-M",
+                &root,
+                &tip,
+            ],
+            b"",
+        );
+        assert_eq!(status, "A\tnew.rs\nD\told.rs");
+        if unchanged {
+            let blob = git(
+                f.root.path(),
+                &["rev-parse", &format!("{tip}:unchanged.rs")],
+                b"",
+            );
+            std::fs::remove_file(
+                f.root
+                    .path()
+                    .join(".git/objects")
+                    .join(&blob[..2])
+                    .join(&blob[2..]),
+            )
+            .unwrap();
+        }
+        for (query, old_path, old_source, new_path, new_source) in [
+            (format!("show {tip}"), "old.rs", removed, "new.rs", added),
+            (
+                format!("diff {root}..{tip}"),
+                "old.rs",
+                removed,
+                "new.rs",
+                added,
+            ),
+            (
+                format!("diff {tip}..{root}"),
+                "new.rs",
+                added,
+                "old.rs",
+                removed,
+            ),
+        ] {
+            let shown = f.history(&tip, &query).await;
+            let patch = body(&shown);
+            assert!(
+                patch.contains(&format!("--- a/{old_path}\n+++ /dev/null")),
+                "{shown}"
+            );
+            assert!(
+                patch.contains(&format!("--- /dev/null\n+++ b/{new_path}")),
+                "{shown}"
+            );
+            assert_eq!(patch.matches("diff --git ").count(), 2, "{shown}");
+            assert!(
+                !patch.contains("move ") && !patch.contains("copy "),
+                "{shown}"
+            );
+            for (prefix, source) in [('-', old_source), ('+', new_source)] {
+                for line in source.lines() {
+                    assert!(patch.contains(&format!("{prefix}{line}\n")), "{shown}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_retained_identical_file_prevents_a_false_move() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(
+        &[("origin.rs", source), ("stale.rs", source)],
+        &[],
+        "identical files",
+    );
+    let tip = f.commit(
+        &[("origin.rs", source), ("copied.rs", source)],
+        &[&root],
+        "replace one copy",
+    );
+    for (query, old_path, new_path) in [
+        (format!("show {tip}"), "stale.rs", "copied.rs"),
+        (format!("diff {tip}..{root}"), "copied.rs", "stale.rs"),
+    ] {
+        let shown = f.history(&tip, &query).await;
+        let patch = body(&shown);
+        assert!(
+            patch.contains(&format!("--- a/{old_path}\n+++ /dev/null")),
+            "{shown}"
+        );
+        assert!(
+            patch.contains(&format!("--- /dev/null\n+++ b/{new_path}")),
+            "{shown}"
+        );
+        assert!(
+            !patch.contains("move ") && !patch.contains("copy "),
+            "{shown}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sibling_renames_do_not_claim_a_directional_move() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(&[("origin.rs", source)], &[], "original");
+    let left = f.commit(&[("left.rs", source)], &[&root], "left rename");
+    let right = f.commit(&[("right.rs", source)], &[&root], "right rename");
+    let shown = f.history(&right, &format!("diff {left}..{right}")).await;
+    let patch = body(&shown);
+    assert!(patch.contains("--- a/left.rs\n+++ /dev/null"), "{shown}");
+    assert!(patch.contains("--- /dev/null\n+++ b/right.rs"), "{shown}");
+    assert!(
+        !patch.contains("move ") && !patch.contains("copy "),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn independent_identical_additions_do_not_become_a_move() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(&[], &[], "empty root");
+    let left = f.commit(&[("left.rs", source)], &[&root], "left addition");
+    let right = f.commit(&[("right.rs", source)], &[&root], "right addition");
+    std::fs::create_dir_all(f.root.path().join(".git/info")).unwrap();
+    std::fs::write(
+        f.root.path().join(".git/info/grafts"),
+        format!("{right} {left}\n"),
+    )
+    .unwrap();
+    let shown = f.history(&right, &format!("diff {left}..{right}")).await;
+    let patch = body(&shown);
+    assert!(patch.contains("--- a/left.rs\n+++ /dev/null"), "{shown}");
+    assert!(patch.contains("--- /dev/null\n+++ b/right.rs"), "{shown}");
+    assert!(
+        !patch.contains("move ") && !patch.contains("copy "),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn file_moves_across_multiple_commits_remain_visible() {
+    let f = Fixture::new();
+    let source = "pub fn value() -> i32 { 1 }\n";
+    let root = f.commit(&[("old.rs", source)], &[], "original");
+    let moved = f.commit(&[("new.rs", source)], &[&root], "move file");
+    let tip = f.commit(
+        &[("new.rs", source), ("other.rs", "pub fn other() {}\n")],
+        &[&moved],
+        "another change",
+    );
+    let shown = f.history(&tip, &format!("diff {root}..{tip}")).await;
+    assert!(body(&shown).contains("# ~move old.rs → new.rs"), "{shown}");
+}
+
+#[tokio::test]
+async fn file_comparisons_distinguish_copies_from_moves_and_preserve_edits() {
+    let original = continuation_member("origin.rs", "calculate");
+    for edit_origin in [false, true] {
+        for edit_copy in [false, true] {
+            let f = Fixture::new();
+            let origin = if edit_origin {
+                original.replace("* 3", "* 5")
+            } else {
+                original.clone()
+            };
+            let copied = if edit_copy {
+                original.replace("+ 10", "+ 11")
+            } else {
+                original.clone()
+            };
+            let root = f.commit(&[("origin.rs", &original)], &[], "initial source");
+            let tip = f.commit(
+                &[("origin.rs", &origin), ("copied.rs", &copied)],
+                &[&root],
+                "add destination",
+            );
+            if !edit_origin {
+                let history = f.history(&tip, "log file:copied.rs").await;
+                assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+                assert!(history.contains("copy"), "{history}");
+            }
+            for query in [format!("show {tip}"), format!("diff {root}..{tip}")] {
+                let shown = f.history(&tip, &format!("{query} file:copied.rs")).await;
+                let patch = body(&shown);
+                assert!(
+                    patch.contains("diff --git a/origin.rs b/copied.rs"),
+                    "{shown}"
+                );
+                assert_eq!(patch.matches("diff --git ").count(), 1, "{shown}");
+                assert!(patch.contains("copy origin.rs → copied.rs"), "{shown}");
+                assert!(!patch.contains("move "), "{shown}");
+                assert!(!patch.contains("/dev/null"), "{shown}");
+                if edit_copy {
+                    assert!(patch.contains("-    let adjusted = value + 10;"), "{shown}");
+                    assert!(patch.contains("+    let adjusted = value + 11;"), "{shown}");
+                }
+                assert!(!patch.contains("* 5"), "{shown}");
+                let repository = f.history(&tip, &query).await;
+                let patch = body(&repository);
+                assert!(patch.contains("b/copied.rs"), "{repository}");
+                assert!(!patch.contains("move "), "{repository}");
+                if edit_origin {
+                    assert!(
+                        patch.contains("--- a/origin.rs\n+++ b/origin.rs"),
+                        "{repository}"
+                    );
+                    assert!(
+                        patch.contains("-    let scaled = adjusted * 3;"),
+                        "{repository}"
+                    );
+                    assert!(
+                        patch.contains("+    let scaled = adjusted * 5;"),
+                        "{repository}"
+                    );
+                }
+            }
+            let reversed = f
+                .history(&tip, &format!("diff {tip}..{root} file:copied.rs"))
+                .await;
+            let patch = body(&reversed);
+            assert!(
+                patch.contains("diff --git a/copied.rs b/origin.rs"),
+                "{reversed}"
+            );
+            assert!(
+                patch.contains("copy origin.rs → copied.rs (reverse comparison)"),
+                "{reversed}"
+            );
+            assert!(!patch.contains("move "), "{reversed}");
+            if edit_copy {
+                assert!(
+                    patch.contains("-    let adjusted = value + 11;"),
+                    "{reversed}"
+                );
+                assert!(
+                    patch.contains("+    let adjusted = value + 10;"),
+                    "{reversed}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn indistinguishable_file_origins_remain_independent_changes() {
+    let left = continuation_member("left.rs", "calculate");
+    for edited in [false, true] {
+        let f = Fixture::new();
+        let right = if edited {
+            left.replace("calculate", "compute")
+        } else {
+            left.clone()
+        };
+        let destination = if edited {
+            left.replace("calculate", "updated").replace("+ 10", "+ 11")
+        } else {
+            left.clone()
+        };
+        let before = [("left.rs", left.as_str()), ("right.rs", right.as_str())];
+        let after = [("destination.rs", destination.as_str())];
+        let root = f.commit(&before, &[], "two possible origins");
+        let tip = f.commit(&after, &[&root], "new location");
+        for (query, removed, added) in [
+            (format!("show {tip}"), before.as_slice(), after.as_slice()),
+            (
+                format!("diff {tip}..{root}"),
+                after.as_slice(),
+                before.as_slice(),
+            ),
+        ] {
+            let shown = f.history(&tip, &query).await;
+            let patch = body(&shown);
+            assert_eq!(patch.matches("diff --git ").count(), 3, "{shown}");
+            assert!(
+                !patch.contains("move ") && !patch.contains("copy "),
+                "{shown}"
+            );
+            for (prefix, files) in [('-', removed), ('+', added)] {
+                for &(path, source) in files {
+                    let (old, new) = if prefix == '-' {
+                        (format!("a/{path}"), "/dev/null".into())
+                    } else {
+                        ("/dev/null".into(), format!("b/{path}"))
+                    };
+                    assert!(patch.contains(&format!("--- {old}\n+++ {new}")), "{shown}");
+                    let content = source
+                        .split_inclusive('\n')
+                        .map(|line| format!("{prefix}{line}"))
+                        .collect::<String>();
+                    assert_eq!(
+                        patch.matches(&content).count(),
+                        files.iter().filter(|(_, text)| *text == source).count(),
+                        "{shown}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_directory_replacing_the_old_file_path_does_not_turn_a_move_into_a_copy() {
+    let f = Fixture::new();
+    let source = continuation_member("old.rs", "calculate");
+    let root = f.commit(&[("old.rs", &source)], &[], "initial source");
+    let tip = f.commit(
+        &[
+            ("new.rs", &source),
+            ("old.rs/child.rs", "pub const CHILD: bool = true;\n"),
+        ],
+        &[&root],
+        "relocate and add directory",
+    );
+    for selector in ["", " file:new.rs"] {
+        for (query, old, new) in [
+            (format!("show {tip}"), "old.rs", "new.rs"),
+            (format!("diff {tip}..{root}"), "new.rs", "old.rs"),
+        ] {
+            let shown = f.history(&tip, &format!("{query}{selector}")).await;
+            let patch = body(&shown);
+            assert!(
+                patch.contains(&format!("diff --git a/{old} b/{new}")),
+                "{shown}"
+            );
+            assert!(patch.contains(&format!("move {old} → {new}")), "{shown}");
+            assert!(!patch.contains("copy "), "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_file_lineage_preserves_a_move_followed_by_a_complete_rewrite() {
+    let f = Fixture::new();
+    let original = continuation_member("old.rs", "calculate");
+    let replacement = "pub struct Replacement {\n    pub text: String,\n}\n";
+    let root = f.commit(&[("old.rs", &original)], &[], "initial source");
+    let moved = f.commit(&[("new.rs", &original)], &[&root], "relocate");
+    let tip = f.commit(&[("new.rs", replacement)], &[&moved], "replace contents");
+    for (at, selector) in [(&root, "file:old.rs"), (&tip, "file:new.rs")] {
+        let shown = f
+            .history(at, &format!("diff {root}..{tip} {selector}"))
+            .await;
+        let patch = body(&shown);
+        assert!(patch.contains("--- a/old.rs\n+++ b/new.rs"), "{shown}");
+        assert!(patch.contains("move old.rs → new.rs"), "{shown}");
+        assert!(!patch.contains("/dev/null"), "{shown}");
+        assert!(
+            patch.contains("-fn calculate(value: i32) -> i32 {"),
+            "{shown}"
+        );
+        assert!(patch.contains("+pub struct Replacement {"), "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn selected_file_moves_can_overwrite_an_unrelated_destination() {
+    let f = Fixture::new();
+    let original = continuation_member("origin.rs", "calculate");
+    let edited = original.replace("+ 10", "+ 11");
+    let root = f.commit(
+        &[
+            ("origin.rs", &original),
+            ("destination.rs", "pub struct Unrelated;\n"),
+        ],
+        &[],
+        "initial files",
+    );
+    let moved = f.commit(
+        &[("destination.rs", &original)],
+        &[&root],
+        "overwrite destination",
+    );
+    let tip = f.commit(
+        &[("destination.rs", &edited)],
+        &[&moved],
+        "edit relocated source",
+    );
+    for (at, selector) in [(&root, "file:origin.rs"), (&tip, "file:destination.rs")] {
+        for (query, reverse, changed) in [
+            (format!("show {moved}"), false, false),
+            (format!("diff {root}..{tip}"), false, true),
+            (format!("diff {tip}..{root}"), true, true),
+        ] {
+            let shown = f.history(at, &format!("{query} {selector}")).await;
+            let patch = body(&shown);
+            let (old, new, removed, added) = if reverse {
+                ("destination.rs", "origin.rs", 11, 10)
+            } else {
+                ("origin.rs", "destination.rs", 10, 11)
+            };
+            assert!(
+                patch.contains(&format!("diff --git a/{old} b/{new}")),
+                "{shown}"
+            );
+            assert!(patch.contains(&format!("move {old} → {new}")), "{shown}");
+            assert!(
+                !patch.contains("copy ") && !patch.contains("/dev/null"),
+                "{shown}"
+            );
+            assert!(!patch.contains("Unrelated"), "{shown}");
+            if changed {
+                assert!(
+                    patch.contains(&format!("-    let adjusted = value + {removed};")),
+                    "{shown}"
+                );
+                assert!(
+                    patch.contains(&format!("+    let adjusted = value + {added};")),
+                    "{shown}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sibling_file_comparisons_do_not_invent_directional_copy_events() {
+    let f = Fixture::new();
+    let original = continuation_member("origin.rs", "calculate");
+    let edited = original.replace("+ 10", "+ 11");
+    let root = f.commit(&[("origin.rs", &original)], &[], "initial source");
+    let left = f.commit(
+        &[("origin.rs", &original), ("copied.rs", &original)],
+        &[&root],
+        "add destination",
+    );
+    let right = f.commit(
+        &[("origin.rs", &edited)],
+        &[&root],
+        "edit source on sibling",
+    );
+    for (from, to, old, new, old_text, new_text) in [
+        (&left, &right, "copied.rs", "origin.rs", &original, &edited),
+        (&right, &left, "origin.rs", "copied.rs", &edited, &original),
+    ] {
+        let shown = f
+            .history(&left, &format!("diff {from}..{to} file:copied.rs"))
+            .await;
+        let patch = body(&shown);
+        assert!(
+            patch.contains(&format!("--- a/{old}\n+++ /dev/null")),
+            "{shown}"
+        );
+        assert!(
+            patch.contains(&format!("--- /dev/null\n+++ b/{new}")),
+            "{shown}"
+        );
+        assert_eq!(patch.matches("diff --git ").count(), 2, "{shown}");
+        assert!(
+            !patch.contains("move ") && !patch.contains("copy "),
+            "{shown}"
+        );
+        for (prefix, source) in [('-', old_text), ('+', new_text)] {
+            let content = source
+                .split_inclusive('\n')
+                .map(|line| format!("{prefix}{line}"))
+                .collect::<String>();
+            assert!(patch.contains(&content), "{shown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_moves_with_other_edits_keep_supported_pairs_in_both_directions() {
+    let original = continuation_member("old.rs", "calculate");
+    for edited in [false, true] {
+        let f = Fixture::new();
+        let moved = if edited {
+            original.replace("+ 10", "+ 11")
+        } else {
+            original.clone()
+        };
+        let root = f.commit(
+            &[
+                ("old.rs", &original),
+                ("other.rs", "const COUNT: usize = 1;\n"),
+            ],
+            &[],
+            "initial sources",
+        );
+        let tip = f.commit(
+            &[
+                ("new.rs", &moved),
+                ("other.rs", "const COUNT: usize = 2;\n"),
+            ],
+            &[&root],
+            "relocate and edit",
+        );
+        for (at, selector) in [(&tip, ""), (&tip, " file:new.rs"), (&root, " file:old.rs")] {
+            for (query, reverse) in [
+                (format!("show {tip}"), false),
+                (format!("diff {root}..{tip}"), false),
+                (format!("diff {tip}..{root}"), true),
+            ] {
+                let shown = f.history(at, &format!("{query}{selector}")).await;
+                let patch = body(&shown);
+                let (old_path, new_path, old_value, new_value) = if reverse {
+                    ("new.rs", "old.rs", 11, 10)
+                } else {
+                    ("old.rs", "new.rs", 10, 11)
+                };
+                assert!(
+                    patch.contains(&format!("diff --git a/{old_path} b/{new_path}")),
+                    "{shown}"
+                );
+                assert!(
+                    patch.contains(&format!("move {old_path} → {new_path}")),
+                    "{shown}"
+                );
+                assert!(
+                    !patch.contains("/dev/null") && !patch.contains("copy "),
+                    "{shown}"
+                );
+                if edited {
+                    assert!(
+                        patch.contains(&format!("-    let adjusted = value + {old_value};")),
+                        "{shown}"
+                    );
+                    assert!(
+                        patch.contains(&format!("+    let adjusted = value + {new_value};")),
+                        "{shown}"
+                    );
+                }
+                assert_eq!(
+                    patch.matches("diff --git ").count(),
+                    if selector.is_empty() { 2 } else { 1 },
+                    "{shown}"
+                );
+                if selector.is_empty() {
+                    let (old_count, new_count) = if reverse { (2, 1) } else { (1, 2) };
+                    assert!(
+                        patch.contains(&format!("-const COUNT: usize = {old_count};")),
+                        "{shown}"
+                    );
+                    assert!(
+                        patch.contains(&format!("+const COUNT: usize = {new_count};")),
+                        "{shown}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn complete_same_path_replacements_remain_one_file_edit() {
+    let f = Fixture::new();
+    let original = "pub struct Record {\n    pub label: String,\n}\n";
+    let replacement = "pub fn enabled() -> bool { true }\n";
+    let root = f.commit(&[("lib.rs", original)], &[], "initial source");
+    let tip = f.commit(&[("lib.rs", replacement)], &[&root], "replace contents");
+    for selector in ["", " file:lib.rs"] {
+        for query in [format!("show {tip}"), format!("diff {root}..{tip}")] {
+            let shown = f.history(&tip, &format!("{query}{selector}")).await;
+            let patch = body(&shown);
+            assert!(patch.contains("--- a/lib.rs\n+++ b/lib.rs"), "{shown}");
+            assert_eq!(patch.matches("diff --git ").count(), 1, "{shown}");
+            assert!(
+                !patch.contains("/dev/null") && !patch.contains("# move"),
+                "{shown}"
+            );
+            for (prefix, source) in [('-', original), ('+', replacement)] {
+                for line in source.lines() {
+                    assert!(patch.contains(&format!("{prefix}{line}\n")), "{shown}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn overload_extraction_identifies_the_retained_wrapper() {
     let f = Fixture::new();
     let before = "class Reader { string Read(string input) { var trimmed = input.Trim(); var canonical = trimmed.ToLowerInvariant(); return canonical.Replace('-', '_'); } }\n";

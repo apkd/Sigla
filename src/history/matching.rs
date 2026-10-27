@@ -165,10 +165,11 @@ impl Mapping {
         }
     }
 }
-const SCORE_MARGIN: usize = 6;
+pub(super) const SCORE_MARGIN: usize = 6;
+pub(super) const MIN_SCORE: usize = 60;
 // Includes reciprocal searches, not just the selected occurrence. Exhaustion
 // is unresolved evidence, never absence or an arbitrary assignment.
-const CANDIDATE_WORK: usize = 65_536;
+pub(super) const CANDIDATE_WORK: usize = 65_536;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Competition {
@@ -941,7 +942,7 @@ impl Tracker {
             if direct.is_some_and(|score| candidate.score + SCORE_MARGIN < score) {
                 break;
             }
-            if candidate.score < 60 {
+            if candidate.score < MIN_SCORE {
                 // A narrow weak result must reach wider origins before it can
                 // report unresolved evidence; it never proves absence.
                 weak = selected.is_empty();
@@ -1108,7 +1109,7 @@ impl Tracker {
         let Some(rival) = claims.iter().find(|c| {
             !c.region.fragment
                 && !overlapping(&c.region, region)
-                && c.score >= 60
+                && c.score >= MIN_SCORE
                 && c.score + SCORE_MARGIN >= score
         }) else {
             return Ok(if search.incomplete.is_some() {
@@ -1159,7 +1160,7 @@ impl Tracker {
             return Ok(Competition::None);
         }
         if search.incomplete.is_some()
-            || claim.score < 60
+            || claim.score < MIN_SCORE
             || predecessors.iter().any(|c| {
                 !c.region.fragment
                     && !c.region.same_alternative(old)

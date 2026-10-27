@@ -4,10 +4,26 @@ use super::{
 };
 use crate::repository::history::Store;
 use anyhow::{Result, ensure};
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 pub(super) const PAGE_BYTES: usize = 24 * 1024;
-const CANONICAL_LIMIT: usize = 64 * 1024 * 1024;
+pub(super) const CANONICAL_LIMIT: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(super) enum FileChange {
+    Move,
+    Copy,
+    ReverseCopy,
+}
+
+/// Whole-file pairs are established by the caller, before rendering can erase
+/// the inventory or lineage evidence that distinguishes a move from a copy.
+pub(super) struct FilePair {
+    pub old: usize,
+    pub new: usize,
+    pub change: FileChange,
+    pub uncertain: bool,
+}
 
 /// Metadata labels are not part of the canonical source stream.
 pub(super) fn label(text: &str, budget: usize) -> String {
@@ -114,44 +130,67 @@ pub(super) fn comparison(
     sources: &mut Sources,
     old: &[Region],
     new: &[Region],
+    files: &[FilePair],
     notes: &[String],
 ) -> Result<String> {
     let mut out = String::new();
     for note in notes {
         writeln!(out, "# {note}").unwrap();
     }
-    // Pair compatible occurrences by context, not ordinal. Remaining occurrences
-    // stay separate additions/deletions (including split fragments and alternatives).
+    // Whole files use path continuity or explicit evidence. Selected regions
+    // retain their context pairing; unmatched occurrences stay independent.
+    let mut file_paths = BTreeMap::<&str, Vec<usize>>::new();
+    for (i, region) in old.iter().enumerate().filter(|(_, r)| r.kind == "file") {
+        file_paths.entry(&region.path).or_default().push(i);
+    }
+    let mut file_pairs = vec![None; new.len()];
+    for pair in files {
+        file_pairs[pair.new] = Some(pair);
+    }
     let mut consumed = vec![false; old.len()];
-    for current in new {
-        let index = old
-            .iter()
-            .enumerate()
-            .filter(|(i, r)| {
-                !consumed[*i]
-                    && (r.path == current.path
-                        || r.blob == current.blob
-                        || old.len() == 1 && new.len() == 1
-                        || r.kind != "file" && r.name == current.name)
-            })
-            .max_by(|(_, a), (_, b)| {
-                let rank = |r: &Region| {
-                    usize::from(r.path == current.path) * 4
-                        + usize::from(r.name == current.name) * 2
-                        + usize::from(r.blob == current.blob)
-                };
-                rank(a).cmp(&rank(b)).then_with(|| b.key().cmp(&a.key()))
-            })
-            .map(|(i, _)| i);
+    for (j, current) in new.iter().enumerate() {
+        let file = file_pairs[j];
+        let rank = |i: usize| {
+            let r = &old[i];
+            (
+                usize::from(r.path == current.path) * 4
+                    + usize::from(r.name == current.name) * 2
+                    + usize::from(r.blob == current.blob),
+                std::cmp::Reverse(r.key()),
+            )
+        };
+        let index = if current.kind == "file" {
+            file_paths
+                .get(current.path.as_str())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&i| !consumed[i])
+                .max_by_key(|&i| rank(i))
+                .or_else(|| file.map(|pair| pair.old).filter(|&i| !consumed[i]))
+        } else {
+            old.iter()
+                .enumerate()
+                .filter(|(i, r)| {
+                    !consumed[*i]
+                        && (r.path == current.path
+                            || r.kind != "file"
+                                && (r.blob == current.blob
+                                    || old.len() == 1 && new.len() == 1
+                                    || r.name == current.name))
+                })
+                .map(|(i, _)| i)
+                .max_by_key(|&i| rank(i))
+        };
         let previous = index.map(|i| {
             consumed[i] = true;
             &old[i]
         });
-        append(store, sources, &mut out, previous, Some(current))?;
+        append(store, sources, &mut out, previous, Some(current), file)?;
     }
     for (i, previous) in old.iter().enumerate() {
         if !consumed[i] {
-            append(store, sources, &mut out, Some(previous), None)?;
+            append(store, sources, &mut out, Some(previous), None, None)?;
         }
     }
     if out.is_empty() {
@@ -165,6 +204,7 @@ fn append(
     out: &mut String,
     old: Option<&Region>,
     new: Option<&Region>,
+    file: Option<&FilePair>,
 ) -> Result<()> {
     if old.zip(new).is_some_and(|(a, b)| {
         a.path == b.path
@@ -202,7 +242,23 @@ fn append(
         writeln!(out, "diff --git {old_name} {new_name}").unwrap();
         if let (Some(a), Some(b)) = (old, new) {
             if a.path != b.path {
-                writeln!(out, "# move {} → {}", a.path, b.path).unwrap();
+                let (event, from, to, suffix) = match file.map(|pair| pair.change) {
+                    Some(FileChange::Copy) => ("copy", &a.path, &b.path, ""),
+                    Some(FileChange::ReverseCopy) => {
+                        ("copy", &b.path, &a.path, " (reverse comparison)")
+                    }
+                    _ => ("move", &a.path, &b.path, ""),
+                };
+                writeln!(
+                    out,
+                    "# {}{event} {from} → {to}{suffix}",
+                    if file.is_some_and(|pair| pair.uncertain) {
+                        "~"
+                    } else {
+                        ""
+                    },
+                )
+                .unwrap();
             }
             if a.name != b.name {
                 writeln!(out, "# rename {} → {}", a.signature(), b.signature()).unwrap();
