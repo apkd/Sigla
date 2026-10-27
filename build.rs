@@ -538,6 +538,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Batching missing inputs changes retry count, not completed graphs.
+        (
+            "ba72b80198d72dd262e80ec34c9fdfdd37b3d514f302344a6a19111ea2fe87f4",
+            "5c379c23f178ba88af622b3fafa87083358ff8bd9b08827b6c5377849295bec7",
+        ),
         // Separate acquisition limits preserve Git package inputs and graphs.
         (
             "db0f9ad05ec046aae589a229652f4104ce9b51ae4d4a5ac02275820df4f092ac",
@@ -565,6 +570,10 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        (
+            "1b03b0f8d0bb24005b1f0a05be3b608f82606ec512db83aaba97ec4cd8fa130b",
+            "145165ef7429e83ad739ef5d2fa1a944cd40f0f5ab500a66e444414329d5d777",
+        ),
         (
             "4e7023452dc7ffc227db9038c975cbe4dae139896728112ea470aedf3924b4b2",
             "145165ef7429e83ad739ef5d2fa1a944cd40f0f5ab500a66e444414329d5d777",

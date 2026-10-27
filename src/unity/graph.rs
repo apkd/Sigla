@@ -155,11 +155,11 @@ fn discover_with_editor(
             logical: s.logical.clone(),
         })
         .collect();
+    if let Some(remote) = &policy.remote {
+        remote.require_analysis_trees(scopes.iter().map(|scope| scope.path.as_path()))?;
+    }
     let mut files = Vec::new();
     for (scope, location) in scopes.iter().enumerate() {
-        if let Some(remote) = &policy.remote {
-            remote.require_analysis_tree(&location.path)?;
-        }
         scan(
             &location.path,
             scope,
@@ -954,6 +954,113 @@ fn response_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_embedded_and_local_package_inputs_are_requested_together() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let editor_root = tempfile::tempdir().unwrap();
+        let write = |base: &Path, path: &str, contents: &str| {
+            let path = base.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        std::fs::create_dir(root.path().join("Assets")).unwrap();
+        write(
+            root.path(),
+            "ProjectSettings/ProjectSettings.asset",
+            "PlayerSettings: {}",
+        );
+        write(
+            root.path(),
+            "Packages/manifest.json",
+            r#"{"dependencies":{"com.example.local":"file:../Local"}}"#,
+        );
+        write(
+            root.path(),
+            "Packages/packages-lock.json",
+            r#"{"dependencies":{"com.example.local":{"version":"file:../Local","source":"local","depth":0}}}"#,
+        );
+        for (path, name) in [
+            ("Packages/embedded", "com.example.embedded"),
+            ("Local", "com.example.local"),
+        ] {
+            write(
+                root.path(),
+                &format!("{path}/package.json"),
+                &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            );
+            write(root.path(), &format!("{path}/Code.cs"), "class Code {}");
+            write(
+                root.path(),
+                &format!("{path}/Package.asmdef"),
+                &format!(r#"{{"name":"{name}","noEngineReferences":true}}"#),
+            );
+        }
+        write(
+            editor_root.path(),
+            "Resources/modules.asset",
+            "PlatformModuleSetup:\n  modules:\n  - name: Core\n    controlledByBuiltinPackage: 0\n",
+        );
+        let version = "6000.3.0f1".parse().unwrap();
+        let editor = Editor {
+            declared: version,
+            selected: version,
+            data: editor_root.path().into(),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let missing = ["Packages/embedded/Plugin.dll", "Local/Plugin.dll"];
+        let mut policy = Policy::new(vec![root.path().into()]).unwrap();
+        policy.remote = Some(crate::discovery::RemoteContext {
+            workspace: root.path().into(),
+            writable: root.path().into(),
+            shared: cache.path().into(),
+            repositories: Vec::new(),
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new(missing.into_iter().map(str::to_owned).collect()),
+        });
+        let empty = || Discovery {
+            leases: crate::cache::views::LeaseSet::new(cache.path()).unwrap(),
+            root: root.path().into(),
+            projects: Vec::new(),
+            sources: Vec::new(),
+            metadata: BTreeSet::new(),
+            dependencies: BTreeSet::new(),
+            diagnostics: Vec::new(),
+        };
+        let error = discover_with_editor(root.path(), &policy, cache.path(), &mut empty(), &editor)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::discovery::RequiredInputs>()
+                .unwrap()
+                .0
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            missing.into_iter().map(str::to_owned).collect()
+        );
+        for path in missing {
+            write(root.path(), path, "not a managed assembly");
+        }
+        let mut found = empty();
+        discover_with_editor(root.path(), &policy, cache.path(), &mut found, &editor).unwrap();
+        assert_eq!(
+            found
+                .sources
+                .iter()
+                .map(|source| source.path.as_path())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.path().join("Packages/embedded/Code.cs"),
+                root.path().join("Local/Code.cs")
+            ])
+            .iter()
+            .map(PathBuf::as_path)
+            .collect()
+        );
+    }
+
     use super::*;
     #[test]
     fn plugin_metadata_accepts_unity_anonymous_platform_entry() {

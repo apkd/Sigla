@@ -58,7 +58,18 @@ impl RemoteContext {
     }
 
     pub fn require_analysis_tree(&self, directory: &Path) -> Result<()> {
-        self.require(self.analysis_inputs(directory)?)
+        self.require_analysis_trees([directory])
+    }
+
+    pub fn require_analysis_trees<'a>(
+        &'a self,
+        directories: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<()> {
+        let inputs = directories
+            .into_iter()
+            .map(|directory| self.analysis_inputs(directory))
+            .collect::<Result<Vec<_>>>()?;
+        self.require(inputs.into_iter().flatten())
     }
 
     fn analysis_inputs<'a>(
@@ -1451,6 +1462,52 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn required_analysis_trees_combine_missing_paths_and_preserve_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let missing = ["Packages/one/Plugin.dll", "Local/two/Plugin.dll"];
+        let ignored = [
+            "Packages/one/Documentation~/Unused.dll",
+            "Packages/one/Picture.png",
+            "Other/Unused.dll",
+        ];
+        write(root.path(), "Packages/one/Present.cs", "class Present {}");
+        let remote = RemoteContext {
+            workspace: root.path().into(),
+            writable: root.path().into(),
+            shared: outside.path().into(),
+            repositories: Vec::new(),
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new(
+                missing
+                    .into_iter()
+                    .chain(ignored)
+                    .chain(["Packages/one/Present.cs"])
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        };
+        let directories = [
+            root.path().join("Packages"),
+            root.path().join("Local"),
+            root.path().join("Packages/one"),
+            outside.path().to_owned(),
+        ];
+        let check = || remote.require_analysis_trees(directories.iter().map(PathBuf::as_path));
+        let error = check().unwrap_err();
+        let paths = &error.downcast_ref::<RequiredInputs>().unwrap().0;
+        assert_eq!(
+            paths.iter().cloned().collect::<BTreeSet<_>>(),
+            missing.into_iter().map(str::to_owned).collect()
+        );
+        assert_eq!(paths.len(), missing.len());
+        for path in missing {
+            write(root.path(), path, "payload");
+        }
+        check().unwrap();
+    }
+
     use super::*;
 
     fn empty_fallback(root: &Path, cache: &Path) -> Discovery {
