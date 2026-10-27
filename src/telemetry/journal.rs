@@ -94,7 +94,7 @@ struct Position {
 
 pub(super) struct Writer {
     directory: PathBuf,
-    _lock: File,
+    _lock: crate::cache::Ownership,
     run_id: String,
     snapshot: Snapshot,
     active_bytes: usize,
@@ -302,11 +302,11 @@ impl Writer {
             }
             Err(error) => return Err(error.into()),
         };
-        // The lock belongs to this file descriptor and is released even after a crash.
         ensure!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another process owns the monitoring journal"
         );
+        let lock = crate::cache::Ownership(lock);
         let identity = directory.join("identity");
         if !identity.exists() {
             atomic_write(&identity, random_id()?.as_bytes())?;
@@ -867,6 +867,7 @@ pub fn export(directory: &Path, after: Option<&str>) -> Result<Export> {
     if let Ok(lock) = File::open(directory.join("writer.lock"))
         && unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0
     {
+        let _ownership = crate::cache::Ownership(lock);
         for active in &mut result.active {
             active.status = "unfinished".into();
             active.end_ms = Some(snapshot.measured_ms.max(active.start_ms));
@@ -1194,6 +1195,32 @@ mod tests {
         assert!(result.operations.is_empty());
         assert_eq!(result.summaries[0].count, 2);
         assert_eq!(result.active[0].query.as_deref(), Some("complete query"));
+    }
+
+    #[test]
+    fn inherited_descriptor_does_not_keep_a_stopped_writer_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(directory.path()).unwrap();
+        let mut active = record("interrupted", 1, "running", false);
+        active.end_ms = None;
+        writer.accept(Event::Operation(active));
+        writer.flush().unwrap();
+        // A child between fork and exec retains the same open file description.
+        let inherited = writer._lock.0.try_clone().unwrap();
+        drop(writer);
+
+        let stale = export(directory.path(), None).unwrap();
+        assert_eq!(stale.active[0].status, "unfinished");
+        let writer = Writer::open(directory.path()).unwrap();
+        let recovered = export(directory.path(), None).unwrap();
+        assert!(recovered.active.is_empty());
+        assert_eq!(recovered.operations.len(), 1);
+        assert_eq!(recovered.operations[0].status, "unfinished");
+        assert!(Writer::open(directory.path()).is_err());
+        drop(inherited);
+        assert!(Writer::open(directory.path()).is_err());
+        drop(writer);
+        assert!(Writer::open(directory.path()).is_ok());
     }
 
     #[test]
