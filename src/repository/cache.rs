@@ -418,7 +418,7 @@ pub(crate) fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin,
     let (prepared, pin) = acquisition.git(request, cache, None, &telemetry)?;
     drop(acquisition);
     Ok((
-        complete(request, cache, prepared, &staging, &telemetry)?,
+        complete(request, cache, prepared, &pin, &staging, &telemetry)?,
         pin,
         staging,
     ))
@@ -492,26 +492,58 @@ pub(super) fn complete(
     request: &Request,
     cache: &Path,
     prepared: Prepared,
+    pin: &Pin,
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
 ) -> Result<Prepared> {
+    if matches!(request.contents, super::materialize::Contents::Inventory) {
+        return Ok(prepared);
+    }
+    // Record raw Git identities before hydration replaces pointer files.
+    import_stage(
+        request,
+        cache,
+        &prepared,
+        staging,
+        telemetry,
+        Some(&pin._pool.root),
+    )?;
     // Hydration only uses staged pointers and the LFS cache. It must not hold
     // the Git pool gate while downloading large objects.
-    let prepared = if matches!(request.contents, super::materialize::Contents::Inventory)
-        || prepared.selected.is_empty()
-    {
+    let prepared = if prepared.selected.is_empty() {
         prepared
     } else {
         let _permit = futures_executor::block_on(staging.capacity.transfer(telemetry))?;
         super::job::hydrate(request, cache, prepared)?
     };
-    if !matches!(request.contents, super::materialize::Contents::Inventory)
-        && fs::read_dir(&request.staging)?.next().is_some()
-    {
+    import_stage(request, cache, &prepared, staging, telemetry, None)?;
+    Ok(prepared)
+}
+
+fn import_stage(
+    request: &Request,
+    cache: &Path,
+    prepared: &Prepared,
+    staging: &Staging,
+    telemetry: &crate::telemetry::Operation,
+    raw_owner: Option<&Path>,
+) -> Result<()> {
+    let phase = if raw_owner.is_some() {
+        "git"
+    } else {
+        "hydrated"
+    };
+    if fs::read_dir(&request.staging)?.next().is_some() {
         let _permit = futures_executor::block_on(staging.capacity.import(telemetry))?;
         let started = std::time::Instant::now();
         let stats = crate::cache::blobs::Store::open(cache)?.import_owned_tree(&request.staging)?;
+        if let Some(root) = raw_owner
+            && let Err(error) = super::files::record(root, cache, prepared, &request.staging)
+        {
+            tracing::warn!(%error, "Could not cache Git file aliases");
+        }
         tracing::info!(
+            phase,
             repository = %request.repository,
             revision = %prepared.revision,
             elapsed_ms = started.elapsed().as_millis(),
@@ -527,13 +559,14 @@ pub(super) fn complete(
         );
     } else {
         tracing::info!(
+            phase,
             repository = %request.repository,
             revision = %prepared.revision,
             elapsed_ms = 0,
             "Repository files imported"
         );
     }
-    Ok(prepared)
+    Ok(())
 }
 
 /// Invoke separately from selector expiration, on a blocking worker, without any
@@ -596,7 +629,11 @@ fn maintain_pool(
         fs::remove_dir_all(&pool.root)?;
         return Ok(());
     }
-    pool.maybe_rebuild(cache, &mut state, pressure, Some(&roots))
+    pool.maybe_rebuild(cache, &mut state, pressure, Some(&roots))?;
+    if pressure {
+        super::files::prune(&pool.root, cache)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

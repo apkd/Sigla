@@ -132,6 +132,8 @@ pub(super) struct Metrics {
     pub inventory_reused: bool,
     pub extracted_files: u64,
     pub extracted_bytes: u64,
+    pub reused_files: u64,
+    pub reused_bytes: u64,
 }
 
 pub(super) fn git(store: &Path) -> Command {
@@ -452,11 +454,13 @@ fn cached_tree_inventory(store: &Path, revision: &str, listing: &File) -> Result
 pub(super) fn prepare(
     request: &Request,
     pinned: Option<Pinned>,
+    cache: &Path,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
     prepare_inventory(
         request,
         pinned,
+        cache,
         |repository| {
             Session::connect(
                 repository,
@@ -473,12 +477,19 @@ fn prepare_with(
     request: &Request,
     connect: impl Fn(&Repository) -> Result<Session>,
 ) -> Result<Prepared> {
-    prepare_inventory(request, None, connect, &mut Metrics::default())
+    prepare_inventory(
+        request,
+        None,
+        request.staging.parent().unwrap(),
+        connect,
+        &mut Metrics::default(),
+    )
 }
 
 fn prepare_inventory(
     request: &Request,
     pinned: Option<Pinned>,
+    cache: &Path,
     connect: impl Fn(&Repository) -> Result<Session>,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
@@ -498,18 +509,19 @@ fn prepare_inventory(
             metrics.inventory_reused = true;
             let mut prepared = pinned.prepared;
             prepared.transfer_bytes = request.transfer_used;
-            return materialize_inventory(request, &repository, prepared, connect, metrics);
+            return materialize_inventory(request, &repository, prepared, cache, connect, metrics);
         }
-        let mut prepared = prepare_fresh(request, connect, metrics)?;
+        let mut prepared = prepare_fresh(request, cache, connect, metrics)?;
         prepared.branch = pinned.prepared.branch;
         prepared.resolved_target = pinned.prepared.resolved_target;
         return Ok(prepared);
     }
-    prepare_fresh(request, connect, metrics)
+    prepare_fresh(request, cache, connect, metrics)
 }
 
 fn prepare_fresh(
     request: &Request,
+    cache: &Path,
     connect: impl Fn(&Repository) -> Result<Session>,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
@@ -619,6 +631,7 @@ fn prepare_fresh(
             tracked,
             directories,
         },
+        cache,
         connect,
         metrics,
     )
@@ -628,6 +641,7 @@ fn materialize_inventory(
     request: &Request,
     repository: &Repository,
     inventory: Prepared,
+    cache: &Path,
     connect: impl Fn(&Repository) -> Result<Session>,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
@@ -757,6 +771,7 @@ fn materialize_inventory(
         .filter(|(path, id)| request.previous.get(*path) != Some(*id))
         .map(|(p, i)| (p.clone(), i.clone()))
         .collect();
+    super::files::reuse(request, cache, &mut changed, &mut omitted, metrics)?;
     let ids: BTreeSet<_> = changed.values().cloned().collect();
     let mut transfer_session = None;
     for chunk in ids.iter().collect::<Vec<_>>().chunks(2048) {
@@ -957,6 +972,7 @@ mod tests {
         let complete = prepare_inventory(
             &request,
             Some(pinned.clone()),
+            root.path(),
             |_| panic!("cached blobs must not connect"),
             &mut metrics,
         )
@@ -981,6 +997,7 @@ mod tests {
         let unchanged = prepare_inventory(
             &request,
             Some(pinned),
+            root.path(),
             |_| panic!("unchanged inputs must not connect"),
             &mut metrics,
         )
@@ -1028,6 +1045,7 @@ mod tests {
                 prepare_inventory(
                     &invalid,
                     Some(original.clone()),
+                    root.path(),
                     |_| panic!("invalid provenance must not connect"),
                     &mut Metrics::default()
                 )
@@ -1039,6 +1057,7 @@ mod tests {
         let complete = prepare_inventory(
             &request,
             Some(original),
+            root.path(),
             |_| Session::local(&upstream_path),
             &mut metrics,
         )
@@ -1088,8 +1107,13 @@ mod tests {
     }
 
     fn upstream(path: &Path, filter: bool) {
+        upstream_format(path, filter, "sha1");
+    }
+
+    fn upstream_format(path: &Path, filter: bool, format: &str) {
         run(Command::new("git")
             .args(["init", "--quiet", "--initial-branch=main", "--template="])
+            .arg(format!("--object-format={format}"))
             .arg(path))
         .unwrap();
         fs::write(path.join("Code.cs"), "class Searchable {}\n").unwrap();
@@ -1143,6 +1167,140 @@ mod tests {
             additional: vec![],
             previous: BTreeMap::new(),
             subdirectory: None,
+        }
+    }
+
+    #[test]
+    fn immutable_files_are_reused_across_selectors_and_renamed_paths() {
+        use std::os::unix::fs::MetadataExt;
+        for format in ["sha1", "sha256"] {
+            let root = tempfile::tempdir().unwrap();
+            let upstream_path = root.path().join("upstream");
+            upstream_format(&upstream_path, true, format);
+            let mut request = request(root.path());
+            let first = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+            let files = crate::cache::blobs::Store::open(root.path()).unwrap();
+            files.import_owned_tree(&request.staging).unwrap();
+            super::super::files::record(root.path(), root.path(), &first, &request.staging)
+                .unwrap();
+            let source = request.staging.join("Code.cs");
+            let execute = |args: &[&str]| {
+                run(Command::new("git")
+                    .arg("-C")
+                    .arg(&upstream_path)
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                    ])
+                    .args(args))
+                .unwrap();
+            };
+            execute(&["switch", "--quiet", "-c", "renamed"]);
+            execute(&["mv", "Code.cs", "Renamed.cs"]);
+            execute(&[
+                "commit",
+                "--quiet",
+                "-m",
+                "Rename fixture input\n\nMove the source to another path for reuse coverage.",
+            ]);
+            // Start without compressed Git objects; only the weak aliases survive.
+            request.store = root.path().join("fresh-git");
+            request.staging = root.path().join("renamed");
+            request.target = Target::Branch("renamed".into());
+            let mut metrics = Metrics::default();
+            let next = prepare_inventory(
+                &request,
+                None,
+                root.path(),
+                |_| Session::local(&upstream_path),
+                &mut metrics,
+            )
+            .unwrap();
+            assert_eq!(metrics.extracted_files, 0);
+            assert_eq!(metrics.reused_files as usize, next.selected.len());
+            assert_eq!(
+                fs::metadata(&source).unwrap().ino(),
+                fs::metadata(request.staging.join("Renamed.cs"))
+                    .unwrap()
+                    .ino()
+            );
+            assert_eq!(
+                files
+                    .import_owned_tree(&request.staging)
+                    .unwrap()
+                    .hashed_bytes,
+                0
+            );
+            let blob = next.selected["Renamed.cs"].clone();
+            assert!(
+                !crate::process::capture(
+                    git(&request.store).args(["cat-file", "-e", &blob]),
+                    Duration::from_secs(10),
+                    None,
+                    None
+                )
+                .unwrap()
+                .status
+                .success()
+            );
+
+            // Aliases are weak: no selected view means the canonical file is collectible.
+            fs::remove_file(&source).unwrap();
+            fs::remove_file(request.staging.join("Renamed.cs")).unwrap();
+            assert!(files.collect_with_pressure(true).unwrap() > 0);
+            request.staging = root.path().join("after-collection");
+            let mut metrics = Metrics::default();
+            prepare_inventory(
+                &request,
+                None,
+                root.path(),
+                |_| Session::local(&upstream_path),
+                &mut metrics,
+            )
+            .unwrap();
+            assert_eq!(metrics.reused_files, 0);
+            assert!(metrics.extracted_files > 0);
+            assert_eq!(
+                fs::read(request.staging.join("Renamed.cs")).unwrap(),
+                fs::read(upstream_path.join("Renamed.cs")).unwrap()
+            );
+            super::super::files::prune(root.path(), root.path()).unwrap();
+            let aliases: serde_json::Value =
+                serde_json::from_slice(&fs::read(root.path().join("files.json")).unwrap()).unwrap();
+            assert!(aliases["entries"].as_object().unwrap().is_empty());
+
+            fs::write(root.path().join("files.json"), "incomplete publication").unwrap();
+            request.staging = root.path().join("after-corruption");
+            prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+            assert_eq!(
+                fs::read(request.staging.join("Renamed.cs")).unwrap(),
+                fs::read(upstream_path.join("Renamed.cs")).unwrap()
+            );
+
+            fs::write(upstream_path.join("Renamed.cs"), "class Changed {}\n").unwrap();
+            execute(&[
+                "commit",
+                "--quiet",
+                "-am",
+                "Change fixture input\n\nReplace the source contents for acquisition coverage.",
+            ]);
+            request.staging = root.path().join("changed");
+            let mut metrics = Metrics::default();
+            prepare_inventory(
+                &request,
+                None,
+                root.path(),
+                |_| Session::local(&upstream_path),
+                &mut metrics,
+            )
+            .unwrap();
+            assert!(metrics.extracted_files > 0);
+            assert_eq!(
+                fs::read_to_string(request.staging.join("Renamed.cs")).unwrap(),
+                "class Changed {}\n"
+            );
         }
     }
 

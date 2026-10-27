@@ -15,6 +15,22 @@ use std::{
 };
 
 pub type Id = [u8; 32];
+
+pub(crate) enum Linked {
+    Missing,
+    Oversized(u64),
+    File(u64),
+}
+
+/// Match ordinary create_new file permissions without changing the process umask.
+pub(crate) fn creation_mode(directory: &Path) -> Result<u32> {
+    let temporary = tempfile::tempdir_in(directory)?;
+    let file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(temporary.path().join("mode"))?;
+    Ok(file.metadata()?.mode() & 0o777)
+}
 const ATTRIBUTE: &std::ffi::CStr = c"user.sigla.blob";
 static OPEN: LazyLock<Mutex<BTreeMap<PathBuf, Weak<Store>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
@@ -103,6 +119,52 @@ impl Store {
     fn path(&self, id: &Id) -> PathBuf {
         let name = blake3::Hash::from_bytes(*id).to_hex();
         self.root.join(&name[..2]).join(&name[2..])
+    }
+
+    /// Resolve a weak content hint. The caller holds a lease through linking.
+    pub(crate) fn cached_size(&self, id: &Id, mode: u32) -> Result<Option<u64>> {
+        let path = self.path(id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.mode() & 0o777 == mode
+                    && marked_id(&path)? == Some(*id) =>
+            {
+                Ok(Some(metadata.len()))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn link_cached(
+        &self,
+        id: &Id,
+        mode: u32,
+        limit: Option<u64>,
+        destination: &Path,
+    ) -> Result<Linked> {
+        let Some(size) = self.cached_size(id, mode)? else {
+            return Ok(Linked::Missing);
+        };
+        if limit.is_some_and(|limit| size > limit) {
+            return Ok(Linked::Oversized(size));
+        }
+        fs::create_dir_all(destination.parent().context("Cache input has no parent")?)?;
+        fs::hard_link(self.path(id), destination)?;
+        Ok(Linked::File(size))
+    }
+
+    pub(crate) fn file_identity(&self, path: &Path) -> Result<Option<(Id, u32)>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(self
+            .identity(path, &metadata)?
+            .map(|id| (id, metadata.mode() & 0o777)))
     }
 
     /// Replace a private file with a link to the immutable copy. Hold a store lease.
@@ -198,7 +260,7 @@ impl Store {
         Ok(())
     }
 
-    /// Import a private, fully hydrated stage. Its files must no longer be writable.
+    /// Import a stopped, private stage. Later changes must replace files atomically.
     pub(crate) fn import_owned_tree(&self, root: &Path) -> Result<ImportStats> {
         let _lease = self.lease()?;
         let mut files = Vec::new();
@@ -252,6 +314,10 @@ impl Store {
         let mut input = regular(path)?;
         let metadata = input.metadata()?;
         stats.files += 1;
+        if self.identity(path, &metadata)?.is_some() {
+            stats.reused += 1;
+            return Ok(());
+        }
         // A shared inode can still be modified by its other owner.
         if metadata.nlink() != 1 {
             let started = Instant::now();
@@ -382,19 +448,9 @@ impl Store {
         if !metadata.is_file() || metadata.nlink() < 2 || !path.starts_with(self.cache()) {
             return Ok(None);
         }
-        let path = CString::new(path.as_os_str().as_bytes())?;
-        let mut id = [0; 32];
-        let size = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                ATTRIBUTE.as_ptr(),
-                id.as_mut_ptr().cast(),
-                id.len(),
-            )
-        };
-        if size != id.len() as isize {
+        let Some(id) = marked_id(path)? else {
             return Ok(None);
-        }
+        };
         match fs::symlink_metadata(self.path(&id)) {
             Ok(blob)
                 if blob.is_file()
@@ -514,6 +570,20 @@ impl Store {
         lock.unlock()?;
         result
     }
+}
+
+fn marked_id(path: &Path) -> Result<Option<Id>> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut id = [0; 32];
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            ATTRIBUTE.as_ptr(),
+            id.as_mut_ptr().cast(),
+            id.len(),
+        )
+    };
+    Ok((size == id.len() as isize).then_some(id))
 }
 
 pub fn identity(path: &Path, metadata: &fs::Metadata) -> Result<Option<Id>> {
@@ -823,6 +893,40 @@ pub(crate) fn allocated_attributed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn weak_links_validate_mode_size_and_survive_without_existing_views() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let source = cache.path().join("source");
+        fs::write(&source, b"immutable bytes").unwrap();
+        let mode = fs::metadata(&source).unwrap().mode() & 0o777;
+        let lease = store.lease().unwrap();
+        let id = store.import(&source).unwrap();
+        let inode = fs::metadata(&source).unwrap().ino();
+        fs::remove_file(&source).unwrap();
+        let destination = cache.path().join("linked");
+        assert!(matches!(
+            store
+                .link_cached(&id, mode ^ 0o100, None, &destination)
+                .unwrap(),
+            Linked::Missing
+        ));
+        assert!(matches!(
+            store.link_cached(&id, mode, Some(0), &destination).unwrap(),
+            Linked::Oversized(_)
+        ));
+        assert!(matches!(
+            store.link_cached(&id, mode, None, &destination).unwrap(),
+            Linked::File(_)
+        ));
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+        drop(lease);
+        assert_eq!(store.collect_with_pressure(true).unwrap(), 0);
+        fs::remove_file(destination).unwrap();
+        assert!(store.collect_with_pressure(true).unwrap() > 0);
+        assert!(store.cached_size(&id, mode).unwrap().is_none());
+    }
+
     use super::*;
 
     #[test]

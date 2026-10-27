@@ -6,6 +6,7 @@ use url::Url;
 pub(crate) mod admission;
 pub mod cache;
 mod credentials;
+mod files;
 mod github;
 pub(crate) mod history;
 pub mod job;

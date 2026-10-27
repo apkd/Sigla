@@ -145,6 +145,8 @@ fn run(request: &Request, cache: &Path, action: Action) -> Result<Prepared> {
         inventory_reused = output.metrics.inventory_reused,
         extracted_files = output.metrics.extracted_files,
         extracted_bytes = output.metrics.extracted_bytes,
+        reused_files = output.metrics.reused_files,
+        reused_bytes = output.metrics.reused_bytes,
         "Repository acquisition phase completed"
     );
     if !lfs && let Some(endpoint) = &prepared.transport {
@@ -166,16 +168,14 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
     let started = std::time::Instant::now();
     let lfs = matches!(&action, Action::Hydrate(_));
     let mut metrics = Metrics::default();
+    let cache = input.parent().unwrap().parent().unwrap();
     let result = match action {
-        Action::Hydrate(mut prepared) => super::lfs::hydrate(
-            &request,
-            &mut prepared,
-            input.parent().unwrap().parent().unwrap(),
-        )
-        .map(|()| prepared),
-        Action::Prepare => super::materialize::prepare(&request, None, &mut metrics),
+        Action::Hydrate(mut prepared) => {
+            super::lfs::hydrate(&request, &mut prepared, cache).map(|()| prepared)
+        }
+        Action::Prepare => super::materialize::prepare(&request, None, cache, &mut metrics),
         Action::Materialize(pinned) => {
-            super::materialize::prepare(&request, Some(pinned), &mut metrics)
+            super::materialize::prepare(&request, Some(pinned), cache, &mut metrics)
         }
     }
     .map_err(Failure::from_error);

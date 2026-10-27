@@ -1226,6 +1226,7 @@ impl Manager {
                 &request,
                 &cache,
                 prepared,
+                &pin,
                 &worker_staging,
                 &worker_telemetry,
             )?;
@@ -1409,12 +1410,14 @@ impl Manager {
         let staged = stage.clone();
         let worker_staging = staging.clone();
         let worker_telemetry = telemetry.clone();
+        let worker_pin = _pool_pin.clone();
         prepared = tokio::task::spawn_blocking(move || {
             let _stage = staged;
             super::cache::complete(
                 &request,
                 &cache,
                 prepared,
+                &worker_pin,
                 &worker_staging,
                 &worker_telemetry,
             )

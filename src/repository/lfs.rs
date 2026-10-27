@@ -295,7 +295,10 @@ struct Pending {
 impl Pending {
     fn publish(&self, cached: &Path, staging: &Path) -> Result<()> {
         for path in &self.paths {
-            fs::copy(cached, staging.join(path))?;
+            let destination = staging.join(path);
+            let temporary = tempfile::tempdir_in(destination.parent().unwrap())?;
+            fs::copy(cached, temporary.path().join("file"))?;
+            fs::rename(temporary.path().join("file"), destination)?;
         }
         Ok(())
     }
@@ -822,6 +825,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let contents = b"class Cached {}";
         let (request, mut prepared) = preparation(root.path(), &[("cached.cs", contents)]);
+        let files = crate::cache::blobs::Store::open(root.path()).unwrap();
+        files.import_owned_tree(&request.staging).unwrap();
+        let pointer = fs::read(request.staging.join("cached.cs")).unwrap();
+        let retained = root.path().join("raw-pointer");
+        fs::hard_link(request.staging.join("cached.cs"), &retained).unwrap();
         fs::create_dir(root.path().join("lfs")).unwrap();
         fs::write(
             root.path()
@@ -839,6 +847,7 @@ mod tests {
         )
         .unwrap();
         assert!(prepared.unavailable.is_empty());
+        assert_eq!(fs::read(retained).unwrap(), pointer);
         assert_eq!(
             fs::read(request.staging.join("cached.cs")).unwrap(),
             contents
