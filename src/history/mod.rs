@@ -67,7 +67,18 @@ pub(crate) fn run_cached(
         _ => None, // Selected-source lineage has no known commit-count bound.
     });
     let mut tracker = Tracker::new(store, cache.clone());
+    let started = std::time::Instant::now();
     let result = execute(&mut tracker, selector, &request);
+    let (parsed_sources, parse_sum_us) = tracker.sources.parse_totals();
+    tracing::debug!(
+        evaluation_ms = started.elapsed().as_millis(),
+        fetch_ms = tracker.store.fetch_elapsed.as_millis(),
+        log_including_fetch_and_parse_ms = tracker.store.log_elapsed.as_millis(),
+        merge_graph_including_fetch_ms = tracker.store.traversal_elapsed.as_millis(),
+        parsed_sources,
+        parse_sum_us,
+        "History evaluation timings"
+    );
     let stats = cache.stats();
     tracing::debug!(
         bytes = stats.bytes,
@@ -110,7 +121,10 @@ fn execute(tracker: &mut Tracker, revision: Option<&str>, request: &Request) -> 
     let header = format!("at {at}\ntarget {target}");
     match &request.command {
         Command::Log { skip, limit } => {
-            log(tracker, anchor, state, repository, &header, *skip, *limit)
+            let started = std::time::Instant::now();
+            let result = log(tracker, anchor, state, repository, &header, *skip, *limit);
+            tracker.store.log_elapsed += started.elapsed();
+            result
         }
         Command::Show {
             commit,
@@ -516,9 +530,7 @@ fn log(
 ) -> Result<String> {
     let mut page = Page::new(header, skip, limit);
     loop {
-        if let Err(error) = check(&tracker.store.cancel) {
-            return Ok(page.end(false, Some(&error)));
-        }
+        check(&tracker.store.cancel)?;
         if repository {
             page.push(&commit, None);
             if commit.parents.is_empty() {
@@ -550,7 +562,10 @@ fn log(
             })();
             let (graph, trace) = match interval {
                 Ok(value) => value,
-                Err(error) => return Ok(page.end(false, Some(&error))),
+                Err(error) => {
+                    check(&tracker.store.cancel)?;
+                    return Ok(page.end(false, Some(&error)));
+                }
             };
             let previous = graph.boundary.as_ref().and_then(|id| {
                 trace
@@ -583,7 +598,10 @@ fn log(
             }
             commit = match graph.boundary_commit(&mut tracker.store) {
                 Ok(commit) => commit,
-                Err(error) => return Ok(page.end(false, Some(&error))),
+                Err(error) => {
+                    check(&tracker.store.cancel)?;
+                    return Ok(page.end(false, Some(&error)));
+                }
             };
             state = previous.unwrap_or_default();
             continue;
@@ -613,6 +631,7 @@ fn log(
         let next = match step {
             Ok(next) => next,
             Err(error) => {
+                check(&tracker.store.cancel)?;
                 tracker.store.boundaries.insert(commit.id.clone());
                 return Ok(page.end(false, Some(&error)));
             }

@@ -7,6 +7,7 @@ mod shader;
 use crate::model::Language;
 use serde::{Deserialize, Serialize};
 pub use shader::extract;
+pub(crate) use shader::extract_cancellable;
 use std::{collections::BTreeMap, ops::Range, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

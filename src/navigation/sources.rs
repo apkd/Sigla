@@ -14,7 +14,8 @@ pub(crate) fn repository(
     prepared: &crate::repository::materialize::Prepared,
     path: &str,
     mode: Option<crate::navigation::Mode>,
-    read_remote: impl FnOnce(&str) -> Result<Option<Vec<u8>>>,
+    cancel: &dyn crate::cancellation::Cancellation,
+    read_remote: impl FnOnce(&str) -> Result<Option<crate::memory::Source<Vec<u8>>>>,
 ) -> Result<Option<String>> {
     let language = |path: &std::path::Path| match path.extension().and_then(|e| e.to_str()) {
         Some("cs") => Some(crate::model::Language::CSharp),
@@ -50,26 +51,31 @@ pub(crate) fn repository(
         .filter_map(|(p, l)| l.map(|l| (p.clone(), (p, l))))
         .collect();
     let mut resolved = false;
-    let text = view(&files, root, path, mode, false, |(path, language)| {
-        resolved = true;
-        let local = contents.map(|contents| contents.join(path));
-        let _admission = local
-            .as_ref()
-            .map(std::fs::metadata)
-            .transpose()?
-            .map(|metadata| crate::memory::admit_file(metadata.len(), false));
-        let bytes = if let Some(path) = local {
-            std::fs::read(path)?
-        } else if let Some(bytes) = read_remote(path)? {
-            bytes
-        } else {
-            return Ok(None);
-        };
-        Ok(Some((
-            *language,
-            crate::model::decode_owned(bytes, *language)?,
-        )))
-    })?;
+    let text = view(
+        &files,
+        root,
+        path,
+        mode,
+        false,
+        cancel,
+        |(path, language)| {
+            resolved = true;
+            let local = contents.map(|contents| contents.join(path));
+            let bytes = if let Some(path) = local {
+                crate::memory::Source::read(std::fs::metadata(&path)?.len(), cancel, || {
+                    Ok(std::fs::read(path)?)
+                })?
+            } else if let Some(bytes) = read_remote(path)? {
+                bytes
+            } else {
+                return Ok(None);
+            };
+            Ok(Some((
+                *language,
+                bytes.map(|bytes| crate::model::decode_owned(bytes, *language))?,
+            )))
+        },
+    )?;
     Ok(resolved.then_some(text).flatten())
 }
 
@@ -249,6 +255,7 @@ impl Sources<'_> {
             path,
             mode,
             absolute,
+            self.cancel,
             |key| {
                 let file = self
                     .manifest
@@ -256,7 +263,7 @@ impl Sources<'_> {
                     .get(key)
                     .or_else(|| self.manifest.deferred.get(key))
                     .unwrap();
-                Ok(Some((file.language, file.read_source()?)))
+                Ok(Some((file.language, file.read_source(self.cancel)?)))
             },
         )?
         .context("Source contents are unavailable")
@@ -297,7 +304,8 @@ fn view<T>(
     path: &str,
     mode: crate::navigation::Mode,
     absolute: bool,
-    read: impl FnOnce(&T) -> Result<Option<(crate::model::Language, String)>>,
+    cancel: &dyn crate::cancellation::Cancellation,
+    read: impl FnOnce(&T) -> Result<Option<(crate::model::Language, crate::memory::Source<String>)>>,
 ) -> Result<Option<String>> {
     let indexed = |p: &str| {
         files.contains_key(p)
@@ -355,7 +363,10 @@ fn view<T>(
     let (range, first, last) = crate::navigation::lines(&source, requested)?;
     let (body, tag) = match mode {
         crate::navigation::Mode::Exact => (source[range].to_owned(), language.tag()),
-        crate::navigation::Mode::Minified => (crate::minify::render(&source, language, range), ""),
+        crate::navigation::Mode::Minified => (
+            crate::minify::render_admitted(&source, language, range, cancel)?,
+            "",
+        ),
     };
     let fence = "`".repeat(3.max(body.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
     let separator = if body.ends_with('\n') { "" } else { "\n" };
@@ -371,6 +382,59 @@ fn view<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_view_remains_available_while_parser_is_busy() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        let parser = crate::memory::admit_file(u64::MAX, false, &()).unwrap();
+        let files = BTreeMap::from([("Code.cs".to_owned(), ())]);
+        let text = view(
+            &files,
+            std::path::Path::new("/repo"),
+            "Code.cs",
+            crate::navigation::Mode::Exact,
+            false,
+            &(),
+            |_| {
+                Ok(Some((
+                    crate::model::Language::CSharp,
+                    crate::memory::Source::read(16, &(), || Ok("class Example {}".to_owned()))?,
+                )))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(text.contains("class Example {}"));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancelled.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(crate::minify::render_admitted(
+                    "class Example {}",
+                    crate::model::Language::CSharp,
+                    0..16,
+                    &*worker_cancel,
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        cancelled.store(true, Ordering::Release);
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(parser);
+        assert!(result.unwrap().is_err());
+        worker.join().unwrap();
+    }
 
     #[test]
     fn view_prefers_literal_filenames_before_location_suffixes() {
@@ -397,11 +461,12 @@ mod tests {
                 path,
                 crate::navigation::Mode::Exact,
                 false,
+                &(),
                 |file| {
                     selected = Some(*file);
                     Ok(Some((
                         crate::model::Language::CSharp,
-                        "first\nsecond\n".into(),
+                        crate::memory::Source::read(13, &(), || Ok("first\nsecond\n".into()))?,
                     )))
                 },
             )
@@ -431,9 +496,12 @@ mod tests {
             &prepared,
             "Code.cs:2",
             Some(crate::navigation::Mode::Exact),
+            &(),
             |path| {
                 assert_eq!(path, "src/Code.cs");
-                Ok(Some(b"// first line\nclass Example {}\n".to_vec()))
+                Ok(Some(crate::memory::Source::read(32, &(), || {
+                    Ok(b"// first line\nclass Example {}\n".to_vec())
+                })?))
             },
         )
         .unwrap()
@@ -447,6 +515,7 @@ mod tests {
                 &prepared,
                 "Code.cs",
                 Some(crate::navigation::Mode::Exact),
+                &(),
                 |_| Ok(None),
             )
             .unwrap()
@@ -459,6 +528,7 @@ mod tests {
                 &prepared,
                 "Missing.cs",
                 Some(crate::navigation::Mode::Exact),
+                &(),
                 |_| panic!("Unknown files must not be downloaded"),
             )
             .unwrap()

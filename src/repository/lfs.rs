@@ -777,6 +777,7 @@ mod tests {
                 &snapshot,
                 path,
                 Some(crate::navigation::Mode::Exact),
+                &(),
                 |_| panic!("Materialized sources must not be downloaded"),
             )
             .unwrap()

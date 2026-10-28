@@ -43,7 +43,7 @@ fn current_batch_progresses_while_parser_budget_is_fully_reserved() {
     );
     let jobs = [(key.clone(), (stamp, &input, &project))];
     std::thread::scope(|threads| {
-        let reservation = crate::memory::admit_file(u64::MAX, false);
+        let reservation = crate::memory::admit_file(u64::MAX, false, &()).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
         threads.spawn(move || {
             sender.send(index_source_batch(&store, &jobs)).unwrap();

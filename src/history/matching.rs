@@ -228,9 +228,10 @@ pub(super) struct Tracker {
 }
 impl Tracker {
     pub fn new(store: Store, cache: Arc<Cache>) -> Self {
+        let sources = Sources::new(cache.clone()).with_operation(store.operation.clone());
         Self {
             store,
-            sources: Sources::new(cache.clone()),
+            sources,
             cache,
         }
     }

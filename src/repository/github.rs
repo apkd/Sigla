@@ -195,7 +195,12 @@ fn commit_response(
 
 /// Read one immutable source object without waiting for bulk Git acquisition.
 /// Unsupported responses fall back to the ordinary repository materializer.
-pub(super) fn blob(repository: &Repository, oid: &str) -> Result<Option<Vec<u8>>> {
+pub(super) fn blob(
+    repository: &Repository,
+    oid: &str,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> Result<Option<crate::memory::Source<Vec<u8>>>> {
+    cancel.check()?;
     if repository.identity.endpoint != Endpoint::Github {
         return Ok(None);
     }
@@ -223,13 +228,29 @@ pub(super) fn blob(repository: &Repository, oid: &str) -> Result<Option<Vec<u8>>
     let limit = response
         .content_length()
         .unwrap_or(super::materialize::TRANSFER_LIMIT);
-    read_blob(id, response, limit)
+    read_blob(id, response, limit, cancel)
 }
 
-fn read_blob(id: gix_hash::ObjectId, input: impl Read, limit: u64) -> Result<Option<Vec<u8>>> {
-    let _admission = crate::memory::admit_file(limit, false);
-    let mut bytes = Vec::new();
-    input.take(limit + 1).read_to_end(&mut bytes)?;
+fn read_blob(
+    id: gix_hash::ObjectId,
+    input: impl Read,
+    limit: u64,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> Result<Option<crate::memory::Source<Vec<u8>>>> {
+    let bytes = crate::memory::Source::read(limit, cancel, || {
+        let mut bytes = Vec::new();
+        let mut input = input.take(limit + 1);
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            cancel.check()?;
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        Ok(bytes)
+    })?;
     if bytes.len() as u64 > limit {
         return Ok(None);
     }
@@ -372,13 +393,16 @@ mod tests {
         let source = b"class Example {}\n";
         let id = object_id(source);
         assert_eq!(
-            read_blob(id, source.as_slice(), 1024).unwrap().unwrap(),
+            read_blob(id, source.as_slice(), 1024, &())
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             source
         );
-        assert!(read_blob(id, b"class Different {}".as_slice(), 1024).is_err());
+        assert!(read_blob(id, b"class Different {}".as_slice(), 1024, &()).is_err());
         let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 12\n";
         assert!(
-            read_blob(object_id(pointer), pointer.as_slice(), 1024)
+            read_blob(object_id(pointer), pointer.as_slice(), 1024, &())
                 .unwrap()
                 .is_none()
         );

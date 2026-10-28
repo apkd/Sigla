@@ -34,6 +34,28 @@ pub fn render(source: &str, language: Language, range: Range<usize>) -> String {
     apply(source, range, edits)
 }
 
+/// Minification parses C# and Rust input and therefore shares parser admission.
+pub(crate) fn render_admitted(
+    source: &str,
+    language: Language,
+    range: Range<usize>,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> anyhow::Result<String> {
+    cancel.check()?;
+    let _admission = if matches!(language, Language::Rust | Language::CSharp) {
+        Some(crate::memory::admit_file(
+            source.len() as u64,
+            false,
+            cancel,
+        )?)
+    } else {
+        None
+    };
+    let result = render(source, language, range);
+    cancel.check()?;
+    Ok(result)
+}
+
 fn apply(source: &str, range: Range<usize>, mut edits: Vec<Edit>) -> String {
     edits.sort_by_key(|e| (e.range.start, std::cmp::Reverse(e.range.end)));
     let mut cursor = range.start;

@@ -2,17 +2,28 @@ use super::{
     DeclarationInfo, File, Include, OccurrenceInfo, Region, Role,
     lex::{Kind, Lexer},
 };
+use crate::cancellation::Cancellation;
 use crate::model::{Declaration, Facts, Language, Occurrence, WriteKind};
 use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
 };
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, ParseOptions, Parser, Tree};
 
+#[cfg(test)]
 pub fn extract(source: &str, language: Language) -> Result<Facts> {
+    extract_cancellable(source, language, &())
+}
+
+pub(super) fn extract_cancellable(
+    source: &str,
+    language: Language,
+    cancel: &dyn Cancellation,
+) -> Result<Facts> {
+    cancel.check()?;
     let (regions, host_errors) = if language == Language::ShaderLab {
-        shader_regions(source)
+        shader_regions(source, cancel)?
     } else {
         (
             vec![Region {
@@ -28,10 +39,11 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
     };
     let mut native = File::default();
     for mut region in regions {
+        cancel.check()?;
         let text = &source[region.span.clone()];
         // Included numeric tables have no declarations or references. Feeding a
         // long comma list to a translation-unit grammar causes quadratic recovery.
-        if numeric_fragment(text) {
+        if numeric_fragment_cancellable(text, cancel)? {
             if region.language == Language::Header {
                 region.language = Language::Cpp;
             }
@@ -39,12 +51,12 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
             facts.errors = true; // It is still not a complete translation unit.
             continue;
         }
-        let mut tree = parse(text, region.language)?;
+        let mut tree = parse(text, region.language, cancel)?;
         if region.language == Language::Header {
             region.language = Language::Cpp;
             if tree.root_node().has_error() {
-                let c = parse(text, Language::C)?;
-                if error_size(c.root_node()) < error_size(tree.root_node()) {
+                let c = parse(text, Language::C, cancel)?;
+                if error_size(c.root_node(), cancel)? < error_size(tree.root_node(), cancel)? {
                     tree = c;
                     region.language = Language::C;
                 }
@@ -70,8 +82,9 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
             conditional: 0,
             calls: HashMap::new(),
             writes: HashMap::new(),
+            cancel,
         }
-        .walk(tree.root_node());
+        .walk(tree.root_node())?;
     }
     // Declarations and uses occupy separate records. Sort once, keeping all sites.
     let declared: BTreeSet<_> = facts
@@ -86,6 +99,7 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
         .collect();
     occurrences.sort_by_key(|(o, _)| (o.span.start, o.span.end));
     for (occurrence, info) in occurrences {
+        cancel.check()?;
         let index = facts.occurrences.len() as u32;
         native
             .names
@@ -104,7 +118,7 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
     Ok(facts)
 }
 
-fn parse(source: &str, language: Language) -> Result<Tree> {
+fn parse(source: &str, language: Language, cancel: &dyn Cancellation) -> Result<Tree> {
     let grammar = match language {
         Language::C => tree_sitter_c::LANGUAGE,
         Language::Cpp | Language::Header => tree_sitter_cpp::LANGUAGE,
@@ -114,15 +128,27 @@ fn parse(source: &str, language: Language) -> Result<Tree> {
     };
     let mut parser = Parser::new();
     parser.set_language(&grammar.into())?;
-    parser
-        .parse(source, None)
-        .context("Native parsing was interrupted")
+    let bytes = source.as_bytes();
+    let mut progress = |_: &tree_sitter::ParseState| cancel.is_cancelled();
+    let tree = parser.parse_with_options(
+        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+        None,
+        Some(ParseOptions::new().progress_callback(&mut progress)),
+    );
+    cancel.check()?;
+    tree.context("Native parsing was interrupted")
 }
 
+#[cfg(test)]
 fn numeric_fragment(source: &str) -> bool {
+    numeric_fragment_cancellable(source, &()).unwrap()
+}
+
+fn numeric_fragment_cancellable(source: &str, cancel: &dyn Cancellation) -> Result<bool> {
     let mut number = true;
     let mut seen = false;
     for token in Lexer::new(source, 0..source.len()) {
+        cancel.check()?;
         let text = &source[token.span];
         if number {
             if token.kind != Kind::Literal
@@ -132,34 +158,40 @@ fn numeric_fragment(source: &str) -> bool {
                         || matches!(c, b'x' | b'X' | b'u' | b'U' | b'l' | b'L' | b'.' | b'\'')
                 })
             {
-                return false;
+                return Ok(false);
             }
             seen = true;
         } else if text != "," {
-            return false;
+            return Ok(false);
         }
         number = !number;
     }
-    seen
+    Ok(seen)
 }
 
-fn error_size(node: Node<'_>) -> usize {
+fn error_size(node: Node<'_>, cancel: &dyn Cancellation) -> Result<usize> {
     let mut size = 0;
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {
+        cancel.check()?;
         if node.is_error() || node.is_missing() {
             size += node.byte_range().len().max(1);
         } else if node.has_error() {
-            pending.extend(node.children(&mut node.walk()));
+            pending.extend(
+                node.children(&mut node.walk())
+                    .take_while(|_| !cancel.is_cancelled()),
+            );
         }
     }
-    size
+    cancel.check()?;
+    Ok(size)
 }
 
-fn shader_regions(source: &str) -> (Vec<Region>, bool) {
+fn shader_regions(source: &str, cancel: &dyn Cancellation) -> Result<(Vec<Region>, bool)> {
     let mut regions = Vec::new();
     let mut open: Option<(usize, &str, Language)> = None;
     for token in Lexer::new(source, 0..source.len()) {
+        cancel.check()?;
         if token.kind != Kind::Name {
             continue;
         }
@@ -187,7 +219,7 @@ fn shader_regions(source: &str) -> (Vec<Region>, bool) {
             language,
         });
     }
-    (regions, open.is_some())
+    Ok((regions, open.is_some()))
 }
 
 struct Scope {
@@ -197,7 +229,7 @@ struct Scope {
 
 // Exit actions keep scope and binding lifetimes independent of the native stack.
 enum Work<'tree> {
-    Visit(Node<'tree>),
+    Visit(Node<'tree>, Option<Node<'tree>>),
     ScopedDeclarator(Node<'tree>, u32),
     LeaveScoped(bool),
     DeclareRangeBindings(Node<'tree>),
@@ -205,9 +237,13 @@ enum Work<'tree> {
     LeaveConditional,
 }
 
-fn children<'tree>(node: Node<'tree>, pending: &mut Vec<Work<'tree>>) {
+fn children<'tree>(node: Node<'tree>, pending: &mut Vec<Work<'tree>>, cancel: &dyn Cancellation) {
     let start = pending.len();
-    pending.extend(node.named_children(&mut node.walk()).map(Work::Visit));
+    pending.extend(
+        node.named_children(&mut node.walk())
+            .take_while(|_| !cancel.is_cancelled())
+            .map(|child| Work::Visit(child, Some(node))),
+    );
     // The last scheduled child runs first, so reverse only this node's children.
     pending[start..].reverse();
 }
@@ -239,6 +275,7 @@ struct Walker<'a> {
     conditional: usize,
     calls: HashMap<usize, Call>,
     writes: HashMap<usize, Write>,
+    cancel: &'a dyn Cancellation,
 }
 
 impl Walker<'_> {
@@ -287,7 +324,7 @@ impl Walker<'_> {
             self.owners.push(owner);
         }
         pending.push(Work::LeaveScoped(owner.is_some()));
-        children(node, pending);
+        children(node, pending, self.cancel);
     }
 
     fn declare(&mut self, node: Node<'_>, name: Option<Node<'_>>, kind: &str) -> u32 {
@@ -442,9 +479,9 @@ impl Walker<'_> {
         });
     }
 
-    fn identifier(&mut self, node: Node<'_>) {
+    fn identifier(&mut self, node: Node<'_>, parent: Option<Node<'_>>) {
         let mut info = None;
-        if let Some(parent) = node.parent() {
+        if let Some(parent) = parent {
             if parent.kind() == "field_expression"
                 && parent.child_by_field_name("field") == Some(node)
             {
@@ -584,6 +621,9 @@ impl Walker<'_> {
     ) {
         let mut functions = BTreeMap::new();
         for i in 0..node.child_count() {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             if node.field_name_for_child(i as u32) != Some("declarator") {
                 continue;
             }
@@ -625,10 +665,13 @@ impl Walker<'_> {
         }
         let start = pending.len();
         for child in node.named_children(&mut node.walk()) {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             if let Some(&owner) = functions.get(&child.id()) {
                 pending.push(Work::ScopedDeclarator(child, owner));
             } else {
-                pending.push(Work::Visit(child));
+                pending.push(Work::Visit(child, Some(node)));
             }
         }
         pending[start..].reverse();
@@ -721,6 +764,9 @@ impl Walker<'_> {
         if let Some(value) = node.child_by_field_name("value") {
             for token in Lexer::new(self.source, self.span(value)).filter(|t| t.kind == Kind::Name)
             {
+                if self.cancel.is_cancelled() {
+                    break;
+                }
                 self.occurrence(
                     self.source[token.span.clone()].into(),
                     token.span,
@@ -744,7 +790,7 @@ impl Walker<'_> {
                         relative: text.starts_with('"'),
                     });
                 } else {
-                    pending.push(Work::Visit(path));
+                    pending.push(Work::Visit(path, Some(node)));
                 }
             }
             return;
@@ -771,11 +817,12 @@ impl Walker<'_> {
         }
     }
 
-    fn walk(&mut self, node: Node<'_>) {
-        let mut pending = vec![Work::Visit(node)];
+    fn walk(&mut self, node: Node<'_>) -> Result<()> {
+        let mut pending = vec![Work::Visit(node, None)];
         while let Some(work) = pending.pop() {
+            self.cancel.check()?;
             match work {
-                Work::Visit(node) => self.visit(node, &mut pending),
+                Work::Visit(node, parent) => self.visit(node, parent, &mut pending),
                 Work::ScopedDeclarator(node, owner) => {
                     self.scoped(node, Some(owner), "public", &mut pending);
                 }
@@ -803,9 +850,15 @@ impl Walker<'_> {
                 Work::LeaveConditional => self.conditional -= 1,
             }
         }
+        self.cancel.check()
     }
 
-    fn visit<'tree>(&mut self, node: Node<'tree>, pending: &mut Vec<Work<'tree>>) {
+    fn visit<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        parent: Option<Node<'tree>>,
+        pending: &mut Vec<Work<'tree>>,
+    ) {
         match node.kind() {
             "namespace_definition" => {
                 let owner = self.declare(node, node.child_by_field_name("name"), "namespace");
@@ -898,7 +951,7 @@ impl Walker<'_> {
                 let body = node.child_by_field_name("body");
                 pending.push(Work::LeaveScope);
                 if let Some(body) = body {
-                    pending.push(Work::Visit(body));
+                    pending.push(Work::Visit(body, Some(node)));
                 }
                 pending.push(Work::DeclareRangeBindings(node));
                 let start = pending.len();
@@ -906,7 +959,10 @@ impl Walker<'_> {
                     .named_children(&mut node.walk())
                     .filter(|child| Some(*child) != body)
                 {
-                    pending.push(Work::Visit(child));
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
+                    pending.push(Work::Visit(child, Some(node)));
                 }
                 pending[start..].reverse();
                 return;
@@ -946,7 +1002,7 @@ impl Walker<'_> {
             "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_else" => {
                 self.conditional += 1;
                 pending.push(Work::LeaveConditional);
-                children(node, pending);
+                children(node, pending, self.cancel);
                 return;
             }
             "call_expression" | "new_expression" => self.call(node),
@@ -968,11 +1024,11 @@ impl Walker<'_> {
             | "type_identifier"
             | "namespace_identifier"
             | "statement_identifier" => {
-                self.identifier(node);
+                self.identifier(node, parent);
                 return;
             }
             "primitive_type" if self.calls.contains_key(&self.span(node).start) => {
-                self.identifier(node);
+                self.identifier(node, parent);
                 return;
             }
             "operator_name" | "destructor_name" => {
@@ -985,7 +1041,7 @@ impl Walker<'_> {
             }
             _ => (),
         }
-        children(node, pending);
+        children(node, pending, self.cancel);
     }
 }
 
@@ -1120,6 +1176,55 @@ fn lvalue(mut node: Node<'_>) -> Option<(Node<'_>, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CancelAfter(AtomicUsize, usize);
+
+    impl Cancellation for CancelAfter {
+        fn is_cancelled(&self) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed) >= self.1
+        }
+    }
+
+    #[test]
+    fn tree_sitter_parsing_can_be_cancelled() {
+        let source = "int f() { return value; }\n".repeat(100_000);
+        let cancel = CancelAfter(AtomicUsize::new(0), 0);
+        assert!(
+            parse(&source, Language::Cpp, &cancel)
+                .unwrap_err()
+                .is::<crate::diagnostics::Cancelled>()
+        );
+    }
+
+    #[test]
+    fn shader_preparation_can_be_cancelled() {
+        let source = format!(
+            "BEGIN_PROPERTIES\n{}END_PROPERTIES\n",
+            "_Color (\"Color\", Color) = (1, 1, 1, 1)\n".repeat(10_000)
+        );
+        let cancel = CancelAfter(AtomicUsize::new(0), 100);
+        assert!(
+            super::super::shader::extract_cancellable(&source, Language::ShaderLab, &cancel)
+                .unwrap_err()
+                .is::<crate::diagnostics::Cancelled>()
+        );
+    }
+
+    #[test]
+    fn field_and_qualified_identifiers_keep_their_receivers() {
+        let source = "void f(Object &object) { object.value; Space::value; }";
+        let facts = extract(source, Language::Cpp).unwrap();
+        let native = facts.native.as_ref().unwrap();
+        let values: Vec<_> = facts
+            .occurrences
+            .iter()
+            .zip(&native.occurrences)
+            .filter(|(occurrence, _)| occurrence.name == "value")
+            .map(|(_, info)| (&source[info.receiver.clone().unwrap()], info.qualified))
+            .collect();
+        assert_eq!(values, [("object", false), ("Space", true)]);
+    }
 
     #[test]
     fn numeric_include_fragments_preserve_content_without_error_recovery() {
@@ -1157,7 +1262,10 @@ void work(int *out, Box<int> &box) {
         assert!(
             !facts.errors,
             "{}",
-            parse(source, Language::Cpp).unwrap().root_node().to_sexp()
+            parse(source, Language::Cpp, &())
+                .unwrap()
+                .root_node()
+                .to_sexp()
         );
         let native = facts.native.as_ref().unwrap();
         assert!(
@@ -1192,7 +1300,10 @@ void work(int *out, Box<int> &box) {
         assert!(
             facts.occurrences.iter().any(|o| o.name == "get" && o.call),
             "{}",
-            parse(source, Language::Cpp).unwrap().root_node().to_sexp()
+            parse(source, Language::Cpp, &())
+                .unwrap()
+                .root_node()
+                .to_sexp()
         );
         assert_eq!(
             facts

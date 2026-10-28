@@ -31,7 +31,10 @@ impl Graph {
     ) -> Result<Self> {
         let mut discovery = Discovery::new(tips)?;
         let cancel = store.cancel.clone();
-        let mut graph = match discovery.run(&cancel, source, |id| store.commit(id)) {
+        let started = std::time::Instant::now();
+        let result = discovery.run(&cancel, source, |id| store.commit(id));
+        store.traversal_elapsed += started.elapsed();
+        let mut graph = match result {
             Ok(graph) => graph,
             Err(error) => {
                 // Only failed acquisition is a coverage boundary. A successful

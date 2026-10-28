@@ -5,6 +5,7 @@ use super::{
     sequence,
 };
 use crate::{
+    cancellation::Cancellation,
     extract::{HistoricalDeclaration, HistoricalPresence},
     model::{Declaration, Language},
     repository::history::Store,
@@ -14,7 +15,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock, atomic::AtomicBool},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 pub(super) const ADAPTER_VERSION: u32 = 6;
@@ -187,12 +191,30 @@ impl Source {
         std::mem::size_of::<Self>() + self.cost
     }
 }
+#[derive(Clone)]
 pub(super) struct Sources {
     cache: Arc<Cache>,
+    operation: crate::telemetry::Operation,
+    stats: Arc<ParseStats>,
+}
+#[derive(Default)]
+struct ParseStats {
+    count: AtomicU64,
+    elapsed_us: AtomicU64,
 }
 pub(super) struct PendingSources {
     sources: Sources,
     pending: VecDeque<(String, PendingSource)>,
+    cancel: Arc<AtomicBool>,
+}
+struct PrefetchCancellation<'a> {
+    request: &'a AtomicBool,
+    prefetch: &'a AtomicBool,
+}
+impl Cancellation for PrefetchCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.request.load(Ordering::Acquire) || self.prefetch.load(Ordering::Acquire)
+    }
 }
 enum PendingSource {
     Ready(Result<Arc<Source>>),
@@ -229,15 +251,23 @@ impl PendingSources {
         {
             let pending = match self.sources.input(store, path, blob) {
                 Ok(input @ Input::Parse { .. }) if *WORKERS > 1 => {
-                    let sources = Sources::new(self.sources.cache.clone());
+                    let sources = self.sources.clone();
                     let cancel = store.cancel.clone();
+                    let prefetch = self.cancel.clone();
                     let path = path.to_owned();
                     PendingSource::Running(std::thread::spawn(move || {
-                        sources.parse(input, &path, &cancel)
+                        sources.parse(
+                            input,
+                            &path,
+                            &PrefetchCancellation {
+                                request: &cancel,
+                                prefetch: &prefetch,
+                            },
+                        )
                     }))
                 }
                 input => PendingSource::Ready(
-                    input.and_then(|input| self.sources.parse(input, path, &store.cancel)),
+                    input.and_then(|input| self.sources.parse(input, path, store.cancel.as_ref())),
                 ),
             };
             self.pending.push_back((path.to_owned(), pending));
@@ -253,6 +283,7 @@ impl PendingSources {
 }
 impl Drop for PendingSources {
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
         // An early result or error still owns these workers. Reap them without
         // propagating failures from candidates the caller did not consume.
         for (_, pending) in self.pending.drain(..) {
@@ -276,7 +307,21 @@ impl Default for Sources {
 }
 impl Sources {
     pub fn new(cache: Arc<Cache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            operation: Default::default(),
+            stats: Default::default(),
+        }
+    }
+    pub fn with_operation(mut self, operation: crate::telemetry::Operation) -> Self {
+        self.operation = operation;
+        self
+    }
+    pub fn parse_totals(&self) -> (u64, u64) {
+        (
+            self.stats.count.load(Ordering::Relaxed),
+            self.stats.elapsed_us.load(Ordering::Relaxed),
+        )
     }
     pub fn anchor(
         &mut self,
@@ -294,12 +339,13 @@ impl Sources {
         self.get(store, path, blob).map(Some)
     }
     pub fn get(&self, store: &mut Store, path: &str, blob: &str) -> Result<Arc<Source>> {
-        self.parse(self.input(store, path, blob)?, path, &store.cancel)
+        self.parse(self.input(store, path, blob)?, path, store.cancel.as_ref())
     }
     pub fn pending(&self) -> PendingSources {
         PendingSources {
-            sources: Self::new(self.cache.clone()),
+            sources: self.clone(),
             pending: VecDeque::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
     fn input(&self, store: &mut Store, path: &str, blob: &str) -> Result<Input> {
@@ -324,8 +370,8 @@ impl Sources {
             java,
         })
     }
-    fn parse(&self, input: Input, path: &str, cancel: &AtomicBool) -> Result<Arc<Source>> {
-        crate::repository::history::check(cancel)?;
+    fn parse(&self, input: Input, path: &str, cancel: &dyn Cancellation) -> Result<Arc<Source>> {
+        cancel.check()?;
         let (key, bytes, language, java) = match input {
             Input::Cached(source) => return Ok(source),
             Input::Parse {
@@ -335,9 +381,11 @@ impl Sources {
                 java,
             } => (key, bytes, language, java),
         };
-        let _worker = crate::memory::admit_worker();
-        let _admission = crate::memory::admit_file(bytes.len() as u64, false);
-        crate::repository::history::check(cancel)?;
+        let _admission = {
+            let _wait = self.operation.wait("parser_admission");
+            crate::memory::admit_file(bytes.len() as u64, false, cancel)?
+        };
+        cancel.check()?;
         ensure!(
             !bytes.contains(&0),
             "binary source at {path}; contents were not followed"
@@ -353,8 +401,13 @@ impl Sources {
         let facts = if java {
             java::extract(&text, cancel)
         } else {
-            crate::extract::historical(&text, language)
+            crate::extract::historical_cancellable(&text, language, cancel)
         };
+        self.stats.count.fetch_add(1, Ordering::Relaxed);
+        self.stats.elapsed_us.fetch_add(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         tracing::trace!(
             path,
             ?language,
@@ -362,7 +415,7 @@ impl Sources {
             elapsed_us = started.elapsed().as_micros(),
             "Historical source parse"
         );
-        crate::repository::history::check(cancel)?;
+        cancel.check()?;
         let (declarations, calls, presence, incomplete) = match facts {
             Ok(facts) => (
                 facts.declarations,
@@ -408,6 +461,7 @@ impl Sources {
             incomplete,
             cost,
         });
+        cancel.check()?;
         Ok(self.cache.put_source(key, source))
     }
     pub fn text(&mut self, store: &mut Store, region: &Region) -> Result<String> {
@@ -756,6 +810,32 @@ mod tests {
         barrier.wait();
         dropped.join().unwrap();
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_pending_sources_cancels_unused_workers_before_join() {
+        use std::{sync::mpsc, time::Duration};
+
+        let mut pending = Sources::default().pending();
+        let cancel = pending.cancel.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        pending.pending.push_back((
+            "unused.cs".into(),
+            PendingSource::Running(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                while !cancel.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(anyhow::anyhow!("prefetch cancelled"))
+            })),
+        ));
+        started_rx.recv().unwrap();
+        std::thread::spawn(move || {
+            drop(pending);
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 
     #[test]

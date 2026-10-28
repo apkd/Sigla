@@ -13,12 +13,25 @@ pub fn extract(
     defines: &[String],
     edition: &str,
 ) -> anyhow::Result<Facts> {
-    match language {
+    extract_cancellable(source, language, defines, edition, &())
+}
+
+pub(crate) fn extract_cancellable(
+    source: &str,
+    language: Language,
+    defines: &[String],
+    edition: &str,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> anyhow::Result<Facts> {
+    cancel.check()?;
+    let result = match language {
         Language::CSharp => csharp::extract(source, defines),
         Language::Rust => rust::extract(source, edition),
         Language::Markdown | Language::Text => Ok(Facts::default()),
-        language => crate::native::extract(source, language),
-    }
+        language => crate::native::extract_cancellable(source, language, cancel),
+    }?;
+    cancel.check()?;
+    Ok(result)
 }
 
 /// History-only facts. They are neither binding input nor persisted snapshot data.
@@ -79,12 +92,24 @@ impl std::ops::Deref for HistoricalDeclaration {
 }
 
 /// Syntax-only committed-source parsing; never discovers a build graph.
+#[cfg(test)]
 pub(crate) fn historical(source: &str, language: Language) -> anyhow::Result<HistoricalFacts> {
-    match language {
+    historical_cancellable(source, language, &())
+}
+
+pub(crate) fn historical_cancellable(
+    source: &str,
+    language: Language,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> anyhow::Result<HistoricalFacts> {
+    cancel.check()?;
+    let result = match language {
         Language::CSharp => csharp::historical(source),
         Language::Rust => rust::historical(source),
-        _ => Ok(extract(source, language, &[], "2024")?.into()),
-    }
+        _ => Ok(extract_cancellable(source, language, &[], "2024", cancel)?.into()),
+    }?;
+    cancel.check()?;
+    Ok(result)
 }
 
 impl From<Facts> for HistoricalFacts {

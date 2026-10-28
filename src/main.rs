@@ -23,9 +23,14 @@ use std::{
 struct Cli {
     #[command(flatten)]
     options: sigla::config::Options,
-    /// maximum concurrent indexing/search jobs across all workspaces.
-    #[arg(long,global=true,default_value_t=2,value_parser=clap::value_parser!(u16).range(1..=16))]
-    workers: u16,
+    /// Override each query, preparation, indexing and navigation pool. Defaults:
+    /// queries use up to four available CPUs; other pools use two workers each.
+    #[arg(long,global=true,value_parser=clap::value_parser!(u16).range(1..=16))]
+    workers: Option<u16>,
+    /// Parser admission memory in MiB; defaults to 25% of the effective memory
+    /// limit, capped at 4 GiB. Source reads use a separate quarter of this budget.
+    #[arg(long, global=true,value_parser=clap::value_parser!(u64).range(1..))]
+    parser_memory_mib: Option<u64>,
     #[command(subcommand)]
     command: Command,
 }
@@ -191,6 +196,7 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
         })
         .await?;
     }
+    App::configure_parser_memory(cli.parser_memory_mib)?;
     if let Command::Metadata { command } = cli.command {
         return tokio::task::spawn_blocking(move || command.run()).await?;
     }
@@ -228,20 +234,35 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
     let mut policy = Policy::new(cli.options.local_roots())?;
     policy.unity_platform = cli.options.unity_platform;
     policy.unity_editors = cli.options.unity_editors;
+    let workers = usize::from(cli.workers.unwrap_or(2));
+    let query_workers = cli.workers.map_or_else(
+        || {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4)
+        },
+        usize::from,
+    );
+    tracing::info!(
+        query_workers,
+        preparation_workers = workers,
+        indexing_workers = workers,
+        navigation_workers = workers,
+        "Worker pools configured"
+    );
     let app = Arc::new(
         match remote {
-            Some(remote) => {
-                App::remote(policy, cli.options.cache_dir, cli.workers as usize, remote)?
-            }
+            Some(remote) => App::remote(policy, cli.options.cache_dir, workers, remote)?,
             None if cli.options.mode == sigla::config::Mode::Hybrid => App::hybrid(
                 policy,
                 cli.options.cache_dir,
-                cli.workers as usize,
+                workers,
                 cli.options.upstream.as_deref().unwrap(),
                 cli.options.upstream_token_file.as_deref(),
             )?,
-            None => App::new(policy, cli.options.cache_dir, cli.workers as usize)?,
+            None => App::new(policy, cli.options.cache_dir, workers)?,
         }
+        .with_query_workers(query_workers)?
         .with_cache_limits(cache_limits),
     );
     match cli.command {

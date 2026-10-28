@@ -26,7 +26,9 @@ const MEMORY: usize = 64 * 1024 * 1024;
 const OBJECT_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(crate) fn check(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::Acquire), "history cancelled");
+    if cancel.load(Ordering::Acquire) {
+        return Err(anyhow::Error::new(crate::diagnostics::Cancelled).context("history cancelled"));
+    }
     Ok(())
 }
 
@@ -273,6 +275,10 @@ pub(crate) struct Store {
     resolved: BTreeMap<String, String>,
     planner: planner::Planner,
     tree_have: Option<gix_hash::ObjectId>,
+    pub(crate) operation: crate::telemetry::Operation,
+    pub(crate) fetch_elapsed: Duration,
+    pub(crate) traversal_elapsed: Duration,
+    pub(crate) log_elapsed: Duration,
     pub cancel: Arc<AtomicBool>,
     pub complete: BTreeSet<String>,
     pub boundaries: BTreeSet<String>,
@@ -364,6 +370,10 @@ impl Store {
             resolved: BTreeMap::new(),
             planner: planner::Planner::default(),
             tree_have: None,
+            operation: Default::default(),
+            fetch_elapsed: Duration::ZERO,
+            traversal_elapsed: Duration::ZERO,
+            log_elapsed: Duration::ZERO,
             complete: BTreeSet::new(),
             boundaries: BTreeSet::new(),
             reads: 0,
@@ -371,6 +381,9 @@ impl Store {
     }
     pub fn owner(&self) -> Option<PathBuf> {
         self.lease.as_ref().map(ObjectLease::owner)
+    }
+    pub fn set_operation(&mut self, operation: crate::telemetry::Operation) {
+        self.operation = operation;
     }
     pub fn cache_scope(&self) -> &[u8; 32] {
         &self.cache_scope
@@ -526,6 +539,7 @@ impl Store {
             let start = Instant::now();
             let mut transfer = None;
             let session = remote.session()?;
+            let _wait = self.operation.wait("history_git_fetch");
             let result = lease.acquire(|pool, view| {
                 let measured = materialize::receive_filtered_measured(
                     session,
@@ -539,6 +553,8 @@ impl Store {
                 transfer = Some(measured);
                 Ok(bytes)
             });
+            self.fetch_elapsed += start.elapsed();
+            drop(_wait);
             let reusable = session.can_fetch_again() && result.is_ok();
             if !reusable {
                 remote.session = None;

@@ -112,18 +112,22 @@ pub struct FileEntry {
     pub metadata: bool,
 }
 impl FileEntry {
-    pub(crate) fn read_source(&self) -> Result<String> {
-        let _admission = crate::memory::admit_file(self.stamp.size, false);
-        ensure!(
-            Stamp::read(&self.path)? == self.stamp,
-            "Source changed; retry query"
-        );
-        let source = read_stable(&self.path, self.language)?;
-        ensure!(
-            Stamp::read(&self.path)? == self.stamp,
-            "Source changed; retry query"
-        );
-        Ok(source)
+    pub(crate) fn read_source(
+        &self,
+        cancel: &dyn crate::cancellation::Cancellation,
+    ) -> Result<crate::memory::Source<String>> {
+        crate::memory::Source::read(self.stamp.size, cancel, || {
+            ensure!(
+                Stamp::read(&self.path)? == self.stamp,
+                "Source changed; retry query"
+            );
+            let source = read_stable(&self.path, self.language)?;
+            ensure!(
+                Stamp::read(&self.path)? == self.stamp,
+                "Source changed; retry query"
+            );
+            Ok(source)
+        })
     }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -888,7 +892,9 @@ impl InputContents {
         self,
         path: &Path,
         id: &crate::store::ObjectId,
+        cancel: &dyn crate::cancellation::Cancellation,
     ) -> Result<crate::store::shared::Encoded> {
+        cancel.check()?;
         if let Self::Archived(analysis) = self {
             return Ok(analysis.encoded);
         }
@@ -906,9 +912,11 @@ impl InputContents {
         {
             return Ok(encoded);
         }
-        crate::store::payload::encode(self.extract()?)
+        let extracted = self.extract(cancel)?;
+        cancel.check()?;
+        crate::store::payload::encode(extracted)
     }
-    fn extract(self) -> Result<FileData> {
+    fn extract(self, cancel: &dyn crate::cancellation::Cancellation) -> Result<FileData> {
         match self {
             Self::Archived(_) => unreachable!(),
             Self::Metadata { bytes, stem } => crate::metadata::file_data_bytes(bytes, &stem),
@@ -918,7 +926,9 @@ impl InputContents {
                 defines,
                 edition,
             } => {
-                let facts = crate::extract::extract(&source, language, &defines, &edition)?;
+                let facts = crate::extract::extract_cancellable(
+                    &source, language, &defines, &edition, cancel,
+                )?;
                 Ok(FileData {
                     source,
                     facts,
@@ -954,7 +964,7 @@ fn index_input(
             storage: started.elapsed(),
         });
     }
-    let _admission = crate::memory::admit_file(stamp.size, input.metadata);
+    let _admission = crate::memory::admit_file(stamp.size, input.metadata, &())?;
     let mut extraction = std::time::Duration::ZERO;
     let installed = (|| -> Result<_> {
         verify()?;
@@ -964,7 +974,7 @@ fn index_input(
             let start = std::time::Instant::now();
             let data = contents
                 .map_or_else(|| InputContents::read(input, project), Ok)?
-                .encode(&input.path, &id);
+                .encode(&input.path, &id, &());
             extraction = start.elapsed();
             data
         })
@@ -1054,14 +1064,33 @@ fn input_identity(
 }
 
 fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
+    index_source_batch_cancellable(store, jobs, &(), &crate::telemetry::Operation::default())
+}
+
+fn index_source_batch_cancellable(
+    store: &Store,
+    jobs: &[SourceJob<'_>],
+    cancel: &dyn crate::cancellation::Cancellation,
+    operation: &crate::telemetry::Operation,
+) -> IndexedSources {
     let mut results = BTreeMap::new();
     while results.len() < jobs.len() {
-        results.extend(index_source_chunk(store, &jobs[results.len()..]));
+        results.extend(index_source_chunk(
+            store,
+            &jobs[results.len()..],
+            cancel,
+            operation,
+        ));
     }
     results
 }
 
-fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
+fn index_source_chunk(
+    store: &Store,
+    jobs: &[SourceJob<'_>],
+    cancel: &dyn crate::cancellation::Cancellation,
+    operation: &crate::telemetry::Operation,
+) -> IndexedSources {
     use crate::store::shared::Reuse;
     let mut results = BTreeMap::new();
     let mut retry = Vec::new();
@@ -1101,9 +1130,30 @@ fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
         }
         // Reserve unresolved work once, never while holding another parsing
         // reservation. Cache-only batches need neither admission nor a worker.
-        let mut admission = needs_admission
-            .then(|| crate::memory::admit_batch(total, largest, INDEX_BATCH_BYTES, metadata));
-        let worker = needs_admission.then(crate::memory::admit_worker);
+        let mut admission = match needs_admission
+            .then(|| {
+                let _wait = operation.wait("parser_admission");
+                crate::memory::admit_batch(total, largest, INDEX_BATCH_BYTES, metadata, cancel)
+            })
+            .transpose()
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                let error = std::sync::Arc::new(error);
+                return jobs
+                    .iter()
+                    .map(|(key, (stamp, _, _))| {
+                        (
+                            key.clone(),
+                            (
+                                stamp.clone(),
+                                Err(crate::diagnostics::shared_error(error.clone())),
+                            ),
+                        )
+                    })
+                    .collect();
+            }
+        };
         let mut pending = Vec::new();
         let mut prepared = Vec::new();
         let mut encoded_bytes = 0u64;
@@ -1124,6 +1174,7 @@ fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                     let started = std::time::Instant::now();
                     let mut extraction = std::time::Duration::ZERO;
                     let stage = (|| -> Result<_> {
+                        cancel.check()?;
                         // Admission can wait. Recheck mutable inputs before
                         // reading, after reading, and again before publication.
                         ensure!(
@@ -1141,7 +1192,7 @@ fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                                 let started = std::time::Instant::now();
                                 let data = contents
                                     .map_or_else(|| InputContents::read(input, project), Ok)?
-                                    .encode(&input.path, &id);
+                                    .encode(&input.path, &id, cancel);
                                 extraction = started.elapsed();
                                 data
                             })
@@ -1169,8 +1220,8 @@ fn index_source_chunk(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
                 break;
             }
         }
-        drop(worker);
         if let Some(admission) = &mut admission {
+            admission.release_worker();
             // Keep the existing conservative encoded/name expansion estimate,
             // but release the largest parser's temporary working space.
             admission.shrink_to(encoded_bytes.saturating_mul(8));
@@ -1244,6 +1295,8 @@ pub(crate) fn index_native_batch(
     store: &Store,
     files: &BTreeMap<String, FileEntry>,
     projects: &[Project],
+    cancel: &dyn crate::cancellation::Cancellation,
+    operation: &crate::telemetry::Operation,
 ) -> BTreeMap<String, Result<()>> {
     let inputs: Vec<_> = files
         .iter()
@@ -1270,7 +1323,7 @@ pub(crate) fn index_native_batch(
             )
         })
         .collect();
-    index_source_batch(store, &jobs)
+    index_source_batch_cancellable(store, &jobs, cancel, operation)
         .into_iter()
         .map(|(key, (_, result))| (key, result.map(|_| ())))
         .collect()

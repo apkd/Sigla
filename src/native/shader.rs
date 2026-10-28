@@ -6,16 +6,26 @@ use super::{
     DeclarationInfo, File, OccurrenceInfo, Role,
     lex::{Kind, Lexer, Token},
 };
+use crate::cancellation::Cancellation;
 use crate::model::{Declaration, Facts, Language, Occurrence, OccurrenceRole, WriteKind};
 use anyhow::Result;
 use std::{borrow::Cow, collections::BTreeSet, ops::Range};
 
 pub fn extract(source: &str, language: Language) -> Result<Facts> {
+    extract_cancellable(source, language, &())
+}
+
+pub(crate) fn extract_cancellable(
+    source: &str,
+    language: Language,
+    cancel: &dyn Cancellation,
+) -> Result<Facts> {
+    cancel.check()?;
     if !matches!(language, Language::Hlsl | Language::ShaderLab) {
-        return super::extract::extract(source, language);
+        return super::extract::extract_cancellable(source, language, cancel);
     }
-    let prepared = prepare(source, language);
-    let mut facts = super::extract::extract(&prepared.text, prepared.language)?;
+    let prepared = prepare_cancellable(source, language, cancel)?;
+    let mut facts = super::extract::extract_cancellable(&prepared.text, prepared.language, cancel)?;
     facts.errors |= prepared.errors;
     let custom_pragmas =
         prepared.text.contains("native_pass") || prepared.text.contains("native_mesh");
@@ -27,6 +37,7 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
         .take()
         .expect("native extractor supplies native facts");
     for authored in prepared.declarations {
+        cancel.check()?;
         // Masked block-format files have one full-file HLSL region. Never create
         // an out-of-region declaration: native navigation depends on this invariant.
         let Some(region) = native
@@ -65,8 +76,10 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
     if custom_pragmas {
         let mut entries = Vec::new();
         for (region, info) in native.regions.iter().enumerate() {
+            cancel.check()?;
             if info.language == Language::Hlsl {
-                let (spans, errors) = entry_points(&prepared.text, info.span.clone());
+                let (spans, errors) =
+                    entry_points_cancellable(&prepared.text, info.span.clone(), cancel)?;
                 facts.errors |= errors;
                 entries.extend(spans.into_iter().map(|span| (region as u32, span)));
             }
@@ -78,6 +91,7 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
             .collect();
         let mut changed = false;
         for (region, span) in entries {
+            cancel.check()?;
             if !occupied.insert((span.start, span.end)) {
                 continue;
             }
@@ -100,7 +114,7 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
             });
         }
         if changed {
-            rebuild_occurrences(&mut facts, &mut native);
+            rebuild_occurrences(&mut facts, &mut native, cancel)?;
         }
     }
     facts.native = Some(native);
@@ -109,7 +123,11 @@ pub fn extract(source: &str, language: Language) -> Result<Facts> {
 
 /// Occurrence ordinals back both tables and the reverse indexes. Declaration
 /// ordinals are deliberately NOT reordered (locals and parents refer to them).
-fn rebuild_occurrences(facts: &mut Facts, native: &mut File) {
+fn rebuild_occurrences(
+    facts: &mut Facts,
+    native: &mut File,
+    cancel: &dyn Cancellation,
+) -> Result<()> {
     let mut occurrences: Vec<_> = std::mem::take(&mut facts.occurrences)
         .into_iter()
         .zip(std::mem::take(&mut native.occurrences))
@@ -118,6 +136,7 @@ fn rebuild_occurrences(facts: &mut Facts, native: &mut File) {
     native.names.clear();
     native.calls.clear();
     for (occurrence, info) in occurrences {
+        cancel.check()?;
         let index = facts.occurrences.len() as u32;
         native
             .names
@@ -132,6 +151,7 @@ fn rebuild_occurrences(facts: &mut Facts, native: &mut File) {
         facts.occurrences.push(occurrence);
         native.occurrences.push(info);
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -182,13 +202,33 @@ fn marker_word(word: &str) -> Option<(bool, String)> {
     }
 }
 
-fn contains_ascii_case_insensitive(text: &str, pattern: &[u8]) -> bool {
-    text.as_bytes()
-        .windows(pattern.len())
-        .any(|part| part.eq_ignore_ascii_case(pattern))
+fn contains_ascii_case_insensitive(
+    text: &str,
+    pattern: &[u8],
+    cancel: &dyn Cancellation,
+) -> Result<bool> {
+    for (index, part) in text.as_bytes().windows(pattern.len()).enumerate() {
+        if index % 4096 == 0 {
+            cancel.check()?;
+        }
+        if part.eq_ignore_ascii_case(pattern) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
+#[cfg(test)]
 fn prepare(source: &str, language: Language) -> Prepared<'_> {
+    prepare_cancellable(source, language, &()).unwrap()
+}
+
+fn prepare_cancellable<'a>(
+    source: &'a str,
+    language: Language,
+    cancel: &dyn Cancellation,
+) -> Result<Prepared<'a>> {
+    cancel.check()?;
     let first =
         Lexer::new(source, 0..source.len()).find(|token| &source[token.span.clone()] != "\u{feff}");
     // Standard ShaderLab starts with Shader, not BEGIN_*. Leave its existing
@@ -198,8 +238,8 @@ fn prepare(source: &str, language: Language) -> Prepared<'_> {
             token.kind == Kind::Name && marker_word(&source[token.span]).is_some()
         });
     let properties = language == Language::Hlsl
-        && (contains_ascii_case_insensitive(source, b"BEGIN_PROPERTIES")
-            || contains_ascii_case_insensitive(source, b"END_PROPERTIES"));
+        && (contains_ascii_case_insensitive(source, b"BEGIN_PROPERTIES", cancel)?
+            || contains_ascii_case_insensitive(source, b"END_PROPERTIES", cancel)?);
     let mut prepared = Prepared {
         text: Cow::Borrowed(source),
         language,
@@ -207,33 +247,34 @@ fn prepare(source: &str, language: Language) -> Prepared<'_> {
         errors: false,
     };
     if !surface && !properties {
-        return prepared;
+        return Ok(prepared);
     }
-    let (blocks, markers, errors) = scan_blocks(source, surface);
+    let (blocks, markers, errors) = scan_blocks(source, surface, cancel)?;
     prepared.errors = errors;
     let mut text = source.as_bytes().to_vec();
     if surface {
-        blank(&mut text);
+        blank(&mut text, cancel)?;
         prepared.language = Language::Hlsl;
     }
     for marker in markers {
-        blank(&mut text[marker]);
+        blank(&mut text[marker], cancel)?;
     }
     for block in blocks {
+        cancel.check()?;
         if !surface {
-            blank(&mut text[block.span.clone()]);
+            blank(&mut text[block.span.clone()], cancel)?;
         }
         match block.kind.as_str() {
             "CODE" | "DEFINES" | "CBUFFER" if surface => {
                 text[block.body.clone()].copy_from_slice(&source.as_bytes()[block.body]);
             }
             "PROPERTIES" => {
-                let (declarations, errors) = property_declarations(source, block.body);
+                let (declarations, errors) = property_declarations(source, block.body, cancel)?;
                 prepared.declarations.extend(declarations);
                 prepared.errors |= errors;
             }
             "VARYINGS" if surface => {
-                let (declarations, errors) = varying_declarations(source, block.body);
+                let (declarations, errors) = varying_declarations(source, block.body, cancel)?;
                 prepared.declarations.extend(declarations);
                 prepared.errors |= errors;
             }
@@ -247,15 +288,19 @@ fn prepare(source: &str, language: Language) -> Prepared<'_> {
     // Every removed byte is replaced, including every byte of a UTF-8 scalar;
     // retained slices end on line/token boundaries. Byte positions never move.
     prepared.text = Cow::Owned(String::from_utf8(text).expect("mask preserves UTF-8"));
-    prepared
+    Ok(prepared)
 }
 
-fn blank(bytes: &mut [u8]) {
-    for byte in bytes {
+fn blank(bytes: &mut [u8], cancel: &dyn Cancellation) -> Result<()> {
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        if index % 4096 == 0 {
+            cancel.check()?;
+        }
         if !matches!(*byte, b'\r' | b'\n') {
             *byte = b' ';
         }
     }
+    Ok(())
 }
 
 fn physical_start(source: &str, at: usize) -> usize {
@@ -312,11 +357,16 @@ fn logical_end(source: &str, at: usize, limit: usize) -> usize {
 /// The whole-file lexer skips comments and strings, including multiline ones.
 /// `previous_end` distinguishes a marker/directive from a name inside code or a
 /// continued macro. A marker's optional argument is opaque (CBUFFER/PASS names).
-fn scan_blocks(source: &str, surface: bool) -> (Vec<Block>, Vec<Range<usize>>, bool) {
+fn scan_blocks(
+    source: &str,
+    surface: bool,
+    cancel: &dyn Cancellation,
+) -> Result<(Vec<Block>, Vec<Range<usize>>, bool)> {
     let mut markers = Vec::new();
     let mut errors = false;
     let mut previous_end = 0;
     for token in Lexer::new(source, 0..source.len()) {
+        cancel.check()?;
         if &source[token.span.clone()] == "\u{feff}" && token.span.start == 0 {
             continue;
         }
@@ -335,13 +385,16 @@ fn scan_blocks(source: &str, surface: bool) -> (Vec<Block>, Vec<Range<usize>>, b
             continue;
         }
         let end = physical_end(source, token.span.end, source.len());
-        let tail: Vec<_> = Lexer::new(source, token.span.end..end).collect();
+        let tail: Vec<_> = Lexer::new(source, token.span.end..end)
+            .take_while(|_| !cancel.is_cancelled())
+            .collect();
+        cancel.check()?;
         if !(tail.is_empty()
             || open
                 && surface
                 && matches!(kind.as_str(), "CBUFFER" | "INSTANCING_BUFFER" | "PASS")
                 && spelling(source, &tail, 0) == Some("(")
-                && closing(source, &tail, 0).ok() == Some(tail.len() - 1))
+                && closing(source, &tail, 0, cancel).ok() == Some(tail.len() - 1))
         {
             errors |= surface;
             continue;
@@ -361,6 +414,7 @@ fn scan_blocks(source: &str, surface: bool) -> (Vec<Block>, Vec<Range<usize>>, b
     let mut blocks = Vec::new();
     let mut active: Option<Marker> = None;
     for marker in markers {
+        cancel.check()?;
         if marker.open {
             if let Some(previous) = active.take() {
                 // Recover at the next opener rather than swallowing all later code.
@@ -391,7 +445,8 @@ fn scan_blocks(source: &str, surface: bool) -> (Vec<Block>, Vec<Range<usize>>, b
             span: previous.line.start..source.len(),
         });
     }
-    (blocks, spans, errors)
+    cancel.check()?;
+    Ok((blocks, spans, errors))
 }
 
 fn spelling<'a>(source: &'a str, tokens: &[Token], index: usize) -> Option<&'a str> {
@@ -400,9 +455,17 @@ fn spelling<'a>(source: &'a str, tokens: &[Token], index: usize) -> Option<&'a s
 
 /// Match balanced punctuation without recursion. On failure return the point
 /// already inspected, so malformed input cannot force quadratic rescanning.
-fn closing(source: &str, tokens: &[Token], start: usize) -> std::result::Result<usize, usize> {
+fn closing(
+    source: &str,
+    tokens: &[Token],
+    start: usize,
+    cancel: &dyn Cancellation,
+) -> std::result::Result<usize, usize> {
     let mut stack = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(start) {
+        if cancel.is_cancelled() {
+            return Err(index);
+        }
         let word = &source[token.span.clone()];
         match word {
             "(" => stack.push(")"),
@@ -422,13 +485,20 @@ fn closing(source: &str, tokens: &[Token], start: usize) -> std::result::Result<
     Err(tokens.len())
 }
 
-fn property_declarations(source: &str, body: Range<usize>) -> (Vec<Authored>, bool) {
-    let tokens: Vec<_> = Lexer::new(source, body.clone()).collect();
+fn property_declarations(
+    source: &str,
+    body: Range<usize>,
+    cancel: &dyn Cancellation,
+) -> Result<(Vec<Authored>, bool)> {
+    let tokens: Vec<_> = Lexer::new(source, body.clone())
+        .take_while(|_| !cancel.is_cancelled())
+        .collect();
     let mut result = Vec::new();
     let mut errors = false;
     let mut at = 0;
     while at < tokens.len() {
-        match property(source, &tokens, at) {
+        cancel.check()?;
+        match property(source, &tokens, at, cancel) {
             Ok((declaration, next)) => {
                 result.push(declaration);
                 at = next;
@@ -440,23 +510,26 @@ fn property_declarations(source: &str, body: Range<usize>) -> (Vec<Authored>, bo
                 let end = physical_end(source, tokens[at].span.start, body.end);
                 at = inspected.max(at + 1);
                 while at < tokens.len() && tokens[at].span.start < end {
+                    cancel.check()?;
                     at += 1;
                 }
             }
         }
     }
-    (result, errors)
+    cancel.check()?;
+    Ok((result, errors))
 }
 
 fn property(
     source: &str,
     tokens: &[Token],
     start: usize,
+    cancel: &dyn Cancellation,
 ) -> std::result::Result<(Authored, usize), usize> {
     let mut at = start;
     let mut attributes = Vec::new();
     while spelling(source, tokens, at) == Some("[") {
-        let end = closing(source, tokens, at)?;
+        let end = closing(source, tokens, at, cancel)?;
         attributes.push(source[tokens[at].span.start..tokens[end].span.end].to_owned());
         at = end + 1;
     }
@@ -464,7 +537,7 @@ fn property(
     if name.kind != Kind::Name || spelling(source, tokens, at + 1) != Some("(") {
         return Err(at + 1);
     }
-    let header_end = closing(source, tokens, at + 1)?;
+    let header_end = closing(source, tokens, at + 1, cancel)?;
     if tokens
         .get(at + 2)
         .is_none_or(|token| token.kind != Kind::Literal)
@@ -479,7 +552,7 @@ fn property(
     let kind = spelling(source, tokens, type_start).ok_or(header_end + 1)?;
     if kind == "Range" {
         if spelling(source, tokens, type_start + 1) != Some("(")
-            || closing(source, tokens, type_start + 1)? != header_end - 1
+            || closing(source, tokens, type_start + 1, cancel)? != header_end - 1
         {
             return Err(header_end + 1);
         }
@@ -492,14 +565,14 @@ fn property(
             if spelling(source, tokens, default) != Some("(") {
                 return Err(default);
             }
-            closing(source, tokens, default)?
+            closing(source, tokens, default, cancel)?
         }
         "2D" | "2DArray" | "3D" | "Cube" | "CubeArray" => {
             if !spelling(source, tokens, default).is_some_and(|word| word.starts_with('"')) {
                 return Err(default);
             }
             if spelling(source, tokens, default + 1) == Some("{") {
-                closing(source, tokens, default + 1)?
+                closing(source, tokens, default + 1, cancel)?
             } else {
                 default
             }
@@ -552,15 +625,23 @@ fn varying_type(word: &str) -> bool {
         })
 }
 
-fn varying_declarations(source: &str, body: Range<usize>) -> (Vec<Authored>, bool) {
-    let tokens: Vec<_> = Lexer::new(source, body.clone()).collect();
+fn varying_declarations(
+    source: &str,
+    body: Range<usize>,
+    cancel: &dyn Cancellation,
+) -> Result<(Vec<Authored>, bool)> {
+    let tokens: Vec<_> = Lexer::new(source, body.clone())
+        .take_while(|_| !cancel.is_cancelled())
+        .collect();
     let mut result = Vec::new();
     let mut errors = false;
     let mut at = 0;
     while at < tokens.len() {
+        cancel.check()?;
         let end = logical_end(source, tokens[at].span.start, body.end);
         let mut next = at + 1;
         while next < tokens.len() && tokens[next].span.start < end {
+            cancel.check()?;
             next += 1;
         }
         let row = &tokens[at..next];
@@ -607,14 +688,25 @@ fn varying_declarations(source: &str, body: Range<usize>) -> (Vec<Authored>, boo
             conditional: prefix != "*",
         });
     }
-    (result, errors)
+    cancel.check()?;
+    Ok((result, errors))
 }
 
+#[cfg(test)]
 fn entry_points(source: &str, range: Range<usize>) -> (Vec<Range<usize>>, bool) {
+    entry_points_cancellable(source, range, &()).unwrap()
+}
+
+fn entry_points_cancellable(
+    source: &str,
+    range: Range<usize>,
+    cancel: &dyn Cancellation,
+) -> Result<(Vec<Range<usize>>, bool)> {
     let mut result = Vec::new();
     let mut errors = false;
     let mut previous_end = range.start;
     for token in Lexer::new(source, range.clone()) {
+        cancel.check()?;
         if token.span.start == range.start && &source[token.span.clone()] == "\u{feff}" {
             continue;
         }
@@ -626,7 +718,10 @@ fn entry_points(source: &str, range: Range<usize>) -> (Vec<Range<usize>>, bool) 
             continue;
         }
         let end = logical_end(source, token.span.end, range.end);
-        let words: Vec<_> = Lexer::new(source, token.span.end..end).collect();
+        let words: Vec<_> = Lexer::new(source, token.span.end..end)
+            .take_while(|_| !cancel.is_cancelled())
+            .collect();
+        cancel.check()?;
         if spelling(source, &words, 0) != Some("pragma") {
             continue;
         }
@@ -654,7 +749,7 @@ fn entry_points(source: &str, range: Range<usize>) -> (Vec<Range<usize>>, bool) 
         }
         result.extend(selected.iter().map(|&index| words[index].span.clone()));
     }
-    (result, errors)
+    Ok((result, errors))
 }
 
 #[cfg(test)]

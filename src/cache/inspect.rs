@@ -89,6 +89,8 @@ pub struct Report {
     pub active_view_leases: Vec<PathBuf>,
     #[serde(default)]
     pub pending_retirement_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::memory::Resources>,
     pub preview: Preview,
     pub notes: Vec<String>,
 }
@@ -376,6 +378,7 @@ pub(crate) fn build(
             Vec::new()
         },
         pending_retirement_bytes: super::blobs::allocated(&cache.join("retired-views"))?,
+        resources: live_service.then(crate::memory::resources),
         preview: Preview {
             reclaim_target_bytes,
             cleanup_estimate_bytes: cleanup,
@@ -463,6 +466,22 @@ impl Report {
             self.limits.max_bytes as f64 / 1_000_000_000.0,
             self.limits.headroom_percent
         );
+        if let Some(resources) = &self.resources {
+            for (name, budget) in [
+                ("Parsing", &resources.parsing),
+                ("Source reads", &resources.sources),
+            ] {
+                text.push_str(&format!(
+                    "{name}: {} / {} reserved; workers {} / {}; {} waiting (oldest {} ms)\n",
+                    size(budget.reserved_bytes),
+                    size(budget.capacity_bytes),
+                    budget.active_workers,
+                    budget.worker_limit,
+                    budget.waiting,
+                    budget.oldest_wait_ms
+                ));
+            }
+        }
         text.push_str("\nDisk by category (shared inodes divided between categories):\n");
         text.push_str(&format!(
             "Active dependency leases: {}; pending retired storage: {}\n",

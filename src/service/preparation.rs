@@ -150,7 +150,9 @@ impl App {
             tracing::Span::current().record("revision", prepared.revision.as_str());
         }
         let remote = self.remote.as_ref().unwrap().clone();
-        tokio::task::spawn_blocking(move || {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
+        let result = tokio::task::spawn_blocking(move || {
             let _activity = activity;
             let _permit = permit;
             let root = branch.source();
@@ -168,8 +170,8 @@ impl App {
                 super::Request::Search(_) => unreachable!(),
             };
             let Some(text) = crate::navigation::sources::repository(
-                &root, contents, prepared, &path, mode,
-                |path| remote.source_blob(&branch, prepared, path),
+                &root, contents, prepared, &path, mode, &cancel,
+                |path| remote.source_blob(&branch, prepared, path, &cancel),
             )? else {
                 return Ok(None);
             };
@@ -177,7 +179,9 @@ impl App {
             Ok(Some(CallToolResult::success(vec![ContentBlock::text(format!(
                 "{text}\n\n> Repository inventory available; preparation and indexing are still running."
             ))])))
-        }).await?
+        }).await?;
+        guard.disarm();
+        result
     }
 
     pub(super) async fn navigate_early(

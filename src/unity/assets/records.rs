@@ -72,8 +72,7 @@ fn load(
     let cached = if let Some(cached) = cached {
         cached
     } else {
-        let _admission = crate::memory::admit_file(stamp.size, false);
-        let _worker = crate::memory::admit_worker();
+        let _admission = crate::memory::admit_file(stamp.size, false, cancel)?;
         let bytes = source.map_or_else(|| std::fs::read(file), Ok)?;
         let (mut parsed, unavailable) = match std::str::from_utf8(&bytes) {
             Ok(text)

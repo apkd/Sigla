@@ -434,6 +434,15 @@ impl Branch {
         }
     }
 
+    pub(crate) fn try_analyze(&self) -> Option<AnalysisGuard> {
+        let analysis = self.analysis.clone().try_read_owned().ok()?;
+        let state = self.state.clone().try_read_owned().ok()?;
+        Some(AnalysisGuard {
+            state,
+            _analysis: analysis,
+        })
+    }
+
     pub(crate) async fn publish(&self) -> PublicationGuard {
         let analysis = self.analysis.clone().write_owned().await;
         let state = self.state.clone().write_owned().await;
@@ -969,15 +978,17 @@ impl Manager {
         branch: &Branch,
         prepared: &Prepared,
         path: &str,
-    ) -> Result<Option<Vec<u8>>> {
+        cancel: &dyn crate::cancellation::Cancellation,
+    ) -> Result<Option<crate::memory::Source<Vec<u8>>>> {
         let oid = prepared
             .selected
             .get(path)
             .context("Source is not selected")?;
         authorize(&self.options.rules, &branch.repository)?;
-        match super::github::blob(&branch.repository, oid) {
+        match super::github::blob(&branch.repository, oid, cancel) {
             Ok(bytes) => Ok(bytes),
             Err(error) => {
+                cancel.check()?;
                 tracing::warn!(%error, "On-demand source read failed; awaiting repository acquisition");
                 Ok(None)
             }

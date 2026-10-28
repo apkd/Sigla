@@ -1,16 +1,12 @@
 //! Transient Java implementation/call facts for history source ranges only.
 //! This adapter does not participate in indexing, binding or named selectors.
 use crate::{
+    cancellation::Cancellation,
     extract::{HistoricalDeclaration, HistoricalFacts},
     model::{Declaration, Occurrence, OccurrenceRole, WriteKind},
-    repository::history::check,
 };
 use anyhow::{Context, Result, ensure};
-use std::{
-    ops::Range,
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{ops::Range, path::Path};
 use tree_sitter::{Node, ParseOptions, Parser};
 
 const SOURCE_BYTES: usize = 16 * 1024 * 1024;
@@ -46,8 +42,8 @@ struct Work {
     bytes: usize,
 }
 impl Work {
-    fn step(&mut self, cancel: &AtomicBool) -> Result<()> {
-        check(cancel)?;
+    fn step(&mut self, cancel: &dyn Cancellation) -> Result<()> {
+        cancel.check()?;
         ensure!(
             self.nodes < WORK,
             "historical Java traversal work limit reached"
@@ -91,7 +87,12 @@ fn annotation(node: Node<'_>) -> bool {
     matches!(node.kind(), "annotation" | "marker_annotation")
 }
 
-fn spelling(node: Node<'_>, source: &str, work: &mut Work, cancel: &AtomicBool) -> Result<String> {
+fn spelling(
+    node: Node<'_>,
+    source: &str,
+    work: &mut Work,
+    cancel: &dyn Cancellation,
+) -> Result<String> {
     let mut text = String::new();
     walk(node, |node| {
         work.step(cancel)?;
@@ -110,7 +111,7 @@ fn parameters(
     node: Node<'_>,
     source: &str,
     work: &mut Work,
-    cancel: &AtomicBool,
+    cancel: &dyn Cancellation,
 ) -> Result<Vec<String>> {
     let mut result = Vec::new();
     if let Some(parameters) = node.child_by_field_name("parameters") {
@@ -147,7 +148,7 @@ fn declaration(
     source: &str,
     package: &str,
     work: &mut Work,
-    cancel: &AtomicBool,
+    cancel: &dyn Cancellation,
 ) -> Result<Option<HistoricalDeclaration>> {
     let (Some(name), Some(body)) = (
         node.child_by_field_name("name"),
@@ -251,8 +252,8 @@ fn declaration(
     }))
 }
 
-pub(super) fn extract(source: &str, cancel: &AtomicBool) -> Result<HistoricalFacts> {
-    check(cancel)?;
+pub(super) fn extract(source: &str, cancel: &dyn Cancellation) -> Result<HistoricalFacts> {
+    cancel.check()?;
     ensure!(
         source.len() <= SOURCE_BYTES,
         "historical Java source byte limit reached"
@@ -268,7 +269,7 @@ pub(super) fn extract(source: &str, cancel: &AtomicBool) -> Result<HistoricalFac
     let mut steps = 0;
     let mut progress = |_: &tree_sitter::ParseState| {
         steps += 1;
-        cancel.load(Ordering::Relaxed) || steps >= WORK
+        cancel.is_cancelled() || steps >= WORK
     };
     let tree = parser
         .parse_with_options(
@@ -277,7 +278,7 @@ pub(super) fn extract(source: &str, cancel: &AtomicBool) -> Result<HistoricalFac
             Some(ParseOptions::new().progress_callback(&mut progress)),
         )
         .context("historical Java parse work limit or cancellation")?;
-    check(cancel)?;
+    cancel.check()?;
     let root = tree.root_node();
     let mut facts = HistoricalFacts {
         incomplete: root
@@ -357,7 +358,10 @@ mod tests {
         *,
     };
     use crate::{model::Language, repository::history::Store};
-    use std::{process::Command, sync::Arc};
+    use std::{
+        process::Command,
+        sync::{Arc, atomic::AtomicBool},
+    };
 
     #[test]
     fn java_facts_keep_types_calls_and_lexical_owners_private() {

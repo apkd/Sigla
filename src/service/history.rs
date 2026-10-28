@@ -69,6 +69,11 @@ impl App {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel = Cancel(cancel.clone());
+        operation.stage("history_admission");
+        let history_permit = {
+            let _wait = operation.wait("history_admission");
+            self.history_workers.clone().acquire_owned().await?
+        };
         tracing::Span::current().record("stage", "query_admission");
         operation.stage("query_admission");
         let permit = {
@@ -90,46 +95,75 @@ impl App {
         let query = query.to_owned();
         tracing::Span::current().record("stage", "evaluation");
         operation.stage("evaluation");
+        let blocking_operation =
+            crate::telemetry::operation("history_work", Some(path), Some(&query));
+        if let Some(id) = blocking_operation.id() {
+            operation.link(&id);
+        }
         let text = tokio::task::spawn_blocking(move || -> Result<String> {
-            let (_permit, _activity) = (permit, activity);
-            crate::repository::history::check(&cancel)?;
-            let (store, selector) = if let Some(repository) = repository {
-                let selector = repository.selector.clone();
-                (
-                    crate::repository::history::Store::remote(
-                        repository,
-                        rules.as_ref().unwrap(),
-                        &app.cache,
-                        cancel,
-                    )?,
-                    selector,
-                )
+            let (_permit, _history_permit, _activity) = (permit, history_permit, activity);
+            blocking_operation.stage("evaluation");
+            #[cfg(test)]
+            {
+                app.history_started.notify_one();
+                drop(futures_executor::block_on(app.history_pause.acquire()).unwrap());
+            }
+            let result = (|| -> Result<String> {
+                crate::repository::history::check(&cancel)?;
+                let (mut store, selector) = if let Some(repository) = repository {
+                    let selector = repository.selector.clone();
+                    (
+                        crate::repository::history::Store::remote(
+                            repository,
+                            rules.as_ref().unwrap(),
+                            &app.cache,
+                            cancel,
+                        )?,
+                        selector,
+                    )
+                } else {
+                    let (path, selector) = local.unwrap();
+                    (
+                        crate::repository::history::Store::local(&path, cancel)?,
+                        selector,
+                    )
+                };
+                store.set_operation(blocking_operation.clone());
+                let owner = store.owner();
+                if let Some(owner) = &owner {
+                    app.owners
+                        .lock()
+                        .unwrap()
+                        .record_history(owner, crate::cache::now());
+                }
+                let result = crate::history::run_cached(
+                    store,
+                    selector.as_deref(),
+                    &query,
+                    app.history_cache.clone(),
+                );
+                app.trim_idle();
+                if let Some(owner) = &owner {
+                    let mut owners = app.owners.lock().unwrap();
+                    owners.record_history(owner, crate::cache::now());
+                    owners.flush()?;
+                }
+                result
+            })();
+            let diagnostic = result
+                .as_ref()
+                .err()
+                .and_then(crate::diagnostics::monitoring);
+            if let Some(diagnostic) = diagnostic {
+                blocking_operation.diagnose(diagnostic);
+            }
+            blocking_operation.finish(if result.is_ok() {
+                "success"
+            } else if diagnostic == Some(crate::telemetry::Diagnostic::RequestCancelled) {
+                "cancelled"
             } else {
-                let (path, selector) = local.unwrap();
-                (
-                    crate::repository::history::Store::local(&path, cancel)?,
-                    selector,
-                )
-            };
-            let owner = store.owner();
-            if let Some(owner) = &owner {
-                app.owners
-                    .lock()
-                    .unwrap()
-                    .record_history(owner, crate::cache::now());
-            }
-            let result = crate::history::run_cached(
-                store,
-                selector.as_deref(),
-                &query,
-                app.history_cache.clone(),
-            );
-            app.trim_idle();
-            if let Some(owner) = &owner {
-                let mut owners = app.owners.lock().unwrap();
-                owners.record_history(owner, crate::cache::now());
-                owners.flush()?;
-            }
+                "error"
+            });
             result
         })
         .await??;

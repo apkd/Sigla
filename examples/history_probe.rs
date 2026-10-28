@@ -5,7 +5,7 @@ use sigla::{config, discovery::Policy, service::App};
 use std::{path::Path, sync::Arc, time::Instant};
 
 #[derive(Parser)]
-struct Options {
+struct ProbeOptions {
     #[command(flatten)]
     service: config::Options,
     codebase: String,
@@ -28,7 +28,7 @@ fn allocated(path: &Path) -> Result<u64> {
         .parse()?)
 }
 
-async fn run(options: Options) -> Result<()> {
+async fn run(options: ProbeOptions) -> Result<()> {
     ensure!(options.repeat > 0, "Use at least one repetition");
     let remote = options.service.validate()?;
     let policy = Policy::new(options.service.local_roots())?;
@@ -70,5 +70,5 @@ fn main() -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(run(Options::parse()))
+        .block_on(run(ProbeOptions::parse()))
 }

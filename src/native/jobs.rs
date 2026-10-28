@@ -326,7 +326,7 @@ impl Jobs {
                             tokio::task::spawn_blocking(move || {
                                 let _permit = permit;
                                 let bytes = files.values().map(|file| file.stamp.size.max(1)).sum::<u64>();
-                                let results = crate::workspace::index_native_batch(&store, &files, &manifest.projects);
+                                let results = crate::workspace::index_native_batch(&store, &files, &manifest.projects, &cancel, &operation);
                                 (bytes, results)
                             }).await.context("Source extraction worker stopped")
                         });

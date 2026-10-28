@@ -8,6 +8,8 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
+#[cfg(test)]
+mod admission_tests;
 mod history;
 mod indexes;
 mod inspection;
@@ -35,11 +37,17 @@ enum Request {
     View(String, crate::navigation::Mode),
 }
 type Startup = tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>;
+type QueryAdmission = (
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedMutexGuard<Option<Workspace>>,
+    Option<crate::repository::manager::AnalysisGuard>,
+);
 pub struct App {
     policy: Policy,
     cache: PathBuf,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceSlot>>,
     workers: Arc<tokio::sync::Semaphore>,
+    history_workers: Arc<tokio::sync::Semaphore>,
     preparation_workers: Arc<tokio::sync::Semaphore>,
     indexing_workers: Arc<tokio::sync::Semaphore>,
     navigation_workers: Arc<tokio::sync::Semaphore>,
@@ -66,9 +74,72 @@ pub struct App {
     discovery_pause: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     indexing_pause: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    admission_started: tokio::sync::Notify,
+    #[cfg(test)]
+    history_started: tokio::sync::Notify,
+    #[cfg(test)]
+    history_pause: Arc<tokio::sync::Semaphore>,
     _ownership: Ownership,
 }
 impl App {
+    /// Configure process-wide parser memory before creating service instances.
+    pub fn configure_parser_memory(mib: Option<u64>) -> Result<()> {
+        crate::memory::configure_parser_memory(mib)
+    }
+
+    /// Adjust foreground capacity without increasing preparation or indexing.
+    pub fn with_query_workers(mut self, workers: usize) -> Result<Self> {
+        ensure!(workers > 0, "At least one query worker is required");
+        self.workers = Arc::new(tokio::sync::Semaphore::new(workers));
+        self.history_workers = Arc::new(tokio::sync::Semaphore::new(
+            workers.saturating_sub(1).max(1),
+        ));
+        Ok(self)
+    }
+
+    async fn admit_query(
+        &self,
+        workspace: Arc<tokio::sync::Mutex<Option<Workspace>>>,
+        branch: Option<&Arc<crate::repository::manager::Branch>>,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<QueryAdmission> {
+        loop {
+            let state = {
+                let _wait = operation.wait("workspace_lock");
+                workspace.clone().lock_owned().await
+            };
+            let branch_state = match branch {
+                Some(branch) => {
+                    let _wait = operation.wait("branch_analysis");
+                    Some(branch.analyze().await)
+                }
+                None => None,
+            };
+            if let Ok(permit) = self.workers.clone().try_acquire_owned() {
+                return Ok((permit, state, branch_state));
+            }
+            drop(branch_state);
+            drop(state);
+            #[cfg(test)]
+            self.admission_started.notify_one();
+            let permit = {
+                let _wait = operation.wait("query_admission");
+                self.workers.clone().acquire_owned().await?
+            };
+            if let Ok(state) = workspace.clone().try_lock_owned() {
+                let branch_state = branch
+                    .map(|branch| branch.try_analyze().ok_or(()))
+                    .transpose();
+                if let Ok(branch_state) = branch_state {
+                    return Ok((permit, state, branch_state));
+                }
+            }
+            // Return scarce query capacity before joining the lock queues.
+            // The next iteration awaits a lock; it does not busy-poll.
+            drop(permit);
+        }
+    }
     #[cfg(test)]
     async fn request_cancellable(
         self: &Arc<Self>,
@@ -184,6 +255,9 @@ impl App {
             cache,
             workspaces: Mutex::new(HashMap::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            history_workers: Arc::new(tokio::sync::Semaphore::new(
+                workers.saturating_sub(1).max(1),
+            )),
             preparation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             indexing_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             navigation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
@@ -207,6 +281,12 @@ impl App {
             discovery_pause: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             indexing_pause: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            admission_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            history_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            history_pause: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         // Recovery above is mandatory. Retirement and space reclamation are
         // scheduled by start_setup, never part of synchronous construction.
@@ -913,11 +993,11 @@ impl App {
             preparation.complete().await?;
         }
         let asset_workspace = workspace.clone();
-        let mut state = {
+        let state = {
             let _wait = operation.wait("workspace_lock");
             workspace.lock_owned().await
         };
-        let mut branch_state = match &branch {
+        let branch_state = match &branch {
             Some(branch) => {
                 let _wait = operation.wait("branch_analysis");
                 Some(branch.analyze().await)
@@ -933,6 +1013,9 @@ impl App {
                 prepared.tracked.len(),
             )
         });
+        let branch_generation = branch
+            .as_ref()
+            .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
         let repository_root = branch
             .as_ref()
             .map(|branch| branch.source().canonicalize())
@@ -1009,10 +1092,10 @@ impl App {
             }
         }
         let wait_assets = asset_request && indexes::wait_assets(&request, query.as_ref());
+        drop(branch_state);
+        drop(state);
         if wait_assets || needed.values().any(|wait| *wait) {
             // Waiting requests own neither workspace locks nor query workers.
-            drop(state);
-            drop(branch_state);
             for (group, wait) in &needed {
                 if *wait {
                     let _wait = operation.wait("source_indexing");
@@ -1025,50 +1108,64 @@ impl App {
                 let _wait = operation.wait("assets");
                 crate::unity::assets::jobs::wait(ticket.clone()).await?;
             }
-            state = {
-                let _wait = operation.wait("workspace_lock");
-                asset_workspace.clone().lock_owned().await
-            };
-            branch_state = match &branch {
-                Some(branch) => {
-                    let _wait = operation.wait("branch_analysis");
-                    Some(branch.analyze().await)
-                }
-                None => None,
-            };
-            ensure!(
-                crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?
-                    == asset_generation,
-                crate::diagnostics::RefreshRequired(
-                    "Workspace changed during indexing; retry query"
-                )
-            );
-            ensure!(
-                branch_state
-                    .as_ref()
-                    .and_then(|s| s.as_ref())
-                    .map(|s| &s.prepared.revision)
-                    == context.as_ref().map(|(_, _, revision, _)| revision),
-                crate::diagnostics::RefreshRequired(
-                    "Repository changed during indexing; retry query"
-                )
-            );
         }
         tracing::Span::current().record("stage", "query_admission");
         operation.stage("query_admission");
-        let permit = {
-            let _wait = operation.wait("query_admission");
-            self.workers.clone().acquire_owned().await?
-        };
+        let (permit, mut state, branch_state) = self
+            .admit_query(asset_workspace, branch.as_ref(), &operation)
+            .await?;
+        let current = state.as_ref().ok_or(crate::diagnostics::RefreshRequired(
+            "Workspace was retired during admission",
+        ))?;
+        ensure!(
+            crate::unity::assets::jobs::generation(&current.manifest)? == asset_generation,
+            crate::diagnostics::RefreshRequired(
+                "Workspace changed while awaiting admission; retry query"
+            )
+        );
+        ensure!(
+            branch_state
+                .as_ref()
+                .and_then(|s| s.as_ref())
+                .map(|s| &s.prepared.revision)
+                == context.as_ref().map(|(_, _, revision, _)| revision)
+                && branch
+                    .as_ref()
+                    .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire))
+                    == branch_generation
+                && branch_state
+                    .as_ref()
+                    .and_then(|state| state.as_ref())
+                    .is_none_or(|state| !state.repair),
+            crate::diagnostics::RefreshRequired(
+                "Repository changed while awaiting admission; retry query"
+            )
+        );
         tracing::Span::current().record("stage", "evaluation");
         operation.stage("evaluation");
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();
         let rendering_activity = activity.clone();
+        let work_query = match &request {
+            Request::Search(query) | Request::Browse(query) | Request::View(query, _) => {
+                query.as_str()
+            }
+            Request::History(_) => unreachable!(),
+        };
+        let work_repository = context
+            .as_ref()
+            .map(|(identity, _, _, _)| identity.to_string())
+            .unwrap_or_else(|| usage_entry.display().to_string());
+        let blocking_operation =
+            crate::telemetry::operation("query_work", Some(&work_repository), Some(work_query));
+        if let Some(id) = blocking_operation.id() {
+            operation.link(&id);
+        }
         let result = tokio::task::spawn_blocking(move || {
             let _activity = rendering_activity;
             let _permit = permit;
+            blocking_operation.stage("evaluation");
             app.trim_idle();
             let result = (|| {
                 let _branch_state = branch_state;
@@ -1157,6 +1254,17 @@ impl App {
                 Ok(result)
             })();
             app.trim_idle();
+            if cancel.is_cancelled() {
+                blocking_operation.diagnose(crate::telemetry::Diagnostic::RequestCancelled);
+                blocking_operation.finish("cancelled");
+            } else {
+                if let Err(error) = &result
+                    && let Some(diagnostic) = crate::diagnostics::monitoring(error)
+                {
+                    blocking_operation.diagnose(diagnostic);
+                }
+                blocking_operation.finish(if result.is_ok() { "success" } else { "error" });
+            }
             result
         })
         .await?;
