@@ -88,6 +88,11 @@ impl App {
         crate::memory::configure_parser_memory(mib)
     }
 
+    /// Configure process-wide cache memory before creating service instances.
+    pub fn configure_cache_memory(mib: Option<u64>) -> Result<()> {
+        crate::memory::configure_cache_memory(mib)
+    }
+
     /// Adjust foreground capacity without increasing preparation or indexing.
     pub fn with_query_workers(mut self, workers: usize) -> Result<Self> {
         ensure!(workers > 0, "At least one query worker is required");
@@ -1069,6 +1074,7 @@ impl App {
         if let Some(job_id) = ticket.telemetry_id() {
             operation.link(&job_id);
         }
+        let ticket = asset_request.then_some(ticket);
         let needed = indexes::groups(&request, query.as_ref(), &state.as_ref().unwrap().manifest);
         let mut source_tickets = std::collections::BTreeMap::new();
         for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
@@ -1106,7 +1112,7 @@ impl App {
                 tracing::Span::current().record("stage", "assets");
                 operation.stage("assets");
                 let _wait = operation.wait("assets");
-                crate::unity::assets::jobs::wait(ticket.clone()).await?;
+                crate::unity::assets::jobs::wait(ticket.as_ref().unwrap().clone()).await?;
             }
         }
         tracing::Span::current().record("stage", "query_admission");
@@ -1171,15 +1177,30 @@ impl App {
                 let _branch_state = branch_state;
                 let workspace = state.as_mut().unwrap();
                 let store = workspace.store.clone();
-                let mut manifest = workspace.manifest.as_ref().clone();
+                let mut manifest = workspace.manifest.clone();
+                let asset_only = query.as_ref().is_some_and(|q| {
+                    matches!(
+                        q.selector.as_str(),
+                        "instance" | "references" | "dependencies"
+                    )
+                });
                 let mut ready = Vec::new();
                 let mut pending = std::collections::BTreeSet::new();
                 let mut remaining = None;
                 for (group, ticket) in &source_tickets {
                     match ticket.ready() {
                         Some(Ok(snapshot)) => {
-                            manifest.files.extend(snapshot.manifest.files.clone());
-                            ready.push((*group, snapshot));
+                            // Remote summaries include the completed source inventory.
+                            if !snapshot.manifest.files.is_empty()
+                                && (!asset_only || context.is_some())
+                            {
+                                Arc::make_mut(&mut manifest)
+                                    .files
+                                    .extend(snapshot.manifest.files.clone());
+                            }
+                            if !asset_only {
+                                ready.push((*group, snapshot));
+                            }
                         }
                         _ if needed.contains_key(group) => {
                             pending.extend(
@@ -1198,42 +1219,43 @@ impl App {
                         _ => (),
                     }
                 }
-                let assets = if asset_request {
-                    ticket.ready_index()
-                } else {
-                    None
-                };
+                let assets = ticket.as_ref().and_then(|ticket| ticket.ready_index());
                 if asset_request && assets.is_none() {
                     pending.insert("Unity assets");
                 }
-                // Pin the shared LMDB snapshot under the publication gate. It
-                // stays on this blocking thread through rendering and destruction.
-                let mut search = Search::new(&store, &manifest, &cancel)?;
-                for (group, snapshot) in ready {
-                    search.with_source(group, snapshot.store.clone())?;
-                }
-                if let Some(assets) = &assets {
-                    search.with_assets(assets);
-                }
-                drop(state);
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
-                let mut text = match request {
-                    Request::History(_) => unreachable!("history bypasses snapshot preparation"),
-                    Request::Search(_) => {
-                        let query = query.as_ref().unwrap();
-                        if matches!(
-                            query.selector.as_str(),
-                            "instance" | "references" | "dependencies"
-                        ) {
-                            assets.as_ref().unwrap().search(query)
-                        } else if query.selector == "file" {
-                            search.files(query, root)
-                        } else {
-                            search.run(query)
-                        }
+                let mut text = if asset_only {
+                    drop(state);
+                    assets
+                        .as_ref()
+                        .unwrap()
+                        .search_with_cancel(query.as_ref().unwrap(), &cancel)
+                } else {
+                    // Pin source snapshots under the publication gate, then
+                    // keep them on this thread through rendering and destruction.
+                    let mut search = Search::new(&store, &manifest, &cancel)?;
+                    for (group, snapshot) in ready {
+                        search.with_source(group, snapshot.store.clone())?;
                     }
-                    Request::Browse(path) => search.browse(root, &path, allow_absolute),
-                    Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
+                    if let Some(assets) = &assets {
+                        search.with_assets(assets);
+                    }
+                    drop(state);
+                    match request {
+                        Request::History(_) => {
+                            unreachable!("history bypasses snapshot preparation")
+                        }
+                        Request::Search(_) => {
+                            let query = query.as_ref().unwrap();
+                            if query.selector == "file" {
+                                search.files(query, root)
+                            } else {
+                                search.run(query)
+                            }
+                        }
+                        Request::Browse(path) => search.browse(root, &path, allow_absolute),
+                        Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
+                    }
                 }?;
                 if !pending.is_empty() {
                     let eta = remaining
@@ -1253,6 +1275,8 @@ impl App {
                 app.record_usage(&usage_entry, usage_branch.as_deref(), &manifest);
                 Ok(result)
             })();
+            drop(ticket);
+            drop(source_tickets);
             app.trim_idle();
             if cancel.is_cancelled() {
                 blocking_operation.diagnose(crate::telemetry::Diagnostic::RequestCancelled);
@@ -1280,11 +1304,11 @@ impl App {
         if let Some(branch) = branch {
             branch.record_use();
         }
-        self.owners.lock().unwrap().observe(
+        self.owners.lock().unwrap().touch(
             entry,
             branch.map(|branch| branch.root.as_path()),
             manifest,
-            Some(crate::cache::now()),
+            crate::cache::now(),
         );
     }
 }

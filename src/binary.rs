@@ -1,7 +1,9 @@
 //! Portable records shared by the store and metadata archive.
 mod bounded;
+mod stream;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+pub(crate) use stream::decode_reader;
 
 pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(postcard::to_allocvec(value)?)

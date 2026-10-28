@@ -25,7 +25,7 @@ pub struct Snapshot {
 type Outcome = std::result::Result<Arc<Snapshot>, Arc<anyhow::Error>>;
 #[derive(Clone)]
 pub struct Ticket {
-    outcome: watch::Receiver<Option<Outcome>>,
+    outcome: Arc<watch::Receiver<Option<Outcome>>>,
     progress: Arc<Progress>,
     telemetry_id: Option<String>,
 }
@@ -36,12 +36,13 @@ impl Ticket {
     pub fn ready(&self) -> Option<Outcome> {
         self.outcome.borrow().clone()
     }
-    pub async fn wait(mut self) -> Result<Arc<Snapshot>> {
+    pub async fn wait(self) -> Result<Arc<Snapshot>> {
+        let mut outcome = self.outcome.as_ref().clone();
         loop {
             if let Some(result) = self.ready() {
                 return result.map_err(crate::diagnostics::shared_error);
             }
-            self.outcome
+            outcome
                 .changed()
                 .await
                 .context("Source indexing worker stopped")?;
@@ -146,9 +147,10 @@ impl Jobs {
                     key.clone(),
                     job.used,
                     (job.ticket.progress.retained.load(Ordering::Relaxed) as usize).max(256),
-                    result
-                        .as_ref()
-                        .map_or(true, |snapshot| Arc::strong_count(snapshot) == 1),
+                    Arc::strong_count(&job.ticket.outcome) == 1
+                        && result
+                            .as_ref()
+                            .map_or(true, |snapshot| Arc::strong_count(snapshot) == 1),
                 ))
             })
             .collect();
@@ -213,7 +215,7 @@ impl Jobs {
                 .sum(),
         });
         let ticket = Ticket {
-            outcome,
+            outcome: Arc::new(outcome),
             progress: progress.clone(),
             telemetry_id: None,
         };
@@ -399,5 +401,50 @@ impl Jobs {
             }
         });
         Ok(ticket)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trimming_keeps_snapshots_pinned_by_tickets_or_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = Arc::new(Snapshot {
+            store: Store::open_workspace(&root.path().join("analysis"), [1; 32], root.path(), None)
+                .unwrap(),
+            manifest: Manifest::default(),
+        });
+        let ticket = Ticket {
+            outcome: Arc::new(watch::channel(Some(Ok(snapshot))).1),
+            progress: Arc::new(Progress {
+                started: Instant::now(),
+                completed: AtomicU64::new(0),
+                total: 0,
+                retained: AtomicU64::new(1024),
+            }),
+            telemetry_id: None,
+        };
+        let jobs = Jobs::default();
+        jobs.running.lock().unwrap().insert(
+            (root.path().into(), Group::Native),
+            Job {
+                generation: [0; 32],
+                ticket: ticket.clone(),
+                cancel: CancellationToken::new(),
+                writer: Arc::new(tokio::sync::Mutex::new(())),
+                used: Instant::now(),
+            },
+        );
+        jobs.trim_completed();
+        assert_eq!(jobs.running.lock().unwrap().len(), 1);
+        let snapshot = ticket.ready().unwrap().unwrap();
+        drop(ticket);
+        jobs.trim_completed();
+        assert_eq!(jobs.running.lock().unwrap().len(), 1);
+        drop(snapshot);
+        jobs.trim_completed();
+        assert!(jobs.running.lock().unwrap().is_empty());
     }
 }

@@ -9,6 +9,7 @@ use std::{
 
 const MIB: u64 = 1024 * 1024;
 static PARSER_BYTES: OnceLock<u64> = OnceLock::new();
+static CACHE_BYTES: OnceLock<usize> = OnceLock::new();
 static PARSING: OnceLock<Budget> = OnceLock::new();
 static SOURCES: OnceLock<Budget> = OnceLock::new();
 
@@ -31,6 +32,31 @@ pub(crate) fn configure_parser_memory(mib: Option<u64>) -> anyhow::Result<()> {
         source_memory_bytes = (bytes / 4).max(1),
         parser_workers = parser_workers(),
         "Resource admission configured"
+    );
+    Ok(())
+}
+
+pub(crate) fn configure_cache_memory(mib: Option<u64>) -> anyhow::Result<()> {
+    let limit = memory_limit();
+    let bytes = match mib {
+        Some(mib) => mib
+            .checked_mul(MIB)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| anyhow::anyhow!("Cache memory must be a positive MiB count"))?,
+        None => automatic_cache_budget(limit),
+    };
+    if let Err(bytes) = CACHE_BYTES.set(bytes) {
+        anyhow::ensure!(
+            CACHE_BYTES.get() == Some(&bytes),
+            "Cache memory was already configured"
+        );
+    }
+    tracing::info!(
+        memory_limit_bytes = limit,
+        cache_memory_bytes = bytes,
+        asset_cache_memory_bytes = bytes / 2,
+        "Cache memory configured"
     );
     Ok(())
 }
@@ -88,31 +114,14 @@ fn parser_workers() -> usize {
         .min(4)
 }
 
-/// Budget cached heap independently of mapped database pages and active jobs.
+fn automatic_cache_budget(limit: Option<u64>) -> usize {
+    (limit.unwrap_or(2048 * MIB) / 4).clamp(1, 2048 * MIB) as usize
+}
+
+/// Completed indexes and workspace caches share this target. Pinned entries
+/// cannot be evicted; parser allocations and mapped database pages are separate.
 pub fn cache_budget() -> usize {
-    static BYTES: OnceLock<usize> = OnceLock::new();
-    *BYTES.get_or_init(|| {
-        let mut limit = 2 * 1024 * 1024 * 1024u64;
-        if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup")
-            && let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::"))
-        {
-            let root = std::path::Path::new("/sys/fs/cgroup");
-            let mut directory = root.join(group.trim_start_matches('/'));
-            while directory.starts_with(root) {
-                for name in ["memory.high", "memory.max"] {
-                    if let Ok(value) = std::fs::read_to_string(directory.join(name))
-                        && let Ok(bytes) = value.trim().parse::<u64>()
-                    {
-                        limit = limit.min(bytes);
-                    }
-                }
-                if !directory.pop() {
-                    break;
-                }
-            }
-        }
-        (limit / 4).clamp(32 * 1024 * 1024, 512 * 1024 * 1024) as usize
-    })
+    *CACHE_BYTES.get_or_init(|| automatic_cache_budget(memory_limit()))
 }
 
 /// Count serialized data without allocating a second copy. Call once when a
@@ -165,12 +174,28 @@ pub struct AdmissionStats {
 pub struct Resources {
     pub parsing: AdmissionStats,
     pub sources: AdmissionStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caches: Option<CacheLimits>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CacheLimits {
+    pub memory_limit_bytes: Option<u64>,
+    pub capacity_bytes: u64,
+    pub asset_capacity_bytes: u64,
+    pub dictionary_capacity_bytes: u64,
 }
 
 pub fn resources() -> Resources {
     Resources {
         parsing: parsing().stats(),
         sources: sources().stats(),
+        caches: Some(CacheLimits {
+            memory_limit_bytes: memory_limit(),
+            capacity_bytes: cache_budget() as u64,
+            asset_capacity_bytes: (cache_budget() / 2) as u64,
+            dictionary_capacity_bytes: (cache_budget() / 8) as u64,
+        }),
     }
 }
 
@@ -578,6 +603,29 @@ mod tests {
         );
         assert_eq!(limit_from_cgroup(Some(400), &child, root.path()), Some(400));
         assert_eq!(limit_from_cgroup(None, &child, root.path()), Some(600));
+    }
+
+    #[test]
+    fn cache_allowance_grows_with_memory_and_stays_bounded() {
+        let small = automatic_cache_budget(Some(512 * MIB));
+        let medium = automatic_cache_budget(Some(4096 * MIB));
+        let large = automatic_cache_budget(Some(16384 * MIB));
+        assert!(small < medium && medium < large);
+        for limit in [64 * MIB, 512 * MIB, 4096 * MIB, 16384 * MIB] {
+            assert!((automatic_cache_budget(Some(limit)) as u64) < limit);
+        }
+        assert_eq!(
+            automatic_cache_budget(Some(u64::MAX / 2)),
+            automatic_cache_budget(Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn old_resource_reports_do_not_invent_cache_limits() {
+        let mut report = serde_json::to_value(resources()).unwrap();
+        report.as_object_mut().unwrap().remove("caches");
+        let legacy: Resources = serde_json::from_value(report).unwrap();
+        assert!(legacy.caches.is_none());
     }
 
     #[test]

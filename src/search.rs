@@ -1361,7 +1361,7 @@ impl<'a> Search<'a> {
                 .any(|f| matches!(f.key.as_str(), "project" | "lang"))
             && let Some(assets) = self.assets
         {
-            assets.visit_text(q, |position, result| {
+            assets.visit_text(q, self.cancel, |position, result| {
                 self.check()?;
                 units.insert((result.path.clone(), position), result);
                 Ok(())

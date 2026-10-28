@@ -39,8 +39,8 @@ pub(crate) struct Publication {
 impl Catalog {
     pub fn open(cache: &Path) -> Result<Self> {
         let path = cache.join("owners.json");
-        let entries = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
+        let entries = match fs::File::open(&path) {
+            Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error.into()),
         };
@@ -98,6 +98,24 @@ impl Catalog {
             owner.usage.record(now);
         }
         self.dirty = true;
+    }
+    /// Updates query usage while retaining published dependencies.
+    /// A query using an older inventory must not undo a newer observation.
+    pub fn touch(
+        &mut self,
+        entry: &Path,
+        repository: Option<&Path>,
+        manifest: &crate::workspace::Manifest,
+        now: u64,
+    ) {
+        if let Some(owner) = self.entries.get_mut(entry) {
+            self.revision += 1;
+            owner.usage.record(now);
+            self.dirty = true;
+        } else {
+            // Early navigation may finish before workspace preparation publishes.
+            self.observe(entry, repository, manifest, Some(now));
+        }
     }
     pub fn remove(&mut self, entry: &Path) {
         self.revision += 1;
@@ -317,5 +335,34 @@ mod tests {
         assert!(!reopened.retains(&new));
         reopened.flush().unwrap();
         assert!(Catalog::open(cache.path()).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn completed_old_query_cannot_replace_newer_dependencies() {
+        let cache = tempfile::tempdir().unwrap();
+        let entry = cache.path().join("workspace");
+        let old = cache.path().join(VIEW_KINDS[0]).join("old");
+        let new = cache.path().join(VIEW_KINDS[0]).join("new");
+        let mut catalog = Catalog::open(cache.path()).unwrap();
+        let older = Manifest {
+            dependencies: BTreeSet::from([old.join("source.cpp")]),
+            ..Manifest::default()
+        };
+        let newer = Manifest {
+            dependencies: BTreeSet::from([new.join("source.cpp")]),
+            ..Manifest::default()
+        };
+        // Navigation can complete before preparation registers its dependencies.
+        catalog.touch(&entry, None, &older, 100);
+        assert!(catalog.retains(&old));
+        catalog.observe(&entry, None, &newer, None);
+        catalog.touch(&entry, None, &older, 200);
+        assert!(!catalog.retains(&old));
+        assert!(catalog.retains(&new));
+        assert_eq!(catalog.entries[&entry].usage.last_use, 200);
+        catalog.flush().unwrap();
+        let restored = Catalog::open(cache.path()).unwrap();
+        assert!(!restored.retains(&old));
+        assert!(restored.retains(&new));
     }
 }

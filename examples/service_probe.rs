@@ -12,6 +12,8 @@ struct Workload {
     concurrency: usize,
     #[serde(default)]
     idle_ms: u64,
+    #[serde(default)]
+    cache_memory_mib: Option<u64>,
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[serde(default)]
     trim_idle: bool,
@@ -69,6 +71,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("Expected workload JSON file")?;
     let workload: Workload = serde_json::from_slice(&std::fs::read(path)?)?;
+    sigla::service::App::configure_cache_memory(workload.cache_memory_mib)?;
     let app = Arc::new(sigla::service::App::new(
         sigla::discovery::Policy::new(workload.roots)?,
         workload.cache,

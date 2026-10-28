@@ -806,6 +806,9 @@ impl App {
     }
 
     fn seed_owners(&self) -> Result<bool> {
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(false);
+        }
         let mut known = true;
         for (owner, _, used) in crate::repository::cache::history_owners(&self.cache)? {
             self.owners.lock().unwrap().seed(&owner, None, used);
@@ -821,6 +824,9 @@ impl App {
         if self.cache.join("analysis").is_dir() {
             let database = crate::store::Database::open(&self.cache.join("analysis"))?;
             for (key, info) in database.workspaces()? {
+                if self.inspection_shutdown.is_cancelled() {
+                    return Ok(false);
+                }
                 if info.phase == crate::store::shared::Phase::Deleting {
                     continue;
                 }
@@ -845,19 +851,29 @@ impl App {
                 }
             }
         }
-        let snapshot = self.owners.lock().unwrap().clone();
-        let removed: Vec<_> = snapshot
-            .entries
-            .values()
-            .filter(|owner| {
-                fs::symlink_metadata(owner.repository.as_deref().unwrap_or(&owner.entry))
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            })
-            .map(|owner| owner.entry.clone())
-            .collect();
+        let (revision, paths) = {
+            let owners = self.owners.lock().unwrap();
+            let paths: Vec<_> = owners
+                .entries
+                .values()
+                .map(|owner| (owner.entry.clone(), owner.repository.clone()))
+                .collect();
+            (owners.revision(), paths)
+        };
+        let mut removed = Vec::new();
+        for (entry, repository) in paths {
+            if self.inspection_shutdown.is_cancelled() {
+                return Ok(false);
+            }
+            if fs::symlink_metadata(repository.as_deref().unwrap_or(&entry))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                removed.push(entry);
+            }
+        }
         {
             let mut owners = self.owners.lock().unwrap();
-            if owners.revision() == snapshot.revision() {
+            if owners.revision() == revision {
                 for entry in removed {
                     owners.remove(&entry);
                 }
@@ -1609,6 +1625,17 @@ mod tests {
         app.collect_views(true).unwrap();
         assert!(managed.is_file());
         assert!(native.is_file());
+    }
+
+    #[test]
+    fn cancelled_ownership_scan_keeps_existing_owners() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let missing = cache.path().join("missing-workspace");
+        app.owners.lock().unwrap().seed(&missing, None, 0);
+        app.inspection_shutdown.cancel();
+        assert!(!app.seed_owners().unwrap());
+        assert!(app.owners.lock().unwrap().entries.contains_key(&missing));
     }
 
     fn app(cache: &Path, rules: Vec<Rule>) -> App {

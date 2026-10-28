@@ -1,12 +1,14 @@
 //! Carry depth and allocation limits through Serde's nested visitors.
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
-use std::fmt;
+use std::{cell::Cell, fmt, rc::Rc};
 
 pub(super) struct Budget {
     remaining: usize,
     initial: usize,
+    streamed: Option<Rc<Cell<usize>>>,
     pub failure: Option<&'static str>,
 }
+
 impl Budget {
     pub fn new(bytes: usize) -> Self {
         let initial = bytes
@@ -16,17 +18,36 @@ impl Budget {
             // A one-byte enum variant can decode to a large inline Rust enum.
             remaining: initial,
             initial,
+            streamed: None,
             failure: None,
+        }
+    }
+    pub fn streamed(bytes: Rc<Cell<usize>>) -> Self {
+        Self {
+            streamed: Some(bytes),
+            ..Self::new(0)
         }
     }
     pub fn allocated(&self) -> usize {
         self.initial - self.remaining
     }
     fn charge<E: de::Error>(&mut self, bytes: usize) -> Result<(), E> {
+        if let Some(read) = &self.streamed {
+            // Whole indexes can exceed the per-object ceiling. Limit their
+            // expansion by consumed input, including work on input-free values.
+            let allowance = read.get().saturating_mul(1024).max(64 * 1024);
+            self.remaining = self.remaining.saturating_add(allowance - self.initial);
+            self.initial = allowance;
+        }
         self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
             self.failure = Some("Binary record allocation limit exceeded");
             E::custom("Binary record allocation limit exceeded")
         })?;
+        if self.streamed.is_some() {
+            // Past input must not fund unbounded work on later input-free values.
+            // Clip after charging so a large field can pay from its actual bytes.
+            self.remaining = self.remaining.min(64 * 1024);
+        }
         Ok(())
     }
 }
@@ -273,5 +294,49 @@ impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Checked<'_, A> {
                 depth: self.depth,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::binary::{decode_reader, encode};
+    use serde::Deserialize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn earlier_fields_cannot_fund_later_input_free_work() {
+        static VISITS: AtomicUsize = AtomicUsize::new(0);
+        struct CountedUnit;
+        impl<'de> Deserialize<'de> for CountedUnit {
+            fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+                <()>::deserialize(decoder)?;
+                VISITS.fetch_add(1, Ordering::Relaxed);
+                Ok(Self)
+            }
+        }
+        let work: Vec<_> = [128, 4096]
+            .into_iter()
+            .map(|length| {
+                let mut bytes = encode(&"x".repeat(length)).unwrap();
+                bytes.extend(encode(&u64::MAX).unwrap());
+                VISITS.store(0, Ordering::Relaxed);
+                assert!(
+                    decode_reader::<(String, Vec<CountedUnit>)>(bytes.as_slice(), bytes.len(), &())
+                        .is_err()
+                );
+                VISITS.load(Ordering::Relaxed)
+            })
+            .collect();
+        assert_eq!(work[0], work[1]);
+        assert!(work[0] > 0);
+    }
+
+    #[test]
+    fn consuming_input_replenishes_stream_budget_after_large_field() {
+        let value = ("x".repeat(8193), vec![(7_u8, ()); 70_000]);
+        let bytes = encode(&value).unwrap();
+        let decoded: (String, Vec<(u8, ())>) =
+            decode_reader(bytes.as_slice(), bytes.len(), &()).unwrap();
+        assert_eq!(decoded, value);
     }
 }

@@ -49,12 +49,18 @@ pub struct Index {
     retained_bytes: usize,
 }
 impl Index {
-    fn current(&self) -> bool {
-        self.observed
-            .iter()
-            .all(|(path, stamp)| Stamp::read(path).as_ref().ok() == Some(stamp))
+    fn current(&self, cancel: &dyn crate::cancellation::Cancellation) -> Result<bool> {
+        cancel.check()?;
+        for (path, stamp) in &self.observed {
+            cancel.check()?;
+            if Stamp::read(path).as_ref().ok() != Some(stamp) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     fn measure(&mut self) {
+        let started = std::time::Instant::now();
         // Count shared object/type allocations once across prefab instances.
         let mut objects = std::collections::HashSet::new();
         let mut types = std::collections::HashSet::new();
@@ -125,6 +131,7 @@ impl Index {
             shared_issues = issues.len(),
             type_bytes,
             issue_bytes,
+            elapsed_ms = started.elapsed().as_millis(),
             "Unity asset allocations measured"
         );
     }
@@ -291,9 +298,7 @@ fn script_types(
     ))?)
     .as_bytes();
     let path = cache.join("script-types.zst");
-    if let Ok(file) = std::fs::File::open(&path)
-        && let Ok(bytes) = zstd::stream::decode_all(file)
-        && let Ok((saved, types)) = postcard::from_bytes::<([u8; 32], ScriptTypes)>(&bytes)
+    if let Ok((saved, types)) = records::read::<([u8; 32], ScriptTypes)>(&path, cancel)
         && saved == key
     {
         return Ok(types);
@@ -610,19 +615,20 @@ pub fn build(
         "Asset indexing cancelled or superseded"
     );
     ensure!(
-        index.current(),
+        index.current(cancel)?,
         "Unity inputs changed during indexing; retry query"
     );
     index.measure();
     Ok(index)
 }
 
-fn content(asset: &Asset) -> Result<Parsed> {
+fn content(asset: &Asset, cancel: &dyn crate::cancellation::Cancellation) -> Result<Parsed> {
     records::content(
         asset
             .content
             .as_ref()
             .context("Asset contents unavailable")?,
+        cancel,
     )
 }
 
@@ -699,7 +705,7 @@ mod tests {
             "Object.asset",
             b"Changed nested worktree asset",
         );
-        assert!(index.current());
+        assert!(index.current(&()).unwrap());
         let direct = build_at(&project_worktree);
         assert_eq!(direct.assets.len(), 1);
         assert!(direct.assets.values().any(|a| !a.objects.is_empty()));
@@ -769,7 +775,7 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].unavailable.as_ref(), Some(reason));
         }
-        assert!(index.current());
+        assert!(index.current(&()).unwrap());
         write(
             root.path(),
             "Three/ProjectSettings/ProjectVersion.txt",
@@ -781,7 +787,7 @@ mod tests {
             b"--- !u!1 &1\nGameObject:\n  m_Name: New\n",
         );
         assert!(
-            !index.current(),
+            !index.current(&()).unwrap(),
             "A new sibling project invalidates the inventory"
         );
     }

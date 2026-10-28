@@ -1,8 +1,8 @@
 //! Bounded parallel loading of immutable serialized asset records.
 use super::parse::{self, Object, Parsed};
-use crate::workspace::Stamp;
+use crate::{cancellation::Cancellation, workspace::Stamp};
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -43,6 +43,7 @@ fn load(
         Stamp::read(file)? == *stamp,
         "Asset changed before being read; retry query"
     );
+    let _admission = crate::memory::admit_file(stamp.size, false, cancel)?;
     let mut source = None;
     let identity = if let Some(id) = stamp.immutable() {
         *id
@@ -64,15 +65,13 @@ fn load(
         shared.restore(&text)?;
         shared.restore(&record)?;
     }
-    let cached = std::fs::File::open(&record)
+    let cached = read::<Cached>(&record, cancel)
         .ok()
-        .and_then(|f| zstd::stream::decode_all(f).ok())
-        .and_then(|bytes| postcard::from_bytes::<Cached>(&bytes).ok())
         .filter(|c| c.version == VERSION && (c.unavailable.is_some() || text.is_file()));
+    cancel.check()?;
     let cached = if let Some(cached) = cached {
         cached
     } else {
-        let _admission = crate::memory::admit_file(stamp.size, false, cancel)?;
         let bytes = source.map_or_else(|| std::fs::read(file), Ok)?;
         let (mut parsed, unavailable) = match std::str::from_utf8(&bytes) {
             Ok(text)
@@ -176,11 +175,18 @@ pub(super) fn load_all(
     })
 }
 
-pub(super) fn content(path: &Path) -> Result<Parsed> {
-    let bytes = zstd::stream::decode_all(std::fs::File::open(path)?)?;
+pub(super) fn content(path: &Path, cancel: &dyn Cancellation) -> Result<Parsed> {
     // Object summaries are already held by the index; content consumers use
     // only fragments, omissions, and the original byte count.
-    Ok(postcard::from_bytes(&bytes)?)
+    read(path, cancel)
+}
+
+pub(super) fn read<T: DeserializeOwned>(path: &Path, cancel: &dyn Cancellation) -> Result<T> {
+    crate::binary::decode_reader(
+        zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?,
+        512 * 1024 * 1024,
+        cancel,
+    )
 }
 
 pub(super) fn available(path: &Path) -> bool {
@@ -225,7 +231,7 @@ mod tests {
         assert_eq!(shared.collect(true).unwrap(), 0);
         drop(first);
         assert_eq!(shared.collect(true).unwrap(), 0);
-        let cached = content(&paths[1]).unwrap();
+        let cached = content(&paths[1], &()).unwrap();
         assert_eq!(
             cached
                 .fragments
@@ -262,7 +268,7 @@ mod tests {
                     record.objects[0].name,
                     path.file_stem().unwrap().to_str().unwrap()
                 );
-                let cached = content(record.content.as_ref().unwrap()).unwrap();
+                let cached = content(record.content.as_ref().unwrap(), &()).unwrap();
                 assert_eq!(
                     cached
                         .fragments

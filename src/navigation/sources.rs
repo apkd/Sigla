@@ -245,7 +245,7 @@ impl Sources<'_> {
     ) -> Result<String> {
         self.check()?;
         if let Some(assets) = self.assets
-            && let Some(text) = assets.view(path)?
+            && let Some(text) = assets.view_with_cancel(path, self.cancel)?
         {
             return Ok(text);
         }

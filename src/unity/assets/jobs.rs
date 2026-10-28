@@ -14,7 +14,7 @@ use tokio::sync::{Semaphore, watch};
 type Outcome = std::result::Result<Arc<Index>, Arc<anyhow::Error>>;
 #[derive(Clone)]
 pub struct Ticket {
-    outcome: watch::Receiver<Option<Outcome>>,
+    outcome: Arc<watch::Receiver<Option<Outcome>>>,
     telemetry_id: Option<String>,
 }
 impl Ticket {
@@ -32,14 +32,10 @@ impl Ticket {
     fn borrow(&self) -> watch::Ref<'_, Option<Outcome>> {
         self.outcome.borrow()
     }
-
-    async fn changed(&mut self) -> std::result::Result<(), watch::error::RecvError> {
-        self.outcome.changed().await
-    }
 }
 pub fn empty() -> Ticket {
     Ticket {
-        outcome: watch::channel(Some(Ok(Arc::new(Index::default())))).1,
+        outcome: Arc::new(watch::channel(Some(Ok(Arc::new(Index::default())))).1),
         telemetry_id: None,
     }
 }
@@ -60,6 +56,7 @@ struct Completed {
     index: Arc<Index>,
     snapshot: Option<super::snapshot::Pending>,
     started: std::time::Instant,
+    origin: &'static str,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _dependencies: crate::cache::views::LeaseSet,
 }
@@ -106,15 +103,17 @@ impl Jobs {
                         result
                             .as_ref()
                             .map_or(256, |index| index.retained_bytes + 256),
-                        result
-                            .as_ref()
-                            .map_or(true, |index| Arc::strong_count(index) == 1),
+                        Arc::strong_count(&job.ticket.outcome) == 1
+                            && result
+                                .as_ref()
+                                .map_or(true, |index| Arc::strong_count(index) == 1),
                     )
                 })
             })
             .collect();
         completed.sort_by_key(|(_, used, _, _)| *used);
         let mut bytes: usize = completed.iter().map(|(_, _, size, _)| size).sum();
+        let mut retired = Vec::new();
         for (key, _, size, idle) in completed {
             if bytes <= limit {
                 break;
@@ -123,8 +122,20 @@ impl Jobs {
                 continue;
             }
             tracing::debug!(workspace = %key.display(), retained_bytes = size, total_bytes = bytes, budget_bytes = limit, "Evicting Unity asset index");
-            jobs.remove(&key);
+            retired.push(jobs.remove(&key).unwrap());
             bytes -= size;
+        }
+        // Large graphs can take time to free. Let unrelated roots start first.
+        drop(jobs);
+        let count = retired.len();
+        let started = std::time::Instant::now();
+        drop(retired);
+        if count > 0 {
+            tracing::debug!(
+                count,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Unity asset indexes retired"
+            );
         }
     }
     pub fn shutdown(&self) {
@@ -173,7 +184,7 @@ impl Jobs {
             operation.target(&branch.name);
         }
         let ticket = Ticket {
-            outcome: ticket,
+            outcome: Arc::new(ticket),
             telemetry_id: operation.id(),
         };
         let cancel = self.shutdown.child_token();
@@ -251,10 +262,28 @@ impl Jobs {
                     drop(branch_state);
                     drop(state);
                     let started = std::time::Instant::now();
-                    let (index, built) = if let Some(previous) = previous.as_ref().filter(|index| same_generation && request.branch.is_none() && index.current()) {
-                        (previous.clone(), false)
-                    } else if let Some(index) = super::snapshot::load(&request.cache, generation) {
-                        (Arc::new(index), false)
+                    let retained = if same_generation && request.branch.is_none() {
+                        if let Some(index) = &previous {
+                            let checked = std::time::Instant::now();
+                            let current = index.current(&building_cancel)?;
+                            tracing::debug!(
+                                workspace = %request.root.display(),
+                                observed = index.observed.len(),
+                                current,
+                                elapsed_ms = checked.elapsed().as_millis(),
+                                "Unity retained asset validation"
+                            );
+                            current.then(|| index.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let (index, built, origin) = if let Some(previous) = retained {
+                        (previous, false, "retained")
+                    } else if let Some(index) = super::snapshot::load(&request.cache, generation, &building_cancel)? {
+                        (Arc::new(index), false, "snapshot")
                     } else {
                         (Arc::new(super::build(
                             &request.root,
@@ -262,13 +291,13 @@ impl Jobs {
                             &manifest,
                             &store,
                             super::BuildOptions { previous: previous.as_deref(), records: Some(&request.records), remote: request.branch.is_some(), omitted: &omitted, cancel: &building_cancel },
-                        )?), true)
+                        )?), true, "built")
                     };
                     ensure!(!building_cancel.is_cancelled(), "Asset indexing superseded");
                     let snapshot = built
                         .then(|| super::snapshot::stage(&request.cache, generation, &index))
                         .transpose()?;
-                    Ok(Completed { request, index, snapshot, started, _permit: permit, _dependencies: dependencies })
+                    Ok(Completed { request, index, snapshot, started, origin, _permit: permit, _dependencies: dependencies })
                 })
                 .await??;
                 publish(completed, &cancel, sender.clone(), operation.clone()).await
@@ -345,7 +374,14 @@ async fn publish(
             snapshot.publish()?;
             tracing::info!(workspace = %completed.request.root.display(), files = completed.index.assets.len(), elapsed_ms = completed.started.elapsed().as_millis(), "Unity asset index ready");
         }
-        tracing::debug!(workspace = %completed.request.root.display(), retained_bytes = completed.index.retained_bytes, built, elapsed_ms = completed.started.elapsed().as_millis(), "Unity asset index acquired");
+        tracing::debug!(
+            workspace = %completed.request.root.display(),
+            retained_bytes = completed.index.retained_bytes,
+            built,
+            origin = completed.origin,
+            elapsed_ms = completed.started.elapsed().as_millis(),
+            "Unity asset index acquired"
+        );
         sender.send_replace(Some(Ok(completed.index)));
         // Both guards cover the snapshot activation and the watcher notification.
         drop(branch_state);
@@ -353,12 +389,13 @@ async fn publish(
         Ok(())
     }).await?
 }
-pub async fn wait(mut ticket: Ticket) -> Result<Arc<Index>> {
+pub async fn wait(ticket: Ticket) -> Result<Arc<Index>> {
+    let mut outcome = ticket.outcome.as_ref().clone();
     loop {
-        if let Some(result) = ticket.borrow().clone() {
+        if let Some(result) = outcome.borrow().clone() {
             return result.map_err(crate::diagnostics::shared_error);
         }
-        ticket
+        outcome
             .changed()
             .await
             .context("Asset indexing worker stopped")?;
@@ -368,6 +405,53 @@ pub async fn wait(mut ticket: Ticket) -> Result<Arc<Index>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_keeps_indexes_pinned_by_tickets_or_queries() {
+        let jobs = Jobs::default();
+        let ticket = empty();
+        jobs.running.lock().unwrap().insert(
+            "workspace".into(),
+            Job {
+                generation: [0; 32],
+                ticket: ticket.clone(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                used: std::time::Instant::now(),
+            },
+        );
+        jobs.trim_completed();
+        assert_eq!(jobs.running.lock().unwrap().len(), 1);
+        let index = ticket.ready_index().unwrap();
+        drop(ticket);
+        jobs.trim_completed();
+        assert_eq!(jobs.running.lock().unwrap().len(), 1);
+        drop(index);
+        jobs.trim_completed();
+        assert!(jobs.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_observe_the_same_publication() {
+        use std::{future::Future, task::Poll};
+        let (sender, outcome) = watch::channel(None);
+        let ticket = Ticket {
+            outcome: Arc::new(outcome),
+            telemetry_id: None,
+        };
+        let first = wait(ticket.clone());
+        let second = wait(ticket);
+        tokio::pin!(first, second);
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let index = Arc::new(Index::default());
+        sender.send_replace(Some(Ok(index.clone())));
+        assert!(Arc::ptr_eq(&first.await.unwrap(), &index));
+        assert!(Arc::ptr_eq(&second.await.unwrap(), &index));
+    }
 
     async fn completed(root: &std::path::Path, cache: &std::path::Path) -> Completed {
         let workspace = Workspace::open(
@@ -428,6 +512,7 @@ mod tests {
             index,
             snapshot,
             started: std::time::Instant::now(),
+            origin: "built",
             _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
             _dependencies: dependencies,
         }
@@ -447,7 +532,7 @@ mod tests {
             let cancel = tokio_util::sync::CancellationToken::new();
             let (sender, ticket) = watch::channel(None);
             let ticket = Ticket {
-                outcome: ticket,
+                outcome: Arc::new(ticket),
                 telemetry_id: None,
             };
             let publication = publish(
@@ -463,7 +548,11 @@ mod tests {
             })
             .await;
             assert!(ticket.borrow().is_none());
-            assert!(super::super::snapshot::load(&assets, generation).is_none());
+            assert!(
+                super::super::snapshot::load(&assets, generation, &())
+                    .unwrap()
+                    .is_none()
+            );
             if changed {
                 refreshing.as_mut().unwrap().prepared.revision = "changed".into();
             }
@@ -478,11 +567,19 @@ mod tests {
                         .any(|cause| cause.is::<crate::diagnostics::RefreshRequired>())
                 );
                 assert!(ticket.borrow().is_none());
-                assert!(super::super::snapshot::load(&assets, generation).is_none());
+                assert!(
+                    super::super::snapshot::load(&assets, generation, &())
+                        .unwrap()
+                        .is_none()
+                );
             } else {
                 result.unwrap();
                 assert!(wait(ticket).await.is_ok());
-                assert!(super::super::snapshot::load(&assets, generation).is_some());
+                assert!(
+                    super::super::snapshot::load(&assets, generation, &())
+                        .unwrap()
+                        .is_some()
+                );
             }
         }
     }
@@ -559,7 +656,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (sender, ticket) = watch::channel(None);
         let ticket = Ticket {
-            outcome: ticket,
+            outcome: Arc::new(ticket),
             telemetry_id: None,
         };
         let publication = publish(
@@ -579,7 +676,11 @@ mod tests {
         assert!(publication.await.is_err());
         assert!(workspace.try_lock().is_ok());
         assert!(ticket.borrow().is_none());
-        assert!(super::super::snapshot::load(&assets, generation).is_none());
+        assert!(
+            super::super::snapshot::load(&assets, generation, &())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -590,7 +691,7 @@ mod tests {
         .context("asset publication");
         let (sender, ticket) = watch::channel(Some(Err(Arc::new(failure))));
         let ticket = Ticket {
-            outcome: ticket,
+            outcome: Arc::new(ticket),
             telemetry_id: None,
         };
         let error = wait(ticket.clone()).await.err().expect("refresh must fail");

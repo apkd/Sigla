@@ -523,6 +523,7 @@ impl Workspace {
                             {
                                 return Ok(modules);
                             }
+                            let _admission = crate::memory::admit_file(stamp.size, false, &())?;
                             Ok(crate::extract::rust_modules(
                                 &read_stable(&input.path, input.language)?,
                                 &project.edition,

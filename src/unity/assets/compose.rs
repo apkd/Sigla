@@ -553,7 +553,9 @@ mod tests {
         ));
 
         super::super::snapshot::save(cache.path(), [3; 32], &index).unwrap();
-        let mut saved = super::super::snapshot::load(cache.path(), [3; 32]).unwrap();
+        let mut saved = super::super::snapshot::load(cache.path(), [3; 32], &())
+            .unwrap()
+            .unwrap();
         for (key, composed) in &index.instances {
             for (expected, actual) in composed.objects.iter().zip(&saved.instances[key].objects) {
                 assert_eq!(actual.ty, expected.ty);
@@ -624,8 +626,14 @@ mod tests {
         asset(&mut index, "Independent.prefab", "independent", PREFAB);
         build(&mut index).unwrap();
         super::super::snapshot::save(cache.path(), [1; 32], &index).unwrap();
-        let saved = super::super::snapshot::load(cache.path(), [1; 32]).unwrap();
-        assert!(super::super::snapshot::load(cache.path(), [2; 32]).is_none());
+        let saved = super::super::snapshot::load(cache.path(), [1; 32], &())
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::super::snapshot::load(cache.path(), [2; 32], &())
+                .unwrap()
+                .is_none()
+        );
         for (key, expected) in &index.instances {
             let actual = &saved.instances[key];
             assert_eq!(actual.aliases, expected.aliases);
@@ -670,7 +678,11 @@ mod tests {
         index.assets.get_mut("Base.prefab").unwrap().content =
             Some(cache.path().join("missing.text.zst"));
         super::super::snapshot::save(cache.path(), [1; 32], &index).unwrap();
-        assert!(super::super::snapshot::load(cache.path(), [1; 32]).is_none());
+        assert!(
+            super::super::snapshot::load(cache.path(), [1; 32], &())
+                .unwrap()
+                .is_none()
+        );
     }
     fn placement(id: i64, guid: &str, changes: &str, removed: &str) -> String {
         format!(
@@ -835,7 +847,9 @@ mod tests {
         index.measure();
         let legacy_bytes = index.retained_bytes;
         super::super::snapshot::save(cache.path(), [4; 32], &index).unwrap();
-        let restored = super::super::snapshot::load(cache.path(), [4; 32]).unwrap();
+        let restored = super::super::snapshot::load(cache.path(), [4; 32], &())
+            .unwrap()
+            .unwrap();
         for (key, references) in expected {
             assert_eq!(
                 restored.instances[&key]

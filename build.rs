@@ -457,6 +457,7 @@ fn main() {
                 .into_bytes();
         }
         let facts = name.starts_with("Cargo.")
+            || name.starts_with("src/binary/")
             || name.starts_with("vendor/tree-sitter-c-sharp/")
             || name.starts_with("src/extract/")
             || name.starts_with("src/native/") && !name.ends_with("jobs.rs")
@@ -521,6 +522,16 @@ fn main() {
     // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
     // prefix-scan oracle tests also cover recovery, top-level code and directives.
     let analysis_aliases: &[(&str, &str)] = &[
+        // Shared stream cursors and bounded work retain valid extracted records.
+        (
+            "b7d333ec38a4b11155238613efb0d2c67cecae2f2a4401883b980eca13c677cd",
+            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
+        ),
+        // Stream decoding and fingerprint coverage leave extracted records unchanged.
+        (
+            "e0bf102146b0b5c5f0f48fe43ccd8f5f2b5ede0cb49d08a95b215a6c14523af3",
+            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
+        ),
         // Admission adds an existing executor dependency without changing records.
         (
             "10c610797834103c1b9d2b7377b57b5d8913e9f05e15e35deea5981fca8727eb",
@@ -538,6 +549,16 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Decoder safeguards retain the completed discovery graph.
+        (
+            "8706be81a0fe1c76713a24513b1f689911db713f90d97cc967417e7a4a7b7a54",
+            "a75d85f257ecf40eadc848a217961e1687abaebbc976ceaba0fa945ab515757e",
+        ),
+        // Rust module admission changes scheduling, not discovered graphs.
+        (
+            "983e4bb01e38b324e2bd510f818134043945885b72f2494da79d0ce8eb63c6ac",
+            "a75d85f257ecf40eadc848a217961e1687abaebbc976ceaba0fa945ab515757e",
+        ),
         // Batching missing inputs changes retry count, not completed graphs.
         (
             "ba72b80198d72dd262e80ec34c9fdfdd37b3d514f302344a6a19111ea2fe87f4",
@@ -570,6 +591,17 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        // Cancellation, cache ownership and timings leave asset records unchanged.
+        (
+            "a7b3926522dd62496e60de4af1d4575dbeaa76b9fe5ac8fef467ebf58f90ba14",
+            "869730ab76207835787d55eae648d6a036e28062862726a67c18489c83f1b346",
+        ),
+        // Borrowed snapshot fields retain the owned format. Streaming reads and
+        // ticket pins preserve completed indexes; composition round trips agree.
+        (
+            "ea070f539d3d34bea3d1b3d95023417b863aa63969b20b6bef17a2571f091e6a",
+            "869730ab76207835787d55eae648d6a036e28062862726a67c18489c83f1b346",
+        ),
         (
             "1b03b0f8d0bb24005b1f0a05be3b608f82606ec512db83aaba97ec4cd8fa130b",
             "145165ef7429e83ad739ef5d2fa1a944cd40f0f5ab500a66e444414329d5d777",
@@ -595,6 +627,16 @@ fn main() {
     // Content reads skip an unused summary decode; record writers and parsers
     // are unchanged, so existing records retain their identities.
     let asset_record_aliases: &[(&str, &str)] = &[
+        // Cancellable content reads retain existing parser and record output.
+        (
+            "7144951c56df962a843143a217233821922003ca9b4b32bf095e5fddc70954a6",
+            "e80e976471351cff9d66e10a7caf210cc8d87dfae64acb26493f128d189619d3",
+        ),
+        // Admission and streaming decode do not change record writers or parsing.
+        (
+            "9452a3c8a7a1c3cc5daf2e7d5e8a7694f06074199f0097edffcc0de0561ccb0a",
+            "e80e976471351cff9d66e10a7caf210cc8d87dfae64acb26493f128d189619d3",
+        ),
         (
             "a7d4ff626cdd6e550e6fe9f841794fc702e8224b08b1a630e9c743d908e57125",
             "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",

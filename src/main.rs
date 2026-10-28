@@ -31,6 +31,10 @@ struct Cli {
     /// limit, capped at 4 GiB. Source reads use a separate quarter of this budget.
     #[arg(long, global=true,value_parser=clap::value_parser!(u64).range(1..))]
     parser_memory_mib: Option<u64>,
+    /// Completed-index and workspace cache memory in MiB; defaults to 25% of
+    /// the effective memory limit, capped at 2 GiB. Asset indexes receive half.
+    #[arg(long, global=true,value_parser=clap::value_parser!(u64).range(1..))]
+    cache_memory_mib: Option<u64>,
     #[command(subcommand)]
     command: Command,
 }
@@ -197,6 +201,7 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
         .await?;
     }
     App::configure_parser_memory(cli.parser_memory_mib)?;
+    App::configure_cache_memory(cli.cache_memory_mib)?;
     if let Command::Metadata { command } = cli.command {
         return tokio::task::spawn_blocking(move || command.run()).await?;
     }

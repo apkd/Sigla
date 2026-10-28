@@ -1,4 +1,5 @@
 use super::{Asset, Index, compose::Instance, content};
+use crate::cancellation::Cancellation;
 use crate::query::{Query, qualified_name_rank};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -89,8 +90,10 @@ impl Index {
     pub(crate) fn visit_text(
         &self,
         q: &Query,
+        cancel: &dyn Cancellation,
         mut visit: impl FnMut(usize, crate::render::SearchResult) -> Result<()>,
     ) -> Result<()> {
+        cancel.check()?;
         ensure!(
             q.target.name.len() <= super::yaml::VALUE_LIMIT,
             "Asset text query exceeds value size limit"
@@ -100,15 +103,18 @@ impl Index {
             .build()?;
         let selected = selection(q);
         for (key, asset) in &self.assets {
+            cancel.check()?;
             if !selected(asset) || asset.content.is_none() {
                 continue;
             }
-            let parsed = content(asset)?;
+            let parsed = content(asset, cancel)?;
             let mut previous = None;
             for fragment in &parsed.fragments {
+                cancel.check()?;
                 let mut offset = 0;
                 let mut line = fragment.line;
                 for matched in literal.find_iter(&fragment.text) {
+                    cancel.check()?;
                     let start = fragment.start + matched.start();
                     let end = fragment.start + matched.end();
                     // Advance between starts so multiline matches retain their newlines.
@@ -181,6 +187,14 @@ impl Index {
         Ok((matches[0].0.clone(), None))
     }
     pub fn search(&self, q: &Query) -> Result<String> {
+        self.search_with_cancel(q, &())
+    }
+    pub(crate) fn search_with_cancel(
+        &self,
+        q: &Query,
+        cancel: &dyn Cancellation,
+    ) -> Result<String> {
+        cancel.check()?;
         let mut lines = Vec::new();
         let mut incomplete = false;
         let mut unresolved_types = false;
@@ -191,6 +205,7 @@ impl Index {
             .transpose()?;
         let selected = selection(q);
         for (key, asset) in &self.assets {
+            cancel.check()?;
             if !selected(asset) {
                 continue;
             }
@@ -204,6 +219,7 @@ impl Index {
                 && let Some((target_asset, target_object)) = &target
             {
                 for control in asset.objects.iter().filter(|o| o.prefab.is_some()) {
+                    cancel.check()?;
                     let prefab = control.prefab.as_ref().unwrap();
                     let Some(source) = self.resolve(&asset.project, &prefab.source.guid) else {
                         continue;
@@ -244,6 +260,7 @@ impl Index {
                     continue;
                 }
                 for object in composition.objects.iter().filter(|o| o.alive) {
+                    cancel.check()?;
                     if q.selector == "instance" {
                         let Some(ty) = &object.ty else {
                             continue;
@@ -278,6 +295,7 @@ impl Index {
                             continue;
                         }
                         for (field, destination) in &object.references {
+                            cancel.check()?;
                             if destination.raw.null() {
                                 continue;
                             }
@@ -358,6 +376,14 @@ impl Index {
         Ok(lines.join("\n\n"))
     }
     pub fn view(&self, path: &str) -> Result<Option<String>> {
+        self.view_with_cancel(path, &())
+    }
+    pub(crate) fn view_with_cancel(
+        &self,
+        path: &str,
+        cancel: &dyn Cancellation,
+    ) -> Result<Option<String>> {
+        cancel.check()?;
         if let Some((asset, id)) = decode(path) {
             let source = self
                 .assets
@@ -390,7 +416,11 @@ impl Index {
                     .iter()
                     .find(|o| o.id.to_string() == id && o.prefab.is_some())
                 {
-                    return Ok(Some(self.saved(source, Some(document.span.clone()))?));
+                    return Ok(Some(self.saved(
+                        source,
+                        Some(document.span.clone()),
+                        cancel,
+                    )?));
                 }
                 return Ok(Some(format!(
                     "{}\nObject ID: {id}\nNo surviving saved object is available for this target",
@@ -407,8 +437,9 @@ impl Index {
                 "\n\nSaved definition: {}:{}",
                 definition.path, object.object.line
             )?;
-            result.push_str(&self.saved(definition, Some(object.object.span.clone()))?);
+            result.push_str(&self.saved(definition, Some(object.object.span.clone()), cancel)?);
             for (source, id) in &object.evidence {
+                cancel.check()?;
                 if result.len() >= 64 * 1024 {
                     result.push_str("\n[View truncated]\n");
                     break;
@@ -420,10 +451,11 @@ impl Index {
                         "\nPrefab overrides: {}:{}",
                         source.path, control.line
                     )?;
-                    result.push_str(&self.saved(source, Some(control.span.clone()))?);
+                    result.push_str(&self.saved(source, Some(control.span.clone()), cancel)?);
                 }
             }
             for (field, reference) in &object.references {
+                cancel.check()?;
                 if reference.raw.null() {
                     continue;
                 }
@@ -486,13 +518,14 @@ impl Index {
                 asset.path, asset.guid
             )));
         }
-        let parsed = content(asset)?;
         if range.is_none() {
-            return Ok(Some(self.saved(asset, None)?));
+            return Ok(Some(self.saved(asset, None, cancel)?));
         }
+        let parsed = content(asset, cancel)?;
         let mut result = String::new();
         for (fragment_index, fragment) in parsed.fragments.iter().enumerate() {
             for (i, line) in fragment.text.split_inclusive('\n').enumerate() {
+                cancel.check()?;
                 let number = fragment.line + i;
                 if range.is_none_or(|(first, last)| number >= first && number <= last) {
                     let clipped: String = line.chars().take(4096).collect();
@@ -527,11 +560,17 @@ impl Index {
         }
         Ok(Some(result))
     }
-    fn saved(&self, asset: &Asset, range: Option<std::ops::Range<usize>>) -> Result<String> {
-        let parsed = content(asset)?;
+    fn saved(
+        &self,
+        asset: &Asset,
+        range: Option<std::ops::Range<usize>>,
+        cancel: &dyn Cancellation,
+    ) -> Result<String> {
+        let parsed = content(asset, cancel)?;
         let range = range.unwrap_or(0..parsed.bytes);
         let mut result = String::new();
         for (i, fragment) in parsed.fragments.iter().enumerate() {
+            cancel.check()?;
             let start = range.start.max(fragment.start);
             let end = range.end.min(fragment.start + fragment.text.len());
             if start < end {
@@ -636,7 +675,7 @@ mod tests {
         query.target.name = needle.into();
         let mut results = Vec::new();
         index
-            .visit_text(&query, |offset, result| {
+            .visit_text(&query, &(), |offset, result| {
                 results.push((offset, result));
                 Ok(())
             })
@@ -703,7 +742,13 @@ mod tests {
             "é".repeat(super::super::yaml::VALUE_LIMIT / 2 + 1)
         );
         let (_root, index) = index(&source);
-        assert!(content(&index.assets["fixture"]).unwrap().fragments.len() > 1);
+        assert!(
+            content(&index.assets["fixture"], &())
+                .unwrap()
+                .fragments
+                .len()
+                > 1
+        );
         let results = search(&index, "écho");
         assert_eq!(
             results
@@ -716,5 +761,48 @@ mod tests {
             r.symbol.as_ref().is_some_and(|(_, name)| name == "Café")
                 && decode(r.target.as_ref().unwrap()).unwrap().1 == "1"
         }));
+    }
+
+    #[test]
+    fn cancelled_queries_stop_even_when_asset_text_has_no_matches() {
+        let (_root, index) = index("--- !u!1 &1\nGameObject:\n  m_Name: Unmatched\n");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let text = Query::parse("text:missing").unwrap();
+        let result = index.visit_text(&text, &cancel, |_, _| {
+            panic!("No asset text match was expected")
+        });
+        assert!(result.unwrap_err().is::<crate::diagnostics::Cancelled>());
+
+        let instance = Query::parse("instance:GameObject limit:3").unwrap();
+        assert!(
+            index
+                .search_with_cancel(&instance, &cancel)
+                .unwrap_err()
+                .is::<crate::diagnostics::Cancelled>()
+        );
+        assert!(
+            index
+                .view_with_cancel("Assets/Object.prefab", &cancel)
+                .unwrap_err()
+                .is::<crate::diagnostics::Cancelled>()
+        );
+    }
+
+    #[test]
+    fn text_scan_can_be_cancelled_after_starting_without_finding_a_match() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct CancelAfterStart(AtomicBool);
+        impl Cancellation for CancelAfterStart {
+            fn is_cancelled(&self) -> bool {
+                self.0.swap(true, Ordering::Relaxed)
+            }
+        }
+        let (_root, index) = index("--- !u!1 &1\nGameObject:\n  m_Name: Unmatched\n");
+        let cancel = CancelAfterStart(AtomicBool::new(false));
+        let result = index.visit_text(&Query::parse("text:missing").unwrap(), &cancel, |_, _| {
+            panic!("No asset text match was expected")
+        });
+        assert!(result.unwrap_err().is::<crate::diagnostics::Cancelled>());
     }
 }

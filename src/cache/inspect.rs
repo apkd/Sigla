@@ -467,6 +467,15 @@ impl Report {
             self.limits.headroom_percent
         );
         if let Some(resources) = &self.resources {
+            if let Some(caches) = &resources.caches {
+                text.push_str(&format!(
+                    "Index and workspace cache allowance: {} (asset indexes: {}); separate name dictionary: {}; effective memory limit: {}\n",
+                    size(caches.capacity_bytes),
+                    size(caches.asset_capacity_bytes),
+                    size(caches.dictionary_capacity_bytes),
+                    caches.memory_limit_bytes.map_or_else(|| "unknown".into(), size),
+                ));
+            }
             for (name, budget) in [
                 ("Parsing", &resources.parsing),
                 ("Source reads", &resources.sources),
