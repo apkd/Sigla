@@ -22,7 +22,7 @@ use std::{
     sync::{Arc, LazyLock, atomic::AtomicBool},
 };
 
-pub(super) const ADAPTER_VERSION: u32 = 7;
+pub(super) const ADAPTER_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Region {

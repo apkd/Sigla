@@ -85,3 +85,32 @@ async fn smoke_inline_rust_qualification_still_resolves() {
         .await;
     assert_eq!(ids(&result), [commit.as_str()], "{result}");
 }
+
+#[tokio::test]
+async fn managed_history_accepts_required_identifiers() {
+    let fixture = Fixture::new();
+    let commit = fixture.commit(
+        &[
+            (
+                "managed/Program.cs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/managed/Program.cs")),
+            ),
+            (
+                "managed/TrackedFileSystem.cs",
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/managed/TrackedFileSystem.cs"
+                )),
+            ),
+        ],
+        &[],
+        "managed source anchor",
+    );
+    for query in [
+        "log method:Discovery.Run path:managed/Program.cs",
+        "log method:TrackedFileSystem.Reading path:managed/TrackedFileSystem.cs",
+    ] {
+        let result = fixture.history(&commit, query).await;
+        assert_eq!(ids(&result), [commit.as_str()], "{result}");
+    }
+}
