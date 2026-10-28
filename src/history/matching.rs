@@ -374,7 +374,9 @@ impl Tracker {
                     .iter()
                     .filter(|(path, entry)| {
                         matches!(entry.mode, 0o100644 | 0o100755)
-                            && regions::language(path).is_some_and(|l| !l.document())
+                            && regions::language(path).is_some_and(|language| {
+                                !language.document() && regions::anchor_language(query, language)
+                            })
                             && filters.iter().all(|(p, negate)| p.matches(path) != *negate)
                             && query
                                 .target

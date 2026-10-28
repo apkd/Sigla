@@ -1,4 +1,6 @@
 mod java;
+#[cfg(test)]
+mod smoke_tests;
 mod text;
 
 pub(super) use text::{TextContext, TextEvidence, TextRange, TextTokens, paragraphs, text_range};
@@ -20,7 +22,7 @@ use std::{
     sync::{Arc, LazyLock, atomic::AtomicBool},
 };
 
-pub(super) const ADAPTER_VERSION: u32 = 6;
+pub(super) const ADAPTER_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Region {
@@ -442,6 +444,14 @@ impl Sources {
     }
 }
 
+/// Exclude languages that cannot match the selector's written qualification.
+pub(super) fn anchor_language(query: &crate::query::Query, language: Language) -> bool {
+    query.loose
+        || query.target.location.is_some()
+        || language != Language::CSharp
+        || !query.target.name.contains("::")
+}
+
 /// A necessary spelling check, never evidence that a matching declaration exists.
 fn may_declare(query: &crate::query::Query, text: &str) -> bool {
     if query.loose
@@ -456,7 +466,12 @@ fn may_declare(query: &crate::query::Query, text: &str) -> bool {
     {
         return true;
     }
-    let parts: Vec<_> = query.target.name.split('.').collect();
+    let separator = if query.target.name.contains("::") {
+        "::"
+    } else {
+        "."
+    };
+    let parts: Vec<_> = query.target.name.split(separator).collect();
     if parts.iter().any(|part| {
         part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
     }) {
