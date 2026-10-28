@@ -50,6 +50,20 @@ class Worker {
 ")}";
     int Target() { return 1; }
 }"#,
+        r#"/*
+#:project ../Library.csproj
+#!/usr/bin/env dotnet
+*/
+class Worker {
+    string Banner = """
+        #:property DefineConstants=FEATURE
+        #!/usr/bin/env dotnet
+        """;
+    string Other = @"
+#:sdk Microsoft.NET.Sdk
+";
+    int Target() { return 1; }
+}"#,
     ] {
         let projected = project(source, &mut Conditions::default(), &[false; 128]).unwrap();
         assert_eq!(projected.text, source);
@@ -170,17 +184,93 @@ fn projection_preserves_utf8_offsets_bom_and_every_line_ending() {
 }
 
 #[test]
+fn file_based_app_directives_are_opaque_to_historical_preprocessing() {
+    let source = r#"#!/usr/bin/env dotnet
+#:project ../src/Prophet.csproj
+#:property AssemblyName=Prophet.Tests
+#:property DefineConstants=FEATURE
+#:sdk Microsoft.NET.Sdk
+#:package Example@1.0.0
+#:include Helpers.cs
+#:custom https://example.test/ " /* #if false
+class Worker {
+#if FEATURE
+    int Target() { return 1; }
+#else
+    string Target() { return "other"; }
+#endif
+}"#;
+    let facts = extract(source).unwrap();
+    assert!(facts.incomplete.is_none(), "{:?}", facts.incomplete);
+    assert_eq!(
+        signatures(&facts),
+        BTreeSet::from([("int".into(), vec![]), ("string".into(), vec![])])
+    );
+    assert!(facts.declarations.iter().all(|d| !d.uncertain));
+    for declaration in facts.declarations.iter().filter(|d| d.name == "Target") {
+        assert_eq!(&source[declaration.name_span.clone()], "Target");
+        assert!(source[declaration.span.clone()].contains("Target()"));
+    }
+}
+
+#[test]
+fn file_based_app_directives_preserve_offsets_and_newline_bytes() {
+    for ending in ["\n", "\r\n", "\r", "\u{85}", "\u{2028}", "\u{2029}"] {
+        let header = format!(
+            "\u{feff}\t#:project ../Café/Library.csproj{ending}  #:property Description=żółw{ending}"
+        );
+        let source = format!("{header}class Café {{ int Target() {{ return 1; }} }}{ending}");
+        let projected = project(&source, &mut Conditions::default(), &[]).unwrap();
+        assert_eq!(projected.guard, TRUE);
+        assert_eq!(source.len(), projected.text.len());
+        assert_eq!(&source[header.len()..], &projected.text[header.len()..]);
+        assert_eq!(source.find("Target"), projected.text.find("Target"));
+        for (offset, c) in source.char_indices() {
+            let range = offset..offset + c.len_utf8();
+            if newline(c) {
+                assert_eq!(
+                    &source.as_bytes()[range.clone()],
+                    &projected.text.as_bytes()[range]
+                );
+            } else if offset < header.len() {
+                assert!(projected.text.as_bytes()[range].iter().all(|&b| b == b' '));
+            }
+        }
+    }
+}
+
+#[test]
+fn file_directive_placement_does_not_change_source_facts() {
+    for source in [
+        "\n#!/usr/bin/env dotnet\nclass Worker {}\n",
+        "class Worker {}\n#:project Library.csproj\n",
+    ] {
+        let facts = extract(source).unwrap();
+        assert!(facts.incomplete.is_none(), "{source:?}");
+        assert!(facts.declarations.iter().any(|d| d.name == "Worker"));
+    }
+}
+
+#[test]
 fn malformed_directives_and_unfinished_headers_remain_explicit() {
     for directive in [
         "#endif",
         "#else",
         "#elif A",
         "#if A",
+        "#if\n#endif",
         "#if A & B\n#endif",
+        "#if A &&\n#endif",
+        "#if false\n#if A & B\n#endif\n#endif",
         "#if A\n#else\n#else\n#endif",
         "#if A\n#else\n#elif B\n#endif",
+        "#if A\n#else A\n#endif",
+        "#if A\n#endif A",
         "#if_FEATURE",
         "#if1",
+        "#ifdef A\n#endif",
+        "# :project ../Library.csproj",
+        "# !/usr/bin/env dotnet",
         "#define true",
         "#region Unclosed",
     ] {
@@ -191,6 +281,13 @@ fn malformed_directives_and_unfinished_headers_remain_explicit() {
             facts.declarations.iter().all(|d| d.uncertain),
             "{directive}"
         );
+        let with_metadata = format!(
+            "#!/usr/bin/env dotnet\n#:project ../Library.csproj\n#:property PublishAot=false\n{source}"
+        );
+        let with_metadata = extract(&with_metadata).unwrap();
+        assert_eq!(with_metadata.incomplete, facts.incomplete, "{directive}");
+        assert!(with_metadata.declarations.iter().all(|d| d.uncertain));
+        assert!(with_metadata.occurrences.is_empty());
     }
     let facts = extract("class Worker { int Target(int value, ) { return 1; }").unwrap();
     assert!(facts.incomplete.is_some());

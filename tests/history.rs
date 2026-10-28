@@ -4142,6 +4142,105 @@ async fn nested_rejection_stays_uncertain_inside_a_bounded_interval() {
     assert!(page.ends_with("more skip:2\n"), "{page}");
 }
 #[tokio::test]
+async fn file_based_app_directives_do_not_poison_unrelated_histories() {
+    let f = Fixture::new();
+    let script = "#:project ../src/App.csproj\r\n#:property TargetFramework=net10.0\r\nConsole.WriteLine(ConsentScript.Check());\r\nclass ConsentScript { public static int Check() { return 7; } }\r\n";
+    let script_path = "scripts/verify-tool-consent.cs";
+    let selected_path = "tests/Tools/McpContextTests.cs";
+    let root = f.commit(&[(script_path, script)], &[], "build script");
+    let source = "class Worker { int Target() { return 1; } }\n";
+    let added = f.commit(
+        &[(script_path, script), (selected_path, source)],
+        &[&root],
+        "introduce unrelated source",
+    );
+    let edited = source.replace("return 1;", "return 2;");
+    let changed = f.commit(
+        &[(script_path, script), (selected_path, &edited)],
+        &[&added],
+        "first edit",
+    );
+    let edited = source.replace("return 1;", "return 3;");
+    let tip = f.commit(
+        &[(script_path, script), (selected_path, &edited)],
+        &[&changed],
+        "second edit",
+    );
+
+    // Proving the introduction requires analyzing the unrelated script as a
+    // possible predecessor. File history reaches the same search after two edits.
+    for (at, query, expected) in [
+        (
+            &root,
+            "log method:ConsentScript.Check() limit:1",
+            vec![root.as_str()],
+        ),
+        (
+            &added,
+            "log method:Worker.Target() limit:1",
+            vec![added.as_str()],
+        ),
+        (
+            &tip,
+            "log file:tests/Tools/McpContextTests.cs limit:3",
+            vec![tip.as_str(), changed.as_str(), added.as_str()],
+        ),
+        (
+            &tip,
+            "log method:Worker.Target() limit:3",
+            vec![tip.as_str(), changed.as_str(), added.as_str()],
+        ),
+    ] {
+        let history = f.history(at, query).await;
+        assert_eq!(ids(&history), expected, "{query}: {history}");
+        assert!(!history.contains("incomplete:"), "{query}: {history}");
+        assert!(history.ends_with("end\n"), "{query}: {history}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_csharp_conditionals_in_candidates_do_not_prove_absence() {
+    for (directive, reason) in [
+        (
+            "#if FEATURE & OTHER\n#endif",
+            "unsupported historical C# condition",
+        ),
+        (
+            "#elifdef FEATURE",
+            "unsupported historical C# directive #elifdef",
+        ),
+    ] {
+        let f = Fixture::new();
+        let script = format!(
+            "#:project ../src/App.csproj\n#:property TargetFramework=net10.0\n{directive}\nclass ConsentScript {{}}\n"
+        );
+        let root = f.commit(
+            &[("scripts/verify-tool-consent.cs", &script)],
+            &[],
+            "unanalyzable possible predecessor",
+        );
+        let tip = f.commit(
+            &[("Worker.cs", "class Worker { int Target() { return 1; } }\n")],
+            &[&root],
+            "selected source",
+        );
+        // A repeated query must not turn incomplete candidate analysis into a
+        // cached absence and falsely claim that the selected source was added.
+        for _ in 0..2 {
+            for query in ["log method:Worker.Target()", "log file:Worker.cs"] {
+                let history = f.history(&tip, query).await;
+                assert!(ids(&history).is_empty(), "{query}: {history}");
+                assert!(
+                    history.contains("incomplete:") && history.contains(reason),
+                    "{query}: {history}"
+                );
+                assert!(!history.ends_with("end\n"), "{query}: {history}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn directive_text_inside_a_csharp_string_does_not_hide_an_introduction() {
     let f = Fixture::new();
     let original = r#"class Worker {
