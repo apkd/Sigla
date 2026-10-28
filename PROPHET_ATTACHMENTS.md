@@ -1,6 +1,6 @@
 # Prophet attachment issues
 
-This records attachment and response-delivery problems observed during the Sigla prototype work through 2026-10-28 08:19 UTC. The evidence is the current session transcript and the saved responses and patches under `/tmp`. The timestamps below are UTC.
+This records attachment and response-delivery problems observed during the Sigla prototype work through 2026-10-28 08:19 UTC. The evidence is the current session transcript and the archived responses and patches under `/src/sigla/.notes/scratch/sigla-history-improvements`. The timestamps below are UTC.
 
 Ten responses reported **26 failed attachment downloads**. In five responses, a complete patch was still received separately through Magic Wormhole; the failed attachments were individual source files or test logs. In the other five responses, the failed attachment was the advertised patch. One of those responses included the patch inline; the other four required a retry to obtain reviewable code or remained pending when work paused.
 
@@ -23,9 +23,9 @@ These warnings concerned the individual downloads. They do not mean the separate
 | Response time | Prototype | Failure and outcome |
 |---|---|---|
 | 2026-10-28 03:32 | Literal history filenames | `sigla-literal-history-file.patch` could not be downloaded. The response included an inline patch, which was reviewed and integrated as `3bb388b`. |
-| 2026-10-28 04:22 | Path-scoped attribute exclusions | `path_scope_exclusions.patch` could not be downloaded; the response described a fix but supplied no usable code. A single retry supplied a complete patch through Wormhole. That patch was saved as `/tmp/sigla-path-history-attributes.patch`, but review found false omissions and a work-limit regression. |
-| 2026-10-28 05:25 | C# `allows ref struct` history | `sigla-ref-struct-history.patch` could not be downloaded; the response contained no usable patch. A single retry supplied a complete patch through Wormhole. It was saved as `/tmp/sigla-modern-constraints.patch`; grammar ordering and resource concerns prevented integration. |
-| 2026-10-28 07:37 | C# generic alias references | `sigla-generic-alias-uses.patch` could not be downloaded. The response also said its Wormhole transport was unavailable. A single retry delivered `/tmp/sigla-csharp-generic-alias.patch` through normal Wormhole file reception; its SHA-256 matched the supplied value. Review was underway when the goal paused. |
+| 2026-10-28 04:22 | Path-scoped attribute exclusions | `path_scope_exclusions.patch` could not be downloaded; the response described a fix but supplied no usable code. A single retry supplied a complete patch through Wormhole. That patch was saved as `/src/sigla/.notes/scratch/sigla-history-improvements/prototypes/sigla-path-history-attributes.patch`, but review found false omissions and a work-limit regression. |
+| 2026-10-28 05:25 | C# `allows ref struct` history | `sigla-ref-struct-history.patch` could not be downloaded; the response contained no usable patch. A single retry supplied a complete patch through Wormhole. It was saved as `/src/sigla/.notes/scratch/sigla-history-improvements/prototypes/sigla-modern-constraints.patch`; grammar ordering and resource concerns prevented integration. |
+| 2026-10-28 07:37 | C# generic alias references | `sigla-generic-alias-uses.patch` could not be downloaded. The response also said its Wormhole transport was unavailable. A single retry delivered `/src/sigla/.notes/scratch/sigla-history-improvements/prototypes/sigla-csharp-generic-alias.patch` through normal Wormhole file reception; its SHA-256 matched the supplied value. Review was underway when the goal paused. |
 | 2026-10-28 08:17 | Local symlink view | `sigla-local-symlink-view.patch` could not be downloaded; only a description was available. A single retry was submitted before the goal paused. After the turn was interrupted, its execution handle was no longer available and no result was saved. The remote request's final outcome is unknown. |
 
 The generic-alias retry proposed both a text-mode/base64 transfer and a normal file-receive command. The normal file receive succeeded; the text-mode alternative was not used. A response should provide a directly usable file attachment or standard file-receive command rather than require an encoding workaround.
@@ -33,12 +33,12 @@ The generic-alias retry proposed both a text-mode/base64 transfer and a normal f
 ## Other delivery and packaging issues
 
 - The first unsupported-text prototype request returned `ERROR: The existing conversation is no longer available for recovery.` It produced no usable response or patch. The permitted retry returned the complete patch, along with the individual-download warnings listed above.
-- The locally saved reviewed diff for unreadable history candidates omitted the new untracked `src/history/regions/unavailable.rs`. Reconstructing that reviewed prototype requires both `/tmp/sigla-history-unreadable-reviewed.patch` and the original `/tmp/sigla-history-unreadable-candidates.patch`. This was a local patch-packaging issue, not an established Prophet download failure.
+- The locally saved reviewed diff for unreadable history candidates omitted the new untracked `src/history/regions/unavailable.rs`. Reconstructing that reviewed prototype requires both `/src/sigla/.notes/scratch/sigla-history-improvements/prototypes/sigla-history-unreadable-reviewed.patch` and the original `/src/sigla/.notes/scratch/sigla-history-improvements/prototypes/sigla-history-unreadable-candidates.patch`. This was a local patch-packaging issue, not an established Prophet download failure.
 - Attempts to report several of these problems using `m-notify --warning` failed with `c: session is unavailable`. This is a separate notification-session failure; it does not identify the cause of the attachment failures.
 
 ## Evidence and limits
 
 - The session transcript is `/home/dev/.codex/sessions/2026/10/27/rollout-2026-10-27T20-35-38-01a17edc-6faa-79d3-bb57-330e08b92b66.jsonl`.
-- Saved summaries include `/tmp/sigla-history-attribute-unusable-response.md`, `/tmp/sigla-history-csharp-constraints-unusable-response.md`, `/tmp/sigla-generic-alias-unavailable-response.md`, `/tmp/sigla-symlink-view-unavailable-response.md`, and `/tmp/sigla-history-prototype-state.txt`.
-- `/tmp` files are temporary. Wormhole codes are intentionally omitted: they are single-use and may already be consumed or expired.
+- Saved summaries include `/src/sigla/.notes/scratch/sigla-history-improvements/reviews/sigla-history-attribute-unusable-response.md`, `/src/sigla/.notes/scratch/sigla-history-improvements/reviews/sigla-history-csharp-constraints-unusable-response.md`, `/src/sigla/.notes/scratch/sigla-history-improvements/reviews/sigla-generic-alias-unavailable-response.md`, `/src/sigla/.notes/scratch/sigla-history-improvements/reviews/sigla-symlink-view-unavailable-response.md`, and `/src/sigla/.notes/scratch/sigla-history-improvements/reports/sigla-history-prototype-state.txt`.
+- `.notes/scratch` is subject to periodic cleanup. Wormhole codes are intentionally omitted: they are single-use and may already be consumed or expired.
 - This inventory describes failures visible in the transcript and saved artifacts; it does not claim a diagnosis of the underlying attachment service.
