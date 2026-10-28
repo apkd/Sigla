@@ -192,6 +192,9 @@ fn edge_record(tracker: &mut Tracker, state: &State, mapping: &Mapping) -> Resul
         if let Some(label) = link.label() {
             record.notes.insert(label);
         }
+        if let Some(mode) = render::mode_change(&link.to, &link.from) {
+            record.notes.insert(mode);
+        }
     }
     // Identity is independent of line numbers and blob IDs. Unchanged selected
     // bytes moving past an unrelated edit do not create a source-history record.
@@ -672,7 +675,7 @@ fn repository_regions(tree: &cache::SourceTree) -> BTreeMap<String, Region> {
         .filter(|(path, e)| {
             matches!(e.mode, 0o100644 | 0o100755) && regions::language(path).is_some()
         })
-        .map(|(path, e)| (path.clone(), Region::whole(path, &e.id, 0)))
+        .map(|(path, e)| (path.clone(), Region::whole(path, &e.id, e.mode)))
         .collect()
 }
 
@@ -1101,32 +1104,37 @@ fn compare(
         && !new.absent
         && old.regions.len() == 1
         && new.regions.len() == 1;
-    // Equal whole-file objects require no source hydration at all. Mode changes
-    // are reported from tree metadata, including an otherwise empty comparison.
+    // Prune only equal whole-file entries. A mode change must reach the same
+    // pairing and rendering path as a content edit, including selected files.
     let unchanged: BTreeSet<_> = old
         .regions
         .iter()
         .filter(|a| {
             a.kind == "file"
-                && new
-                    .regions
-                    .iter()
-                    .any(|b| b.kind == "file" && a.path == b.path && a.blob == b.blob)
+                && new.regions.iter().any(|b| {
+                    b.kind == "file"
+                        && a.path == b.path
+                        && a.blob == b.blob
+                        && a.file_mode == b.file_mode
+                })
         })
-        .map(|r| (r.path.clone(), r.blob.clone()))
+        .map(|r| (r.path.clone(), r.blob.clone(), r.file_mode))
         .collect();
     old.regions
-        .retain(|r| !unchanged.contains(&(r.path.clone(), r.blob.clone())));
+        .retain(|r| !unchanged.contains(&(r.path.clone(), r.blob.clone(), r.file_mode)));
     new.regions
-        .retain(|r| !unchanged.contains(&(r.path.clone(), r.blob.clone())));
-    if repository {
+        .retain(|r| !unchanged.contains(&(r.path.clone(), r.blob.clone(), r.file_mode)));
+    if repository && let Some(parent) = &parent {
+        let before = tracker.tree(parent)?;
         let after = tracker.tree(&child)?;
-        if let Some(parent) = &parent {
-            let before = tracker.tree(parent)?;
-            for (path, entry) in after.iter() {
-                if let Some(old) = before.get(path).filter(|old| old.mode != entry.mode) {
-                    notes.push(format!("mode {path} {:06o}→{:06o}", old.mode, entry.mode));
-                }
+        for (path, entry) in after.iter() {
+            if let Some(old) = before.get(path).filter(|old| {
+                old.mode != entry.mode
+                    && (regions::language(path).is_none()
+                        || !matches!(old.mode, 0o100644 | 0o100755)
+                        || !matches!(entry.mode, 0o100644 | 0o100755))
+            }) {
+                notes.push(format!("mode {path} {:06o}→{:06o}", old.mode, entry.mode));
             }
         }
     }
@@ -1173,7 +1181,7 @@ mod resource_tests {
 
     #[test]
     fn written_headers_count_towards_the_trace_memory_limit() {
-        let mut region = Region::whole("Worker.cs", "blob", 0);
+        let mut region = Region::whole("Worker.cs", "blob", 0o100644);
         region.written = "header ".repeat(2048);
         let mut bytes = TRACE_MEMORY - region.written.len() / 2;
         let state = State {

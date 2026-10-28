@@ -65,6 +65,7 @@ impl State {
         self.regions.sort_by(|a, b| {
             a.key()
                 .cmp(&b.key())
+                .then_with(|| a.file_mode.cmp(&b.file_mode))
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.kind.cmp(&b.kind))
                 .then_with(|| a.parameters.cmp(&b.parameters))
@@ -309,7 +310,7 @@ impl Tracker {
                         &source,
                     )
                 } else {
-                    Region::whole(path, &entry.id, 0)
+                    Region::whole(path, &entry.id, entry.mode)
                 };
                 state.regions.push(region);
             }
@@ -602,13 +603,15 @@ impl Tracker {
         forward: bool,
         work: &mut usize,
     ) -> Result<Vec<Link>> {
-        if to
+        if let Some(entry) = to
             .get(&region.path)
-            .is_some_and(|e| e.id.as_ref() == region.blob)
+            .filter(|e| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
         {
+            let mut previous = region.clone();
+            previous.file_mode = region.file_mode.map(|_| entry.mode);
             return Ok(vec![Link {
                 from: region.clone(),
-                to: region.clone(),
+                to: previous,
                 relation: Relation::Continue,
                 uncertain: region.weak,
                 reason: "object+context",
@@ -622,9 +625,10 @@ impl Tracker {
         if !exact.is_empty() && (region.kind != "text" || !to.contains_key(&region.path)) {
             return Ok(exact
                 .iter()
-                .map(|(path, _)| {
+                .map(|(path, entry)| {
                     let mut old = region.clone();
                     old.path = (*path).clone();
+                    old.file_mode = region.file_mode.map(|_| entry.mode);
                     let copy = from.get(*path).is_some_and(|e| e.id.as_ref() == old.blob);
                     Link {
                         from: region.clone(),
@@ -643,6 +647,7 @@ impl Tracker {
         {
             let mut previous = region.clone();
             previous.blob = entry.id.to_string();
+            previous.file_mode = Some(entry.mode);
             return Ok(vec![Link {
                 from: region.clone(),
                 to: previous,
@@ -1285,7 +1290,7 @@ impl Tracker {
                 .then(|| regions::map_range(&source.text, &other.text, source_range.clone()))
                 .flatten();
             let candidates = if region.kind == "file" {
-                vec![Region::whole(path, &entry.id, 0)]
+                vec![Region::whole(path, &entry.id, entry.mode)]
             } else {
                 other
                     .declarations
@@ -1668,7 +1673,7 @@ pub(super) fn members(tree: &Tree, selection: paths::CompiledSelection<'_>) -> V
                 && regions::language(path).is_some()
                 && selection.matches(path)
         })
-        .map(|(path, entry)| Region::whole(path, &entry.id, 0))
+        .map(|(path, entry)| Region::whole(path, &entry.id, entry.mode))
         .collect()
 }
 
@@ -1692,7 +1697,7 @@ mod tests {
 
     #[test]
     fn normalization_preserves_written_alternatives_and_uncertainty() {
-        let mut first = Region::whole("Worker.cs", "blob", 100);
+        let mut first = Region::passage("Worker.cs", "blob", 0..100);
         first.kind = "method".into();
         first.name = "Worker.Target".into();
         first.written = "int Target ( int value )".into();
@@ -1738,7 +1743,7 @@ mod tests {
         assert!(!joined.uncertain);
         for live in [
             State {
-                regions: vec![Region::whole("empty.rs", "blob", 0)],
+                regions: vec![Region::whole("empty.rs", "blob", 0o100644)],
                 ..State::default()
             },
             State {

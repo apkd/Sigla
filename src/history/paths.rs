@@ -381,8 +381,8 @@ mod tests {
     }
     fn link(from: &str, before: &str, to: &str, after: &str) -> Link {
         Link {
-            from: Region::whole(from, before, 0),
-            to: Region::whole(to, after, 0),
+            from: Region::whole(from, before, 0o100644),
+            to: Region::whole(to, after, 0o100644),
             relation: Relation::Move,
             uncertain: before != after,
             reason: "file content+path",

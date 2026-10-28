@@ -125,6 +125,20 @@ pub(super) fn counts(old: &str, new: &str) -> (usize, usize) {
         })
 }
 
+/// Compare metadata only after the caller has established a whole-file pair.
+/// Selected declarations and passages deliberately carry no file mode.
+pub(super) fn mode_change(old: &Region, new: &Region) -> Option<String> {
+    let (before, after) = old.file_mode.zip(new.file_mode)?;
+    (before != after).then(|| {
+        let path = if old.path == new.path {
+            new.path.clone()
+        } else {
+            format!("{} → {}", old.path, new.path)
+        };
+        format!("mode {path} {before:06o}→{after:06o}")
+    })
+}
+
 pub(super) fn comparison(
     store: &mut Store,
     sources: &mut Sources,
@@ -223,40 +237,53 @@ fn append(
     new: Option<&Region>,
     file: Option<&FilePair>,
 ) -> Result<()> {
+    let mode = old.zip(new).and_then(|(a, b)| mode_change(a, b));
     if old.zip(new).is_some_and(|(a, b)| {
         a.path == b.path
             && a.blob == b.blob
             && a.span == b.span
             && a.kind == b.kind
             && a.name == b.name
-    }) {
+    }) && mode.is_none()
+    {
         return Ok(());
     }
-    // Only this already-selected, non-identical pair is needed next. Do not
-    // hydrate the remaining comparison ahead of rendering or its memory bound.
-    let blobs: Vec<_> = old.into_iter().chain(new).map(|r| r.blob.clone()).collect();
-    store.prefetch(&blobs, "blob")?;
-    let mut read = |region: Option<&Region>| -> Result<(String, usize)> {
-        if let Some(region) = region {
-            let source = sources.get(store, &region.path, &region.blob)?;
-            Ok((
-                source.text[region.range(&source)].to_owned(),
-                crate::model::position(&source.text, region.span.start).0,
-            ))
-        } else {
-            Ok((String::new(), 1))
-        }
+    let ((a, astart), (b, bstart)) = if old
+        .zip(new)
+        .is_some_and(|(a, b)| a.kind == "file" && b.kind == "file" && a.blob == b.blob)
+    {
+        // Equal whole-file objects have no content diff, even across a move or
+        // mode change. Their metadata needs no source hydration.
+        ((String::new(), 1), (String::new(), 1))
+    } else {
+        // Only this already-selected pair is needed next. Do not hydrate the
+        // remaining comparison ahead of rendering or its memory bound.
+        let blobs: Vec<_> = old.into_iter().chain(new).map(|r| r.blob.clone()).collect();
+        store.prefetch(&blobs, "blob")?;
+        let mut read = |region: Option<&Region>| -> Result<(String, usize)> {
+            if let Some(region) = region {
+                let source = sources.get(store, &region.path, &region.blob)?;
+                Ok((
+                    source.text[region.range(&source)].to_owned(),
+                    crate::model::position(&source.text, region.span.start).0,
+                ))
+            } else {
+                Ok((String::new(), 1))
+            }
+        };
+        (read(old)?, read(new)?)
     };
-    let (a, astart) = read(old)?;
-    let (b, bstart) = read(new)?;
     let old_name = old.map_or("/dev/null".into(), |r| format!("a/{}", r.path));
     let new_name = new.map_or("/dev/null".into(), |r| format!("b/{}", r.path));
     let changed_identity = old
         .zip(new)
         .is_some_and(|(a, b)| a.path != b.path || a.name != b.name);
     let changed_existence = old.is_some() != new.is_some();
-    if a != b || changed_identity || changed_existence {
+    if a != b || changed_identity || changed_existence || mode.is_some() {
         writeln!(out, "diff --git {old_name} {new_name}").unwrap();
+        if let Some(mode) = mode {
+            writeln!(out, "# {mode}").unwrap();
+        }
         if let (Some(a), Some(b)) = (old, new) {
             if a.path != b.path {
                 let (event, from, to, suffix) = match file.map(|pair| pair.change) {

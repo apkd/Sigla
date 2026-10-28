@@ -100,7 +100,12 @@ pub(super) fn filter(graph: &Graph, tracker: &mut Tracker, trace: &mut Trace) ->
                         .regions
                         .iter()
                         .zip(&trace.states[id].regions)
-                        .all(|(a, b)| a.path == b.path && a.name == b.name && a.kind == b.kind)
+                        .all(|(a, b)| {
+                            a.path == b.path
+                                && a.name == b.name
+                                && a.kind == b.kind
+                                && a.file_mode == b.file_mode
+                        })
             })
         };
         let identity_continues = merge.parents.iter().any(|p| same_identity(p));
@@ -266,8 +271,16 @@ pub(super) fn filter(graph: &Graph, tracker: &mut Tracker, trace: &mut Trace) ->
                 if suppressed {
                     let before = retained(&base, &before_edits, &masks);
                     let after = retained(&base, &current_edits, &masks);
+                    // Source rejection cannot erase a separate executable-mode
+                    // change on this already established single-file edge.
+                    let mode_changed = before_state
+                        .regions
+                        .first()
+                        .zip(state.regions.first())
+                        .and_then(|(before, after)| before.file_mode.zip(after.file_mode))
+                        .is_some_and(|(before, after)| before != after);
                     if let Some(record) = trace.records.get_mut(&current) {
-                        if before == after {
+                        if before == after && !mode_changed {
                             record.suppressed = true;
                         } else {
                             record.partial = true;
@@ -278,8 +291,111 @@ pub(super) fn filter(graph: &Graph, tracker: &mut Tracker, trace: &mut Trace) ->
                 pending.push((before_id.clone(), masks));
             }
         }
+        if let (Some(base_mode), Some(merged_mode)) = (
+            single_mode(&trace.states[base_id]),
+            single_mode(&trace.states[id]),
+        ) {
+            let merged_path = trace.states[id].regions[0].path.clone();
+            for (index, parent) in contribution_tips.iter().enumerate() {
+                if merged_mode == base_mode
+                    && trace
+                        .states
+                        .get(parent)
+                        .and_then(single_mode)
+                        .is_some_and(|mode| mode != base_mode)
+                {
+                    let path_retained = trace.states[parent].regions[0].path == merged_path;
+                    reject_mode(
+                        graph,
+                        trace,
+                        parent,
+                        &exclusive[index],
+                        base_mode,
+                        path_retained,
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn single_mode(state: &super::matching::State) -> Option<u32> {
+    if state.uncertain || state.absent {
+        return None;
+    }
+    match state.regions.as_slice() {
+        [region] => region.file_mode,
+        _ => None,
+    }
+}
+
+fn reject_mode(
+    graph: &Graph,
+    trace: &mut Trace,
+    parent: &str,
+    exclusive: &BTreeSet<String>,
+    base: u32,
+    path_retained: bool,
+) {
+    let mut current = parent;
+    while exclusive.contains(current) {
+        let Some(state) = trace.states.get(current) else {
+            mode_unresolved(graph, trace, current, exclusive);
+            break;
+        };
+        let Some(mode) = single_mode(state) else {
+            mode_unresolved(graph, trace, current, exclusive);
+            break;
+        };
+        if mode == base {
+            break;
+        }
+        let [before_id] = graph.commits[current].parents.as_slice() else {
+            mode_unresolved(graph, trace, current, exclusive);
+            break;
+        };
+        let Some(before) = trace.states.get(before_id) else {
+            mode_unresolved(graph, trace, current, exclusive);
+            break;
+        };
+        let Some(before_mode) = single_mode(before) else {
+            mode_unresolved(graph, trace, current, exclusive);
+            break;
+        };
+        if before_mode != mode {
+            let note = render::mode_change(&before.regions[0], &state.regions[0]);
+            if let (Some(note), Some(record)) = (note, trace.records.get_mut(current))
+                && !record.uncertain
+                && record.notes.remove(&note)
+            {
+                if before.regions[0].path != state.regions[0].path && !path_retained {
+                    record.uncertain = true;
+                    record.notes.insert("move attribution unresolved".into());
+                }
+                if record.notes.is_empty()
+                    && record.counted
+                    && record.plus == 0
+                    && record.minus == 0
+                {
+                    record.suppressed = true;
+                } else {
+                    record.partial = true;
+                }
+            }
+            break;
+        }
+        current = before_id;
+    }
+}
+
+fn mode_unresolved(graph: &Graph, trace: &mut Trace, current: &str, exclusive: &BTreeSet<String>) {
+    for affected in graph.ancestors(current).intersection(exclusive) {
+        if let Some(record) = trace.records.get_mut(affected) {
+            record.uncertain = true;
+            record.notes.insert("mode attribution unresolved".into());
+        }
+    }
 }
 
 /// A rejected absence is not an empty textual replacement. Walk only the
@@ -352,7 +468,7 @@ mod tests {
                 (
                     "base".into(),
                     State {
-                        regions: vec![Region::whole("empty.txt", "blob", 0)],
+                        regions: vec![Region::whole("empty.txt", "blob", 0o100644)],
                         ..State::default()
                     },
                 ),
