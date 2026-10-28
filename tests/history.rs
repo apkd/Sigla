@@ -1,6 +1,7 @@
 //! Public-service regressions. Fixtures contain committed objects, not checked-out
 //! source trees; reaching any workspace preparation path is therefore a failure.
 mod real;
+mod weak_files;
 
 use sigla::{discovery::Policy, service::App};
 use std::{

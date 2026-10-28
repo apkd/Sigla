@@ -22,8 +22,11 @@ pub(super) struct State {
     pub scope_exclusions: Vec<paths::Exclusion>,
     // File lineage may be known without a whole historical directory location.
     pub scope_unresolved: bool,
-    // A completed match proved this occurrence absent. An empty default state
-    // carries no such evidence. Absence alongside regions is an alternative.
+    // A completed whole-file search found only possible identities. Keep
+    // this provenance even after candidates converge or disappear.
+    pub file_ancestry_unresolved: bool,
+    // Absence from a completed search, alone or as an alternative alongside
+    // regions. An empty default state carries no such evidence.
     pub absent: bool,
     pub uncertain: bool,
 }
@@ -87,6 +90,7 @@ impl State {
         self.scope_exclusions.sort();
         self.scope_exclusions.dedup();
         self.uncertain |= self.scope_unresolved
+            || self.file_ancestry_unresolved
             || self.regions.iter().any(|r| r.weak)
             || self.absent && (!self.regions.is_empty() || !self.paths.is_empty());
     }
@@ -97,6 +101,7 @@ impl State {
             .extend(other.scope_exclusions.iter().cloned());
         self.absent |= other.absent;
         self.scope_unresolved |= other.scope_unresolved;
+        self.file_ancestry_unresolved |= other.file_ancestry_unresolved;
         self.uncertain |= other.uncertain;
         self.normalize();
     }
@@ -117,6 +122,8 @@ pub(super) struct Link {
     pub to: Region,
     pub relation: Relation,
     pub uncertain: bool,
+    // Weak whole-file evidence also permits no identity link at this edge.
+    pub absence_alternative: bool,
     pub reason: &'static str,
 }
 impl Link {
@@ -168,8 +175,9 @@ impl Mapping {
 }
 pub(super) const SCORE_MARGIN: usize = 6;
 pub(super) const MIN_SCORE: usize = 60;
-// Includes reciprocal searches, not just the selected occurrence. Exhaustion
-// is unresolved evidence, never absence or an arbitrary assignment.
+// Includes whole-file alternatives and reciprocal searches, not just the
+// selected occurrence. Exhaustion is unresolved evidence, never absence or an
+// arbitrary assignment.
 pub(super) const CANDIDATE_WORK: usize = 65_536;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -526,6 +534,7 @@ impl Tracker {
                 absent: state.absent,
                 uncertain: state.uncertain,
                 scope_unresolved: state.scope_unresolved,
+                file_ancestry_unresolved: state.file_ancestry_unresolved,
                 ..State::default()
             },
             links: Vec::new(),
@@ -539,11 +548,25 @@ impl Tracker {
                 to.id,
                 region.path
             );
-            let mapped = self.region(&a, &b, region, forward, &mut work)?;
-            if mapped.is_empty() && state.paths.is_empty() {
+            let mapped = self.region(
+                &a,
+                &b,
+                region,
+                forward,
+                state.file_ancestry_unresolved,
+                &mut work,
+            )?;
+            let optional = mapped.iter().any(|link| link.absence_alternative);
+            if (mapped.is_empty() || optional) && state.paths.is_empty() {
                 result.state.absent = true;
             }
+            result.state.file_ancestry_unresolved |= optional;
             for link in mapped {
+                if state.file_ancestry_unresolved {
+                    // Exact matches of inherited alternatives can multiply
+                    // without scoring. Bound retained relations as well.
+                    candidate_work(&mut work, &self.store.cancel)?;
+                }
                 result.state.uncertain |= link.uncertain;
                 result.state.regions.push(link.to.clone());
                 result.links.push(link);
@@ -628,6 +651,7 @@ impl Tracker {
                     to: region.clone(),
                     relation: Relation::Continue,
                     uncertain: region.weak,
+                    absence_alternative: false,
                     reason: "object+context",
                 })
                 .collect(),
@@ -639,6 +663,7 @@ impl Tracker {
         to: &Tree,
         region: &Region,
         forward: bool,
+        bounded_alternatives: bool,
         work: &mut usize,
     ) -> Result<Vec<Link>> {
         if let Some(entry) = to
@@ -652,14 +677,22 @@ impl Tracker {
                 to: previous,
                 relation: Relation::Continue,
                 uncertain: region.weak,
+                absence_alternative: false,
                 reason: "object+context",
             }]);
         }
         // A whole unchanged file carries even tiny members across a file move.
-        let exact: Vec<_> = to
-            .iter()
-            .filter(|(_, e)| e.id.as_ref() == region.blob && matches!(e.mode, 0o100644 | 0o100755))
-            .collect();
+        let mut exact = Vec::new();
+        for (path, entry) in to {
+            if bounded_alternatives {
+                // Many possible identities must not each scan an unbounded
+                // inventory, even when every scan finds just one exact match.
+                candidate_work(work, &self.store.cancel)?;
+            }
+            if entry.id.as_ref() == region.blob && matches!(entry.mode, 0o100644 | 0o100755) {
+                exact.push((path, entry));
+            }
+        }
         if !exact.is_empty() && (region.kind != "text" || !to.contains_key(&region.path)) {
             return Ok(exact
                 .iter()
@@ -673,6 +706,7 @@ impl Tracker {
                         to: old,
                         relation: if copy { Relation::Copy } else { Relation::Move },
                         uncertain: exact.len() > 1 || copy || region.weak,
+                        absence_alternative: false,
                         reason: "identical file object",
                     }
                 })
@@ -691,6 +725,7 @@ impl Tracker {
                 to: previous,
                 relation: Relation::Continue,
                 uncertain: false,
+                absence_alternative: false,
                 reason: "path continuity",
             }]);
         }
@@ -713,6 +748,36 @@ impl Tracker {
             if assignment.settled {
                 break;
             }
+        }
+        if assignment.links.is_empty()
+            && assignment.weak
+            && region.kind == "file"
+            && search.incomplete.is_none()
+            && !search.remaining
+            && !region.weak
+        {
+            // A completed weak search establishes alternatives, not a move or
+            // an introduction. Keep every retained candidate: score ordering
+            // in this band cannot settle identity, including ties. Wider exact
+            // and strong origins have already had their normal opportunity.
+            let mut links = Vec::new();
+            for candidate in search.scored {
+                check(&self.store.cancel)?;
+                let old = candidate.region;
+                let copy = !forward
+                    && from
+                        .get(&old.path)
+                        .is_some_and(|e| e.id.as_ref() == old.blob);
+                links.push(Link {
+                    from: region.clone(),
+                    to: old,
+                    relation: if copy { Relation::Copy } else { Relation::Move },
+                    uncertain: true,
+                    absence_alternative: true,
+                    reason: "weak file content; absence also possible",
+                });
+            }
+            return Ok(links);
         }
         if assignment.links.is_empty() {
             ensure!(
@@ -758,6 +823,7 @@ impl Tracker {
                     to: Region::passage(&region.path, &entry.id, region.span.clone()),
                     relation: Relation::Continue,
                     uncertain: region.weak,
+                    absence_alternative: false,
                     reason: "unchanged text prefix",
                 }]);
             }
@@ -944,6 +1010,7 @@ impl Tracker {
                         Relation::Text
                     },
                     uncertain: region.weak || !context,
+                    absence_alternative: false,
                     reason,
                 });
             }
@@ -1108,6 +1175,7 @@ impl Tracker {
                     || relation == Relation::Copy && candidate.similarity < 70,
                 to: candidate.region.clone(),
                 relation,
+                absence_alternative: false,
                 reason: if alternatives {
                     "competing predecessors"
                 } else if competition == Competition::Uncertain {
@@ -1433,7 +1501,7 @@ impl Tracker {
                     .collect()
             };
             for mut candidate in candidates {
-                if matches!(region.kind.as_str(), "file" | "text") {
+                if region.kind == "text" {
                     check(&self.store.cancel)?;
                 } else {
                     candidate_work(work, &self.store.cancel)?;
@@ -1634,7 +1702,7 @@ fn candidate_work(work: &mut usize, cancel: &AtomicBool) -> Result<()> {
     check(cancel)?;
     ensure!(
         *work < CANDIDATE_WORK,
-        "unresolved target: direct-continuation competition work limit reached"
+        "unresolved target: candidate comparison work limit reached"
     );
     *work += 1;
     Ok(())

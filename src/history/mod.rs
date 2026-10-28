@@ -30,6 +30,7 @@ struct Record {
     counted: bool,
     uncertain: bool,
     scope_unresolved: bool,
+    file_ancestry_unresolved: bool,
     partial: bool,
     suppressed: bool,
     notes: BTreeSet<String>,
@@ -38,6 +39,25 @@ struct Record {
 struct Trace {
     states: BTreeMap<String, State>,
     records: BTreeMap<String, Record>,
+}
+
+const FILE_ANCESTRY: &str = "ancestry: unresolved file identity (absence or candidate ancestry)";
+
+struct Comparison {
+    canonical: String,
+    file_ancestry_unresolved: bool,
+}
+impl Comparison {
+    fn page(&self, header: &str, offset: usize) -> Result<String> {
+        // Repeat identity uncertainty on every byte page without adding it to
+        // the canonical stream or changing that stream's offsets.
+        let header = if self.file_ancestry_unresolved {
+            format!("{header}\n{FILE_ANCESTRY}")
+        } else {
+            header.to_owned()
+        };
+        render::page(&header, &self.canonical, offset)
+    }
 }
 
 pub(crate) fn validate(input: &str) -> Result<()> {
@@ -135,18 +155,14 @@ fn execute(tracker: &mut Tracker, revision: Option<&str>, request: &Request) -> 
                 "{header}\nfrom {base}{}\nto {to}\nparent {parent}",
                 if from.is_none() { " (empty tree)" } else { "" }
             );
-            let canonical = compare(tracker, &anchor, state, repository, from.as_deref(), &to)?;
-            render::page(&header, &canonical, *offset)
+            compare(tracker, &anchor, state, repository, from.as_deref(), &to)?
+                .page(&header, *offset)
         }
         Command::Diff { from, to, offset } => {
             let from = tracker.store.resolve(Some(from))?;
             let to = tracker.store.resolve(Some(to))?;
-            let canonical = compare(tracker, &anchor, state, repository, Some(&from), &to)?;
-            render::page(
-                &format!("{header}\nfrom {from}\nto {to}"),
-                &canonical,
-                *offset,
-            )
+            compare(tracker, &anchor, state, repository, Some(&from), &to)?
+                .page(&format!("{header}\nfrom {from}\nto {to}"), *offset)
         }
     }
 }
@@ -185,16 +201,31 @@ fn edge_record(tracker: &mut Tracker, state: &State, mapping: &Mapping) -> Resul
     let mut record = Record {
         uncertain: state.uncertain || mapping.state.uncertain,
         scope_unresolved: state.scope_unresolved || mapping.state.scope_unresolved,
+        file_ancestry_unresolved: state.file_ancestry_unresolved
+            || mapping.state.file_ancestry_unresolved,
         counted: true,
         ..Record::default()
     };
     for link in &mapping.links {
+        if link.absence_alternative {
+            record.notes.insert(format!(
+                "add {} (path only; predecessor unresolved)",
+                link.from.path
+            ));
+        }
         if let Some(label) = link.label() {
             record.notes.insert(label);
         }
         if let Some(mode) = render::mode_change(&link.to, &link.from) {
             record.notes.insert(mode);
         }
+    }
+    if mapping.links.iter().any(|link| link.absence_alternative) {
+        // The path addition is already known. Rendering every possible old
+        // file cannot settle its identity or produce meaningful line counts.
+        record.changed = true;
+        record.counted = false;
+        return Ok(record);
     }
     // Identity is independent of line numbers and blob IDs. Unchanged selected
     // bytes moving past an unrelated edit do not create a source-history record.
@@ -252,6 +283,7 @@ fn combine(record: &mut Record, other: Record) {
     record.changed |= other.changed;
     record.uncertain |= other.uncertain;
     record.scope_unresolved |= other.scope_unresolved;
+    record.file_ancestry_unresolved |= other.file_ancestry_unresolved;
     record.notes.extend(other.notes);
     record.counted = false;
 }
@@ -367,6 +399,7 @@ fn forwards(
         if let Some(previous) = trace.states.get(id) {
             state.uncertain |= previous.uncertain;
             state.scope_unresolved |= previous.scope_unresolved;
+            state.file_ancestry_unresolved |= previous.file_ancestry_unresolved;
         }
         if records {
             let mut record = None;
@@ -380,8 +413,16 @@ fn forwards(
                     }
                 } else {
                     let mapping = tracker.map(child, &graph.commits[*parent], &state)?;
+                    let mut expected = before.clone();
+                    if state.file_ancestry_unresolved {
+                        // A possible forward continuation introduces absence at
+                        // the child, not at its already established parent.
+                        // Reverse verification may inherit that alternative;
+                        // every concrete occurrence must still agree exactly.
+                        expected.absent |= state.absent;
+                    }
                     ensure!(
-                        mapping.state.same_occurrences(before),
+                        mapping.state.same_occurrences(&expected),
                         "unresolved target at {id}: branch bridge has competing predecessors"
                     );
                     mapping
@@ -411,6 +452,7 @@ struct Page {
     emitted: usize,
     deferred: bool,
     scope_unresolved: bool,
+    file_ancestry_unresolved: bool,
 }
 impl Page {
     fn new(header: &str, skip: usize, limit: usize) -> Self {
@@ -422,6 +464,7 @@ impl Page {
             emitted: 0,
             deferred: false,
             scope_unresolved: false,
+            file_ancestry_unresolved: false,
         }
     }
     fn remaining(&self) -> usize {
@@ -435,6 +478,7 @@ impl Page {
     fn push(&mut self, commit: &Commit, record: Option<&Record>) {
         // Coverage survives unchanged/suppressed records and numeric skipping.
         self.scope_unresolved |= record.is_some_and(|r| r.scope_unresolved);
+        self.file_ancestry_unresolved |= record.is_some_and(|r| r.file_ancestry_unresolved);
         if record.is_some_and(|r| !r.changed || r.suppressed) {
             return;
         }
@@ -481,7 +525,8 @@ impl Page {
         } else {
             writeln!(line, "{} {} {}", commit.id, commit.date, subject).unwrap();
         }
-        if self.emitted > 0 && self.text.len() + line.len() + 128 > render::PAGE_BYTES {
+        let footer = 128 + usize::from(self.file_ancestry_unresolved) * (FILE_ANCESTRY.len() + 1);
+        if self.emitted > 0 && self.text.len() + line.len() + footer > render::PAGE_BYTES {
             self.deferred = true;
             return;
         }
@@ -489,6 +534,9 @@ impl Page {
         self.emitted += 1;
     }
     fn end(mut self, more: bool, incomplete: Option<&anyhow::Error>) -> String {
+        if self.file_ancestry_unresolved {
+            writeln!(self.text, "{FILE_ANCESTRY}").unwrap();
+        }
         if self.scope_unresolved && (incomplete.is_some() || more || self.deferred) {
             writeln!(self.text, "coverage: {}", paths::UNRESOLVED).unwrap();
         }
@@ -748,7 +796,11 @@ fn linked_files(old: &[Region], new: &[Region], links: &[matching::Link]) -> Vec
     let mut before = vec![0; old.len()];
     let mut after = vec![0; new.len()];
     for link in links {
-        if link.from.kind != "file" || link.to.kind != "file" || link.from.path == link.to.path {
+        if link.absence_alternative
+            || link.from.kind != "file"
+            || link.to.kind != "file"
+            || link.from.path == link.to.path
+        {
             continue;
         }
         let Some(i) = old.iter().position(|r| r.same_alternative(&link.to)) else {
@@ -809,6 +861,11 @@ fn comparison_files(
     lineage: bool,
     order: ComparisonOrder,
 ) -> Result<Vec<render::FilePair>> {
+    // Snapshot similarity must not settle a weak identity edge encountered
+    // earlier in the trace, even if later contents converge to an exact match.
+    if old.file_ancestry_unresolved || new.file_ancestry_unresolved {
+        return Ok(Vec::new());
+    }
     let Some(before) = before else {
         return Ok(Vec::new());
     };
@@ -1012,7 +1069,7 @@ fn compare(
     repository: bool,
     from: Option<&str>,
     to: &str,
-) -> Result<String> {
+) -> Result<Comparison> {
     let child = tracker.store.commit(to)?;
     let parent = from.map(|id| tracker.store.commit(id)).transpose()?;
     if repository {
@@ -1093,6 +1150,13 @@ fn compare(
                 "~alternative or inferred region ancestry; not independent whole-file edits".into(),
             );
         }
+        for (endpoint, state) in [("from", &old), ("to", &new)] {
+            if state.file_ancestry_unresolved && state.absent && !state.regions.is_empty() {
+                notes.push(format!(
+                    "~{endpoint}: file may be absent; candidate regions are alternative ancestry"
+                ));
+            }
+        }
         (old, new, notes, order, Vec::new())
     };
     // A single selected occurrence was traced through actual history. Establish
@@ -1139,7 +1203,7 @@ fn compare(
         }
     }
     let files = comparison_files(tracker, parent.as_ref(), &child, &old, &new, lineage, order)?;
-    render::comparison(
+    let canonical = render::comparison(
         &mut tracker.store,
         &mut tracker.sources,
         &old.regions,
@@ -1147,7 +1211,11 @@ fn compare(
         &files,
         &notes,
         &opaque,
-    )
+    )?;
+    Ok(Comparison {
+        canonical,
+        file_ancestry_unresolved: old.file_ancestry_unresolved || new.file_ancestry_unresolved,
+    })
 }
 
 #[cfg(test)]
