@@ -5006,6 +5006,48 @@ async fn equal_renamed_continuations_remain_uncertain_in_either_file_order() {
 }
 
 #[tokio::test]
+async fn repeated_edited_competition_keeps_identical_blobs_at_distinct_paths() {
+    for (extension, kind) in [("cs", "method:Worker."), ("rs", "function:")] {
+        let original = format!("original.{extension}");
+        let paths = [format!("a.{extension}"), format!("z.{extension}")];
+        let before = continuation_source(&original, &continuation_member(&original, "original"));
+        let after = continuation_source(&original, &continuation_member(&original, "continued"))
+            .replace("+ 10", "+ 11");
+        let f = Fixture::new();
+        let root = f.commit(&[(&original, &before)], &[], "initial implementation");
+        let tip = f.commit(
+            &[(&paths[0], &after), (&paths[1], &after)],
+            &[&root],
+            "two edited destinations",
+        );
+        let mut expected = Vec::new();
+        for path in &paths {
+            let query = format!("log {kind}continued path:{path}");
+            let history = f.history(&tip, &query).await;
+            assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+            assert!(
+                history.contains(&format!("~move {original}→{path}")),
+                "{history}"
+            );
+            assert!(
+                history.contains("competing direct continuations"),
+                "{history}"
+            );
+            assert!(!history.contains("copy"), "{history}");
+            expected.push((query, history));
+        }
+        // Uncertain mappings are deliberately not cached. Replaying per-file
+        // scores must still distinguish both the selected and candidate paths,
+        // even though their blobs, declaration ranges, and signatures coincide.
+        for _ in 0..2 {
+            for (query, history) in expected.iter().rev() {
+                assert_eq!(f.history(&tip, query).await, *history);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn an_edited_local_namesake_does_not_hide_a_changed_file_tie() {
     for (path, destination, kind) in [
         ("Worker.cs", "Retained.cs", "method:Worker."),
