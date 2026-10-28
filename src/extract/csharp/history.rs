@@ -226,6 +226,7 @@ fn blank(source: &str, bytes: &mut [u8], range: Range<usize>) {
 fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard, calls: bool) -> HistoricalFacts {
     let mut facts = Facts::default();
     let recovered = tree.root_node().has_error();
+    let mut recovery_sites = Vec::new();
     let mut tokens = Vec::new();
     let mut field_headers = HashMap::new();
     let mut cursor = tree.walk();
@@ -233,6 +234,21 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard, calls: bool) ->
     let mut scopes = DeclarationScopes::default();
     'walk: loop {
         let node = cursor.node();
+        if recovery_sites.len() < 4 && (node.is_error() || node.is_missing()) {
+            // Use Unicode columns, like public source selectors, rather than
+            // tree-sitter's byte columns. Projections keep original offsets.
+            let (line, column) = crate::model::position(analysis, node.start_byte());
+            let kind = if node.is_missing() {
+                format!("missing {}", node.kind())
+            } else {
+                node.kind().to_owned()
+            };
+            recovery_sites.push(format!(
+                "{kind} at {line}:{column} (bytes {}..{})",
+                node.start_byte(),
+                node.end_byte()
+            ));
+        }
         let field_header = callables::field_header(node);
         // A local inside a field-initializer lambda is not itself a field.
         if node.kind() != "variable_declarator" || field_header.is_some() {
@@ -304,8 +320,14 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard, calls: bool) ->
     HistoricalFacts {
         declarations,
         occurrences: facts.occurrences,
-        incomplete: recovered
-            .then(|| "historical parse recovery left candidate scope incomplete".into()),
+        incomplete: recovered.then(|| {
+            let mut reason = "historical parse recovery left candidate scope incomplete".to_owned();
+            if !recovery_sites.is_empty() {
+                reason.push_str(": ");
+                reason.push_str(&recovery_sites.join("; "));
+            }
+            reason
+        }),
         ..HistoricalFacts::default()
     }
 }
@@ -377,5 +399,7 @@ fn fact_bytes(facts: &HistoricalFacts) -> usize {
             .sum::<usize>()
 }
 
+#[cfg(test)]
+mod smoke_tests;
 #[cfg(test)]
 mod tests;
