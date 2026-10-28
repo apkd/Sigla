@@ -132,10 +132,23 @@ pub(super) fn comparison(
     new: &[Region],
     files: &[FilePair],
     notes: &[String],
+    opaque: &[String],
 ) -> Result<String> {
     let mut out = String::new();
     for note in notes {
         writeln!(out, "# {note}").unwrap();
+    }
+    for path in opaque {
+        writeln!(out, "diff --git a/{path} b/{path}").unwrap();
+        writeln!(
+            out,
+            "# source object changed; contents excluded by committed attributes in one snapshot"
+        )
+        .unwrap();
+        ensure!(
+            out.len() <= CANONICAL_LIMIT,
+            "canonical diff exceeds history memory bound"
+        );
     }
     // Whole files use path continuity or explicit evidence. Selected regions
     // retain their context pairing; unmatched occurrences stay independent.
@@ -196,6 +209,10 @@ pub(super) fn comparison(
     if out.is_empty() {
         out.push_str("No changes.\n");
     }
+    ensure!(
+        out.len() <= CANONICAL_LIMIT,
+        "canonical diff exceeds history memory bound"
+    );
     Ok(out)
 }
 fn append(

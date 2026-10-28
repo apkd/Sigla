@@ -227,6 +227,154 @@ async fn selected_content_or_unresolved(
 }
 
 #[tokio::test]
+async fn attribute_only_visibility_changes_do_not_create_file_changes() {
+    let f = Fixture::new();
+    let source = "class Target { int Value() => 1; }\n";
+    let rule = "Target.cs -diff\n";
+    let root = f.commit(&[("Target.cs", source)], &[], "source");
+    let hidden = f.commit(
+        &[("Target.cs", source), (".gitattributes", rule)],
+        &[&root],
+        "hide source",
+    );
+    let visible = f.commit(&[("Target.cs", source)], &[&hidden], "show source");
+    for commit in [&hidden, &visible] {
+        let shown = f.history(&visible, &format!("show {commit}")).await;
+        let patch = body(&shown);
+        assert!(patch.contains(".gitattributes"), "{shown}");
+        assert!(
+            !patch.contains("a/Target.cs") && !patch.contains("b/Target.cs"),
+            "{shown}"
+        );
+        assert!(!patch.contains("move "), "{shown}");
+        let selected = f
+            .error(&visible, &format!("show {commit} file:Target.cs"))
+            .await;
+        assert_unresolved_history(&selected);
+    }
+    let history = f.history(&visible, "log file:Target.cs").await;
+    assert!(history.contains("incomplete:"), "{history}");
+}
+
+#[tokio::test]
+async fn visibility_changes_do_not_read_excluded_file_contents() {
+    let f = Fixture::new();
+    let source = "class Target { int Value() => 1; }\n";
+    let root = f.commit(&[("Target.cs", source)], &[], "source");
+    let hidden = f.commit(
+        &[
+            ("Target.cs", source),
+            (".gitattributes", "Target.cs -diff\n"),
+            ("Added.cs", "class Added {}\n"),
+        ],
+        &[&root],
+        "hide source",
+    );
+    let blob = git(
+        f.root.path(),
+        &["rev-parse", &format!("{hidden}:Target.cs")],
+        b"",
+    );
+    std::fs::remove_file(
+        f.root
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    let shown = f.history(&hidden, &format!("show {hidden}")).await;
+    assert!(body(&shown).contains(".gitattributes"), "{shown}");
+    assert!(!body(&shown).contains("Target.cs b/Target.cs"), "{shown}");
+    assert!(body(&shown).contains("+++ b/Added.cs"), "{shown}");
+}
+
+#[tokio::test]
+async fn edits_across_an_attribute_exclusion_are_reported_without_source_content() {
+    let f = Fixture::new();
+    let old = "class Target { int Value() => 1; }\n";
+    let new = "class Target { int Value() => 2; }\n";
+    let other_old = "class Other { int Value() => 1; }\n";
+    let other_new = "class Other { int Value() => 2; }\n";
+    let root = f.commit(
+        &[("Target.cs", old), ("Other.cs", other_old)],
+        &[],
+        "source",
+    );
+    let hidden = f.commit(
+        &[
+            ("Target.cs", new),
+            ("Other.cs", other_new),
+            (".gitattributes", "Target.cs -diff\n"),
+        ],
+        &[&root],
+        "edit and hide",
+    );
+    let visible = f.commit(
+        &[("Target.cs", new), ("Other.cs", other_new)],
+        &[&hidden],
+        "show source",
+    );
+    for query in [
+        format!("diff {root}..{hidden}"),
+        format!("diff {hidden}..{root}"),
+    ] {
+        let shown = f.history(&visible, &query).await;
+        let patch = body(&shown);
+        assert!(
+            patch.contains("diff --git a/Target.cs b/Target.cs"),
+            "{shown}"
+        );
+        assert!(
+            patch.contains("excluded by committed attributes"),
+            "{shown}"
+        );
+        assert!(!patch.contains("class Target"), "{shown}");
+        assert!(patch.contains("class Other"), "{shown}");
+    }
+    let selected = f
+        .error(&visible, &format!("show {hidden} file:Target.cs"))
+        .await;
+    assert_unresolved_history(&selected);
+}
+
+#[tokio::test]
+async fn nested_attributes_use_each_committed_tree() {
+    let f = Fixture::new();
+    let source = "class Target { int Value() => 1; }\n";
+    let root_rule = "*.cs diff\n";
+    let nested_rule = "Target.cs -diff\n";
+    let root = f.commit(
+        &[("src/Target.cs", source), (".gitattributes", root_rule)],
+        &[],
+        "source",
+    );
+    let hidden = f.commit(
+        &[
+            ("src/Target.cs", source),
+            (".gitattributes", root_rule),
+            ("src/.gitattributes", nested_rule),
+        ],
+        &[&root],
+        "nested exclusion",
+    );
+    let visible = f.commit(
+        &[("src/Target.cs", source), (".gitattributes", root_rule)],
+        &[&hidden],
+        "remove exclusion",
+    );
+    for commit in [&hidden, &visible] {
+        let shown = f.history(&visible, &format!("show {commit}")).await;
+        let patch = body(&shown);
+        assert!(patch.contains("src/.gitattributes"), "{shown}");
+        assert!(
+            !patch.contains("a/src/Target.cs") && !patch.contains("b/src/Target.cs"),
+            "{shown}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn committed_objects_ignore_worktree_index_and_invalid_build_graph() {
     let fixture = Fixture::new();
     let commit = fixture.commit(

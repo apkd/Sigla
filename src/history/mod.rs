@@ -202,6 +202,7 @@ fn edge_record(tracker: &mut Tracker, state: &State, mapping: &Mapping) -> Resul
         &state.regions,
         &linked_files(&mapping.state.regions, &state.regions, &mapping.links),
         &[],
+        &[],
     )?;
     record.changed = canonical != "No changes.\n" || !record.notes.is_empty();
     if !record.changed {
@@ -666,15 +667,77 @@ fn endpoints(
     Ok((trace.states, order))
 }
 
-fn repository_regions(tracker: &mut Tracker, commit: &Commit) -> Result<Vec<Region>> {
-    Ok(tracker
-        .tree(commit)?
-        .iter()
+fn repository_regions(tree: &cache::SourceTree) -> BTreeMap<String, Region> {
+    tree.iter()
         .filter(|(path, e)| {
             matches!(e.mode, 0o100644 | 0o100755) && regions::language(path).is_some()
         })
-        .map(|(path, e)| Region::whole(path, &e.id, 0))
-        .collect())
+        .map(|(path, e)| (path.clone(), Region::whole(path, &e.id, 0)))
+        .collect()
+}
+
+fn reconcile_repository_visibility(
+    before: &cache::SourceTree,
+    after: &cache::SourceTree,
+    old: &mut BTreeMap<String, Region>,
+    new: &mut BTreeMap<String, Region>,
+    notes: &mut Vec<String>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for path in old.keys() {
+        check(cancel)?;
+        if !new.contains_key(path) && after.excluded.contains_key(path) {
+            paths.push(path.clone());
+        }
+    }
+    for path in new.keys() {
+        check(cancel)?;
+        if !old.contains_key(path) && before.excluded.contains_key(path) {
+            paths.push(path.clone());
+        }
+    }
+    let mut opaque = Vec::new();
+    for path in paths {
+        check(cancel)?;
+        let (before_entry, after_entry, remove_old) =
+            match (old.contains_key(&path), new.contains_key(&path)) {
+                (true, false) => {
+                    let Some(after_entry) = after.excluded.get(&path) else {
+                        continue;
+                    };
+                    let before_entry = before
+                        .get(&path)
+                        .context("visible source is absent from its snapshot")?;
+                    (before_entry, after_entry, true)
+                }
+                (false, true) => {
+                    let Some(before_entry) = before.excluded.get(&path) else {
+                        continue;
+                    };
+                    let after_entry = after
+                        .get(&path)
+                        .context("visible source is absent from its snapshot")?;
+                    (before_entry, after_entry, false)
+                }
+                _ => continue,
+            };
+        if before_entry.mode != after_entry.mode {
+            notes.push(format!(
+                "mode {path} {:06o}→{:06o}",
+                before_entry.mode, after_entry.mode
+            ));
+        }
+        if before_entry.id != after_entry.id {
+            opaque.push(path.clone());
+        }
+        if remove_old {
+            old.remove(&path);
+        } else {
+            new.remove(&path);
+        }
+    }
+    Ok(opaque)
 }
 
 fn linked_files(old: &[Region], new: &[Region], links: &[matching::Link]) -> Vec<render::FilePair> {
@@ -959,7 +1022,7 @@ fn compare(
             .collect();
         tracker.store.prefetch(&trees, "tree")?;
     }
-    let (mut old, mut new, mut notes, order) = if repository {
+    let (mut old, mut new, mut notes, order, opaque) = if repository {
         let order = if parent
             .as_ref()
             .is_some_and(|p| child.parents.contains(&p.id))
@@ -973,21 +1036,42 @@ fn compare(
         } else {
             ComparisonOrder::Unordered
         };
+        let before = parent
+            .as_ref()
+            .map(|commit| tracker.tree(commit))
+            .transpose()?;
+        let after = tracker.tree(&child)?;
+        let mut old = before
+            .as_deref()
+            .map(repository_regions)
+            .unwrap_or_default();
+        let mut new = repository_regions(&after);
+        let mut notes =
+            vec!["source files only; binary, symlink, submodule and LFS payloads excluded".into()];
+        let opaque = if let Some(before) = before.as_deref() {
+            reconcile_repository_visibility(
+                before,
+                &after,
+                &mut old,
+                &mut new,
+                &mut notes,
+                &tracker.store.cancel,
+            )?
+        } else {
+            Vec::new()
+        };
         (
             State {
-                regions: parent
-                    .as_ref()
-                    .map(|p| repository_regions(tracker, p))
-                    .transpose()?
-                    .unwrap_or_default(),
+                regions: old.into_values().collect(),
                 ..State::default()
             },
             State {
-                regions: repository_regions(tracker, &child)?,
+                regions: new.into_values().collect(),
                 ..State::default()
             },
-            vec!["source files only; binary, symlink, submodule and LFS payloads excluded".into()],
+            notes,
             order,
+            opaque,
         )
     } else {
         let (mut states, order) = endpoints(tracker, anchor, state, from, to)?;
@@ -1006,7 +1090,7 @@ fn compare(
                 "~alternative or inferred region ancestry; not independent whole-file edits".into(),
             );
         }
-        (old, new, notes, order)
+        (old, new, notes, order, Vec::new())
     };
     // A single selected occurrence was traced through actual history. Establish
     // this before pruning: one remaining snapshot change is not lineage evidence.
@@ -1054,6 +1138,7 @@ fn compare(
         &new.regions,
         &files,
         &notes,
+        &opaque,
     )
 }
 

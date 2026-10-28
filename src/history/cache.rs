@@ -6,7 +6,6 @@ use super::{
 use crate::repository::history::Tree;
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -32,7 +31,7 @@ pub(super) fn key(scope: &Key, value: &impl Serialize) -> Key {
 
 pub(super) struct SourceTree {
     pub entries: Tree,
-    pub excluded: BTreeSet<String>,
+    pub excluded: Tree,
 }
 impl Deref for SourceTree {
     type Target = Tree;
@@ -42,17 +41,12 @@ impl Deref for SourceTree {
 }
 impl SourceTree {
     fn heap_bytes(&self) -> usize {
+        fn tree_bytes(tree: &Tree) -> usize {
+            tree.keys().map(|path| path.capacity() + 160).sum()
+        }
         // Charge shared object IDs in each snapshot: they can outlive the
         // decoded directories that originally allocated them.
-        self.entries
-            .keys()
-            .map(|p| p.capacity() + 160)
-            .sum::<usize>()
-            + self
-                .excluded
-                .iter()
-                .map(|p| p.capacity() + 80)
-                .sum::<usize>()
+        tree_bytes(&self.entries) + tree_bytes(&self.excluded)
     }
 }
 

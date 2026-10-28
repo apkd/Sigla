@@ -250,9 +250,13 @@ impl Tracker {
             })
             .map(|(p, _)| p.as_str())
             .collect();
-        let excluded = self.store.source_exclusions(&commit.tree, &tree, &paths)?;
-        if !excluded.is_empty() {
-            tree.retain(|p, _| !excluded.contains(p));
+        let exclusions = self.store.source_exclusions(&commit.tree, &tree, &paths)?;
+        let mut excluded = Tree::new();
+        for path in exclusions {
+            let entry = tree
+                .remove(&path)
+                .with_context(|| format!("source exclusion is absent from tree: {path}"))?;
+            excluded.insert(path, entry);
         }
         check(&self.store.cancel)?;
         Ok(self.cache.put_tree(
@@ -491,7 +495,7 @@ impl Tracker {
         let mut work = 0;
         for region in &state.regions {
             ensure!(
-                !b.excluded.contains(&region.path),
+                !b.excluded.contains_key(&region.path),
                 "unresolved target at {}: {} is excluded by committed source attributes",
                 to.id,
                 region.path
