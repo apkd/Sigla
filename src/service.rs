@@ -1407,7 +1407,7 @@ calls:* in:Parser.Parse
 text:"TODO" path:src/**
 file:*.cs
 file:src/**/*.cs"#,
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn search(
         &self,
@@ -1435,7 +1435,7 @@ log path:src/**
 log @src/Parser.cs:20:5
 log @docs/design.md:20-35
 diff abc1234..def5678 file:src/Parser.cs"#,
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn history(
         &self,
@@ -1448,7 +1448,7 @@ diff abc1234..def5678 file:src/Parser.cs"#,
 
     #[tool(
         description = "Browse indexed files. Omit path for the repository root; pass a directory path to explore it.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn browse(
         &self,
@@ -1461,7 +1461,7 @@ diff abc1234..def5678 file:src/Parser.cs"#,
 
     #[tool(
         description = "Read an indexed file by path. mode: minified (default) simplifies code for reading; exact preserves source text.\n\nExamples:\npath=\"src/Server.cs\"\npath=\"src/Server.cs:20-50\"",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn view(
         &self,
