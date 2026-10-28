@@ -438,6 +438,14 @@ pub fn split_parameters(input: &str) -> Result<Vec<String>> {
 }
 
 pub(crate) fn lex(input: &str) -> Result<Vec<String>> {
+    lex_with(input, false)
+}
+
+pub(crate) fn lex_history(input: &str) -> Result<Vec<String>> {
+    lex_with(input, true)
+}
+
+fn lex_with(input: &str, literal_files: bool) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let mut token = String::new();
     let mut stack = Vec::new();
@@ -474,8 +482,10 @@ pub(crate) fn lex(input: &str) -> Result<Vec<String>> {
             }
             bail!("Use double quotes around query values, for example `text:\"hello world\"`.");
         }
-        let literal =
-            token.starts_with("operator:") || token.starts_with("text:") || token.starts_with("x:");
+        let literal = token.starts_with("operator:")
+            || token.starts_with("text:")
+            || token.starts_with("x:")
+            || literal_files && token.starts_with("file:");
         if !literal {
             match c {
                 '(' | '[' | '{' => stack.push(c),

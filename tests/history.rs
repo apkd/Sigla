@@ -149,6 +149,81 @@ fn next(page: &str) -> Option<usize> {
     })
 }
 
+#[tokio::test]
+async fn file_selectors_treat_glob_characters_as_literal_names() {
+    let f = Fixture::new();
+    let files = [
+        ("docs/Version[1].md", "bracket literal\n"),
+        ("docs/Version1.md", "bracket match\n"),
+        ("docs/Star*.md", "star literal\n"),
+        ("docs/StarA.md", "star match\n"),
+        ("docs/Question?.md", "question literal\n"),
+        ("docs/QuestionA.md", "question match\n"),
+        ("docs/Unclosed[.md", "unclosed bracket\n"),
+        ("docs/With Space*.md", "space and star\n"),
+        ("docs/Quote\".md", "quoted name\n"),
+        ("docs/Unclosed(.md", "unclosed parenthesis\n"),
+    ];
+    let root = f.commit(&files, &[], "add files");
+    for (selector, content, other) in [
+        (
+            "file:docs/Version[1].md",
+            "bracket literal",
+            "bracket match",
+        ),
+        ("file:docs/Star*.md", "star literal", "star match"),
+        (
+            "file:docs/Question?.md",
+            "question literal",
+            "question match",
+        ),
+        (
+            "file:docs/Unclosed[.md",
+            "unclosed bracket",
+            "bracket match",
+        ),
+        (
+            r#"file:"docs/With Space*.md""#,
+            "space and star",
+            "star match",
+        ),
+        (r#"file:"docs/Quote\".md""#, "quoted name", "star match"),
+        (
+            "file:docs/Unclosed(.md",
+            "unclosed parenthesis",
+            "bracket match",
+        ),
+    ] {
+        let shown = f.history(&root, &format!("show {root} {selector}")).await;
+        assert!(shown.contains(content), "{shown}");
+        assert!(!shown.contains(other), "{shown}");
+        let log = f.history(&root, &format!("log {selector}")).await;
+        assert_eq!(ids(&log), vec![root.as_str()], "{log}");
+    }
+    let glob = f
+        .history(&root, &format!("show {root} path:docs/Version[1].md"))
+        .await;
+    assert!(glob.contains("bracket match"), "{glob}");
+    assert!(glob.contains("bracket literal"), "{glob}");
+    assert!(
+        f.error(&root, "log file:../outside.md")
+            .await
+            .contains("path")
+    );
+
+    let mut changed = files;
+    changed[0].1 = "bracket literal edited\n";
+    changed[1].1 = "bracket match edited\n";
+    let tip = f.commit(&changed, &[&root], "edit both files");
+    let log = f.history(&tip, "log file:docs/Version[1].md").await;
+    assert_eq!(ids(&log), vec![tip.as_str(), root.as_str()], "{log}");
+    let diff = f
+        .history(&tip, &format!("diff {root}..{tip} file:docs/Version[1].md"))
+        .await;
+    assert!(diff.contains("bracket literal edited"), "{diff}");
+    assert!(!diff.contains("bracket match edited"), "{diff}");
+}
+
 // These fixtures fit in one hunk, so both rendered sides must contain the
 // complete selected passage, including whitespace and the final newline.
 fn selected_hunk_content(patch: &str) -> (String, String) {
