@@ -61,11 +61,25 @@ pub fn sizes(
         let response = request
             .send()
             .map_err(|_| anyhow::anyhow!("GitHub file inventory request failed"))?;
-        ensure!(
-            response.status().is_success(),
-            "GitHub file inventory unavailable (HTTP {}); check API credentials or rate limits",
-            response.status()
-        );
+        let status = response.status();
+        if !status.is_success() {
+            let mut details = Vec::new();
+            for name in ["x-ratelimit-remaining", "x-ratelimit-reset", "retry-after"] {
+                if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok()) {
+                    details.push(format!("{name}={value}"));
+                }
+            }
+            if let Ok(error) =
+                serde_json::from_reader::<_, serde_json::Value>(response.take(16 * 1024))
+                && let Some(message) = error["message"].as_str()
+            {
+                details.push(message.to_owned());
+            }
+            anyhow::bail!(
+                "GitHub file inventory unavailable (HTTP {status}, tree {sha}, recursive={recursive}): {}",
+                details.join("; ")
+            );
+        }
         serde_json::from_reader(response.take(16 * 1024 * 1024))
             .context("Invalid GitHub file inventory")
     };
@@ -271,30 +285,33 @@ fn inventory(
     revision: &str,
     mut fetch: impl FnMut(&str, bool) -> Result<Tree>,
 ) -> Result<BTreeMap<String, u64>> {
-    let first = fetch(revision, true)?;
+    let mut count = 0;
+    let mut fetch = |sha: &str, recursive| {
+        count += 1;
+        ensure!(count <= 100_000, "GitHub tree traversal limit exceeded");
+        fetch(sha, recursive)
+    };
     let mut sizes = BTreeMap::new();
-    if !first.truncated {
-        for entry in first.tree {
-            insert(&mut sizes, entry)?;
-        }
-    } else {
-        let mut pending = vec![(String::new(), revision.to_owned())];
-        let mut count = 0;
-        while let Some((prefix, sha)) = pending.pop() {
-            count += 1;
-            ensure!(count <= 100_000, "GitHub tree traversal limit exceeded");
-            let tree = fetch(&sha, false)?;
+    let mut pending = vec![(String::new(), revision.to_owned())];
+    while let Some((prefix, sha)) = pending.pop() {
+        let mut tree = fetch(&sha, true)?;
+        let split = tree.truncated;
+        if split {
+            // Split only oversized subtrees; complete recursive responses cover
+            // their descendants without one API request per directory.
+            tree = fetch(&sha, false)?;
             ensure!(
                 !tree.truncated,
                 "GitHub returned an incomplete directory inventory"
             );
-            for mut entry in tree.tree {
-                entry.path = format!("{prefix}{}", entry.path);
-                if entry.kind == "tree" {
-                    pending.push((format!("{}/", entry.path), entry.sha));
-                } else {
-                    insert(&mut sizes, entry)?;
-                }
+        }
+        for mut entry in tree.tree {
+            entry.path = format!("{prefix}{}", entry.path);
+            if split && entry.kind == "tree" {
+                validate_path(&entry.path)?;
+                pending.push((format!("{}/", entry.path), entry.sha));
+            } else {
+                insert(&mut sizes, entry)?;
             }
         }
     }
@@ -408,20 +425,43 @@ mod tests {
         );
     }
     #[test]
-    fn truncated_listing_is_replaced_by_complete_subtree_walk() {
+    fn truncated_listing_uses_complete_recursive_subtrees() {
         let result = inventory("commit", |sha, recursive| {
-            let json = if recursive {
-                serde_json::json!({"truncated":true,"tree":[{"path":"partial","type":"blob","sha":"p","size":99}]})
-            } else if sha == "commit" {
-                serde_json::json!({"truncated":false,"tree":[{"path":"Assets","type":"tree","sha":"subtree"}]})
-            } else {
-                serde_json::json!({"truncated":false,"tree":[{"path":"Thing.prefab","type":"blob","sha":"blob","size":123}]})
+            let json = match (sha, recursive) {
+                ("commit", true) => serde_json::json!({"truncated":true,"tree":[{"path":"partial","type":"blob","sha":"p","size":99}]}),
+                ("commit", false) => serde_json::json!({"truncated":false,"tree":[{"path":"Assets","type":"tree","sha":"subtree"},{"path":"README.md","type":"blob","sha":"readme","size":42}]}),
+                ("subtree", true) => serde_json::json!({"truncated":false,"tree":[{"path":"Nested","type":"tree","sha":"nested"},{"path":"Nested/Thing.prefab","type":"blob","sha":"blob","size":123}]}),
+                _ => panic!("A complete recursive subtree needs no further requests"),
             };
             Ok(serde_json::from_value(json)?)
         }).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result.contains_key("Assets/Thing.prefab"));
-        assert!(!result.contains_key("partial"));
+        assert_eq!(
+            result,
+            BTreeMap::from([
+                ("README.md".into(), 42),
+                ("Assets/Nested/Thing.prefab".into(), 123),
+            ])
+        );
+    }
+    #[test]
+    fn nested_truncated_subtrees_are_split_without_retaining_partial_entries() {
+        let result = inventory("commit", |sha, recursive| {
+            let json = match (sha, recursive) {
+                ("commit" | "subtree", true) => serde_json::json!({"truncated":true,"tree":[{"path":"partial","type":"blob","sha":"p","size":99}]}),
+                ("commit", false) => serde_json::json!({"truncated":false,"tree":[{"path":"Assets","type":"tree","sha":"subtree"}]}),
+                ("subtree", false) => serde_json::json!({"truncated":false,"tree":[{"path":"Nested","type":"tree","sha":"nested"},{"path":"Direct.prefab","type":"blob","sha":"direct","size":45}]}),
+                ("nested", true) => serde_json::json!({"truncated":false,"tree":[{"path":"Thing.prefab","type":"blob","sha":"blob","size":123}]}),
+                _ => panic!("Unexpected tree request"),
+            };
+            Ok(serde_json::from_value(json)?)
+        }).unwrap();
+        assert_eq!(
+            result,
+            BTreeMap::from([
+                ("Assets/Direct.prefab".into(), 45),
+                ("Assets/Nested/Thing.prefab".into(), 123),
+            ])
+        );
     }
     #[test]
     fn incomplete_subtrees_and_missing_sizes_fail_instead_of_selecting_blindly() {
