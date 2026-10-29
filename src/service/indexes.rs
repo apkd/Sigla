@@ -7,6 +7,33 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+pub(super) struct Wait(pub Option<tokio::time::Instant>);
+
+impl Wait {
+    pub async fn until<T>(
+        &self,
+        work: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<Option<T>> {
+        match self.0 {
+            Some(deadline) => match tokio::time::timeout_at(deadline, work).await {
+                Ok(result) => result.map(Some),
+                Err(_) => Ok(None),
+            },
+            None => work.await.map(Some),
+        }
+    }
+}
+
+pub(super) fn pending(stage: &str) -> rmcp::model::CallToolResult {
+    let mut result = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+        format!(
+            "> Results are not available yet: {stage} is still running. This does not mean there are no matches. Retry this request; background setup and indexing continue."
+        ),
+    )]);
+    result.structured_content = Some(serde_json::json!({"complete": false}));
+    result
+}
+
 pub(super) fn groups(
     request: &Request,
     query: Option<&Query>,
@@ -254,9 +281,10 @@ impl super::App {
         manifest: &Manifest,
         revision: Option<String>,
         refresh: bool,
+        assets_pending: bool,
         activity: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> anyhow::Result<crate::unity::assets::jobs::Ticket> {
-        if !has_unity(manifest) {
+        if !has_unity(manifest) && !assets_pending {
             return Ok(crate::unity::assets::jobs::empty());
         }
         let cache = branch
@@ -274,12 +302,13 @@ impl super::App {
         Ok(self.assets.start(crate::unity::assets::jobs::Request {
             workspace,
             branch,
+            remote: self.remote.clone(),
             root: manifest.root.clone(),
             cache,
             records: self.asset_records.clone(),
             expected: crate::unity::assets::jobs::generation(manifest)?,
             revision,
-            refresh,
+            refresh: refresh || assets_pending,
             activity,
             leases,
         }))

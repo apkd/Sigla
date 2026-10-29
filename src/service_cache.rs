@@ -1684,6 +1684,7 @@ mod tests {
             repair: false,
             additional: Default::default(),
             prepared: Prepared {
+                deferred_assets: Default::default(),
                 revision,
                 branch: Some(branch.into()),
                 selected: Default::default(),

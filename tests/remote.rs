@@ -10,6 +10,8 @@ use std::{
 
 #[path = "support/configuration_documents.rs"]
 mod configuration_documents;
+#[path = "support/remote_assets.rs"]
+mod remote_assets;
 
 fn git(root: &Path, args: &[&str]) -> Result<()> {
     ensure!(
@@ -77,6 +79,14 @@ fn ssh() -> Result<()> {
         .write_all(b"request\n")?;
     if root.join("../offline").exists() {
         std::process::exit(1);
+    }
+    if std::env::args().any(|arg| arg.contains("git-lfs-authenticate")) {
+        fs::write(root.join("../lfs-started"), "")?;
+        let started = Instant::now();
+        while root.join("../pause-lfs").exists() && started.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        anyhow::bail!("Fixture LFS server is unavailable");
     }
     let error = Command::new("git")
         .arg("upload-pack")
@@ -702,6 +712,7 @@ fn main() -> Result<()> {
         ensure!(count > 0, "File count must be positive");
         return acquisition_probe(&root, &binary, count, expect_reuse);
     }
+    remote_assets::code_precedes_asset_downloads()?;
     lifecycle()?;
     println!("Remote lifecycle checks passed");
     Ok(())

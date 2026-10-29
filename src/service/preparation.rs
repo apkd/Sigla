@@ -176,9 +176,15 @@ impl App {
                 return Ok(None);
             };
             branch.record_use();
-            Ok(Some(CallToolResult::success(vec![ContentBlock::text(format!(
-                "{text}\n\n> Repository inventory available; preparation and indexing are still running."
-            ))])))
+            let mut result = CallToolResult::success(vec![ContentBlock::text(if mode.is_none() {
+                format!("> Repository file inventory; symbol and asset indexing are still running.\n\n{text}")
+            } else {
+                text
+            })]);
+            if mode.is_none() {
+                result.structured_content = Some(serde_json::json!({"complete": false}));
+            }
+            Ok(Some(result))
         }).await?;
         guard.disarm();
         result
@@ -229,9 +235,12 @@ impl App {
                 }
             }?;
             if assets_pending {
-                text.push_str("\n\n> Index incomplete: Unity assets");
+                text = format!("> Index incomplete: Unity assets. This view covers the available sources.\n\n{text}");
             }
             let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            if assets_pending {
+                result.structured_content = Some(serde_json::json!({"complete": false}));
+            }
             if let Some((identity, branch, revision, tracked)) = &inventory.context {
                 crate::summary::Summary::build(
                     identity, branch, revision, *tracked, &root, manifest,
@@ -463,6 +472,8 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             let generation = preparing_branch
                 .as_ref()
                 .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
+            let assets_pending = branch_state.as_ref().and_then(|s| s.as_ref())
+                .is_some_and(|s| !s.prepared.deferred_assets.is_empty());
             drop(branch_state);
             if let Some(branch) = &preparing_branch {
                 let mut gate = {
@@ -494,6 +505,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     .as_ref()
                     .map(|(_, _, revision, _)| revision.clone()),
                 false,
+                assets_pending,
                 preparing_activity.clone(),
             )?;
             if let Some(job_id) = assets.telemetry_id() {

@@ -148,7 +148,7 @@ pub fn migrate(cache: &Path) -> Result<()> {
         let state: crate::repository::manager::State =
             serde_json::from_slice(&fs::read(state_path)?)?;
         ensure!(
-            matches!(state.schema, 2..=4),
+            matches!(state.schema, 2..=5),
             "Unknown legacy selector schema"
         );
         let target = state.target.clone().unwrap_or_else(|| {

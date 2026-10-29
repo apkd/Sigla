@@ -181,6 +181,22 @@ fn baseline(path: &str) -> bool {
 
 pub const ASSET_LIMIT: u64 = 32 * 1024 * 1024;
 
+pub fn optional_asset(path: &Path) -> bool {
+    if path.ends_with("ProjectSettings/ProjectSettings.asset") {
+        return false;
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "meta")
+    {
+        let name = path.file_name().unwrap().to_string_lossy();
+        return ![".asmdef.meta", ".asmref.meta", ".dll.meta", ".rsp.meta"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+    }
+    asset(path) || visual_graph(path)
+}
+
 pub fn asset(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(

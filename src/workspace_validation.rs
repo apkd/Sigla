@@ -231,6 +231,7 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
         let asset_jobs = crate::unity::assets::jobs::Jobs::default();
         let asset_started = std::time::Instant::now();
         let ticket = asset_jobs.start(crate::unity::assets::jobs::Request {
+            remote: None,
             leases: crate::cache::views::LeaseSet::new(cache).unwrap(),
             records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
             activity: activity.clone(),
@@ -268,6 +269,7 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
         let cached_started = std::time::Instant::now();
         let cached_jobs = crate::unity::assets::jobs::Jobs::default();
         let cached = cached_jobs.start(crate::unity::assets::jobs::Request {
+            remote: None,
             leases: crate::cache::views::LeaseSet::new(cache).unwrap(),
             records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),
             activity,

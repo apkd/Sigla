@@ -253,6 +253,7 @@ mod refresh_tests {
         let mut short = branch(Target::Named("abcdef1".into()), 0);
         short.name = "abcdef1".into();
         let prepared = Prepared {
+            deferred_assets: Default::default(),
             omitted: Default::default(),
             transfer_bytes: 0,
             unavailable: Default::default(),
@@ -292,6 +293,7 @@ mod refresh_tests {
             refreshed: now(),
             policy: String::new(),
             prepared: Prepared {
+                deferred_assets: Default::default(),
                 omitted: Default::default(),
                 transfer_bytes: 0,
                 unavailable: Default::default(),
@@ -1039,7 +1041,7 @@ impl Manager {
                 };
                 if let Some(value) = &mut state {
                     ensure!(
-                        matches!(value.schema, 2..=4)
+                        matches!(value.schema, 2..=5)
                             && value.repository == repository.identity
                             && value.branch == name
                             && value
@@ -1165,6 +1167,41 @@ impl Manager {
         paths: Vec<String>,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
+        self.extend_inputs(
+            branch,
+            revision,
+            paths,
+            super::materialize::Contents::Sources,
+            telemetry,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_assets(
+        &self,
+        branch: &Branch,
+        revision: &str,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<()> {
+        self.extend_inputs(
+            branch,
+            revision,
+            Vec::new(),
+            super::materialize::Contents::All,
+            telemetry,
+        )
+        .await
+    }
+
+    async fn extend_inputs(
+        &self,
+        branch: &Branch,
+        revision: &str,
+        paths: Vec<String>,
+        contents: super::materialize::Contents,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<()> {
+        let assets = matches!(contents, super::materialize::Contents::All);
         authorize(&self.options.rules, &branch.repository)?;
         for path in &paths {
             self.options.selection.require(path)?;
@@ -1178,6 +1215,17 @@ impl Manager {
             branch.state.read().await.clone()
         }
         .context("Repository inputs are unavailable")?;
+        if assets {
+            ensure!(
+                before.prepared.revision == revision && !before.repair,
+                crate::diagnostics::RefreshRequired(
+                    "Repository changed before asset acquisition; retry query"
+                )
+            );
+            if before.prepared.deferred_assets.is_empty() {
+                return Ok(());
+            }
+        }
         if before.prepared.revision != revision {
             return Ok(());
         }
@@ -1192,7 +1240,7 @@ impl Manager {
         );
         let request = Request {
             transfer_used: before.prepared.transfer_bytes,
-            contents: super::materialize::Contents::All,
+            contents,
             unlimited_transfer: self
                 .options
                 .rules
@@ -1208,13 +1256,19 @@ impl Manager {
             exclude: self.options.selection.patterns.1.clone(),
             required: paths.clone(),
             additional: before.additional.iter().cloned().collect(),
-            previous: before
-                .prepared
-                .selected
-                .iter()
-                .filter(|(p, _)| branch.source().join(p).is_file())
-                .map(|(p, id)| (p.clone(), id.clone()))
-                .collect(),
+            // Optional acquisition must leave the published code inputs alone,
+            // including inputs already recorded as unavailable until refresh.
+            previous: if assets {
+                before.prepared.selected.clone()
+            } else {
+                before
+                    .prepared
+                    .selected
+                    .iter()
+                    .filter(|(p, _)| branch.source().join(p).is_file())
+                    .map(|(p, id)| (p.clone(), id.clone()))
+                    .collect()
+            },
             subdirectory: None,
         };
         let cache = self.cache.clone();
@@ -1246,17 +1300,23 @@ impl Manager {
         .await??;
         prepared.branch = before.prepared.branch.clone();
         prepared.resolved_target = before.prepared.resolved_target.clone();
+        if assets {
+            prepared.unavailable.extend(before.prepared.unavailable);
+        }
         telemetry.stage("required_input_publication");
         let mut state = {
             let _wait = telemetry.wait("repository_publication");
             branch.publish().await
         };
-        let mut next = before;
+        let mut next = state.as_ref().unwrap().clone();
+        next.schema = 5;
         next.additional.extend(paths);
         next.prepared = prepared;
-        next.repair = true;
-        branch.persist(&next)?;
-        *state = Some(next.clone());
+        if !assets {
+            next.repair = true;
+            branch.persist(&next)?;
+            *state = Some(next.clone());
+        }
         for path in next.prepared.selected.keys() {
             let staged = stage.path().join(path);
             if next.prepared.unavailable.contains(path) {
@@ -1275,7 +1335,9 @@ impl Manager {
         next.repair = false;
         branch.persist(&next)?;
         *state = Some(next);
-        branch.generation.fetch_add(1, Ordering::Release);
+        if !assets {
+            branch.generation.fetch_add(1, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1322,7 +1384,7 @@ impl Manager {
             Target::clone(branch.acquisition_target(before.as_ref().map(|state| &state.prepared)));
         let mut request = Request {
             transfer_used: 0,
-            contents: super::materialize::Contents::All,
+            contents: super::materialize::Contents::Sources,
             unlimited_transfer: self
                 .options
                 .rules
@@ -1440,7 +1502,7 @@ impl Manager {
             branch.publish().await
         };
         let mut next = State {
-            schema: 4,
+            schema: 5,
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),

@@ -70,6 +70,7 @@ impl Target {
 pub enum Contents {
     #[default]
     All,
+    Sources,
     Inventory,
     Only(BTreeSet<String>),
 }
@@ -100,6 +101,8 @@ pub struct Request {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Prepared {
+    #[serde(default)]
+    pub deferred_assets: BTreeSet<String>,
     #[serde(default)]
     pub omitted: BTreeMap<String, String>,
     #[serde(default)]
@@ -551,6 +554,7 @@ fn prepare_fresh(
         let name = branch.context("Repository does not advertise a default branch")?;
         super::validate_branch(&name)?;
         return Ok(Prepared {
+            deferred_assets: BTreeSet::new(),
             omitted: BTreeMap::new(),
             transfer_bytes: 0,
             unavailable: BTreeSet::new(),
@@ -620,6 +624,7 @@ fn prepare_fresh(
         request,
         &repository,
         Prepared {
+            deferred_assets: BTreeSet::new(),
             omitted: BTreeMap::new(),
             transfer_bytes,
             unavailable: BTreeSet::new(),
@@ -720,6 +725,7 @@ fn materialize_inventory(
     }
     if matches!(request.contents, Contents::Inventory) {
         return Ok(Prepared {
+            deferred_assets: BTreeSet::new(),
             omitted: BTreeMap::new(),
             transfer_bytes,
             unavailable: BTreeSet::new(),
@@ -732,9 +738,24 @@ fn materialize_inventory(
             directories,
         });
     }
-    let sizes = if selected.keys().any(|path| {
-        super::selection::asset(Path::new(path)) || super::selection::visual_graph(Path::new(path))
-    }) {
+    let mut deferred_assets = BTreeSet::new();
+    if matches!(request.contents, Contents::Sources) {
+        selected.retain(|path, id| {
+            let defer = super::selection::optional_asset(Path::new(path))
+                && request.previous.get(path) != Some(id)
+                && !request.required.contains(path)
+                && !request.additional.contains(path);
+            if defer {
+                deferred_assets.insert(path.clone());
+            }
+            !defer
+        });
+    }
+    let sizes = if !matches!(request.contents, Contents::Sources)
+        && selected.keys().any(|path| {
+            super::selection::asset(Path::new(path))
+                || super::selection::visual_graph(Path::new(path))
+        }) {
         super::github::sizes(repository, &revision, &request.store)?
     } else {
         None
@@ -912,6 +933,7 @@ fn materialize_inventory(
     }
     selected.retain(|p, _| !omitted.contains_key(p));
     Ok(Prepared {
+        deferred_assets,
         omitted,
         transfer_bytes,
         unavailable: BTreeSet::new(),
@@ -1630,6 +1652,99 @@ mod tests {
                 fs::read(upstream_path.join(path)).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn sources_defer_optional_payloads_and_keep_build_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let optional = [
+            "Assets/Object.asset",
+            "Assets/Object.asset.meta",
+            "Assets/Code.cs.meta",
+            "Assets/Graph.shadergraph",
+            "ProjectSettings/QualitySettings.asset",
+        ];
+        let required = [
+            "ProjectSettings/ProjectSettings.asset",
+            "ProjectSettings/ProjectVersion.txt",
+            "Assets/Code.cs",
+            "Assets/Assembly.asmdef",
+            "Assets/Assembly.asmdef.meta",
+            "Required.asset",
+        ];
+        for path in optional.iter().chain(&required) {
+            let target = upstream_path.join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, path).unwrap();
+        }
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&upstream_path)
+            .args(["add", "."]))
+        .unwrap();
+        run(Command::new("git").arg("-C").arg(&upstream_path).args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Add code and optional assets\n\nExercise staged repository preparation.",
+        ]))
+        .unwrap();
+        let mut request = request(root.path());
+        request.contents = Contents::Sources;
+        request.include.push("**/*.shadergraph".into());
+        request.required.push("Required.asset".into());
+        let sources = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        for path in optional {
+            assert!(sources.deferred_assets.contains(path), "{path}");
+            assert!(!sources.selected.contains_key(path));
+            assert!(!request.staging.join(path).exists());
+            assert!(
+                !git(&request.store)
+                    .args(["cat-file", "-e", &sources.tracked[path]])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        for path in required {
+            assert_eq!(
+                fs::read(request.staging.join(path)).unwrap(),
+                path.as_bytes()
+            );
+        }
+        let saved: Prepared =
+            serde_json::from_slice(&serde_json::to_vec(&sources).unwrap()).unwrap();
+        assert_eq!(saved.deferred_assets, sources.deferred_assets);
+        request.previous = sources.selected.clone();
+        request.transfer_used = sources.transfer_bytes;
+        request.target = Target::Commit(sources.revision.clone());
+        request.contents = Contents::All;
+        let complete = prepare_inventory(
+            &request,
+            Some(pinned(&request, saved)),
+            root.path(),
+            |_| Session::local(&upstream_path),
+            &mut Metrics::default(),
+        )
+        .unwrap();
+        assert!(complete.deferred_assets.is_empty());
+        for path in optional {
+            assert_eq!(
+                fs::read(request.staging.join(path)).unwrap(),
+                path.as_bytes()
+            );
+        }
+        request.previous = complete.selected;
+        request.contents = Contents::Sources;
+        let reused = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        assert!(reused.deferred_assets.is_empty());
     }
 
     #[test]

@@ -22,11 +22,11 @@ impl Ticket {
         self.telemetry_id.clone()
     }
     pub fn ready_index(&self) -> Option<Arc<Index>> {
-        self.outcome
-            .borrow()
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .cloned()
+        self.ready().and_then(Result::ok)
+    }
+
+    pub fn ready(&self) -> Option<Outcome> {
+        self.outcome.borrow().clone()
     }
 
     fn borrow(&self) -> watch::Ref<'_, Option<Outcome>> {
@@ -43,6 +43,7 @@ pub struct Request {
     pub activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     pub workspace: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     pub branch: Option<Arc<Branch>>,
+    pub remote: Option<Arc<crate::repository::manager::Manager>>,
     pub root: PathBuf,
     pub cache: PathBuf,
     pub records: std::sync::Arc<crate::cache::artifacts::Store>,
@@ -65,6 +66,7 @@ struct Job {
     ticket: Ticket,
     cancel: tokio_util::sync::CancellationToken,
     used: std::time::Instant,
+    retry_after: std::time::Instant,
 }
 pub struct Jobs {
     running: Mutex<HashMap<PathBuf, Job>>,
@@ -154,12 +156,18 @@ impl Jobs {
         let mut jobs = self.running.lock().unwrap();
         let (same_generation, previous) = if let Some(job) = jobs.get_mut(&request.root) {
             let outcome = job.ticket.borrow();
-            if job.generation == generation
-                && (outcome.is_none()
-                    || outcome
-                        .as_ref()
-                        .is_some_and(|r| r.is_ok() && !request.refresh))
-            {
+            let reuse = match outcome.as_ref() {
+                None => true,
+                Some(Ok(_)) => !request.refresh,
+                Some(Err(error)) => {
+                    request.branch.is_some()
+                        && std::time::Instant::now() < job.retry_after
+                        && !error
+                            .chain()
+                            .any(|cause| cause.is::<crate::diagnostics::RefreshRequired>())
+                }
+            };
+            if job.generation == generation && reuse {
                 job.used = std::time::Instant::now();
                 return job.ticket.clone();
             }
@@ -195,6 +203,8 @@ impl Jobs {
                 ticket: ticket.clone(),
                 cancel: cancel.clone(),
                 used: std::time::Instant::now(),
+                // Failed remote acquisition must not restart on every code query.
+                retry_after: std::time::Instant::now() + std::time::Duration::from_secs(30),
             },
         );
         let workers = self.workers.clone();
@@ -209,6 +219,12 @@ impl Jobs {
                     permit = workers.acquire_owned() => permit?,
                 };
                 drop(_wait);
+                if let (Some(remote), Some(branch)) = (&request.remote, &request.branch) {
+                    operation.stage("asset_acquisition");
+                    let _wait = operation.wait("asset_acquisition");
+                    // Retain the request, leases and worker until blocking acquisition exits.
+                    remote.complete_assets(branch, request.revision.as_deref().unwrap(), &operation).await?;
+                }
                 operation.stage("asset_capture");
                 let _wait = operation.wait("asset_capture");
                 let (state, branch_state) = tokio::select! {
@@ -417,6 +433,7 @@ mod tests {
                 ticket: ticket.clone(),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 used: std::time::Instant::now(),
+                retry_after: std::time::Instant::now(),
             },
         );
         jobs.trim_completed();
@@ -453,6 +470,30 @@ mod tests {
         assert!(Arc::ptr_eq(&second.await.unwrap(), &index));
     }
 
+    #[tokio::test]
+    async fn failed_remote_jobs_share_the_failure_until_retry_is_due() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let jobs = Jobs::default();
+        jobs.workers.close();
+        let fixture = completed(root.path(), cache.path()).await;
+        let first = jobs.start(fixture.request);
+        assert!(wait(first.clone()).await.is_err());
+        let fixture = completed(root.path(), cache.path()).await;
+        let shared = jobs.start(fixture.request);
+        assert!(Arc::ptr_eq(&first.outcome, &shared.outcome));
+        jobs.running
+            .lock()
+            .unwrap()
+            .get_mut(root.path())
+            .unwrap()
+            .retry_after = std::time::Instant::now();
+        let fixture = completed(root.path(), cache.path()).await;
+        let retried = jobs.start(fixture.request);
+        assert!(!Arc::ptr_eq(&first.outcome, &retried.outcome));
+        assert!(wait(retried).await.is_err());
+    }
+
     async fn completed(root: &std::path::Path, cache: &std::path::Path) -> Completed {
         let workspace = Workspace::open(
             root.into(),
@@ -476,6 +517,7 @@ mod tests {
             refreshed: 0,
             policy: String::new(),
             prepared: crate::repository::materialize::Prepared {
+                deferred_assets: Default::default(),
                 revision: "initial".into(),
                 branch: None,
                 omitted: Default::default(),
@@ -501,6 +543,7 @@ mod tests {
                 activity: Arc::new(Arc::new(tokio::sync::RwLock::new(())).read_owned().await),
                 workspace: Arc::new(tokio::sync::Mutex::new(Some(workspace))),
                 branch: Some(branch),
+                remote: None,
                 root: root.into(),
                 cache: assets,
                 records: Arc::new(crate::cache::artifacts::Store::open(cache).unwrap()),

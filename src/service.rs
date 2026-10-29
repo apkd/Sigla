@@ -51,6 +51,7 @@ pub struct App {
     preparation_workers: Arc<tokio::sync::Semaphore>,
     indexing_workers: Arc<tokio::sync::Semaphore>,
     navigation_workers: Arc<tokio::sync::Semaphore>,
+    index_wait: std::time::Duration,
     inspection_shutdown: tokio_util::sync::CancellationToken,
     assets: crate::unity::assets::jobs::Jobs,
     sources: crate::native::jobs::Jobs,
@@ -266,6 +267,7 @@ impl App {
             preparation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             indexing_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             navigation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            index_wait: std::time::Duration::from_secs(90),
             inspection_shutdown: tokio_util::sync::CancellationToken::new(),
             assets: Default::default(),
             sources: Default::default(),
@@ -702,6 +704,7 @@ impl App {
         upstream: Option<&crate::upstream::Upstream>,
         operation: crate::telemetry::Operation,
     ) -> Result<CallToolResult> {
+        let deadline = tokio::time::Instant::now() + self.index_wait;
         ensure!(
             !path.trim().is_empty(),
             "Argument `codebase` must not be empty. Provide a local project path or repository URL"
@@ -754,13 +757,16 @@ impl App {
             let _wait = operation.wait("upstream");
             return upstream.call(name, args.as_object().unwrap().clone()).await;
         }
-        match self.request(path, request.clone(), operation.clone()).await {
+        match self
+            .request(path, request.clone(), operation.clone(), deadline)
+            .await
+        {
             Err(error)
                 if error
                     .chain()
                     .any(|cause| cause.is::<crate::diagnostics::RefreshRequired>()) =>
             {
-                self.request(path, request, operation).await
+                self.request(path, request, operation, deadline).await
             }
             result => result,
         }
@@ -771,6 +777,7 @@ impl App {
         path: &str,
         request: Request,
         operation: crate::telemetry::Operation,
+        deadline: tokio::time::Instant,
     ) -> Result<CallToolResult> {
         if let Request::History(query) = &request {
             return self.history_request(path, query, operation).await;
@@ -798,6 +805,8 @@ impl App {
             }
             _ => None,
         };
+        let wait =
+            indexes::Wait((!query.as_ref().is_some_and(|q| q.wait_complete)).then_some(deadline));
         self.start_setup();
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
         if let Some(repository) = &repository {
@@ -818,12 +827,19 @@ impl App {
                     anyhow::anyhow!("Repository identifiers require --mode remote")
                 })?;
                 let _wait = operation.wait("repository_acquisition");
-                let branch = if matches!(request, Request::Browse(_) | Request::View(..)) {
-                    remote
-                        .resolve_inventory_monitored(repository, &operation)
-                        .await?
-                } else {
-                    remote.resolve_monitored(repository, &operation).await?
+                let branch = wait
+                    .until(async {
+                        if matches!(request, Request::Browse(_) | Request::View(..)) {
+                            remote
+                                .resolve_inventory_monitored(repository, &operation)
+                                .await
+                        } else {
+                            remote.resolve_monitored(repository, &operation).await
+                        }
+                    })
+                    .await?;
+                let Some(branch) = branch else {
+                    return Ok(indexes::pending("Repository preparation"));
                 };
                 Some(branch)
             }
@@ -944,17 +960,27 @@ impl App {
             {
                 operation.stage("navigation");
                 let _wait = operation.wait("navigation");
-                if let Some(result) = self
-                    .navigate_repository(branch.clone(), request.clone(), activity.clone())
+                let Some(result) = wait
+                    .until(self.navigate_repository(
+                        branch.clone(),
+                        request.clone(),
+                        activity.clone(),
+                    ))
                     .await?
-                {
+                else {
+                    return Ok(indexes::pending("Repository source preparation"));
+                };
+                if let Some(result) = result {
                     return Ok(result);
                 }
             }
             tracing::Span::current().record("stage", "preparation");
             let inventory = {
                 let _wait = operation.wait("workspace_preparation");
-                preparation.inventory().await?
+                let Some(inventory) = wait.until(preparation.inventory()).await? else {
+                    return Ok(indexes::pending("Repository setup"));
+                };
+                inventory
             };
             if let Some((_, selector, revision, _)) = &inventory.context {
                 tracing::Span::current().record("selector", selector.as_str());
@@ -964,7 +990,10 @@ impl App {
             operation.stage("inventory_validation");
             let current = {
                 let _wait = operation.wait("inventory_validation");
-                inventory.current().await?
+                let Some(current) = wait.until(inventory.current()).await? else {
+                    return Ok(indexes::pending("Workspace validation"));
+                };
+                current
             };
             if current {
                 break (workspace, preparation, inventory);
@@ -972,9 +1001,21 @@ impl App {
             // A shared job may predate this request's filesystem changes.
             // Drain it before preparing a fresh inventory, including when the
             // changes caused its semantic extraction to fail.
-            let _ = preparation.complete().await;
+            if wait
+                .until(async {
+                    let _ = preparation.complete().await;
+                    Ok(())
+                })
+                .await?
+                .is_none()
+            {
+                return Ok(indexes::pending("Workspace preparation"));
+            }
         };
         if indexes::navigation(&request, query.as_ref())
+            && (!matches!(request, Request::Search(_))
+                || indexes::source_only(&request, query.as_ref())
+                || !indexes::has_unity(&inventory.manifest))
             && (preparation.running()
                 || preparation.retained_inventory()
                 || indexes::source_only(&request, query.as_ref()))
@@ -995,7 +1036,9 @@ impl App {
         operation.stage("source_indexing");
         {
             let _wait = operation.wait("workspace_preparation");
-            preparation.complete().await?;
+            if wait.until(preparation.complete()).await?.is_none() {
+                return Ok(indexes::pending("Code indexing"));
+            }
         }
         let asset_workspace = workspace.clone();
         let state = {
@@ -1069,6 +1112,10 @@ impl App {
             &state.as_ref().unwrap().manifest,
             context.as_ref().map(|(_, _, revision, _)| revision.clone()),
             asset_request && branch.is_none(),
+            branch_state
+                .as_ref()
+                .and_then(|s| s.as_ref())
+                .is_some_and(|s| !s.prepared.deferred_assets.is_empty()),
             activity.clone(),
         )?;
         if let Some(job_id) = ticket.telemetry_id() {
@@ -1100,19 +1147,44 @@ impl App {
         let wait_assets = asset_request && indexes::wait_assets(&request, query.as_ref());
         drop(branch_state);
         drop(state);
-        if wait_assets || needed.values().any(|wait| *wait) {
-            // Waiting requests own neither workspace locks nor query workers.
-            for (group, wait) in &needed {
-                if *wait {
-                    let _wait = operation.wait("source_indexing");
-                    source_tickets[group].clone().wait().await?;
+        // All relevant indexes share the time left from request start. Waiting
+        // owns neither workspace locks nor query workers, and keeps jobs running.
+        let source_wait = async |group| {
+            if let Some(required) = needed.get(&group) {
+                let _wait = operation.wait("source_indexing");
+                let result = source_tickets[&group].clone().wait().await;
+                if *required {
+                    result?;
                 }
             }
-            if wait_assets {
+            Ok::<_, anyhow::Error>(())
+        };
+        let asset_wait = async {
+            if let Some(ticket) = &ticket {
                 tracing::Span::current().record("stage", "assets");
                 operation.stage("assets");
                 let _wait = operation.wait("assets");
-                crate::unity::assets::jobs::wait(ticket.as_ref().unwrap().clone()).await?;
+                let result = crate::unity::assets::jobs::wait(ticket.clone()).await;
+                if wait_assets {
+                    result?;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        wait.until(async {
+            tokio::try_join!(
+                source_wait(crate::native::Group::Native),
+                source_wait(crate::native::Group::Shaders),
+                asset_wait,
+            )?;
+            Ok(())
+        })
+        .await?;
+        if wait_assets {
+            match ticket.as_ref().unwrap().ready() {
+                Some(Ok(_)) => (),
+                Some(Err(error)) => return Err(crate::diagnostics::shared_error(error)),
+                None => return Ok(indexes::pending("Unity asset preparation and indexing")),
             }
         }
         tracing::Span::current().record("stage", "query_admission");
@@ -1202,7 +1274,14 @@ impl App {
                                 ready.push((*group, snapshot));
                             }
                         }
-                        _ if needed.contains_key(group) => {
+                        Some(Err(_)) if needed.contains_key(group) => {
+                            pending.extend(
+                                manifest.deferred.values()
+                                    .filter(|f| crate::native::Group::of(f.language) == Some(*group))
+                                    .map(|f| format!("{} (indexing failed)", f.language.tag())),
+                            );
+                        }
+                        None if needed.contains_key(group) => {
                             pending.extend(
                                 manifest
                                     .deferred
@@ -1210,7 +1289,7 @@ impl App {
                                     .filter(|f| {
                                         crate::native::Group::of(f.language) == Some(*group)
                                     })
-                                    .map(|f| f.language.tag()),
+                                    .map(|f| f.language.tag().to_owned()),
                             );
                             if let Some(seconds) = ticket.remaining_seconds() {
                                 remaining = Some(remaining.unwrap_or(0).max(seconds));
@@ -1221,7 +1300,11 @@ impl App {
                 }
                 let assets = ticket.as_ref().and_then(|ticket| ticket.ready_index());
                 if asset_request && assets.is_none() {
-                    pending.insert("Unity assets");
+                    pending.insert(if ticket.as_ref().and_then(|t| t.ready()).is_some() {
+                        "Unity assets (preparation or indexing failed)".into()
+                    } else {
+                        "Unity assets".into()
+                    });
                 }
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
                 let mut text = if asset_only {
@@ -1257,15 +1340,19 @@ impl App {
                         Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
                     }
                 }?;
-                if !pending.is_empty() {
+                let incomplete = !pending.is_empty();
+                if incomplete {
                     let eta = remaining
                         .map_or(String::new(), |seconds| format!(" (~{seconds}s remaining)"));
-                    text.push_str(&format!(
-                        "\n\n> Index incomplete: {}{eta}",
+                    text = format!(
+                        "> Index incomplete: {}{eta}. Results below cover only completed indexes; missing matches are not conclusive.\n\n{text}",
                         pending.into_iter().collect::<Vec<_>>().join(", ")
-                    ));
+                    );
                 }
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                if incomplete {
+                    result.structured_content = Some(serde_json::json!({"complete": false}));
+                }
                 if let Some((identity, branch, revision, tracked)) = context {
                     crate::summary::Summary::build(
                         &identity, &branch, &revision, tracked, root, &manifest,
@@ -1383,8 +1470,8 @@ derived: matches direct written bases; native impl: is unsupported.
 Macro bodies contribute identifier references, not inferred calls or writes.
 ShaderLab indexes embedded code and entry-point pragmas, not properties or material links.
 
-Broad queries return ready results and one incomplete-index notice. Stale groups are hidden during refresh.
-Queries narrowed to a background group wait for it; wait:complete waits for all relevant groups.
+Queries wait up to 90 seconds from request start for setup and relevant indexes, then clearly mark incomplete results.
+Stale groups are hidden during refresh. wait:complete waits for all relevant indexes without this wait limit.
 
 Unity assets
 instance:TYPE finds saved and inherited Component/ScriptableObject instances, including derived types.
@@ -2028,18 +2115,29 @@ mod tests {
             "float shader_ready() { return 0; }",
         )
         .unwrap();
-        let app = Arc::new(
-            App::new(
-                Policy::new(vec![root.path().into()]).unwrap(),
-                cache.path().into(),
-                1,
-            )
-            .unwrap(),
-        );
+        let mut app = App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap();
+        app.index_wait = Duration::from_millis(50);
+        let app = Arc::new(app);
         let native = app.sources.pause(Group::Native).await;
         let shader = app.sources.pause(Group::Shaders).await;
         let path = root.path().to_str().unwrap();
-        let broad = app.search(path, "symbol:*").await.unwrap();
+        app.search(path, "type:Available lang:rust wait:complete")
+            .await
+            .unwrap();
+        let broad = app
+            .dispatch(path, Request::Search("symbol:*".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            broad.structured_content.as_ref().unwrap()["complete"],
+            false
+        );
+        let broad = result_text(broad).unwrap();
         assert!(
             broad.contains("Available")
                 && !broad.contains("native_ready")
@@ -2112,6 +2210,160 @@ mod tests {
             scope.read().unwrap().id(),
             before,
             "Reopening completed groups must not write analysis"
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn broad_queries_wait_for_ready_indexes_and_cancel_only_the_waiter() {
+        use crate::native::Group;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("code.rs"), "pub struct Available;").unwrap();
+        std::fs::write(root.path().join("native.cpp"), "void native_ready() {}").unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let pause = app.sources.pause(Group::Native).await;
+        let path = root.path().to_str().unwrap();
+        assert!(
+            app.search(path, "type:Available lang:rust")
+                .await
+                .unwrap()
+                .contains("Available")
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut cancelled = Box::pin(app.request_cancellable(
+            path,
+            Request::Search("symbol:*".into()),
+            &cancel,
+            None,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut cancelled)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        assert!(
+            cancelled
+                .await
+                .unwrap_err()
+                .chain()
+                .any(|error| error.is::<crate::diagnostics::Cancelled>())
+        );
+        let mut waiting = Box::pin(app.search(path, "symbol:*"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(pause);
+        let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.contains("native_ready") && result.contains("Available"),
+            "{result}"
+        );
+        assert!(!result.contains("Index incomplete"), "{result}");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn preparation_wait_expires_without_claiming_an_empty_search() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub struct Available;").unwrap();
+        let mut app = App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap();
+        app.index_wait = Duration::from_millis(50);
+        let app = Arc::new(app);
+        let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
+        let path = root.path().to_str().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.dispatch(path, Request::Search("type:Available".into())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.structured_content.unwrap()["complete"], false);
+        drop(pause);
+        let result = app
+            .search(path, "type:Available wait:complete")
+            .await
+            .unwrap();
+        assert!(result.contains("Available"), "{result}");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn asset_deadline_returns_partial_results_or_pending_without_stopping_indexing() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = root.path().join("code.rs");
+        std::fs::write(&source, "pub struct Available;").unwrap();
+        std::fs::create_dir(root.path().join("Assets")).unwrap();
+        std::fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+        std::fs::write(
+            root.path().join("ProjectSettings/ProjectVersion.txt"),
+            "version",
+        )
+        .unwrap();
+        let mut app = App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap();
+        app.index_wait = Duration::from_millis(50);
+        let app = Arc::new(app);
+        let pause = app.assets.pause().await;
+        let path = source.to_str().unwrap();
+        app.search(path, "type:Available lang:rust wait:complete")
+            .await
+            .unwrap();
+        for (query, has_code) in [("text:Available", true), ("instance:*", false)] {
+            let mut waiting = Box::pin(app.dispatch(path, Request::Search(query.into())));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["complete"],
+                false
+            );
+            assert_eq!(result_text(result).unwrap().contains("Available"), has_code);
+        }
+        drop(pause);
+        let result = app
+            .dispatch(path, Request::Search("instance:* wait:complete".into()))
+            .await
+            .unwrap();
+        assert!(
+            result
+                .structured_content
+                .as_ref()
+                .is_none_or(|v| v.get("complete") != Some(&serde_json::json!(false)))
         );
         app.shutdown().await;
     }

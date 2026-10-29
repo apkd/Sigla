@@ -479,6 +479,7 @@ mod tests {
     fn repository_view_reads_only_the_resolved_source_and_can_defer_contents() {
         let root = tempfile::tempdir().unwrap();
         let prepared = crate::repository::materialize::Prepared {
+            deferred_assets: Default::default(),
             omitted: Default::default(),
             transfer_bytes: 0,
             unavailable: Default::default(),

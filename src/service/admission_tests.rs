@@ -146,6 +146,7 @@ async fn query_rechecks_workspace_generation_after_admission_wait() {
         path,
         Request::Search("type:Available".into()),
         crate::telemetry::Operation::default(),
+        tokio::time::Instant::now() + app.index_wait,
     );
     tokio::pin!(request);
     tokio::time::timeout(Duration::from_secs(10), async {

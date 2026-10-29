@@ -715,6 +715,7 @@ mod tests {
                 subdirectory: None,
             },
             Prepared {
+                deferred_assets: Default::default(),
                 omitted: Default::default(),
                 transfer_bytes: 0,
                 unavailable: Default::default(),
@@ -1139,6 +1140,7 @@ mod tests {
             subdirectory: None,
         };
         let prepared = || Prepared {
+            deferred_assets: Default::default(),
             omitted: Default::default(),
             transfer_bytes: 0,
             unavailable: Default::default(),

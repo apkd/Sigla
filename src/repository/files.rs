@@ -221,6 +221,7 @@ mod tests {
             fs::write(stage.join("file.cs"), name).unwrap();
             files.import_owned_tree(&stage).unwrap();
             let prepared = Prepared {
+                deferred_assets: Default::default(),
                 selected: BTreeMap::from([("file.cs".into(), name.repeat(40))]),
                 omitted: Default::default(),
                 transfer_bytes: 0,
