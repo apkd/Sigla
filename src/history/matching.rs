@@ -1299,9 +1299,8 @@ impl Tracker {
         scope: CandidateScope<'_>,
         search: &mut CandidateSearch,
     ) -> Result<bool> {
-        let source = self
-            .sources
-            .get(&mut self.store, &region.path, &region.blob)?;
+        let sources = self.sources.for_region(region);
+        let source = sources.get(&mut self.store, &region.path, &region.blob)?;
         let anonymous = region.kind == "closure";
         let source_range = region.range(&source);
         let source_body = region.body_range(&source);
@@ -1349,8 +1348,8 @@ impl Tracker {
         }
         let mut remaining = paths.iter().enumerate();
         let mut expanded = false;
-        let mut prepared = self.sources.pending();
-        let cache_candidates = !matches!(region.kind.as_str(), "file" | "text");
+        let mut prepared = sources.pending();
+        let cache_candidates = region.kind != "text";
         let cache_scope = *self.store.cache_scope();
         let file_key = |path: &str| {
             if !cache_candidates {
@@ -1472,7 +1471,7 @@ impl Tracker {
                         }),
                 )?
             } else {
-                self.sources.get(&mut self.store, path, &entry.id)?
+                sources.get(&mut self.store, path, &entry.id)?
             };
             if index >= local_count {
                 files.pop_front();

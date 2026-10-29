@@ -112,6 +112,25 @@ pub(crate) fn historical_cancellable(
     Ok(result)
 }
 
+/// Whole-file Rust history needs syntax validity, but no declaration or call facts.
+pub(crate) fn historical_file_cancellable(
+    source: &str,
+    language: Language,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> anyhow::Result<HistoricalFacts> {
+    if language != Language::Rust {
+        return historical_cancellable(source, language, cancel);
+    }
+    cancel.check()?;
+    let parsed = ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2024);
+    let facts = Facts {
+        errors: !parsed.errors().is_empty(),
+        ..Facts::default()
+    };
+    cancel.check()?;
+    Ok(facts.into())
+}
+
 impl From<Facts> for HistoricalFacts {
     fn from(facts: Facts) -> Self {
         Self {

@@ -359,6 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_validation_preserves_recovery_and_symbol_cache() {
+        use super::super::regions::{Region, Sources};
+        let root = repository();
+        for text in [
+            "pub fn selected() { let closure = || called(); closure(); }",
+            "pub fn selected( {",
+        ] {
+            let blob = git(
+                root.path(),
+                &["hash-object", "-w", "--stdin"],
+                text.as_bytes(),
+            );
+            let region = Region::whole("code.rs", &blob, 0o100644);
+            for file_first in [true, false] {
+                let sources = Sources::default();
+                let files = sources.for_region(&region);
+                let mut store =
+                    Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
+                let first = if file_first { &files } else { &sources };
+                first.get(&mut store, "code.rs", &blob).unwrap();
+                let file = files.get(&mut store, "code.rs", &blob).unwrap();
+                let symbols = sources.get(&mut store, "code.rs", &blob).unwrap();
+                assert_eq!(file.text, symbols.text);
+                assert_eq!(file.incomplete, symbols.incomplete);
+                assert!(symbols.declarations.iter().any(|d| d.name == "selected"));
+            }
+        }
+    }
+
+    #[test]
     fn pending_sources_preserve_order_facts_errors_and_cancellation() {
         use super::super::regions::{Region, Sources};
         let root = repository();

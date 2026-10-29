@@ -522,6 +522,11 @@ fn main() {
     // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
     // prefix-scan oracle tests also cover recovery, top-level code and directives.
     let analysis_aliases: &[(&str, &str)] = &[
+        // Whole-file history validation leaves stored extraction unchanged.
+        (
+            "ae37a2d983a2cc170033623fc6f124731e1f735b0841a80579790ac8c3a441d4",
+            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
+        ),
         // Typed decoding slices and closure copies preserve extracted records.
         (
             "68a677db02c7f51ee2630749b7c9047c8d29df04cf118f32331b6cd30526b15d",
@@ -554,6 +559,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Whole-file history validation does not participate in discovery.
+        (
+            "75a8e2548bf5c30cc2b034e20078e1c38f1968922f9695bef151f9ac7214b95b",
+            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
+        ),
         // Decoder and record validation cleanup leaves discovery unchanged.
         (
             "255e16b919e7729aa63b0d63e1d548df185f1f638b3ea697a26aa5eede5d9243",
@@ -601,6 +611,11 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        // Whole-file history validation leaves Unity extraction unchanged.
+        (
+            "703eec02f425de99745600157fad3f87125c6550620a149e49610d368cf5a55e",
+            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
+        ),
         // Decoder and record validation cleanup preserves asset data.
         (
             "ebcb5bb77cc53c8747b6f792fc3b2b74e3dab29541114a3c6939e4900700e895",

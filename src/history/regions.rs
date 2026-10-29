@@ -206,6 +206,7 @@ pub(super) struct Sources {
     cache: Arc<Cache>,
     operation: crate::telemetry::Operation,
     stats: Arc<ParseStats>,
+    file_only: bool,
 }
 #[derive(Default)]
 struct ParseStats {
@@ -308,6 +309,7 @@ enum Input {
         bytes: Vec<u8>,
         language: Language,
         java: bool,
+        file_only: bool,
     },
 }
 impl Default for Sources {
@@ -321,11 +323,18 @@ impl Sources {
             cache,
             operation: Default::default(),
             stats: Default::default(),
+            file_only: false,
         }
     }
     pub fn with_operation(mut self, operation: crate::telemetry::Operation) -> Self {
         self.operation = operation;
         self
+    }
+    pub fn for_region(&self, region: &Region) -> Self {
+        Self {
+            file_only: region.kind == "file",
+            ..self.clone()
+        }
     }
     pub fn parse_totals(&self) -> (u64, u64) {
         (
@@ -369,7 +378,8 @@ impl Sources {
         } else {
             format!("{language:?}/2024")
         };
-        let key = cache::key(store.cache_scope(), &(blob, policy));
+        let file_only = self.file_only && language == Language::Rust;
+        let key = cache::key(store.cache_scope(), &(blob, policy, file_only));
         if let Some(source) = self.cache.source(&key) {
             return Ok(Input::Cached(source));
         }
@@ -378,18 +388,20 @@ impl Sources {
             bytes: store.blob(blob)?,
             language,
             java,
+            file_only,
         })
     }
     fn parse(&self, input: Input, path: &str, cancel: &dyn Cancellation) -> Result<Arc<Source>> {
         cancel.check()?;
-        let (key, bytes, language, java) = match input {
+        let (key, bytes, language, java, file_only) = match input {
             Input::Cached(source) => return Ok(source),
             Input::Parse {
                 key,
                 bytes,
                 language,
                 java,
-            } => (key, bytes, language, java),
+                file_only,
+            } => (key, bytes, language, java, file_only),
         };
         let _admission = {
             let _wait = self.operation.wait("parser_admission");
@@ -410,6 +422,8 @@ impl Sources {
         let started = std::time::Instant::now();
         let facts = if java {
             java::extract(&text, cancel)
+        } else if file_only {
+            crate::extract::historical_file_cancellable(&text, language, cancel)
         } else {
             crate::extract::historical_cancellable(&text, language, cancel)
         };
@@ -475,7 +489,9 @@ impl Sources {
         Ok(self.cache.put_source(key, source))
     }
     pub fn text(&mut self, store: &mut Store, region: &Region) -> Result<String> {
-        let source = self.get(store, &region.path, &region.blob)?;
+        let source = self
+            .for_region(region)
+            .get(store, &region.path, &region.blob)?;
         Ok(source
             .text
             .get(region.range(&source))
