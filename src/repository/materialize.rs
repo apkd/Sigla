@@ -1585,6 +1585,54 @@ mod tests {
     }
 
     #[test]
+    fn generic_hosts_omit_oversized_assets_before_extracting_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let oversized = ["Large.asset", "Large.shadergraph"];
+        File::create(upstream_path.join(oversized[0]))
+            .unwrap()
+            .set_len(super::super::selection::ASSET_LIMIT + 1)
+            .unwrap();
+        fs::hard_link(
+            upstream_path.join(oversized[0]),
+            upstream_path.join(oversized[1]),
+        )
+        .unwrap();
+        fs::write(upstream_path.join("Small.asset"), "small asset").unwrap();
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&upstream_path)
+            .args(["add", "."]))
+        .unwrap();
+        run(Command::new("git").arg("-C").arg(&upstream_path).args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Add assets of different sizes\n\nExercise asset limits without a host API.",
+        ]))
+        .unwrap();
+        let mut request = request(root.path());
+        request.include.push("*.shadergraph".into());
+        let prepared = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        for path in oversized {
+            assert!(prepared.omitted.contains_key(path), "{path}");
+            assert!(!prepared.selected.contains_key(path));
+            assert!(!request.staging.join(path).exists());
+        }
+        for path in ["Code.cs", "Small.asset"] {
+            assert_eq!(
+                fs::read(request.staging.join(path)).unwrap(),
+                fs::read(upstream_path.join(path)).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn github_size_inventory_prevents_oversized_blob_downloads() {
         let root = tempfile::tempdir().unwrap();
         let upstream_path = root.path().join("upstream");

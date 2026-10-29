@@ -790,6 +790,49 @@ mod tests {
     }
 
     #[test]
+    fn oversized_assets_are_omitted_without_contacting_lfs() {
+        let root = tempfile::tempdir().unwrap();
+        let inputs: &[(&str, &[u8])] = &[
+            ("Large.asset", b"asset"),
+            ("Large.shadergraph", b"graph"),
+            ("Ready.cs", b"class Ready {}"),
+        ];
+        let (request, mut prepared) = preparation(root.path(), inputs);
+        let oversized = ["Large.asset", "Large.shadergraph"];
+        for path in oversized {
+            fs::write(
+                request.staging.join(path),
+                format!(
+                    "version https://git-lfs.github.com/spec/v1\noid sha256:{:x}\nsize {}\n",
+                    Sha256::digest(b"oversized asset"),
+                    super::super::selection::ASSET_LIMIT + 1
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(request.staging.join(inputs[2].0), inputs[2].1).unwrap();
+        let transferred = prepared.transfer_bytes;
+        hydrate_with(
+            &request,
+            &mut prepared,
+            root.path(),
+            |_| panic!("Oversized assets must not contact the LFS server"),
+            |_, _, _, _, _| panic!("Oversized assets must not download"),
+        )
+        .unwrap();
+        for path in oversized {
+            assert!(prepared.omitted.contains_key(path));
+            assert!(!prepared.selected.contains_key(path));
+            assert!(!request.staging.join(path).exists());
+        }
+        assert_eq!(prepared.transfer_bytes, transferred);
+        assert_eq!(
+            fs::read(request.staging.join(inputs[2].0)).unwrap(),
+            inputs[2].1
+        );
+    }
+
+    #[test]
     fn batch_downloads_share_objects_and_run_concurrently() {
         use std::sync::{Condvar, Mutex};
         let root = tempfile::tempdir().unwrap();
