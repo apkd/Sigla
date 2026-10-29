@@ -16,6 +16,7 @@ pub fn local_command(
     job: &Path,
     packages: &crate::cache::packages::View,
 ) -> Result<Command> {
+    prepare_dotnet_mountpoint()?;
     let cache = cache.join("dotnet").canonicalize()?;
     for child in ["tmp", "home", "http-cache", "plugins"] {
         fs::create_dir_all(cache.join(child))?;
@@ -29,27 +30,7 @@ pub fn local_command(
         "--ro-bind",
         "/",
         "/",
-        "--tmpfs",
-        "/tmp",
     ]);
-    // Preserve temporary source trees and mounts without requiring a host
-    // /tmp/.dotnet directory. The private parent lets bwrap create that mountpoint.
-    for entry in fs::read_dir("/tmp")? {
-        let entry = entry?;
-        if entry.file_name() == ".dotnet" {
-            continue;
-        }
-        let path = entry.path();
-        if entry.file_type()?.is_symlink() {
-            match fs::read_link(&path) {
-                Ok(target) => command.arg("--symlink").arg(target).arg(path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-        } else {
-            command.arg("--ro-bind-try").arg(&path).arg(&path);
-        }
-    }
     command
         .args([
             // Older .NET runtimes use this fixed path, ignoring TMPDIR.
@@ -61,8 +42,6 @@ pub fn local_command(
             "/tmp/.dotnet/shm",
             "--dir",
             "/tmp/.dotnet/lockfiles",
-            "--remount-ro",
-            "/tmp",
         ])
         .arg("--bind")
         .arg(&cache)
@@ -103,6 +82,49 @@ pub fn local_command(
         .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
         .env("DOTNET_NOLOGO", "1");
     Ok(command)
+}
+
+/// The read-only root bind needs an existing target for the private IPC mount.
+/// Publish an empty directory with .NET's shared permissions, without changing
+/// an existing directory or exposing partially initialized permissions.
+fn prepare_dotnet_mountpoint() -> Result<()> {
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+    const PATH: &str = "/tmp/.dotnet";
+    let validate = |metadata: fs::Metadata| {
+        ensure!(metadata.is_dir(), "{PATH} must be a directory");
+        Ok(())
+    };
+    match fs::symlink_metadata(PATH) {
+        Ok(metadata) => return validate(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".dotnet.")
+        .tempdir_in("/tmp")?;
+    fs::File::open(temporary.path())?.set_permissions(fs::Permissions::from_mode(0o777))?;
+    let source = std::ffi::CString::new(temporary.path().as_os_str().as_bytes())?;
+    let published = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            c"/tmp/.dotnet".as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if published == 0 {
+        // The old temporary name is no longer ours to remove.
+        let _ = temporary.keep();
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).context("Cannot prepare the .NET IPC mountpoint");
+        }
+    }
+    validate(fs::symlink_metadata(PATH)?)
 }
 
 pub struct Sandbox {
@@ -537,7 +559,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_discovery_with_a_fresh_tmp_preserves_inputs_and_confines_writes() {
+    fn local_discovery_preserves_inputs_with_fresh_or_crowded_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "SIGLA_LOCAL_SANDBOX_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Construct the inner launcher inside a fresh /tmp. A nested mount
+            // also checks that inputs survive the recursive read-only bind.
+            let mut outer = Command::new("bwrap");
+            if unsafe { libc::geteuid() } == 0 {
+                outer.args(["--cap-add", "ALL"]);
+            }
+            let output = outer
+                .args([
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--tmpfs",
+                    "/tmp",
+                    "--tmpfs",
+                    "/tmp/nested",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::tests::local_discovery_preserves_inputs_with_fresh_or_crowded_tmp",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(!Path::new("/tmp/.dotnet").exists());
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let source = root.path().join("source");
         let cache = root.path().join("cache");
@@ -548,18 +613,34 @@ mod tests {
         fs::write(source.join("input"), "source").unwrap();
         std::os::unix::fs::symlink("input", source.join("link")).unwrap();
         std::os::unix::fs::symlink("missing", source.join("dangling")).unwrap();
+        fs::write("/tmp/nested/input", "nested").unwrap();
+        std::os::unix::fs::symlink(&source, "/tmp/source-link").unwrap();
+        std::os::unix::fs::symlink("missing", "/tmp/dangling-link").unwrap();
         let leases = crate::cache::views::LeaseSet::new(&cache).unwrap();
         let packages = crate::cache::packages::View::local(&cache, &source, &leases).unwrap();
-        let mut command =
-            local_command(Path::new("/bin/sh"), &source, &cache, &job, &packages).unwrap();
-        command
-            .args([
-                "-ec",
-                r#"
+        let mut fresh_args = None;
+        for crowded in [false, true] {
+            if crowded {
+                // The former per-entry bind list exceeded bubblewrap's limit.
+                for index in 0..3500 {
+                    fs::write(format!("/tmp/entry-{index}"), "temporary").unwrap();
+                }
+            }
+            let mut command =
+                local_command(Path::new("/bin/sh"), &source, &cache, &job, &packages).unwrap();
+            let args = command.get_args().count();
+            assert_eq!(args, *fresh_args.get_or_insert(args));
+            let output = command
+                .args([
+                    "-ec",
+                    r#"
                     test "$(cat input)" = source
                     test "$(cat link)" = source
+                    test "$(cat /tmp/source-link/input)" = source
+                    test "$(cat /tmp/nested/input)" = nested
                     test -L dangling
-                    for path in input new-source /tmp/outside-cache; do
+                    test -L /tmp/dangling-link
+                    for path in input new-source /tmp/outside-cache /tmp/nested/input /tmp/source-link/input; do
                         if (: > "$path") 2>/dev/null; then exit 1; fi
                     done
                     : > /tmp/.dotnet/shm/mutex
@@ -569,33 +650,47 @@ mod tests {
                     : > "$NUGET_PACKAGES/package"
                     : > "$1/result"
                 "#,
-                "sandbox-test",
-            ])
-            .arg(&job);
-        // Hide the host's .NET leftovers while retaining a source tree under /tmp.
-        // Root CI needs mount capabilities until the inner launcher drops them.
-        let mut outer = Command::new("bwrap");
-        if unsafe { libc::geteuid() } == 0 {
-            outer.args(["--cap-add", "ALL"]);
+                    "sandbox-test",
+                ])
+                .arg(&job)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read_to_string(source.join("input")).unwrap(), "source");
+            assert!(cache.join("dotnet/tmp/scratch").is_file());
+            assert!(job.join("result").is_file());
+            assert_eq!(fs::read_dir("/tmp/.dotnet").unwrap().count(), 0);
         }
-        let output = outer
-            .args(["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind"])
-            .arg(root.path())
-            .arg(root.path())
-            .args(["--proc", "/proc", "--dev", "/dev", "--"])
-            .arg(command.get_program())
-            .args(command.get_args())
-            .envs(command.get_envs().map(|(key, value)| (key, value.unwrap())))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        fs::set_permissions("/tmp/.dotnet", fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_dotnet_mountpoint().unwrap();
+        assert_eq!(
+            fs::metadata("/tmp/.dotnet").unwrap().permissions().mode() & 0o777,
+            0o700
         );
-        assert_eq!(fs::read_to_string(source.join("input")).unwrap(), "source");
-        assert!(cache.join("dotnet/tmp/scratch").is_file());
-        assert!(job.join("result").is_file());
+        fs::remove_dir("/tmp/.dotnet").unwrap();
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..8)
+                .map(|_| scope.spawn(prepare_dotnet_mountpoint))
+                .collect();
+            for task in tasks {
+                task.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            fs::metadata("/tmp/.dotnet").unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        fs::remove_dir("/tmp/.dotnet").unwrap();
+        std::os::unix::fs::symlink(&source, "/tmp/.dotnet").unwrap();
+        assert!(prepare_dotnet_mountpoint().is_err());
+        fs::remove_file("/tmp/.dotnet").unwrap();
+        fs::write("/tmp/.dotnet", "existing file").unwrap();
+        assert!(prepare_dotnet_mountpoint().is_err());
+        assert_eq!(fs::read_to_string("/tmp/.dotnet").unwrap(), "existing file");
     }
 
     #[test]

@@ -370,6 +370,47 @@ fn remote_discovery_confines_generated_files_and_hides_host_files() {
 fn restore_with_fresh_home_and_inaccessible_host_runtime_directory() {
     use std::os::unix::fs::PermissionsExt;
 
+    const CHILD: &str = "SIGLA_RESTORE_CROWDED_TMP_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let mut outer = std::process::Command::new("bwrap");
+        if unsafe { libc::geteuid() } == 0 {
+            outer.args(["--cap-add", "ALL"]);
+        }
+        let output = outer
+            .args([
+                "--ro-bind",
+                "/",
+                "/",
+                "--tmpfs",
+                "/tmp",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "msbuild::restore_with_fresh_home_and_inaccessible_host_runtime_directory",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Restore must work without a pre-existing .NET IPC directory, even when
+    // temporary inputs would exceed the launcher's former per-entry limit.
+    for index in 0..3500 {
+        std::fs::write(format!("/tmp/entry-{index}"), "temporary").unwrap();
+    }
     let home = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
