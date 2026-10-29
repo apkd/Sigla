@@ -16,7 +16,13 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
     ] {
         git(&upstream, &args)?;
     }
-    fs::write(upstream.join("lib.rs"), "pub struct Available;\n")?;
+    fs::write(
+        upstream.join("lib.rs"),
+        "#[path=\"Module.asset\"] pub mod child; #[path=\"TooLarge.asset\"] pub mod rejected; pub struct Available;\n",
+    )?;
+    fs::write(upstream.join("Module.asset"), "pub struct RequiredCode;\n")?;
+    fs::File::create(upstream.join("TooLarge.asset"))?
+        .set_len(sigla::repository::selection::ASSET_LIMIT + 1)?;
     fs::write(upstream.join("Ready.asset"), "ready asset contents\n")?;
     fs::write(
         upstream.join("Object.asset"),
@@ -83,6 +89,10 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
         !source.join("Object.asset").exists(),
         "Failed asset was published"
     );
+    ensure!(
+        !source.join("TooLarge.asset").exists(),
+        "Rejected required input was published"
+    );
     let (error, result) = server.query(project, "type:Available lang:rust")?;
     ensure!(
         !error && result.contains("Available"),
@@ -96,6 +106,11 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
     ensure!(
         !error && result.contains("Available"),
         "Cached code failed after an offline restart: {result}"
+    );
+    let (error, result) = server.query(project, "type:RequiredCode lang:rust")?;
+    ensure!(
+        !error && result.contains("RequiredCode"),
+        "Required input with an asset extension was lost: {result}"
     );
     Ok(())
 }

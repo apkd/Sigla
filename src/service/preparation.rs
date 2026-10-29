@@ -328,9 +328,16 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                         .prepared
                         .tracked
                         .keys()
-                        .filter(|p| !applied.prepared.unavailable.contains(*p))
+                        .filter(|p| {
+                            !applied.prepared.unavailable.contains(*p)
+                                && !applied.prepared.omitted.contains_key(*p)
+                        })
                         .cloned()
                         .collect(),
+                );
+                policy.materialized(
+                    policy.remote.as_ref().unwrap().workspace.clone(),
+                    applied.discovery_identity()?,
                 );
             }
             let prepared = loop {
@@ -339,9 +346,6 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 let cache = cache.clone();
                 let current_policy = policy.clone();
                 let owner = preparing_branch.as_ref().map(|branch| branch.root.clone());
-                let generation = preparing_branch
-                    .as_ref()
-                    .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
                 operation.stage("discovery_admission");
                 let permit = {
                     let _wait = operation.wait("discovery_admission");
@@ -366,9 +370,6 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                         )?);
                     }
                     state.as_mut().unwrap().update_policy(current_policy);
-                    if let Some(generation) = generation {
-                        state.as_mut().unwrap().materialized(generation);
-                    }
                     let code = state.as_mut().unwrap();
                     let result = code
                         .prepare()
@@ -424,9 +425,16 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                                 .prepared
                                 .tracked
                                 .keys()
-                                .filter(|p| !applied.prepared.unavailable.contains(*p))
+                                .filter(|p| {
+                                    !applied.prepared.unavailable.contains(*p)
+                                        && !applied.prepared.omitted.contains_key(*p)
+                                })
                                 .cloned()
                                 .collect(),
+                        );
+                        policy.materialized(
+                            policy.remote.as_ref().unwrap().workspace.clone(),
+                            applied.discovery_identity()?,
                         );
                         branch_state = Some(gate);
                     }

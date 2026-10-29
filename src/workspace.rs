@@ -207,7 +207,6 @@ pub struct Workspace {
     directories: BTreeSet<PathBuf>,
     fence: u64,
     initialized: bool,
-    materialization: Option<u64>,
 }
 pub(crate) struct IndexPlan {
     leases: crate::cache::views::LeaseSet,
@@ -284,7 +283,6 @@ impl Workspace {
             directories: BTreeSet::new(),
             fence: 0,
             initialized: false,
-            materialization: None,
         })
     }
     pub fn refresh(&mut self) -> Result<()> {
@@ -294,17 +292,10 @@ impl Workspace {
         Ok(())
     }
 
-    /// Managed materialization bypasses watcher timing, while still comparing input stamps.
-    pub fn materialized(&mut self, generation: u64) {
-        if self.materialization != Some(generation) {
-            self.initialized = false;
-            self.materialization = Some(generation);
-        }
-    }
-
     /// Dependency preparation does not consume an indexing worker.
     pub fn prepare(&mut self) -> Result<Option<Preparation>> {
         let start = std::time::Instant::now();
+        let managed = self.policy.managed_root(self.manifest.metadata.keys());
         if !self.initialized {
             for p in self
                 .manifest
@@ -318,14 +309,18 @@ impl Workspace {
                     Some(p.as_path())
                 } else {
                     p.parent()
-                } && self.directories.insert(dir.into())
+                } && !managed.is_some_and(|root| dir.starts_with(root))
+                    && self.directories.insert(dir.into())
                 {
                     self.monitor.register(dir);
                 }
             }
         }
         let (dirty, fence) = self.monitor.fence(&self.directories, self.fence);
-        let policy_current = self.manifest.discovery_policy == self.policy.identity()?;
+        let policy_current = self.manifest.discovery_policy
+            == self
+                .policy
+                .discovery_identity(self.manifest.metadata.keys())?;
         if self.initialized && !dirty && policy_current && self.store.manifest_current()? {
             return Ok(None);
         }
@@ -394,9 +389,10 @@ impl Workspace {
         self.pending_leases = Some(discovery.leases.clone());
         let mut directories = BTreeSet::new();
         let mut policy_watches = BTreeSet::new();
+        let managed = self.policy.managed_root(discovery.metadata.iter());
         let mut manifest = Manifest {
             source_group: None,
-            discovery_policy: self.policy.identity()?,
+            discovery_policy: self.policy.discovery_identity(discovery.metadata.iter())?,
             environment: [0; 32],
             root: discovery.root,
             projects: discovery.projects,
@@ -408,11 +404,15 @@ impl Workspace {
             diagnostics: discovery.diagnostics,
         };
         for p in discovery.metadata {
+            if p.is_dir() && managed.is_some_and(|root| p.starts_with(root)) {
+                continue;
+            }
             if let Some(dir) = if p.is_dir() {
                 Some(p.as_path())
             } else {
                 p.parent()
-            } {
+            } && !managed.is_some_and(|root| dir.starts_with(root))
+            {
                 if p.file_name().is_some_and(|name| name == "global.json") && !p.is_dir() {
                     policy_watches.insert(dir.to_owned());
                 } else {
@@ -466,7 +466,9 @@ impl Workspace {
         let mut visited = BTreeSet::new();
         let mut stamps = BTreeMap::new();
         while let Some(input) = queue.pop_front() {
-            if let Some(dir) = input.path.parent() {
+            if let Some(dir) = input.path.parent()
+                && !managed.is_some_and(|root| dir.starts_with(root))
+            {
                 directories.insert(dir.to_owned());
                 if self.directories.insert(dir.into()) {
                     self.monitor.register(dir);
@@ -572,6 +574,9 @@ impl Workspace {
                             dir.join(&m.name).join("mod.rs")
                         }
                     };
+                    if let Some(remote) = &self.policy.remote {
+                        remote.require([path.clone()])?;
+                    }
                     if !path.exists() {
                         // watch the nearest existing parent so later module creation
                         // triggers discovery, even when its directory is created first.
@@ -586,9 +591,11 @@ impl Workspace {
                                     continue;
                                 }
                             };
-                            directories.insert(parent.clone());
-                            if self.directories.insert(parent.clone()) {
-                                self.monitor.register(&parent);
+                            if !managed.is_some_and(|root| parent.starts_with(root)) {
+                                directories.insert(parent.clone());
+                                if self.directories.insert(parent.clone()) {
+                                    self.monitor.register(&parent);
+                                }
                             }
                         }
                         continue;
@@ -800,6 +807,9 @@ impl Drop for Workspace {
 #[cfg(test)]
 #[path = "store/workspace_tests.rs"]
 mod storage_tests;
+#[cfg(test)]
+#[path = "workspace_tests.rs"]
+mod tests;
 #[cfg(test)]
 #[path = "workspace_validation.rs"]
 mod validation;

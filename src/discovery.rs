@@ -11,6 +11,7 @@ pub struct Policy {
     pub unity_platform: crate::unity::Platform,
     pub unity_editors: Option<PathBuf>,
     pub remote: Option<RemoteContext>,
+    materialization: Option<(PathBuf, [u8; 32])>,
 }
 
 #[derive(Clone)]
@@ -39,11 +40,23 @@ impl std::error::Error for RequiredInputs {}
 impl RemoteContext {
     pub fn require(&self, paths: impl IntoIterator<Item = PathBuf>) -> Result<()> {
         let mut missing = BTreeSet::new();
-        for path in paths {
+        'inputs: for path in paths {
             if path.is_file() {
                 continue;
             }
             if let Ok(relative) = path.strip_prefix(&self.workspace) {
+                // Explicit compiler inputs may use parent segments within the repository.
+                // Managed source trees contain no symlinks.
+                let mut normalized = PathBuf::new();
+                for part in relative.components() {
+                    match part {
+                        std::path::Component::Normal(part) => normalized.push(part),
+                        std::path::Component::CurDir => (),
+                        std::path::Component::ParentDir if normalized.pop() => (),
+                        _ => continue 'inputs,
+                    }
+                }
+                let relative = normalized.as_path();
                 let relative = relative.to_str().context("Invalid discovery input path")?;
                 crate::repository::selection::validate_path(relative)?;
                 if self.tracked.contains(relative) {
@@ -103,6 +116,43 @@ impl RemoteContext {
 }
 
 impl Policy {
+    /// Repository publication supplies a durable identity for code and build inputs.
+    pub(crate) fn materialized(&mut self, root: PathBuf, identity: [u8; 32]) {
+        self.materialization = Some((root, identity));
+    }
+
+    pub(crate) fn managed_root<'a>(
+        &self,
+        mut metadata: impl Iterator<Item = &'a PathBuf>,
+    ) -> Option<&Path> {
+        let (root, _) = self.materialization.as_ref()?;
+        // MSBuild expressions can inspect arbitrary files, including optional assets.
+        // Its directory stamps must remain part of discovery validation.
+        (!metadata.any(|p| {
+            p.extension()
+                .is_some_and(|e| matches!(e.to_str(), Some("csproj" | "sln" | "slnx")))
+        }))
+        .then_some(root.as_path())
+    }
+
+    pub(crate) fn discovery_identity<'a>(
+        &self,
+        metadata: impl Iterator<Item = &'a PathBuf>,
+    ) -> Result<[u8; 32]> {
+        let identity = self.identity()?;
+        if let Some(materialization) = &self.materialization {
+            let mut hash = blake3::Hasher::new();
+            hash.update(&identity);
+            postcard::to_io(materialization, &mut hash)?;
+            if self.managed_root(metadata).is_none() {
+                // Failed acquisition also changes the virtual tree seen by MSBuild.
+                postcard::to_io(&self.remote.as_ref().map(|r| r.tracked.as_ref()), &mut hash)?;
+            }
+            return Ok(*hash.finalize().as_bytes());
+        }
+        Ok(identity)
+    }
+
     pub fn identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         hash.update(&serde_json::to_vec(&(
@@ -124,6 +174,7 @@ impl Policy {
             unity_platform: Default::default(),
             unity_editors: None,
             remote: None,
+            materialization: None,
             roots: roots
                 .into_iter()
                 .map(|p| {
@@ -1358,6 +1409,9 @@ fn load_cargo(
         _ => (),
     }
     let mut target_paths = BTreeSet::new();
+    if let Some(remote) = &policy.remote {
+        remote.require(roots.iter().map(|(path, _)| path.clone()))?;
+    }
     for (root, module) in roots {
         let root = match policy.canonical(&root) {
             Ok(root) => root,

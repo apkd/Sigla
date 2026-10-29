@@ -445,6 +445,12 @@ fn discover_with_editor(
                     &mut response_defines,
                     &mut response_refs,
                 ) {
+                    if error
+                        .downcast_ref::<crate::discovery::RequiredInputs>()
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
                     response_defines.clear();
                     response_refs.clear();
                     result.diagnostics.push(format!(
@@ -939,11 +945,17 @@ fn response_file(
             .or_else(|| token.strip_prefix("r:"))
         {
             let relative = crate::metadata_archive::reference(root.join(value));
+            if let Some(remote) = &policy.remote {
+                remote.require([relative.clone()])?;
+            }
             let path = if relative.is_file() {
                 relative
             } else {
                 crate::metadata_archive::reference(path.parent().unwrap().join(value))
             };
+            if let Some(remote) = &policy.remote {
+                remote.require([path.clone()])?;
+            }
             references.push(policy.canonical(&path)?);
         } else if token.starts_with('@') {
             bail!("Nested Unity response files are not supported");
@@ -954,6 +966,74 @@ fn response_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn response_references_request_deferred_inputs_before_resolving_fallbacks() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = root.path();
+        std::fs::create_dir(source.join("Assets")).unwrap();
+        let response = source.join("Assets/csc.rsp");
+        std::fs::write(&response, "-r:Plugin.asset").unwrap();
+        // A present fallback must not hide a tracked repository-root reference.
+        std::fs::write(source.join("Assets/Plugin.asset"), "fallback").unwrap();
+        let mut policy = Policy::new(vec![source.into()]).unwrap();
+        policy.remote = Some(crate::discovery::RemoteContext {
+            workspace: source.into(),
+            writable: cache.path().join("generated"),
+            shared: cache.path().into(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new(["Plugin.asset".into()].into()),
+        });
+        let mut references = Vec::new();
+        let error = response_file(
+            &response,
+            source,
+            &policy,
+            &mut BTreeSet::new(),
+            &mut references,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::discovery::RequiredInputs>()
+                .unwrap()
+                .0
+                .contains(&"Plugin.asset".into())
+        );
+        std::fs::write(source.join("Plugin.asset"), "required reference").unwrap();
+        response_file(
+            &response,
+            source,
+            &policy,
+            &mut BTreeSet::new(),
+            &mut references,
+        )
+        .unwrap();
+        assert_eq!(references, [source.join("Plugin.asset")]);
+
+        references.clear();
+        policy.remote.as_mut().unwrap().tracked =
+            std::sync::Arc::new(["Assets/Plugin.asset".into()].into());
+        std::fs::remove_file(source.join("Plugin.asset")).unwrap();
+        std::fs::remove_file(source.join("Assets/Plugin.asset")).unwrap();
+        let error = response_file(
+            &response,
+            source,
+            &policy,
+            &mut BTreeSet::new(),
+            &mut references,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::discovery::RequiredInputs>()
+                .unwrap()
+                .0
+                .contains(&"Assets/Plugin.asset".into())
+        );
+    }
+
     #[test]
     fn missing_embedded_and_local_package_inputs_are_requested_together() {
         let root = tempfile::tempdir().unwrap();

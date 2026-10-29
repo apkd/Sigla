@@ -2703,7 +2703,21 @@ mod tests {
         assert!(refreshed.contains("Prepared"), "{refreshed}");
         assert_ne!(job(), original_job);
         let refreshed_job = job();
-        std::fs::write(owner.join("source/src/lib.rs"), "pub struct Changed;").unwrap();
+        {
+            // Repository writes publish their input identities before queries resume.
+            let mut state = branch.publish().await;
+            std::fs::write(owner.join("source/src/lib.rs"), "pub struct Changed;").unwrap();
+            let prepared = &mut state.as_mut().unwrap().prepared;
+            prepared
+                .selected
+                .insert("src/lib.rs".into(), "changed".into());
+            prepared
+                .tracked
+                .insert("src/lib.rs".into(), "changed".into());
+            branch
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         let changed = app.search(project, "Changed").await.unwrap();
         assert!(changed.contains("Changed"), "{changed}");
         assert_ne!(job(), refreshed_job);

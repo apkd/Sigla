@@ -1,6 +1,68 @@
-//! Explicit opt-in replay of a deployed input manifest. The deployed LMDB is
-//! opened read-only; all extraction and indexing happen in a temporary cache.
+//! Opt-in workspace measurements. Deployed inputs are read-only; extraction
+//! and indexing happen in a temporary cache.
 use super::*;
+
+#[test]
+#[ignore = "measures optional asset publication on a generated source tree"]
+fn optional_asset_discovery_benchmark() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for directory in 0..80 {
+        let directory = root.path().join(format!("module{directory}"));
+        std::fs::create_dir(&directory).unwrap();
+        for file in 0..100 {
+            std::fs::write(
+                directory.join(format!("file{file}.rs")),
+                format!("pub struct Source{file};\n"),
+            )
+            .unwrap();
+        }
+    }
+    let mut policy = Policy::new(vec![root.path().into()]).unwrap();
+    policy.materialized(root.path().into(), [1; 32]);
+    let open = || {
+        Workspace::open(
+            root.path().into(),
+            cache.path(),
+            policy.clone(),
+            &cache.path().join("analysis"),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+    };
+    let mut workspace = open();
+    workspace.refresh().unwrap();
+    assert_eq!(workspace.manifest.files.len(), 8_000);
+    eprintln!("phase,round,elapsed_ms,discovery_ms,refreshed");
+    for round in 0..5 {
+        std::fs::write(
+            root.path().join(format!("module{round}/Scene.asset")),
+            "optional asset\n",
+        )
+        .unwrap();
+        for phase in ["running", "restart"] {
+            if phase == "restart" {
+                drop(workspace);
+                workspace = open();
+            }
+            let started = std::time::Instant::now();
+            let prepared = workspace.prepare().unwrap();
+            let refreshed = prepared.is_some();
+            let discovery = prepared
+                .as_ref()
+                .map_or(Default::default(), |p| p.discovery_time);
+            if let Some(prepared) = prepared {
+                workspace.apply(prepared).unwrap();
+            }
+            eprintln!(
+                "{phase},{round},{:.3},{:.3},{refreshed}",
+                started.elapsed().as_secs_f64() * 1_000.0,
+                discovery.as_secs_f64() * 1_000.0,
+            );
+        }
+    }
+}
 
 #[test]
 #[ignore = "requires SIGLA_BENCH_ROOT; optional SIGLA_BENCH_INDEX replays a deployed snapshot"]

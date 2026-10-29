@@ -248,6 +248,85 @@ mod refresh_tests {
     }
 
     #[test]
+    fn discovery_identity_tracks_code_and_required_inputs_across_restart() {
+        let repository = Repository::parse("https://github.com/owner/repo")
+            .unwrap()
+            .unwrap();
+        let mut state = State {
+            schema: 5,
+            repository: repository.identity,
+            transport: repository.transport,
+            branch: "main".into(),
+            target: None,
+            last_use: 0,
+            refreshed: 0,
+            policy: "selection".into(),
+            prepared: Prepared {
+                deferred_assets: ["Scene.asset".into()].into(),
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+                branch: None,
+                revision: "commit".into(),
+                selected: [("lib.rs".into(), "source".into())].into(),
+                tracked: Default::default(),
+                directories: Default::default(),
+            },
+            indexed_revision: None,
+            repair: false,
+            additional: Default::default(),
+        };
+        let before = state.discovery_identity().unwrap();
+        state
+            .prepared
+            .selected
+            .insert("Scene.asset".into(), "asset".into());
+        state.prepared.deferred_assets.clear();
+        assert_eq!(state.discovery_identity().unwrap(), before);
+        state.prepared.unavailable.insert("Scene.asset".into());
+        assert_eq!(state.discovery_identity().unwrap(), before);
+        let restored: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.discovery_identity().unwrap(), before);
+
+        for path in [
+            "new.rs",
+            "Game.asmdef",
+            "Game.asmdef.meta",
+            "ProjectSettings/ProjectSettings.asset",
+        ] {
+            let mut changed = state.clone();
+            changed
+                .prepared
+                .selected
+                .insert(path.into(), "build input".into());
+            assert_ne!(changed.discovery_identity().unwrap(), before);
+        }
+        let mut changed = state.clone();
+        changed
+            .prepared
+            .selected
+            .insert("lib.rs".into(), "edited".into());
+        assert_ne!(changed.discovery_identity().unwrap(), before);
+        changed = state.clone();
+        changed.prepared.selected.remove("lib.rs");
+        assert_ne!(changed.discovery_identity().unwrap(), before);
+        changed = state.clone();
+        changed.prepared.unavailable.insert("lib.rs".into());
+        assert_ne!(changed.discovery_identity().unwrap(), before);
+        changed = state.clone();
+        changed.prepared.revision = "new commit with an unselected input".into();
+        assert_ne!(changed.discovery_identity().unwrap(), before);
+
+        state.additional.insert("Scene.asset".into());
+        let required = state.discovery_identity().unwrap();
+        assert_ne!(required, before);
+        state.prepared.unavailable.remove("Scene.asset");
+        assert_ne!(state.discovery_identity().unwrap(), required);
+    }
+
+    #[test]
     fn resolved_abbreviation_stays_pinned_without_expanding_display_selector() {
         let options = options();
         let mut short = branch(Target::Named("abcdef1".into()), 0);
@@ -351,6 +430,27 @@ pub struct State {
     pub repair: bool,
     #[serde(default)]
     pub additional: std::collections::BTreeSet<String>,
+}
+
+impl State {
+    pub(crate) fn discovery_identity(&self) -> Result<[u8; 32]> {
+        let mut hash = blake3::Hasher::new();
+        // Include the revision: newly tracked build inputs may not be selected yet.
+        postcard::to_io(
+            &(&self.prepared.revision, &self.policy, &self.additional),
+            &mut hash,
+        )?;
+        for (path, object) in &self.prepared.selected {
+            if !super::selection::optional_asset(Path::new(path)) || self.additional.contains(path)
+            {
+                postcard::to_io(
+                    &(path, object, self.prepared.unavailable.contains(path)),
+                    &mut hash,
+                )?;
+            }
+        }
+        Ok(*hash.finalize().as_bytes())
+    }
 }
 
 pub(crate) struct Inventory {
