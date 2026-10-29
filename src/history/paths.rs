@@ -61,10 +61,9 @@ impl Exclusion {
             (to.to_owned(), self.original.clone())
         } else if let Some(relative) = suffix(&self.root, from) {
             (format!("{to}{relative}"), self.original.clone())
-        } else if let Some(relative) = suffix(from, &self.root) {
-            (to.to_owned(), format!("{}{relative}", self.original))
         } else {
-            return None;
+            let relative = suffix(from, &self.root)?;
+            (to.to_owned(), format!("{}{relative}", self.original))
         };
         Some(Self {
             root,

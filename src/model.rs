@@ -231,9 +231,10 @@ pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
         );
         let little = bytes[0] == 0xff;
         return bytes[4..]
-            .chunks_exact(4)
-            .map(|word| {
-                let word: [u8; 4] = word.try_into().unwrap();
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| {
                 let scalar = if little {
                     u32::from_le_bytes(word)
                 } else {
@@ -252,12 +253,14 @@ pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
         );
         let little = bytes[0] == 0xff;
         let words: Vec<_> = bytes[2..]
-            .chunks_exact(2)
-            .map(|b| {
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&word| {
                 if little {
-                    u16::from_le_bytes([b[0], b[1]])
+                    u16::from_le_bytes(word)
                 } else {
-                    u16::from_be_bytes([b[0], b[1]])
+                    u16::from_be_bytes(word)
                 }
             })
             .collect();

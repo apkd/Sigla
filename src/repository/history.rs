@@ -191,7 +191,7 @@ impl Batch {
         }
         let mut newline = [0];
         self.output.read_exact(&mut newline)?;
-        ensure!(newline == [b'\n'], "Truncated Git object response");
+        ensure!(newline == *b"\n", "Truncated Git object response");
         Ok(Some(Object {
             kind: fields[1].into(),
             bytes,

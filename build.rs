@@ -522,6 +522,11 @@ fn main() {
     // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
     // prefix-scan oracle tests also cover recovery, top-level code and directives.
     let analysis_aliases: &[(&str, &str)] = &[
+        // Typed decoding slices and closure copies preserve extracted records.
+        (
+            "68a677db02c7f51ee2630749b7c9047c8d29df04cf118f32331b6cd30526b15d",
+            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
+        ),
         // Shared stream cursors and bounded work retain valid extracted records.
         (
             "b7d333ec38a4b11155238613efb0d2c67cecae2f2a4401883b980eca13c677cd",
@@ -549,6 +554,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Decoder and record validation cleanup leaves discovery unchanged.
+        (
+            "255e16b919e7729aa63b0d63e1d548df185f1f638b3ea697a26aa5eede5d9243",
+            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
+        ),
         // Decoder safeguards retain the completed discovery graph.
         (
             "8706be81a0fe1c76713a24513b1f689911db713f90d97cc967417e7a4a7b7a54",
@@ -591,6 +601,11 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        // Decoder and record validation cleanup preserves asset data.
+        (
+            "ebcb5bb77cc53c8747b6f792fc3b2b74e3dab29541114a3c6939e4900700e895",
+            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
+        ),
         // Cancellation, cache ownership and timings leave asset records unchanged.
         (
             "a7b3926522dd62496e60de4af1d4575dbeaa76b9fe5ac8fef467ebf58f90ba14",

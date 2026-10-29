@@ -504,18 +504,18 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     }).await??;
                 }
             }
-            let assets = preparing_app.start_assets(
-                workspace.clone(),
-                preparing_branch.clone(),
-                &code.manifest,
-                inventory
+            let assets = preparing_app.start_assets(super::indexes::AssetRequest {
+                workspace: workspace.clone(),
+                branch: preparing_branch.clone(),
+                manifest: &code.manifest,
+                revision: inventory
                     .context
                     .as_ref()
                     .map(|(_, _, revision, _)| revision.clone()),
-                false,
+                refresh: false,
                 assets_pending,
-                preparing_activity.clone(),
-            )?;
+                activity: preparing_activity.clone(),
+            })?;
             if let Some(job_id) = assets.telemetry_id() {
                 operation.link(&job_id);
             }

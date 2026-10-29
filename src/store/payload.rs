@@ -344,8 +344,8 @@ pub fn validate(data: &FileData) -> Result<()> {
                 (info.region as usize) < native.regions.len()
                     && info.owner.is_none_or(declaration)
                     && info.local.is_none_or(declaration)
-                    && info.receiver.as_ref().is_none_or(&valid)
-                    && info.assignment.as_ref().is_none_or(&valid),
+                    && info.receiver.as_ref().is_none_or(valid)
+                    && info.assignment.as_ref().is_none_or(valid),
                 "Invalid native occurrence details"
             );
         }

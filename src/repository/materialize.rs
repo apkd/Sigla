@@ -926,7 +926,7 @@ fn materialize_inventory(
             );
             let mut delimiter = [0];
             contents.read_exact(&mut delimiter)?;
-            ensure!(delimiter == [b'\n'], "Invalid Git blob delimiter");
+            ensure!(delimiter == *b"\n", "Invalid Git blob delimiter");
             metrics.extracted_files += 1;
             metrics.extracted_bytes += size;
         }

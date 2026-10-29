@@ -133,9 +133,9 @@ impl Reader {
                 fields.len() == chunk.len() * 9,
                 "Incomplete Git attribute output"
             );
-            for (path, fields) in chunk.iter().zip(fields.chunks_exact(9)) {
+            for (path, fields) in chunk.iter().zip(fields.as_chunks::<9>().0) {
                 let mut include = true;
-                for fields in fields.chunks_exact(3) {
+                for fields in fields.as_chunks::<3>().0 {
                     ensure!(
                         fields[0] == path.as_bytes(),
                         "Unexpected Git attribute path"

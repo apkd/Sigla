@@ -1106,18 +1106,18 @@ impl App {
         };
         let asset_generation =
             crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?;
-        let ticket = self.start_assets(
-            asset_workspace.clone(),
-            branch.clone(),
-            &state.as_ref().unwrap().manifest,
-            context.as_ref().map(|(_, _, revision, _)| revision.clone()),
-            asset_request && branch.is_none(),
-            branch_state
+        let ticket = self.start_assets(indexes::AssetRequest {
+            workspace: asset_workspace.clone(),
+            branch: branch.clone(),
+            manifest: &state.as_ref().unwrap().manifest,
+            revision: context.as_ref().map(|(_, _, revision, _)| revision.clone()),
+            refresh: asset_request && branch.is_none(),
+            assets_pending: branch_state
                 .as_ref()
                 .and_then(|s| s.as_ref())
                 .is_some_and(|s| !s.prepared.deferred_assets.is_empty()),
-            activity.clone(),
-        )?;
+            activity: activity.clone(),
+        })?;
         if let Some(job_id) = ticket.telemetry_id() {
             operation.link(&job_id);
         }

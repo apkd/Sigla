@@ -273,17 +273,30 @@ pub(super) fn has_unity(manifest: &Manifest) -> bool {
         })
 }
 
+pub(super) struct AssetRequest<'a> {
+    pub workspace: std::sync::Arc<tokio::sync::Mutex<Option<crate::workspace::Workspace>>>,
+    pub branch: Option<std::sync::Arc<crate::repository::manager::Branch>>,
+    pub manifest: &'a Manifest,
+    pub revision: Option<String>,
+    pub refresh: bool,
+    pub assets_pending: bool,
+    pub activity: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
 impl super::App {
     pub(super) fn start_assets(
         &self,
-        workspace: std::sync::Arc<tokio::sync::Mutex<Option<crate::workspace::Workspace>>>,
-        branch: Option<std::sync::Arc<crate::repository::manager::Branch>>,
-        manifest: &Manifest,
-        revision: Option<String>,
-        refresh: bool,
-        assets_pending: bool,
-        activity: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+        request: AssetRequest<'_>,
     ) -> anyhow::Result<crate::unity::assets::jobs::Ticket> {
+        let AssetRequest {
+            workspace,
+            branch,
+            manifest,
+            revision,
+            refresh,
+            assets_pending,
+            activity,
+        } = request;
         if !has_unity(manifest) && !assets_pending {
             return Ok(crate::unity::assets::jobs::empty());
         }

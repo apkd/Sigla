@@ -15,7 +15,7 @@ use std::{
 // Reopening an environment gets a new namespace, even at the same path.
 pub(super) fn namespace() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .expect("Dictionary namespaces exhausted")
 }
 fn generation_key(partition: u64) -> Vec<u8> {

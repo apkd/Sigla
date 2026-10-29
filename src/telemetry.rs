@@ -150,7 +150,7 @@ impl Recorder {
         } as u64;
         if self
             .queued_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
                 queued
                     .checked_add(bytes)
                     .filter(|&total| total <= QUEUE_BYTES)
