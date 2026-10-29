@@ -522,6 +522,16 @@ fn main() {
     // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
     // prefix-scan oracle tests also cover recovery, top-level code and directives.
     let analysis_aliases: &[(&str, &str)] = &[
+        // Move source-read tests after production items for strict Clippy.
+        (
+            "cb50ba5b1f240d9cf70acf196f7db10744a10196c9c1e2b11941d7e777b4c125",
+            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
+        ),
+        // Borrowed source reads leave the stored record format unchanged.
+        (
+            "2c6ce01e18f07e321ac8807bd11110b0c52a2dfd6cc71aab2be8c27f5d7a542f",
+            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
+        ),
         // Whole-file history validation leaves stored extraction unchanged.
         (
             "ae37a2d983a2cc170033623fc6f124731e1f735b0841a80579790ac8c3a441d4",
@@ -559,6 +569,16 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Test-module placement preserves discovery and record identities.
+        (
+            "edd8a473c52a6e2dd885f253f5969356f759c7566b00b684b49be44d12a35ac3",
+            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
+        ),
+        // Source text lookup does not change discovery or persisted records.
+        (
+            "c513520d3badb0131e4b6b80fee6f4e47900a9f72539c68df685d26fae709587",
+            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
+        ),
         // Whole-file history validation does not participate in discovery.
         (
             "75a8e2548bf5c30cc2b034e20078e1c38f1968922f9695bef151f9ac7214b95b",
@@ -611,6 +631,16 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        // Test-module placement preserves asset data and dependencies.
+        (
+            "ec70086245ac65191f96bc784e2a51b8880e6fd3abc41a47f1c71d8d4ee4e47f",
+            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
+        ),
+        // Source text lookup does not change asset data or its dependencies.
+        (
+            "e148d84d34a889c7ba7dee3ab2383964f88b29bb2b8da4ba8bec65a285bbcd6d",
+            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
+        ),
         // Whole-file history validation leaves Unity extraction unchanged.
         (
             "703eec02f425de99745600157fad3f87125c6550620a149e49610d368cf5a55e",

@@ -126,6 +126,21 @@ pub fn decode<T: serde::de::DeserializeOwned>(
     crate::binary::decode_with_size(bytes)
 }
 
+pub(super) fn source(bytes: &[u8]) -> Result<&str> {
+    ensure!(
+        bytes.len() <= MAX_SOURCE_BYTES * 32,
+        "Analysis record exceeds safety bound"
+    );
+    // FileData begins with its UTF-8 source. Borrow it directly from the read
+    // transaction; callers that need facts still use the full validated reader.
+    let (source, _) = postcard::take_from_bytes::<&str>(bytes)?;
+    ensure!(
+        source.len() <= MAX_SOURCE_BYTES,
+        "Source exceeds safety bound"
+    );
+    Ok(source)
+}
+
 pub fn encode(mut data: FileData) -> Result<Encoded> {
     validate(&data)?;
     let mut records = BTreeMap::new();
@@ -591,4 +606,25 @@ pub(crate) fn validate_encoded(encoded: &Encoded) -> Result<()> {
     ensure!(lookups.is_empty(), "Missing declaration lookup");
     ensure!(bodies.is_empty(), "Missing indexed body");
     Ok(())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn source_reads_preserve_utf8_and_reject_invalid_prefixes() {
+        for text in ["", "// λ\r\nfn café() {}\n", &"source\n".repeat(100)] {
+            let encoded = encode(FileData {
+                source: text.into(),
+                facts: Facts::default(),
+                assembly: None,
+            })
+            .unwrap();
+            assert_eq!(source(&encoded.records[DATA]).unwrap(), text);
+        }
+        for bytes in [vec![], vec![5, b'a'], vec![1, 0xff], vec![0xff; 10]] {
+            assert!(source(&bytes).is_err());
+        }
+    }
 }

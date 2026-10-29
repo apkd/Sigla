@@ -275,6 +275,12 @@ impl Store {
             .map(crate::binary::decode)
             .transpose()
     }
+    pub(crate) fn source<'t>(&self, tx: &'t RoTxn<'_>, file: &str) -> Result<Option<&'t str>> {
+        self.scope
+            .record(tx, file, payload::DATA)?
+            .map(payload::source)
+            .transpose()
+    }
     pub fn load(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<FileData>> {
         self.scope
             .record(tx, file, payload::DATA)?

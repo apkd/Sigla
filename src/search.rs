@@ -4,7 +4,7 @@ use crate::{
     store::{FileData, Store},
     workspace::{FileEntry, Manifest, Membership},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 mod native;
 use std::{
     cmp::Reverse,
@@ -1373,6 +1373,7 @@ impl<'a> Search<'a> {
             .case_insensitive(q.loose)
             .build()?;
         for (key, file) in &self.manifest.files {
+            self.check()?;
             if file.metadata || files.as_ref().is_some_and(|files| !files.contains(key)) {
                 continue;
             }
@@ -1381,6 +1382,13 @@ impl<'a> Search<'a> {
                 .iter()
                 .any(|m| self.filters(q, file, m, None, 0, &[]))
             {
+                continue;
+            }
+            let source = self
+                .source_store(key)
+                .source(&self.tx, key)?
+                .context("Missing cache record; retry query")?;
+            if !literal.is_match(source) {
                 continue;
             }
             let data = self.data(key)?;
