@@ -496,7 +496,12 @@ pub(super) fn complete(
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
 ) -> Result<Prepared> {
-    if matches!(request.contents, super::materialize::Contents::Inventory) {
+    if matches!(request.contents, super::materialize::Contents::Inventory)
+        || fs::read_dir(&request.staging)?
+            .next()
+            .transpose()?
+            .is_none()
+    {
         return Ok(prepared);
     }
     // Record raw Git identities before hydration replaces pointer files.

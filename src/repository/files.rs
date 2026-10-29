@@ -113,8 +113,11 @@ pub(super) fn reuse(
     omitted: &mut BTreeMap<String, String>,
     metrics: &mut Metrics,
 ) -> Result<()> {
+    if changed.is_empty() {
+        return Ok(());
+    }
     let aliases = read(request.store.parent().context("Git store has no owner")?);
-    if aliases.is_empty() || changed.is_empty() {
+    if aliases.is_empty() {
         return Ok(());
     }
     let files = Store::open(cache)?;

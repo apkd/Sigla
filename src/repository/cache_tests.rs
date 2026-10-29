@@ -27,6 +27,58 @@ fn candidate(path: &Path, complete: bool, sentinel: &str) {
     }
 }
 
+#[tokio::test]
+async fn unchanged_files_need_no_import_or_hydration_job() {
+    use super::super::materialize::{Contents, Target};
+    use std::collections::BTreeMap;
+
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Pool::open(cache.path(), &identity()).unwrap();
+    let telemetry = crate::telemetry::Operation::default();
+    let staging = pool.capacity.staging(&telemetry).await.unwrap();
+    let request = Request {
+        contents: Contents::All,
+        transfer_used: 0,
+        unlimited_transfer: false,
+        allow_private: false,
+        repository: identity().to_string(),
+        preferred_transport: None,
+        target: Target::Branch("main".into()),
+        store: pool.root.join("current"),
+        staging: cache.path().join("stage"),
+        include: vec![],
+        exclude: vec![],
+        required: vec![],
+        additional: vec![],
+        previous: BTreeMap::new(),
+        subdirectory: None,
+    };
+    fs::create_dir(&request.staging).unwrap();
+    let prepared = Prepared {
+        revision: "a".repeat(40),
+        selected: BTreeMap::from([("Code.cs".into(), "b".repeat(40))]),
+        tracked: BTreeMap::new(),
+        directories: BTreeSet::new(),
+        branch: Some("main".into()),
+        deferred_assets: BTreeSet::new(),
+        omitted: BTreeMap::new(),
+        transfer_bytes: 0,
+        unavailable: BTreeSet::new(),
+        transport: None,
+        resolved_target: None,
+    };
+    let completed = complete(
+        &request,
+        cache.path(),
+        prepared.clone(),
+        &pin(&pool),
+        &staging,
+        &telemetry,
+    )
+    .unwrap();
+    assert_eq!(completed.selected, prepared.selected);
+}
+
 fn publish_selector(cache: &Path, pool: &Pool, root: &Root) {
     let selected: std::collections::BTreeMap<_, _> = root
         .selected

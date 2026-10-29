@@ -247,12 +247,11 @@ mod refresh_tests {
         assert!(!pinned.refresh_due(&options, 0, u64::MAX, None));
     }
 
-    #[test]
-    fn discovery_identity_tracks_code_and_required_inputs_across_restart() {
+    fn state() -> State {
         let repository = Repository::parse("https://github.com/owner/repo")
             .unwrap()
             .unwrap();
-        let mut state = State {
+        State {
             schema: 5,
             repository: repository.identity,
             transport: repository.transport,
@@ -277,7 +276,89 @@ mod refresh_tests {
             indexed_revision: None,
             repair: false,
             additional: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn unchanged_omissions_survive_refresh_but_changed_inputs_retry() {
+        let mut before = state();
+        before.prepared.tracked = [
+            ("Same.asset".into(), "same blob".into()),
+            ("Changed.asset".into(), "old blob".into()),
+        ]
+        .into();
+        before.prepared.omitted = before
+            .prepared
+            .tracked
+            .keys()
+            .map(|path| (path.clone(), "Asset exceeds size limit".into()))
+            .collect();
+        let before: State = serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        let mut prepared = before.prepared.clone();
+        prepared.omitted.clear();
+        prepared.deferred_assets = before.prepared.tracked.keys().cloned().collect();
+        prepared
+            .tracked
+            .insert("Changed.asset".into(), "new blob".into());
+
+        for retry in [false, true] {
+            let mut prior = before.clone();
+            if retry {
+                prior.policy = "new selection rules".into();
+            }
+            let mut next = prepared.clone();
+            prior.reuse_omissions(&mut next, &before.policy);
+            assert_eq!(next.deferred_assets.contains("Same.asset"), retry);
+            assert_eq!(next.omitted.contains_key("Same.asset"), !retry);
+            assert!(next.deferred_assets.contains("Changed.asset"));
+            assert!(!next.omitted.contains_key("Changed.asset"));
+        }
+        // Required inputs are selected immediately, even when previously omitted.
+        prepared.deferred_assets.remove("Same.asset");
+        prepared
+            .selected
+            .insert("Same.asset".into(), "same blob".into());
+        before.reuse_omissions(&mut prepared, &before.policy);
+        assert!(prepared.omitted.is_empty());
+        assert!(prepared.selected.contains_key("Same.asset"));
+    }
+
+    #[test]
+    fn refresh_metadata_does_not_change_published_inputs() {
+        let before = state();
+        let mut next = before.clone();
+        next.last_use += 1;
+        next.refreshed += 1;
+        next.prepared.transfer_bytes += 1;
+        next.prepared.transport = Some("a new transport for the same repository".into());
+        assert!(before.same_inputs(&next));
+        for change in [
+            |s: &mut State| s.repair = true,
+            |s: &mut State| s.policy.push_str("changed"),
+            |s: &mut State| s.prepared.revision.push_str("changed"),
+            |s: &mut State| s.prepared.branch = Some("refs/tags/main".into()),
+            |s: &mut State| {
+                s.prepared.selected.clear();
+            },
+            |s: &mut State| {
+                s.prepared.deferred_assets.clear();
+            },
+            |s: &mut State| {
+                s.prepared.unavailable.insert("lib.rs".into());
+            },
+            |s: &mut State| {
+                s.additional.insert("Required.asset".into());
+            },
+        ] {
+            let mut changed = before.clone();
+            change(&mut changed);
+            assert!(!changed.same_inputs(&next));
+        }
+    }
+
+    #[test]
+    fn discovery_identity_tracks_code_and_required_inputs_across_restart() {
+        let mut state = state();
         let before = state.discovery_identity().unwrap();
         state
             .prepared
@@ -433,6 +514,39 @@ pub struct State {
 }
 
 impl State {
+    fn same_inputs(&self, next: &Self) -> bool {
+        !self.repair
+            && self.policy == next.policy
+            && self.additional == next.additional
+            && self.prepared.revision == next.prepared.revision
+            && self.prepared.branch == next.prepared.branch
+            && self.prepared.resolved_target == next.prepared.resolved_target
+            && self.prepared.selected == next.prepared.selected
+            && self.prepared.tracked == next.prepared.tracked
+            && self.prepared.directories == next.prepared.directories
+            && self.prepared.unavailable == next.prepared.unavailable
+            && self.prepared.omitted == next.prepared.omitted
+            && self.prepared.deferred_assets == next.prepared.deferred_assets
+    }
+
+    fn reuse_omissions(&self, prepared: &mut Prepared, policy: &str) {
+        if self.repair || self.policy != policy {
+            return;
+        }
+        // Only optional, newly deferred inputs qualify. Required inputs and
+        // changed Git blobs must pass through acquisition again.
+        prepared.deferred_assets.retain(|path| {
+            if let Some(reason) = self.prepared.omitted.get(path)
+                && prepared.tracked.get(path) == self.prepared.tracked.get(path)
+            {
+                prepared.omitted.insert(path.clone(), reason.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     pub(crate) fn discovery_identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         // Include the revision: newly tracked build inputs may not be selected yet.
@@ -1400,6 +1514,7 @@ impl Manager {
         .await??;
         prepared.branch = before.prepared.branch.clone();
         prepared.resolved_target = before.prepared.resolved_target.clone();
+        before.reuse_omissions(&mut prepared, &self.options.selection.identity);
         if assets {
             prepared.unavailable.extend(before.prepared.unavailable);
         }
@@ -1562,6 +1677,9 @@ impl Manager {
         if resolved_target.is_some() {
             prepared.resolved_target = resolved_target;
         }
+        if let Some(before) = &before {
+            before.reuse_omissions(&mut prepared, &self.options.selection.identity);
+        }
         if inventory.is_some() {
             let mut sources = prepared.clone();
             let source = stage.clone();
@@ -1618,9 +1736,26 @@ impl Manager {
                 .map(|s| s.additional.clone())
                 .unwrap_or_default(),
         };
+        let source = branch.source();
+        if before.as_ref().is_some_and(|s| s.same_inputs(&next))
+            && fs::read_dir(stage.path())?.next().transpose()?.is_none()
+            && source.is_dir()
+            && next
+                .prepared
+                .directories
+                .iter()
+                .all(|p| source.join(p).is_dir())
+        {
+            // Materialization already checked selected files. Keep the latest
+            // indexing marker, since indexing can finish during acquisition.
+            next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
+            next.repair = false;
+            branch.persist(&next)?;
+            *state = Some(next);
+            return Ok(());
+        }
         branch.persist(&next)?;
         *state = Some(next.clone());
-        let source = branch.source();
         fs::create_dir_all(&source)?;
         if let Some(before) = &before {
             for path in before
