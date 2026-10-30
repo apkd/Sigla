@@ -269,7 +269,7 @@ impl Store {
         let shards = Mutex::new(BTreeSet::new());
         let workers = std::thread::available_parallelism()
             .map_or(1, usize::from)
-            .min(4)
+            .min(8)
             .min(files.len());
         let mut stats = std::thread::scope(|scope| -> Result<ImportStats> {
             let jobs: Vec<_> = (0..workers)
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "compares imports of files already in the blob cache"]
+    #[ignore = "measures cold imports and reuse of cached files"]
     fn owned_import_performance_probe() {
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
         fs::create_dir_all(&target).unwrap();
@@ -1093,7 +1093,9 @@ mod tests {
                 fs::write(stage.join(index.to_string()), bytes).unwrap();
             }
         }
-        store.import_owned_tree(&stages[0]).unwrap();
+        let start = Instant::now();
+        let cold_stats = store.import_owned_tree(&stages[0]).unwrap();
+        let cold = start.elapsed();
         let start = Instant::now();
         store.import_tree(&stages[1]).unwrap();
         let copy = start.elapsed();
@@ -1101,8 +1103,9 @@ mod tests {
         let stats = store.import_owned_tree(&stages[2]).unwrap();
         let owned = start.elapsed();
         eprintln!(
-            "{count} files, {} bytes: copy={copy:?}, owned={owned:?}, reused={}",
+            "{count} files, {} bytes: cold={cold:?}, cold_sync={:?}, copy={copy:?}, owned={owned:?}, reused={}",
             count * bytes.len() as u64,
+            cold_stats.sync,
             stats.reused
         );
     }

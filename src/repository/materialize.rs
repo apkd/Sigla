@@ -322,7 +322,7 @@ impl<W: std::io::Write> std::io::Write for MeasuredWriter<'_, W> {
     }
 }
 
-pub const TRANSFER_LIMIT: u64 = 256 * 1024 * 1024;
+pub const TRANSFER_LIMIT: u64 = 512 * 1024 * 1024;
 
 #[cfg(test)]
 mod budget_tests {
