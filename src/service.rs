@@ -704,6 +704,29 @@ impl App {
         upstream: Option<&crate::upstream::Upstream>,
         operation: crate::telemetry::Operation,
     ) -> Result<CallToolResult> {
+        let raw = matches!(request, Request::View(_, crate::navigation::Mode::Raw));
+        if let Request::View(path, crate::navigation::Mode::Raw) = &request {
+            ensure!(
+                !path.starts_with("unity@"),
+                "Raw view requires a file path; use exact or minified mode to inspect a Unity object."
+            );
+        }
+        let result = self
+            .dispatch_routed(path, request, upstream, operation)
+            .await?;
+        if raw {
+            crate::summary::raw(result)
+        } else {
+            Ok(result)
+        }
+    }
+    async fn dispatch_routed(
+        self: &Arc<Self>,
+        path: &str,
+        request: Request,
+        upstream: Option<&crate::upstream::Upstream>,
+        operation: crate::telemetry::Operation,
+    ) -> Result<CallToolResult> {
         let deadline = tokio::time::Instant::now() + self.index_wait;
         ensure!(
             !path.trim().is_empty(),
@@ -750,6 +773,7 @@ impl App {
                     "view",
                     serde_json::json!({"codebase":project,"path":path,"mode":match mode {
                         crate::navigation::Mode::Exact => "exact",
+                        crate::navigation::Mode::Raw => "raw",
                         crate::navigation::Mode::Minified => "minified",
                     }}),
                 ),
@@ -1307,6 +1331,7 @@ impl App {
                     });
                 }
                 let root = repository_root.as_deref().unwrap_or(&manifest.root);
+                let raw = matches!(request, Request::View(_, crate::navigation::Mode::Raw));
                 let mut text = if asset_only {
                     drop(state);
                     assets
@@ -1340,7 +1365,7 @@ impl App {
                         Request::View(path, mode) => search.view(root, &path, mode, allow_absolute),
                     }
                 }?;
-                let incomplete = !pending.is_empty();
+                let incomplete = !raw && !pending.is_empty();
                 if incomplete {
                     let eta = remaining
                         .map_or(String::new(), |seconds| format!(" (~{seconds}s remaining)"));
@@ -1462,6 +1487,12 @@ impl Mcp {
         name = "search",
         description = r#"Find symbols, follow references, and explore C#, Rust, C/C++, HLSL, GLSL, and ShaderLab code.
 
+Use one search target with optional filters, in any order. A bare name is shorthand for symbol:NAME.
+method:open in:Database finds methods named open inside Database; method:* in:Database lists its methods.
+uses:Database finds code references. calls:Database.open finds calls to that method;
+calls:* in:Database.open finds calls inside it. references: and dependencies: search Unity assets.
+text:"connection failed" searches literal text, not a regular expression.
+
 Native source and shaders
 Bodies are indexed eagerly from source, without preprocessing or build configurations.
 Native references are candidates; local variables and parameters can resolve by lexical scope.
@@ -1491,11 +1522,15 @@ Filters
 project: path: namespace: access: attr: in: lang:
 lang: accepts cs, rust, c, cpp, hlsl, glsl, shaderlab, native, or shaders.
 Prefix filters with - to exclude matches.
+Filters combine with AND. Use separate queries for alternatives.
 File queries support project:, path:, and lang: filters.
+file: selects files; path: restricts another search to matching files.
 project: matches build-project names.
+namespace:Foo selects namespace declarations; symbol:* namespace:Foo selects declarations within Foo and its nested namespaces.
+Namespace filters use a namespace prefix, without wildcards.
 
 Matching
-match:exact (default)
+match:exact (default) is case-sensitive. Symbol names support * wildcards.
 match:loose broadens matching.
 
 Limits
@@ -1534,8 +1569,10 @@ file:src/**/*.cs"#,
         description = r#"Read Git history for code and files. Start with log to find a change, then use show with its commit SHA to read the diff.
 
 Select a declaration, file, directory, or source location as it appears at the codebase revision. History follows renames and moves. diff compares two commits.
+file: selects a literal filename; path: selects a file pattern, such as path:src/**/*.rs.
 
 To continue a long result, repeat the query with the returned skip: or offset: value and keep the codebase revision fixed.
+log uses skip:; show and diff use offset:.
 
 Examples
 log method:Parser.Parse
@@ -1571,7 +1608,7 @@ diff abc1234..def5678 file:src/Parser.cs"#,
     }
 
     #[tool(
-        description = "Read an indexed file by path. mode: minified (default) simplifies code for reading; exact preserves source text.\n\nExamples:\npath=\"src/Server.cs\"\npath=\"src/Server.cs:20-50\"",
+        description = "Read an indexed file by path. The mode argument accepts minified (default, simplified code), exact (source with location and Markdown), or raw (only source text, with no added newline or summary). Raw accepts line ranges and reports unavailable or ambiguous source as an error. Unity object IDs require exact or minified mode.\n\nExample arguments:\n{\"codebase\":\"/path/to/project\",\"path\":\"src/Server.cs:20-50\",\"mode\":\"raw\"}",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn view(
@@ -1801,6 +1838,55 @@ impl ServerHandler for Mcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn raw_view_preserves_source_and_reports_non_source_as_errors() {
+        use rmcp::{ServiceExt, model::CallToolRequestParams};
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = "\u{feff}first\r\n```\r\nlast";
+        std::fs::write(root.path().join("source.md"), source).unwrap();
+        for directory in ["one", "two"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+            std::fs::write(root.path().join(directory).join("same.md"), "text").unwrap();
+        }
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                1,
+            )
+            .unwrap(),
+        );
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move { Mcp::new(app).serve(server_io).await.unwrap() });
+        let client = ().serve(client_io).await.unwrap();
+        let server = server.await.unwrap();
+        for (path, expected) in [
+            ("source.md", Some(source)),
+            ("source.md:2-3", Some("```\r\nlast")),
+            ("same.md", None),
+            ("missing.md", None),
+            ("unity@object", None),
+        ] {
+            let args = serde_json::json!({"codebase":root.path(),"path":path,"mode":"raw"});
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new("view")
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["isError"] == true, expected.is_none(), "{result}");
+            if let Some(expected) = expected {
+                assert_eq!(result["content"].as_array().unwrap().len(), 1);
+                assert_eq!(result["content"][0]["text"], expected);
+            }
+        }
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
+
     #[tokio::test]
     async fn mcp_errors_identify_inputs_and_preserve_response_types() {
         use rmcp::{ServiceExt, model::CallToolRequestParams};

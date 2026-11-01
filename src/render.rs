@@ -389,6 +389,6 @@ mod tests {
             "> Cannot open `/A folder/missing`: No such file or directory."
         );
         let error = crate::query::Query::parse("unknownfilter:value").unwrap_err();
-        assert_eq!(super::error(&error), "> Unknown qualifier `unknownfilter`.");
+        assert!(super::error(&error).starts_with("> Unknown qualifier `unknownfilter`."));
     }
 }

@@ -115,13 +115,14 @@ impl FileEntry {
     pub(crate) fn read_source(
         &self,
         cancel: &dyn crate::cancellation::Cancellation,
+        raw: bool,
     ) -> Result<crate::memory::Source<String>> {
         crate::memory::Source::read(self.stamp.size, cancel, || {
             ensure!(
                 Stamp::read(&self.path)? == self.stamp,
                 "Source changed; retry query"
             );
-            let source = read_stable(&self.path, self.language)?;
+            let source = read_stable_with(&self.path, self.language, raw)?;
             ensure!(
                 Stamp::read(&self.path)? == self.stamp,
                 "Source changed; retry query"
@@ -148,6 +149,9 @@ pub struct Manifest {
 
 impl Manifest {
     pub(crate) fn sources_current(&self) -> bool {
+        self.changed_sources_current(None)
+    }
+    pub(crate) fn changed_sources_current(&self, changes: Option<&crate::watch::Changes>) -> bool {
         self.metadata
             .iter()
             .chain(
@@ -156,6 +160,7 @@ impl Manifest {
                     .chain(self.deferred.values())
                     .map(|file| (&file.path, &file.stamp)),
             )
+            .filter(|(path, _)| changes.is_none_or(|changes| changes.affects(path)))
             .all(|(path, stamp)| Stamp::read_metadata(path).as_ref().ok() == Some(stamp))
     }
     pub fn metadata_visible(&self, file: &FileEntry, project: usize) -> bool {
@@ -316,12 +321,12 @@ impl Workspace {
                 }
             }
         }
-        let (dirty, fence) = self.monitor.fence(&self.directories, self.fence);
+        let (changes, fence) = self.monitor.changes(&self.directories, self.fence);
         let policy_current = self.manifest.discovery_policy
             == self
                 .policy
                 .discovery_identity(self.manifest.metadata.keys())?;
-        if self.initialized && !dirty && policy_current && self.store.manifest_current()? {
+        if self.initialized && !changes.any() && policy_current && self.store.manifest_current()? {
             return Ok(None);
         }
         let cache_current = self.store.manifest_current()?;
@@ -329,6 +334,7 @@ impl Workspace {
             .manifest
             .metadata
             .iter()
+            .filter(|(path, _)| !self.initialized || changes.affects(path))
             .find(|(p, s)| Stamp::read_metadata(p).as_ref().ok() != Some(s))
             .map(|(path, _)| path);
         let changed_source = self
@@ -336,6 +342,7 @@ impl Workspace {
             .files
             .values()
             .chain(self.manifest.deferred.values())
+            .filter(|file| !self.initialized || changes.affects(&file.path))
             .find(|f| Stamp::read(&f.path).as_ref().ok() != Some(&f.stamp))
             .map(|file| &file.path);
         let metadata_changed =
@@ -516,24 +523,36 @@ impl Workspace {
                 continue;
             }
             let modules = if input.language == Language::Rust {
-                let modules = self.store.current(&key, &stamp).and_then(|cached| {
-                    cached.map_or_else(
-                        || {
-                            if let Some(identity) = input_identity(&input, project, &stamp)?
-                                && let Some(object) = self.store.scope.input(&identity)?
-                                && let Some(modules) = self.store.object_modules(&object)?
-                            {
-                                return Ok(modules);
-                            }
-                            let _admission = crate::memory::admit_file(stamp.size, false, &())?;
-                            Ok(crate::extract::rust_modules(
-                                &read_stable(&input.path, input.language)?,
-                                &project.edition,
-                            ))
-                        },
-                        Ok,
+                // The key includes the Rust edition; matching stamps keep syntax facts valid.
+                let retained = self
+                    .manifest
+                    .files
+                    .get(&key)
+                    .filter(|file| file.stamp == stamp)
+                    .map(|file| file.modules.clone());
+                let modules = retained
+                    .map_or_else(
+                        || self.store.current(&key, &stamp),
+                        |modules| Ok(Some(modules)),
                     )
-                });
+                    .and_then(|cached| {
+                        cached.map_or_else(
+                            || {
+                                if let Some(identity) = input_identity(&input, project, &stamp)?
+                                    && let Some(object) = self.store.scope.input(&identity)?
+                                    && let Some(modules) = self.store.object_modules(&object)?
+                                {
+                                    return Ok(modules);
+                                }
+                                let _admission = crate::memory::admit_file(stamp.size, false, &())?;
+                                Ok(crate::extract::rust_modules(
+                                    &read_stable(&input.path, input.language)?,
+                                    &project.edition,
+                                ))
+                            },
+                            Ok,
+                        )
+                    });
                 match modules {
                     Ok(modules) => modules,
                     Err(error) => {
@@ -667,6 +686,8 @@ impl Workspace {
     }
 
     pub(crate) fn apply_plan(&mut self, plan: IndexPlan) -> Result<()> {
+        // Interrupted publications must probe the persisted bindings again.
+        let reuse_current = self.initialized && self.store.manifest_current()?;
         self.initialized = false;
         let indexing_started = std::time::Instant::now();
         self.store.begin_refresh()?;
@@ -699,7 +720,20 @@ impl Workspace {
                 metadata: file.metadata,
             })
             .collect();
-        let mut indexed = index_sources(&self.store, &inputs, &manifest.projects)?;
+        let changed = inputs
+            .iter()
+            .zip(manifest.files.iter())
+            .filter(|(_, (key, file))| {
+                !reuse_current
+                    || self
+                        .manifest
+                        .files
+                        .get(*key)
+                        .is_none_or(|old| old.stamp != file.stamp)
+            })
+            .map(|(input, _)| input.clone())
+            .collect();
+        let mut indexed = index_sources(&self.store, &changed, &manifest.projects)?;
         for input in inputs {
             let project = &manifest.projects[input.project];
             let stamp = Stamp::read(&input.path)?;
@@ -708,6 +742,15 @@ impl Workspace {
                 manifest.files.get(&key).is_some_and(|f| f.stamp == stamp),
                 "File changed during indexing; retry query"
             );
+            if reuse_current
+                && self
+                    .manifest
+                    .files
+                    .get(&key)
+                    .is_some_and(|file| file.stamp == stamp)
+            {
+                continue;
+            }
             let extracted = indexed
                 .remove(&key)
                 .filter(|(before, _)| before == &stamp)
@@ -1418,6 +1461,10 @@ fn index_sources(
 }
 
 fn read_stable(path: &Path, language: Language) -> Result<String> {
+    read_stable_with(path, language, false)
+}
+
+fn read_stable_with(path: &Path, language: Language, raw: bool) -> Result<String> {
     for _ in 0..2 {
         let before = Stamp::read(path)?;
         let bytes = std::fs::read(path)?;
@@ -1429,7 +1476,13 @@ fn read_stable(path: &Path, language: Language) -> Result<String> {
         let after = Stamp::read(path)?;
         if before == after {
             return tracing::debug_span!("decode_source",path=%path.display())
-                .in_scope(|| decode_owned(bytes, language))
+                .in_scope(|| {
+                    if raw {
+                        decode_raw(bytes, language)
+                    } else {
+                        decode_owned(bytes, language)
+                    }
+                })
                 .with_context(|| {
                     format!(
                         "Cannot decode source {}",

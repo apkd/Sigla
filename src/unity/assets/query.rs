@@ -378,6 +378,48 @@ impl Index {
     pub fn view(&self, path: &str) -> Result<Option<String>> {
         self.view_with_cancel(path, &())
     }
+    pub(crate) fn view_raw(&self, path: &str, cancel: &dyn Cancellation) -> Result<Option<String>> {
+        ensure!(
+            !path.starts_with("unity@"),
+            "Raw view requires a file path; Unity object IDs describe composed objects. Use exact or minified mode to inspect an object."
+        );
+        let (path, range) = crate::navigation::location(path)?;
+        let matches =
+            crate::navigation::matches(self.assets.values().map(|a| a.path.as_str()), path);
+        let assets: Vec<_> = self
+            .assets
+            .values()
+            .filter(|a| matches.contains(&a.path.as_str()))
+            .collect();
+        if assets.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            assets.len() == 1,
+            "Asset path is ambiguous across Unity projects"
+        );
+        let asset = assets[0];
+        if asset.content.is_none() && asset.path.ends_with(".cs") {
+            return Ok(None);
+        }
+        ensure!(
+            asset.unavailable.is_none(),
+            "Asset source is unavailable: {}",
+            asset.unavailable.as_deref().unwrap_or_default()
+        );
+        let parsed = content(asset, cancel)?;
+        ensure!(
+            parsed.omissions.is_empty(),
+            "Complete asset source is unavailable; cached asset content has omitted regions. Use exact mode to inspect retained content."
+        );
+        let source: String = parsed.fragments.into_iter().map(|f| f.text).collect();
+        ensure!(
+            source.len() == parsed.bytes,
+            "Complete asset source is unavailable"
+        );
+        let (range, _, _) = crate::navigation::lines(&source, range)?;
+        Ok(Some(source[range].to_owned()))
+    }
     pub(crate) fn view_with_cancel(
         &self,
         path: &str,
@@ -668,6 +710,27 @@ mod tests {
             },
         );
         (root, index)
+    }
+
+    #[test]
+    fn raw_asset_views_preserve_complete_source_and_reject_objects() {
+        let source = "%YAML 1.1\r\n--- !u!1 &1\r\nGameObject:\r\n  m_Name: Example";
+        let (_root, index) = index(source);
+        assert_eq!(
+            index
+                .view_raw("Assets/Object.prefab", &())
+                .unwrap()
+                .unwrap(),
+            source
+        );
+        assert_eq!(
+            index
+                .view_raw("Assets/Object.prefab:4", &())
+                .unwrap()
+                .unwrap(),
+            "  m_Name: Example"
+        );
+        assert!(index.view_raw(&handle("fixture", "1"), &()).is_err());
     }
 
     fn search(index: &Index, needle: &str) -> Vec<(usize, SearchResult)> {

@@ -221,6 +221,14 @@ pub(crate) fn decode_owned(bytes: Vec<u8>, language: Language) -> anyhow::Result
     }
 }
 
+/// Preserve authored UTF-8 text, including its byte order mark, for raw views.
+pub(crate) fn decode_raw(bytes: Vec<u8>, language: Language) -> anyhow::Result<String> {
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) => decode(error.as_bytes(), language),
+    }
+}
+
 pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
     if language != Language::Rust
         && (bytes.starts_with(&[0xff, 0xfe, 0, 0]) || bytes.starts_with(&[0, 0, 0xfe, 0xff]))

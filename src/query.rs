@@ -119,6 +119,174 @@ fn qualifier(token: &str) -> Option<(&str, &str)> {
     Some((&token[..split], &token[split + 1..]))
 }
 
+fn canonical_key(key: &str) -> &str {
+    match key {
+        "t" => "type",
+        "c" => "class",
+        "i" => "interface",
+        "m" => "method",
+        "x" => "text",
+        "language" => "lang",
+        "call" => "calls",
+        "use" => "uses",
+        "write" => "writes",
+        "reference" => "references",
+        "dependency" => "dependencies",
+        "attribute" => "attr",
+        other => other,
+    }
+}
+
+fn token_target(token: &str) -> (&str, &str) {
+    qualifier(token).map_or(("symbol", token), |(key, value)| {
+        (canonical_key(key), value)
+    })
+}
+
+/// Render suggestions through the same quoting rules as query input.
+pub(crate) fn suggestion(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| {
+            let token = if let Some((key, value)) = qualifier(token) {
+                let sign = if key.starts_with('-') { "-" } else { "" };
+                format!(
+                    "{sign}{}:{value}",
+                    canonical_key(key.trim_start_matches('-'))
+                )
+            } else {
+                token.clone()
+            };
+            crate::navigation::quote(&token)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn conflict(tokens: &[String], second: usize) -> String {
+    let is_target = |token: &str| {
+        let (key, _) = token_target(token);
+        key != "namespace" && SELECTORS.contains(&key)
+    };
+    let two_targets = tokens.iter().filter(|t| is_target(t)).count() == 2;
+    let first = tokens[..second]
+        .iter()
+        .position(|t| {
+            let (key, _) = token_target(t);
+            key != "namespace" && SELECTORS.contains(&key)
+        })
+        .expect("a preceding primary selector");
+    let (a, av) = token_target(&tokens[first]);
+    let (b, bv) = token_target(&tokens[second]);
+    let describe = |i: usize| {
+        if qualifier(&tokens[i]).is_none() {
+            format!("bare name {}", crate::render::inline(&tokens[i]))
+        } else {
+            crate::render::inline(&suggestion(&tokens[i..=i]))
+        }
+    };
+    let mut message = format!(
+        "{} and {} both specify search targets.",
+        describe(first),
+        describe(second)
+    );
+    let corrected = |replace: usize, value: String, remove: usize| {
+        let mut copy = tokens.to_vec();
+        copy[replace] = value;
+        copy.remove(remove);
+        suggestion(&copy)
+    };
+    let declaration = |key: &str| {
+        !matches!(
+            key,
+            "uses"
+                | "calls"
+                | "writes"
+                | "derived"
+                | "impl"
+                | "file"
+                | "text"
+                | "instance"
+                | "references"
+                | "dependencies"
+        )
+    };
+    let wildcard =
+        if two_targets && av == "*" && declaration(a) && qualifier(&tokens[second]).is_none() {
+            Some((first, second, a, bv))
+        } else if two_targets && bv == "*" && declaration(b) && qualifier(&tokens[first]).is_none()
+        {
+            Some((second, first, b, av))
+        } else {
+            None
+        };
+    if let Some((selector, bare, key, value)) = wildcard {
+        message.push_str(&format!(
+            " To find a {key} named {}, use: {}.",
+            crate::render::inline(value),
+            crate::render::inline(&corrected(selector, format!("{key}:{value}"), bare))
+        ));
+    } else if two_targets && ((a == "file" && declaration(b)) || (b == "file" && declaration(a))) {
+        let (index, value) = if a == "file" {
+            (first, av)
+        } else {
+            (second, bv)
+        };
+        let mut copy = tokens.to_vec();
+        copy[index] = format!("path:{value}");
+        message.push_str(&format!(
+            " `file:` selects files. To restrict declaration search to a file, use: {}.",
+            crate::render::inline(&suggestion(&copy))
+        ));
+    } else if a == "text"
+        && tokens[second..]
+            .iter()
+            .all(|t| qualifier(t).is_none() || !is_target(t))
+    {
+        let words = tokens[second..]
+            .iter()
+            .filter(|t| qualifier(t).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let copy = tokens
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| *i < second || qualifier(t).is_some())
+            .map(|(i, t)| {
+                if i == first {
+                    format!("text:{av} {}", words.join(" "))
+                } else {
+                    t.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        message.push_str(&format!(
+            " The bare words are outside the text value. To search for the phrase, use: {}.",
+            crate::render::inline(&suggestion(&copy))
+        ));
+    } else {
+        let separate = |keep: usize| {
+            tokens
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| *i == keep || !is_target(t))
+                .map(|(_, t)| t.clone())
+                .collect::<Vec<_>>()
+        };
+        let left = separate(first);
+        let right = separate(second);
+        message.push_str(&format!(
+            " Search separately: {} or {}.",
+            crate::render::inline(&suggestion(&left)),
+            crate::render::inline(&suggestion(&right))
+        ));
+        if qualifier(&tokens[first]).is_none() && qualifier(&tokens[second]).is_none() {
+            message.push_str(" To search a text phrase, use `text:` with a double-quoted value.");
+        }
+    }
+    message
+}
+
 fn natural_language_guidance(input: &str, tokens: &[String]) -> &'static str {
     if input.contains('"') || tokens.iter().any(|t| qualifier(t).is_some()) {
         return "";
@@ -151,22 +319,25 @@ impl Query {
         let mut limit = None;
         let mut offset = false;
         let mut wait_complete = false;
-        for token in &tokens {
+        for (index, token) in tokens.iter().enumerate() {
             let (raw_key, value) = qualifier(token).unwrap_or(("symbol", token.as_str()));
             let negate = raw_key.starts_with('-');
-            let key = match raw_key.trim_start_matches('-') {
-                "t" => "type",
-                "c" => "class",
-                "i" => "interface",
-                "m" => "method",
-                "x" => "text",
-                "language" => "lang",
-                x => x,
-            };
+            let key = canonical_key(raw_key.trim_start_matches('-'));
+            if value.is_empty()
+                && SELECTORS.contains(&key)
+                && !matches!(key, "text" | "references" | "dependencies")
+            {
+                let mut copy = tokens.clone();
+                copy[index] = format!("{key}:*");
+                bail!(
+                    "`{key}:` needs a name or wildcard. To enumerate matches, use: {}.",
+                    crate::render::inline(&suggestion(&copy))
+                );
+            }
             ensure!(!value.is_empty(), "`{key}:` needs a value.");
             ensure!(
                 !negate || FILTERS.contains(&key),
-                "Only metadata and containment filters can be negated."
+                "Search targets cannot be negated. Exclude a scope with `-path:` or `-in:` instead."
             );
             match key {
                 "wait" => {
@@ -192,7 +363,7 @@ impl Query {
                         .ok()
                         .filter(|n| (1..=MAX_LIMIT).contains(n));
                     limit = Some(n.ok_or_else(|| {
-                        anyhow::anyhow!("`limit:` must be between `1` and `{MAX_LIMIT}`.")
+                        anyhow::anyhow!("`limit:` must be between `1` and `{MAX_LIMIT}`. Omit it to use the default limit.")
                     })?);
                 }
                 "namespace" => namespaces.push(Filter {
@@ -208,12 +379,16 @@ impl Query {
                 k if SELECTORS.contains(&k) => {
                     ensure!(
                         primary.is_none(),
-                        "Use one primary selector per query.{}",
+                        "{}{}",
+                        conflict(&tokens, index),
                         natural_language_guidance(input, &tokens)
                     );
                     primary = Some((k.to_owned(), value.to_owned()));
                 }
-                _ => bail!("Unknown qualifier {}.", crate::render::inline(key)),
+                _ => bail!(
+                    "Unknown qualifier {}. Select a target with `symbol:`, `method:`, `calls:`, `uses:`, `text:`, or `file:`; narrow it with `in:`, `path:`, `project:`, or `lang:`.",
+                    crate::render::inline(key)
+                ),
             }
         }
         if primary.is_none() && namespaces.first().is_some_and(|f| !f.negate) {
@@ -225,7 +400,9 @@ impl Query {
             primary = Some(("symbol".into(), "*".into()));
         }
         let (selector, value) = primary.ok_or_else(|| {
-            anyhow::anyhow!("Provide a search target; use `symbol:*` with filters.")
+            let mut copy = vec!["symbol:*".into()];
+            copy.extend(tokens.iter().cloned());
+            anyhow::anyhow!("Filters specify where to search, but no search target was provided. To list declarations, use: {}.", crate::render::inline(&suggestion(&copy)))
         })?;
         if offset {
             let filters = if selector == "file" {
@@ -247,6 +424,24 @@ impl Query {
         }
         if selector == "file" {
             globset::Glob::new(&value)?;
+            if filters.iter().any(|f| f.key == "in")
+                && filters
+                    .iter()
+                    .all(|f| matches!(f.key.as_str(), "in" | "path" | "project" | "lang"))
+            {
+                let mut copy = vec!["symbol:*".into()];
+                copy.extend(tokens.iter().map(|token| {
+                    if token_target(token).0 == "file" {
+                        format!("path:{value}")
+                    } else {
+                        token.clone()
+                    }
+                }));
+                bail!(
+                    "`in:` restricts declarations or text to a containing symbol. To explore declarations in these files, use: {}.",
+                    crate::render::inline(&suggestion(&copy))
+                );
+            }
             ensure!(
                 filters
                     .iter()
@@ -321,13 +516,21 @@ impl Query {
 
 impl Target {
     pub fn parse(value: &str) -> Result<Self> {
-        if let Some(path) = value.strip_prefix('@') {
+        if let Some(path) = value.strip_prefix('@').filter(|path| !path.contains("::")) {
+            let location_error = || {
+                anyhow::anyhow!(
+                    "Search locations use `@path:line:column` with positive coordinates. To read lines instead, use `view` with a path such as `src/File.cs:20`."
+                )
+            };
+            if !path.contains("::") && path.contains(':') && path.matches(':').count() < 2 {
+                return Err(location_error());
+            }
             let mut parts = path.rsplitn(3, ':');
             if let (Some(column), Some(line), Some(path)) =
                 (parts.next(), parts.next(), parts.next())
             {
-                let line = line.parse::<usize>()?;
-                let column = column.parse::<usize>()?;
+                let line = line.parse::<usize>().map_err(|_| location_error())?;
+                let column = column.parse::<usize>().map_err(|_| location_error())?;
                 ensure!(
                     line > 0 && column > 0 && !path.is_empty(),
                     "Locations use `@path:line:column` with positive coordinates."
@@ -617,16 +820,83 @@ pub fn qualified_name_rank(pattern: &str, value: &str, loose: bool) -> Option<u8
 mod tests {
     use super::*;
     #[test]
+    fn conflict_corrections_preserve_scope_and_target() {
+        for (input, expected) in [
+            (
+                "method:* in:Database open path:\"my source/**\"",
+                "method:open in:Database path:\"my source/**\"",
+            ),
+            (
+                "open path:src/** method:* in:Database",
+                "method:open path:src/** in:Database",
+            ),
+            (
+                "method:open file:src/db.rs lang:rust",
+                "method:open path:src/db.rs lang:rust",
+            ),
+            (
+                "text:connection failed again path:src/**",
+                "text:\"connection failed again\" path:src/**",
+            ),
+            (
+                "text:connection failed path:src/** again",
+                "text:\"connection failed again\" path:src/**",
+            ),
+        ] {
+            let expected = serde_json::to_value(Query::parse(expected).unwrap()).unwrap();
+            let error = Query::parse(input).unwrap_err().to_string();
+            assert!(
+                error
+                    .split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .filter_map(|s| Query::parse(s).ok())
+                    .any(|q| serde_json::to_value(q).unwrap() == expected),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_names_share_canonical_semantics() {
+        for (alias, canonical) in [
+            ("call", "calls"),
+            ("use", "uses"),
+            ("write", "writes"),
+            ("reference", "references"),
+            ("dependency", "dependencies"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(Query::parse(&format!("{alias}:Target")).unwrap()).unwrap(),
+                serde_json::to_value(Query::parse(&format!("{canonical}:Target")).unwrap())
+                    .unwrap()
+            );
+        }
+        let query = Query::parse("symbol:* -attribute:Hidden").unwrap();
+        assert_eq!(query.filters[0].key, "attr");
+        assert!(query.filters[0].negate);
+    }
+
+    #[test]
+    fn incomplete_locations_do_not_become_symbol_searches() {
+        for input in ["@src/db.rs:20", "@src/db.rs:bad:2", "@src/db.rs:2:bad"] {
+            assert!(Target::parse(input).is_err());
+        }
+        assert!(Target::parse("@class").unwrap().location.is_none());
+        assert!(Target::parse("module::item").unwrap().location.is_none());
+        assert!(Target::parse("@src/db.rs:20:3").unwrap().location.is_some());
+    }
+
+    #[test]
     fn prose_errors_preserve_the_error_and_offer_valid_recovery_queries() {
-        let ordinary = Query::parse("Alpha Beta").unwrap_err().to_string();
         for input in [
             "Rust CLI argument parsing for --account and --to; grant summary/status output; authentication and execution identity handling; native error reporting and desktop session requirements",
             "How are fields and methods used in the project?",
         ] {
             let message = Query::parse(input).unwrap_err().to_string();
-            assert!(message.starts_with(&ordinary));
-            assert!(message.len() > ordinary.len());
-            let suggestions: Vec<_> = message
+            assert!(message.contains("search targets"));
+            let guidance = natural_language_guidance(input, &lex(input).unwrap());
+            let suggestions: Vec<_> = guidance
                 .split('`')
                 .skip(1)
                 .step_by(2)
@@ -640,7 +910,6 @@ mod tests {
 
     #[test]
     fn structured_and_ambiguous_errors_keep_the_ordinary_diagnostic() {
-        let ordinary = Query::parse("Alpha Beta").unwrap_err().to_string();
         for input in [
             "Alpha Beta",
             "How Parse",
@@ -650,9 +919,9 @@ mod tests {
             "Find the fields and methods for a project \"name with spaces\"",
             "method:Parse text:hello",
         ] {
-            assert_eq!(
-                Query::parse(input).unwrap_err().to_string(),
-                ordinary,
+            assert!(Query::parse(input).is_err(), "{input}");
+            assert!(
+                natural_language_guidance(input, &lex(input).unwrap()).is_empty(),
                 "{input}"
             );
         }
@@ -660,9 +929,9 @@ mod tests {
             "t", "c", "i", "m", "x", "language", "wait", "offset", "match", "limit",
         ]) {
             let input = format!("Find the fields and methods for a project {key}:Example");
-            assert_eq!(
-                Query::parse(&input).unwrap_err().to_string(),
-                ordinary,
+            assert!(Query::parse(&input).is_err(), "{input}");
+            assert!(
+                natural_language_guidance(&input, &lex(&input).unwrap()).is_empty(),
                 "{input}"
             );
         }

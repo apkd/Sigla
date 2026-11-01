@@ -72,7 +72,13 @@ pub(crate) fn repository(
             };
             Ok(Some((
                 *language,
-                bytes.map(|bytes| crate::model::decode_owned(bytes, *language))?,
+                bytes.map(|bytes| {
+                    if mode == crate::navigation::Mode::Raw {
+                        crate::model::decode_raw(bytes, *language)
+                    } else {
+                        crate::model::decode_owned(bytes, *language)
+                    }
+                })?,
             )))
         },
     )?;
@@ -100,6 +106,19 @@ impl Sources<'_> {
     }
     pub fn filter_hint(&self, q: &Query) -> Option<String> {
         for filter in q.filters.iter().filter(|f| !f.negate) {
+            if filter.key == "namespace"
+                && let Some(prefix) = filter
+                    .value
+                    .strip_suffix(".*")
+                    .or_else(|| filter.value.strip_suffix("::*"))
+            {
+                return Some(format!(
+                    "No matches. Namespace filters use a component prefix. To include nested namespaces, use {}.",
+                    crate::render::inline(&crate::query::suggestion(&[format!(
+                        "namespace:{prefix}"
+                    )]))
+                ));
+            }
             if filter.key == "project"
                 && !self
                     .manifest
@@ -128,6 +147,18 @@ impl Sources<'_> {
                         .join(", "),
                     if names.len() > 4 { ", …" } else { "" }
                 ));
+            }
+        }
+        if q.filters.iter().filter(|f| f.key == "lang").count() > 1 {
+            use crate::model::Language::*;
+            // Use file semantics too: headers and ShaderLab can contain several dialects.
+            if ![
+                CSharp, Rust, Markdown, Text, C, Cpp, Header, Hlsl, Glsl, ShaderLab,
+            ]
+            .into_iter()
+            .any(|language| q.file_language_filters(language))
+            {
+                return Some("No matches. The language filters have no common language. Filters combine with AND; use separate queries for alternatives.".into());
             }
         }
         None
@@ -245,7 +276,11 @@ impl Sources<'_> {
     ) -> Result<String> {
         self.check()?;
         if let Some(assets) = self.assets
-            && let Some(text) = assets.view_with_cancel(path, self.cancel)?
+            && let Some(text) = if mode == crate::navigation::Mode::Raw {
+                assets.view_raw(path, self.cancel)?
+            } else {
+                assets.view_with_cancel(path, self.cancel)?
+            }
         {
             return Ok(text);
         }
@@ -263,7 +298,10 @@ impl Sources<'_> {
                     .get(key)
                     .or_else(|| self.manifest.deferred.get(key))
                     .unwrap();
-                Ok(Some((file.language, file.read_source(self.cancel)?)))
+                Ok(Some((
+                    file.language,
+                    file.read_source(self.cancel, mode == crate::navigation::Mode::Raw)?,
+                )))
             },
         )?
         .context("Source contents are unavailable")
@@ -351,7 +389,15 @@ fn view<T>(
         (path.as_str(), file)
     } else {
         let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
+        if mode == crate::navigation::Mode::Raw && matches.is_empty() {
+            return Ok(None);
+        }
         if matches.len() != 1 {
+            ensure!(
+                mode != crate::navigation::Mode::Raw,
+                "{}",
+                crate::navigation::choices(&matches, "files", &path)
+            );
             return Ok(Some(crate::navigation::choices(&matches, "files", &path)));
         }
         let path = matches[0];
@@ -362,6 +408,7 @@ fn view<T>(
     };
     let (range, first, last) = crate::navigation::lines(&source, requested)?;
     let (body, tag) = match mode {
+        crate::navigation::Mode::Raw => return Ok(Some(source[range].to_owned())),
         crate::navigation::Mode::Exact => (source[range].to_owned(), language.tag()),
         crate::navigation::Mode::Minified => (
             crate::minify::render_admitted(&source, language, range, cancel)?,
@@ -382,6 +429,36 @@ fn view<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filter_hints_respect_language_overlap_and_namespace_prefixes() {
+        let manifest = Manifest::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let sources = Sources {
+            manifest: &manifest,
+            assets: None,
+            cancel: &cancel,
+        };
+        assert!(
+            sources
+                .filter_hint(&Query::parse("symbol:* lang:rust lang:cs").unwrap())
+                .is_some()
+        );
+        for input in [
+            "symbol:* lang:c lang:cpp",
+            "symbol:* lang:native lang:cpp",
+            "symbol:* namespace:Example",
+        ] {
+            assert!(
+                sources.filter_hint(&Query::parse(input).unwrap()).is_none(),
+                "{input}"
+            );
+        }
+        assert!(
+            sources
+                .filter_hint(&Query::parse("symbol:* namespace:Example.*").unwrap())
+                .is_some()
+        );
+    }
 
     #[test]
     fn exact_view_remains_available_while_parser_is_busy() {
@@ -509,6 +586,25 @@ mod tests {
         .unwrap();
         assert!(text.contains("class Example {}"));
         assert!(!text.contains("first line"));
+        let raw_source = "\u{feff}// first line\r\nclass Example {}";
+        let raw = repository(
+            root.path(),
+            None,
+            &prepared,
+            "Code.cs",
+            Some(crate::navigation::Mode::Raw),
+            &(),
+            |_| {
+                Ok(Some(crate::memory::Source::read(
+                    raw_source.len() as u64,
+                    &(),
+                    || Ok(raw_source.as_bytes().to_vec()),
+                )?))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw, raw_source);
         assert!(
             repository(
                 root.path(),

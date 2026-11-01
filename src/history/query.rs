@@ -66,7 +66,13 @@ impl Request {
         let endpoint = if verb == "log" {
             None
         } else {
-            Some(tokens.next().context("Missing comparison endpoint")?)
+            Some(tokens.next().with_context(|| {
+                if verb == "show" {
+                    "`show` needs a commit: `show COMMIT`."
+                } else {
+                    "`diff` needs two revisions: `diff FROM..TO`."
+                }
+            })?)
         };
         let mut controls = std::collections::BTreeMap::new();
         let mut selected = Vec::new();
@@ -79,7 +85,30 @@ impl Request {
                     "show" => matches!(key, "parent" | "offset"),
                     _ => key == "offset",
                 };
-                ensure!(valid, "{key}: is not valid for {verb}");
+                if verb == "log" && key == "offset" {
+                    let corrected = crate::query::lex_history(input)?
+                        .into_iter()
+                        .map(|token| {
+                            token
+                                .strip_prefix("offset:")
+                                .map_or_else(|| token.clone(), |value| format!("skip:{value}"))
+                        })
+                        .collect::<Vec<_>>();
+                    anyhow::bail!(
+                        "`log` continues with `skip:N`. Use: {}.",
+                        crate::render::inline(&crate::query::suggestion(&corrected))
+                    );
+                }
+                ensure!(
+                    valid,
+                    "{key}: is not valid for {verb}. {}",
+                    match verb.as_str() {
+                        "log" => "`log` continues with `skip:N` and accepts `limit:N`.",
+                        "show" =>
+                            "`show` continues with the returned `offset:N` and accepts `parent:N`.",
+                        _ => "`diff` continues with the returned `offset:N`.",
+                    }
+                );
                 ensure!(
                     controls.insert(key.to_owned(), number(value)?).is_none(),
                     "Duplicate {key}: control"

@@ -3,9 +3,10 @@ pub(crate) mod sources;
 use anyhow::{Result, ensure};
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::LazyLock};
 
-#[derive(Clone, Copy, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
+    Raw,
     Exact,
     #[default]
     Minified,
@@ -104,9 +105,10 @@ impl std::str::FromStr for Mode {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
         match value {
+            "raw" => Ok(Self::Raw),
             "exact" => Ok(Self::Exact),
             "minified" => Ok(Self::Minified),
-            _ => anyhow::bail!("Use mode `exact` or `minified`"),
+            _ => anyhow::bail!("Use mode `raw`, `exact`, or `minified`"),
         }
     }
 }

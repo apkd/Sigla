@@ -343,7 +343,13 @@ impl Tracker {
             }
             Selector::File(path) | Selector::Text { path, .. } => {
                 let entry = tree.get(path).filter(|e| matches!(e.mode, 0o100644 | 0o100755))
-                    .with_context(|| format!("Target file is absent or excluded by committed source attributes at {}: {path}", commit.id))?;
+                    .with_context(|| {
+                        let mut message = format!("Target file is absent or excluded by committed source attributes at {}: {path}", commit.id);
+                        if matches!(selector, Selector::File(_)) && path.contains(['*', '?', '[', '{']) {
+                            message.push_str(&format!(". `file:` selects a literal filename. To select files with a pattern, use {}.", crate::render::inline(&crate::query::suggestion(&[format!("path:{path}")]))));
+                        }
+                        message
+                    })?;
                 ensure!(
                     regions::language(path).is_some(),
                     "Unsupported source path {path}; binary/LFS payloads are not fetched"

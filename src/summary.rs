@@ -13,6 +13,37 @@ use std::{
 const CONTEXT: &str = "sigla/repository";
 const PREAMBLE: &str = "sigla/repository-summary";
 
+/// Raw source responses never carry session presentation, including through proxies.
+pub(crate) fn raw(mut result: CallToolResult) -> anyhow::Result<CallToolResult> {
+    if result.is_error == Some(true) {
+        return Ok(result);
+    }
+    anyhow::ensure!(
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.get("complete"))
+            .and_then(|v| v.as_bool())
+            != Some(false),
+        "Source is not available yet; retry after preparation completes."
+    );
+    if let Some(meta) = &mut result.meta {
+        meta.0.remove(CONTEXT);
+    }
+    result.content.retain(|block| {
+        !block.as_text().is_some_and(|text| {
+            text.meta
+                .as_ref()
+                .is_some_and(|m| m.0.get(PREAMBLE) == Some(&serde_json::Value::Bool(true)))
+        })
+    });
+    anyhow::ensure!(
+        result.content.len() == 1 && result.content[0].as_text().is_some(),
+        "Raw view requires exactly one source text block"
+    );
+    Ok(result)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Summary {
     pub key: String,
@@ -244,6 +275,18 @@ fn present(mut result: CallToolResult, first: impl FnOnce(String) -> bool) -> Ca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_source_bypasses_summary_and_rejects_pending_results() {
+        let presented = Session::default().present(response("repo", "summary"));
+        let raw = super::raw(presented).unwrap();
+        let presented = Session::default().present(raw);
+        assert_eq!(presented.content.len(), 1);
+        assert_eq!(presented.content[0].as_text().unwrap().text, "result");
+        let mut pending = CallToolResult::success(vec![ContentBlock::text("pending")]);
+        pending.structured_content = Some(serde_json::json!({"complete":false}));
+        assert!(super::raw(pending).is_err());
+    }
 
     fn response(key: &str, table: &str) -> CallToolResult {
         let mut result = CallToolResult::success(vec![ContentBlock::text("result")]);

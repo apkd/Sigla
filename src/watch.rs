@@ -1,7 +1,7 @@
 //! shared, nonrecursive Linux directory watches with a metadata-poll fallback.
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -19,14 +19,54 @@ impl Snapshot {
     pub fn changed(&self) -> bool {
         self.monitor.fence(&self.paths, self.generation).0
     }
+    pub(crate) fn changes(&self) -> Changes {
+        self.monitor.changes(&self.paths, self.generation).0
+    }
 }
+
+/// A bounded event history. Missing coverage always requires full validation.
+#[derive(Default)]
+pub(crate) struct Changes {
+    full: bool,
+    paths: BTreeSet<PathBuf>,
+    trees: BTreeSet<PathBuf>,
+}
+impl Changes {
+    pub(crate) fn affects(&self, path: &Path) -> bool {
+        self.full
+            || self.paths.contains(path)
+            || self.trees.iter().any(|tree| path.starts_with(tree))
+    }
+    pub(crate) fn any(&self) -> bool {
+        self.full || !self.paths.is_empty() || !self.trees.is_empty()
+    }
+}
+struct Change {
+    directory: PathBuf,
+    path: PathBuf,
+    generation: u64,
+    membership: bool,
+    tree: bool,
+}
+const EVENT_LIMIT: usize = 8192;
 struct State {
     inotify: Option<Inotify>,
     directories: HashMap<PathBuf, (WatchDescriptor, usize)>,
     paths: HashMap<WatchDescriptor, PathBuf>,
-    changed: HashMap<PathBuf, u64>,
+    events: VecDeque<Change>,
+    coverage: u64,
     generation: u64,
     fallback: bool,
+}
+impl State {
+    fn record(&mut self, event: Change) {
+        self.events.push_back(event);
+        while self.events.len() > EVENT_LIMIT {
+            self.coverage = self
+                .coverage
+                .max(self.events.pop_front().unwrap().generation);
+        }
+    }
 }
 impl Default for Monitor {
     fn default() -> Self {
@@ -37,7 +77,8 @@ impl Default for Monitor {
                 inotify,
                 directories: HashMap::new(),
                 paths: HashMap::new(),
-                changed: HashMap::new(),
+                events: VecDeque::new(),
+                coverage: 0,
                 generation: 0,
             }),
         }
@@ -96,17 +137,32 @@ impl Monitor {
         }
         let (wd, _) = state.directories.remove(path).unwrap();
         state.paths.remove(&wd);
-        state.changed.remove(path);
+        // Snapshots can outlive the workspace that owned the watch.
+        state.generation += 1;
+        let generation = state.generation;
+        state.record(Change {
+            directory: path.into(),
+            path: path.into(),
+            generation,
+            membership: false,
+            tree: true,
+        });
         if let Some(inotify) = state.inotify.as_mut() {
             let _ = inotify.watches().remove(wd);
         }
     }
     pub fn fence(&self, paths: &BTreeSet<PathBuf>, previous: u64) -> (bool, u64) {
+        let (changes, generation) = self.changes(paths, previous);
+        (changes.any(), generation)
+    }
+    pub(crate) fn changes(&self, paths: &BTreeSet<PathBuf>, previous: u64) -> (Changes, u64) {
         let mut state = self.state.lock().unwrap();
         let mut buffer = [0u8; 65536];
         for batch in 0..8 {
             let events = match state.inotify.as_mut().map(|w| w.read_events(&mut buffer)) {
-                Some(Ok(events)) => events.map(|e| (e.wd, e.mask)).collect::<Vec<_>>(),
+                Some(Ok(events)) => events
+                    .map(|e| (e.wd, e.mask, e.name.map(std::ffi::OsStr::to_owned)))
+                    .collect::<Vec<_>>(),
                 Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Some(Err(_)) | None => {
                     state.fallback = true;
@@ -118,7 +174,7 @@ impl Monitor {
             }
             state.generation += 1;
             let generation = state.generation;
-            for (wd, mask) in events {
+            for (wd, mask, name) in events {
                 if mask.contains(EventMask::Q_OVERFLOW)
                     || (state.paths.contains_key(&wd)
                         && mask.intersects(
@@ -128,20 +184,47 @@ impl Monitor {
                     state.fallback = true;
                 }
                 if let Some(path) = state.paths.get(&wd).cloned() {
-                    state.changed.insert(path, generation);
+                    let changed = name.map_or_else(|| path.clone(), |name| path.join(name));
+                    state.record(Change {
+                        directory: path,
+                        path: changed,
+                        generation,
+                        membership: mask.intersects(
+                            EventMask::CREATE
+                                | EventMask::DELETE
+                                | EventMask::MOVED_FROM
+                                | EventMask::MOVED_TO,
+                        ),
+                        tree: mask.contains(EventMask::ISDIR),
+                    });
                 }
             }
             if batch == 7 {
                 state.fallback = true;
             }
         }
-        (
-            state.fallback
-                || paths
-                    .iter()
-                    .any(|p| state.changed.get(p).is_some_and(|&g| g > previous)),
-            state.generation,
-        )
+        let mut changes = Changes {
+            full: state.fallback || previous < state.coverage,
+            ..Default::default()
+        };
+        if !changes.full {
+            for event in state
+                .events
+                .iter()
+                .rev()
+                .take_while(|e| e.generation > previous)
+                .filter(|e| paths.contains(&e.directory))
+            {
+                changes.paths.insert(event.path.clone());
+                if event.membership {
+                    changes.paths.insert(event.directory.clone());
+                }
+                if event.tree {
+                    changes.trees.insert(event.path.clone());
+                }
+            }
+        }
+        (changes, state.generation)
     }
 }
 
@@ -149,6 +232,55 @@ impl Monitor {
 mod tests {
     use super::*;
     use std::{fs, io::Write};
+
+    #[test]
+    fn named_changes_preserve_independent_readers_and_directory_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let changed = root.path().join("changed.rs");
+        let untouched = root.path().join("untouched.rs");
+        fs::write(&changed, "old").unwrap();
+        fs::write(&untouched, "old").unwrap();
+        let monitor = Arc::new(Monitor::default());
+        monitor.register(root.path());
+        let paths = BTreeSet::from([root.path().into()]);
+        let (_, generation) = monitor.fence(&paths, 0);
+        let first = monitor.snapshot(&paths, generation);
+        let second = first.clone();
+        fs::write(&changed, "changed").unwrap();
+        for reader in [&first, &second] {
+            let changes = reader.changes();
+            assert!(changes.affects(&changed));
+            assert!(!changes.affects(&untouched));
+            assert!(!changes.affects(root.path()));
+        }
+        let (_, generation) = monitor.fence(&paths, generation);
+        let current = monitor.snapshot(&paths, generation);
+        fs::rename(&changed, root.path().join("renamed.rs")).unwrap();
+        let changes = current.changes();
+        assert!(changes.affects(&changed));
+        assert!(changes.affects(&root.path().join("renamed.rs")));
+        assert!(changes.affects(root.path()));
+        assert!(!changes.affects(&untouched));
+        assert!(first.changes().affects(&changed));
+        monitor.unregister(root.path());
+        assert!(current.changes().affects(&untouched));
+    }
+
+    #[test]
+    fn readers_older_than_retained_events_require_full_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let monitor = Monitor::default();
+        monitor.register(root.path());
+        let paths = BTreeSet::from([root.path().into()]);
+        let (_, before) = monitor.fence(&paths, 0);
+        for i in 0..=EVENT_LIMIT {
+            fs::write(root.path().join("file"), i.to_string()).unwrap();
+            monitor.fence(&paths, before);
+        }
+        assert!(monitor.changes(&paths, before).0.full);
+        let (_, now) = monitor.fence(&paths, before);
+        assert!(!monitor.changes(&paths, now).0.any());
+    }
 
     #[test]
     fn writes_are_visible_while_an_inherited_handle_remains_open() {

@@ -12,11 +12,15 @@ pub(super) struct Inventory {
 }
 impl Inventory {
     pub async fn current(self: &Arc<Self>) -> Result<bool> {
-        if !self.watch.changed() {
+        let changes = self.watch.changes();
+        if !changes.any() {
             return Ok(true);
         }
         let inventory = self.clone();
-        Ok(tokio::task::spawn_blocking(move || inventory.manifest.sources_current()).await?)
+        Ok(tokio::task::spawn_blocking(move || {
+            inventory.manifest.changed_sources_current(Some(&changes))
+        })
+        .await?)
     }
 }
 #[derive(Clone)]
@@ -225,7 +229,8 @@ impl App {
                 cancel: &cancel,
             };
             let assets_pending =
-                !indexes::source_only(&request, query.as_ref()) && indexes::has_unity(manifest);
+                !matches!(request, super::Request::View(_, crate::navigation::Mode::Raw))
+                && !indexes::source_only(&request, query.as_ref()) && indexes::has_unity(manifest);
             let mut text = match request {
                 super::Request::History(_) => unreachable!("history bypasses snapshot preparation"),
                 super::Request::Search(_) => sources.files(query.as_ref().unwrap(), &root),

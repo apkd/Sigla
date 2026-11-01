@@ -87,9 +87,12 @@ impl ServerHandler for SummaryProbe {
     }
     async fn call_tool(
         &self,
-        _: CallToolRequestParams,
+        request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if request.name == "view" {
+            assert_eq!(request.arguments.as_ref().unwrap()["mode"], "raw");
+        }
         Ok(serde_json::from_value::<CallToolResult>(serde_json::json!({
             "content":[
                 {"type":"text","text":"summary", "_meta":{"sigla/repository-summary":true}},
@@ -153,6 +156,20 @@ async fn repository_summaries_follow_downstream_sessions_and_survive_upstream_re
         )
     };
     for client in [&first, &second] {
+        let raw = client
+            .call_tool(
+                CallToolRequestParams::new("view").with_arguments(
+                    serde_json::json!({"codebase":"owner/repo", "path":"lib.rs", "mode":"raw"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(raw.is_error, Some(true));
+        assert_eq!(raw.content.len(), 1);
+        assert_eq!(raw.content[0].as_text().unwrap().text, "body");
         assert_eq!(client.call_tool(request()).await.unwrap().content.len(), 2);
         let result = client.call_tool(request()).await.unwrap();
         assert_eq!(result.content.len(), 1);
