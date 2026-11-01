@@ -189,6 +189,10 @@ impl Policy {
         })
     }
     pub fn canonical(&self, path: &Path) -> Result<PathBuf> {
+        ensure!(
+            !self.roots.is_empty(),
+            "Sigla is not configured to accept local paths. Provide a repository URL instead."
+        );
         let path = path.canonicalize().with_context(|| {
             format!(
                 "Cannot open {}",
@@ -1516,6 +1520,27 @@ fn member_dirs(base: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn local_paths_require_configured_roots_before_filesystem_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let denied = Policy::new(Vec::new()).unwrap();
+        let existing_error = denied.canonical(root.path()).unwrap_err().to_string();
+        assert_eq!(
+            existing_error,
+            denied.canonical(&missing).unwrap_err().to_string()
+        );
+        let allowed = Policy::new(vec![root.path().into()]).unwrap();
+        assert_eq!(
+            allowed.canonical(root.path()).unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+        assert_ne!(
+            existing_error,
+            allowed.canonical(&missing).unwrap_err().to_string()
+        );
+    }
+
     #[test]
     fn required_analysis_trees_combine_missing_paths_and_preserve_boundaries() {
         let root = tempfile::tempdir().unwrap();
