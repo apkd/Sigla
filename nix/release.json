@@ -1,20 +1,20 @@
 {
-  "version": "0.1.33",
+  "version": "0.1.34",
   "platforms": {
     "x86_64-linux": {
-      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.33-linux-x64",
-      "hash": "sha256-K9rbrHdpQesC0jY1uLMLjd8psYtbV4k0H6ULGtqEgL0=",
+      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.34-linux-x64",
+      "hash": "sha256-dEXoAwkoNdeb3aYnd3mqMyHtleBvU63j0zL/gUE0xSU=",
       "debug": {
-        "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.33-linux-x64.debug",
-        "hash": "sha256-Uvffy4PSJyWxMMdKKUlGmDpvzuxtvZmmsX/tc3+mhRg="
+        "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.34-linux-x64.debug",
+        "hash": "sha256-tujDqFHVTdK7CD51K2xpp/hTlJLGEAoxpDYNA9T/QGo="
       }
     },
     "aarch64-linux": {
-      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.33-linux-arm64",
-      "hash": "sha256-oUPok/FxOrk77iSFs/eHgwdRDQBYcUZaGX2ocxhpjQo=",
+      "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.34-linux-arm64",
+      "hash": "sha256-KssZFgMHCJexb+p2/hs8lwv5yr4h88qd5HpxVuvgq5E=",
       "debug": {
-        "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.33-linux-arm64.debug",
-        "hash": "sha256-4dEQXjV2aVypRGonBnsGVotO0+rM4R+1SzEXcYXYJmY="
+        "url": "https://github.com/apkd/Sigla/releases/download/build-archive/sigla-0.1.34-linux-arm64.debug",
+        "hash": "sha256-sAnyihJjAXF8DqmknkJbuqg2TSHvQe326LksCu2OZxs="
       }
     }
   }
