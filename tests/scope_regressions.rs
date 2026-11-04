@@ -50,14 +50,23 @@ struct Fixture {
 }
 impl Fixture {
     fn new(source: &str) -> Self {
+        Self::files(&[
+            (
+                "Test.csproj",
+                "<Project><ItemGroup><Compile Include=\"Test.cs\"/></ItemGroup></Project>",
+            ),
+            ("Test.cs", source),
+        ])
+    }
+
+    fn files(files: &[(&str, &str)]) -> Self {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("Test.csproj"),
-            "<Project><ItemGroup><Compile Include=\"Test.cs\"/></ItemGroup></Project>",
-        )
-        .unwrap();
-        std::fs::write(root.path().join("Test.cs"), source).unwrap();
+        for (path, contents) in files {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
         let app = Arc::new(
             App::new(
                 Policy::new(vec![root.path().into()]).unwrap(),
@@ -319,6 +328,62 @@ class Usage { void Test(Other other) { other.Run(); } }
     );
     let result = fixture.query("calls:Target.Run path:Test.cs").await;
     assert_eq!(result, "No matches.");
+}
+
+#[tokio::test]
+async fn unresolved_shared_file_in_unrelated_project_does_not_taint_incoming_search() {
+    let fixture = Fixture::files(&[
+        (
+            "A/A.csproj",
+            r#"<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include="../Usage.cs"/><Compile Include="Target.cs"/><Compile Include="Other.cs"/></ItemGroup></Project>"#,
+        ),
+        (
+            "B/B.csproj",
+            r#"<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include="../Usage.cs"/></ItemGroup></Project>"#,
+        ),
+        ("A/Target.cs", "class Target { public void Run() {} }"),
+        ("A/Other.cs", "class Other { public void Run() {} }"),
+        (
+            "Usage.cs",
+            "class Usage { void Test(Other other) { other.Run(); } }",
+        ),
+    ]);
+
+    for project in ["A", "B"] {
+        let membership = fixture
+            .query(&format!("method:Usage.Test project:{project}"))
+            .await;
+        assert!(membership.contains("Usage.cs"), "{membership}");
+    }
+    let unrelated = fixture.query("calls:Target.Run").await;
+    assert_eq!(unrelated, "No matches.");
+    let resolved = fixture.query("calls:Other.Run").await;
+    assert!(resolved.contains("other.Run()"), "{resolved}");
+    fixture.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn incoming_search_finds_target_in_referenced_project() {
+    let fixture = Fixture::files(&[
+        (
+            "A/A.csproj",
+            r#"<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include="Usage.cs"/><ProjectReference Include="../B/B.csproj"/></ItemGroup></Project>"#,
+        ),
+        (
+            "B/B.csproj",
+            r#"<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include="Target.cs"/></ItemGroup></Project>"#,
+        ),
+        (
+            "A/Usage.cs",
+            "class Usage { void Test(Target target) { target.Run(); } }",
+        ),
+        ("B/Target.cs", "class Target { public void Run() {} }"),
+    ]);
+
+    let result = fixture.query("calls:Target.Run").await;
+    assert!(result.contains("target.Run()"), "{result}");
+    assert!(!result.contains("Possible"), "{result}");
+    fixture.app.shutdown().await;
 }
 
 #[tokio::test]

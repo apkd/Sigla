@@ -1551,6 +1551,7 @@ impl<'a> Search<'a> {
         for key in keys.clone() {
             let data = self.data(&key)?;
             for i in &data.facts.imports {
+                self.check()?;
                 if targets.iter().any(|h| {
                     i.path == h.decl.qualified
                         || i.path == h.decl.name
@@ -1578,7 +1579,9 @@ impl<'a> Search<'a> {
                 continue;
             }
             let data = self.data(&key)?;
+            let mut occurrences = Vec::new();
             for o in &data.facts.occurrences {
+                self.check()?;
                 if only_local
                     && !targets.iter().zip(&local_scopes).any(|(t, scope)| {
                         t.file == key && scope.as_ref().unwrap().contains(&o.span.start)
@@ -1592,16 +1595,32 @@ impl<'a> Search<'a> {
                 {
                     continue;
                 }
+                occurrences.push(o);
+            }
+            // Synthetic and implicit calls can follow their source-order neighbours.
+            occurrences.sort_by_key(|occurrence| occurrence.span.start);
+            let mut containing = ContainingDeclarations::new(&data.facts.declarations);
+            containing
+                .pending
+                .retain(|&index| data.facts.declarations[index].kind != "scope");
+            for o in occurrences {
+                self.check()?;
+                let declaration = containing.at(o.span.start);
                 for m in &file.memberships {
-                    let containing = data
-                        .facts
-                        .declarations
-                        .iter()
-                        .filter(|d| {
-                            !d.local() && d.kind != "scope" && d.span.contains(&o.span.start)
+                    self.check()?;
+                    if !outgoing
+                        && !targets.iter().any(|target| {
+                            let file = &self.manifest.files[&target.file];
+                            if file.metadata {
+                                self.manifest.metadata_visible(file, m.project)
+                            } else {
+                                self.visible(m.project, target.membership.project)
+                            }
                         })
-                        .min_by_key(|d| d.span.end - d.span.start)
-                        .map(|d| contextual(d, m));
+                    {
+                        continue;
+                    }
+                    let containing = declaration.map(|declaration| contextual(declaration, m));
                     if !self.filters(q, file, m, containing.as_ref(), o.span.start, inside) {
                         continue;
                     }
