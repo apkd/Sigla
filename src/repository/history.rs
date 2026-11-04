@@ -229,17 +229,17 @@ struct Remote {
     local: Option<PathBuf>,
 }
 impl Remote {
-    fn connect(&self) -> Result<Session> {
+    fn connect(&self, cancel: &Arc<AtomicBool>) -> Result<Session> {
         #[cfg(test)]
         if let Some(path) = &self.local {
             return Session::local(path);
         }
-        Session::connect(&self.repository, None, self.private)
+        Session::connect_cancellable(&self.repository, None, self.private, cancel.clone())
     }
 
-    fn session(&mut self) -> Result<&mut Session> {
+    fn session(&mut self, cancel: &Arc<AtomicBool>) -> Result<&mut Session> {
         if self.session.is_none() {
-            self.session = Some(self.connect()?);
+            self.session = Some(self.connect(cancel)?);
         }
         Ok(self.session.as_mut().unwrap())
     }
@@ -248,11 +248,11 @@ impl Remote {
         &mut self,
         target: &materialize::Target,
         lease: &ObjectLease,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<String> {
         check(cancel)?;
-        self.session()?;
+        self.session(cancel)?;
         let mut session = self.session.take().unwrap();
         let result = super::revision::resolve(&mut session, target, |session, prefix| {
             let mut resolved = None;
@@ -264,7 +264,7 @@ impl Remote {
                     remaining: (!self.unlimited)
                         .then(|| materialize::TRANSFER_LIMIT.saturating_sub(self.transferred)),
                 }
-                .resolve(session, prefix, || self.connect())?;
+                .resolve(session, prefix, || self.connect(cancel))?;
                 let bytes = value.bytes;
                 resolved = Some(value);
                 Ok(bytes)
@@ -406,7 +406,7 @@ impl Store {
             .unwrap_or(materialize::Target::DefaultBranch);
         let format = {
             let _wait = operation.wait("history_connect");
-            remote.session()?.object_format()?
+            remote.session(&cancel)?.object_format()?
         };
         let lease = super::cache::object_lease_monitored(
             cache,
@@ -627,7 +627,7 @@ impl Store {
             let mut transfer = None;
             let session = {
                 let _wait = self.operation.wait("history_connect");
-                remote.session()?
+                remote.session(&self.cancel)?
             };
             let _wait = self.operation.wait("history_git_fetch");
             let result = lease.acquire(&self.operation, &self.cancel, |pool, view| {

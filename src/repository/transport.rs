@@ -7,6 +7,7 @@ use gix_protocol::{
 use gix_transport::IsSpuriousError;
 use gix_transport::client::blocking_io::{self, Transport};
 use std::{io::Write, path::Path, sync::atomic::AtomicBool, time::Duration};
+mod http;
 
 #[derive(Clone, Copy)]
 pub(super) enum Filter {
@@ -171,6 +172,20 @@ impl Session {
         preferred: Option<&str>,
         allow_private: bool,
     ) -> Result<Self> {
+        Self::connect_cancellable(
+            repository,
+            preferred,
+            allow_private,
+            std::sync::Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub(super) fn connect_cancellable(
+        repository: &super::Repository,
+        preferred: Option<&str>,
+        allow_private: bool,
+        cancel: std::sync::Arc<AtomicBool>,
+    ) -> Result<Self> {
         let endpoints: Vec<_> = repository
             .transports(if allow_private { preferred } else { None })
             .into_iter()
@@ -180,16 +195,34 @@ impl Session {
             !endpoints.is_empty(),
             "Cannot verify public access: repository requires authenticated transport"
         );
-        let (mut session, endpoint) = alternatives(&endpoints, |endpoint| {
-            Self::connect_one(endpoint, allow_private)
-        })
-        .with_context(|| format!("Cannot access {}", repository.identity))?;
+        let connected = alternatives(&endpoints, |endpoint| {
+            super::history::check(&cancel)?;
+            let result = Self::connect_one(endpoint, allow_private, cancel.clone());
+            super::history::check(&cancel)?;
+            result
+        });
+        super::history::check(&cancel)?;
+        let (mut session, endpoint) =
+            connected.with_context(|| format!("Cannot access {}", repository.identity))?;
         session.endpoint = Some(endpoint);
         Ok(session)
     }
 
-    fn connect_one(endpoint: &str, allow_private: bool) -> Result<Self> {
-        let mut transport = blocking_io::connect::connect(endpoint, blocking_io::connect::Options {
+    fn connect_one(
+        endpoint: &str,
+        allow_private: bool,
+        cancel: std::sync::Arc<AtomicBool>,
+    ) -> Result<Self> {
+        if endpoint.starts_with("https://") {
+            let transport = blocking_io::http::connect_http(
+                http::CancellableHttp::new(cancel)?,
+                gix_url::Url::try_from(endpoint)?,
+                gix_transport::Protocol::V2,
+                false,
+            );
+            return Self::handshake(Box::new(transport), allow_private);
+        }
+        let transport = blocking_io::connect::connect(endpoint, blocking_io::connect::Options {
             version: gix_transport::Protocol::V2,
             ssh: blocking_io::ssh::connect::Options {
                 command: Some("ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=30 -oServerAliveInterval=15 -oServerAliveCountMax=2".into()),
@@ -197,17 +230,6 @@ impl Session {
             },
             trace: false,
         })?;
-        if endpoint.starts_with("https://") {
-            transport
-                .configure(&blocking_io::http::Options {
-                    follow_redirects: blocking_io::http::options::FollowRedirects::None,
-                    connect_timeout: Some(Duration::from_secs(30)),
-                    low_speed_limit_bytes_per_second: 1,
-                    low_speed_time_seconds: 30,
-                    ..Default::default()
-                })
-                .map_err(anyhow::Error::from_boxed)?;
-        }
         Self::handshake(transport, allow_private)
     }
 
@@ -262,7 +284,7 @@ impl Session {
                 &mut gix_features::progress::Discard,
                 false,
             )
-            .map_err(|_| anyhow::anyhow!("Repository reference lookup failed"))
+            .context("Repository reference lookup failed")
     }
 
     pub fn can_fetch_again(&self) -> bool {
@@ -405,6 +427,15 @@ struct Wants<'a> {
     filter: Filter,
     haves: &'a [gix_hash::ObjectId],
 }
+
+#[cfg(test)]
+#[path = "transport/stall_tests.rs"]
+mod stall_tests;
+
+#[cfg(test)]
+#[path = "transport/http_tests.rs"]
+mod http_tests;
+
 impl fetch::Negotiate for Wants<'_> {
     fn mark_complete_and_common_ref(&mut self) -> Result<negotiate::Action, negotiate::Error> {
         Ok(negotiate::Action::MustNegotiate {
