@@ -211,6 +211,13 @@ impl Jobs {
         tokio::spawn(async move {
             let log_root = request.root.clone();
             let outcome = async {
+                if let (Some(remote), Some(branch)) = (&request.remote, &request.branch) {
+                    ensure!(!cancel.is_cancelled(), "Asset indexing cancelled or superseded");
+                    operation.stage("asset_acquisition");
+                    let _wait = operation.wait("asset_acquisition");
+                    // Acquisition owns repository capacity and retains the request until it exits.
+                    remote.complete_assets(branch, request.revision.as_deref().unwrap(), &operation).await?;
+                }
                 operation.stage("worker_admission");
                 let _wait = operation.wait("worker_admission");
                 let permit = tokio::select! {
@@ -219,12 +226,6 @@ impl Jobs {
                     permit = workers.acquire_owned() => permit?,
                 };
                 drop(_wait);
-                if let (Some(remote), Some(branch)) = (&request.remote, &request.branch) {
-                    operation.stage("asset_acquisition");
-                    let _wait = operation.wait("asset_acquisition");
-                    // Retain the request, leases and worker until blocking acquisition exits.
-                    remote.complete_assets(branch, request.revision.as_deref().unwrap(), &operation).await?;
-                }
                 operation.stage("asset_capture");
                 let _wait = operation.wait("asset_capture");
                 let (state, branch_state) = tokio::select! {

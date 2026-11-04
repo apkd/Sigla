@@ -31,6 +31,7 @@ pub struct Catalog {
     pub entries: BTreeMap<PathBuf, Owner>,
     dirty: bool,
     revision: u64,
+    dependency_revision: u64,
 }
 pub(crate) struct Publication {
     revision: u64,
@@ -49,6 +50,7 @@ impl Catalog {
             entries,
             dirty: false,
             revision: 0,
+            dependency_revision: 0,
         })
     }
     pub fn observe(
@@ -59,19 +61,8 @@ impl Catalog {
         used: Option<u64>,
     ) {
         self.revision += 1;
-        let initial = used.unwrap_or_else(super::now);
-        let owner = self
-            .entries
-            .entry(entry.to_owned())
-            .or_insert_with(|| Owner {
-                entry: entry.to_owned(),
-                repository: repository.map(Path::to_owned),
-                usage: Usage::new(initial),
-                dependencies: BTreeSet::new(),
-            });
-        owner.repository = repository.map(Path::to_owned);
         let cache = self.path.parent().unwrap();
-        owner.dependencies = manifest
+        let mut dependencies: BTreeSet<_> = manifest
             .files
             .values()
             .chain(manifest.deferred.values())
@@ -80,20 +71,37 @@ impl Catalog {
             .chain(manifest.dependencies.iter())
             .filter_map(|path| super::views::managed_root(cache, path))
             .collect();
-        owner.dependencies.insert(
+        dependencies.insert(
             cache.join("local-jobs").join(
                 blake3::hash(entry.as_os_str().as_encoded_bytes())
                     .to_hex()
                     .as_str(),
             ),
         );
-        owner.dependencies.insert(
+        dependencies.insert(
             cache.join("unity-assets").join(
                 blake3::hash(manifest.root.as_os_str().as_encoded_bytes())
                     .to_hex()
                     .as_str(),
             ),
         );
+        let repository = repository.map(Path::to_owned);
+        if self.entries.get(entry).is_none_or(|owner| {
+            owner.repository != repository || owner.dependencies != dependencies
+        }) {
+            self.dependency_revision += 1;
+        }
+        let owner = self
+            .entries
+            .entry(entry.to_owned())
+            .or_insert_with(|| Owner {
+                entry: entry.to_owned(),
+                repository: repository.clone(),
+                usage: Usage::new(used.unwrap_or_else(super::now)),
+                dependencies: BTreeSet::new(),
+            });
+        owner.repository = repository;
+        owner.dependencies = dependencies;
         if let Some(now) = used {
             owner.usage.record(now);
         }
@@ -118,13 +126,16 @@ impl Catalog {
         }
     }
     pub fn remove(&mut self, entry: &Path) {
-        self.revision += 1;
-        self.entries.remove(entry);
-        self.dirty = true;
+        if self.entries.remove(entry).is_some() {
+            self.revision += 1;
+            self.dependency_revision += 1;
+            self.dirty = true;
+        }
     }
     pub fn seed(&mut self, entry: &Path, repository: Option<&Path>, at: u64) {
         if !self.entries.contains_key(entry) {
             self.revision += 1;
+            self.dependency_revision += 1;
             self.entries.insert(
                 entry.to_owned(),
                 Owner {
@@ -182,8 +193,8 @@ impl Catalog {
                 .any(|dependency| dependency.starts_with(path))
         })
     }
-    pub fn revision(&self) -> u64 {
-        self.revision
+    pub fn dependency_revision(&self) -> u64 {
+        self.dependency_revision
     }
     pub fn view_roots(&self, owner: &Owner) -> Vec<PathBuf> {
         let cache = self.path.parent().unwrap();
@@ -211,6 +222,40 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::workspace::{FileEntry, Manifest, Stamp};
+
+    #[test]
+    fn usage_does_not_invalidate_dependencies_or_publish_stale_usage() {
+        let cache = tempfile::tempdir().unwrap();
+        let entry = cache.path().join("workspace");
+        let mut manifest = Manifest {
+            root: entry.clone(),
+            ..Manifest::default()
+        };
+        let mut catalog = Catalog::open(cache.path()).unwrap();
+        catalog.observe(&entry, None, &manifest, Some(10));
+        let revision = catalog.dependency_revision();
+        let stale = catalog.stage().unwrap().unwrap();
+        catalog.touch(&entry, None, &manifest, 20);
+        catalog.observe(&entry, None, &manifest, None);
+        assert_eq!(catalog.dependency_revision(), revision);
+        catalog.publish(stale).unwrap();
+        assert!(catalog.dirty);
+        catalog.flush().unwrap();
+        assert_eq!(
+            Catalog::open(cache.path()).unwrap().entries[&entry]
+                .usage
+                .last_use,
+            20
+        );
+        manifest
+            .dependencies
+            .insert(cache.path().join("unity-packages/new/source.cs"));
+        catalog.observe(&entry, None, &manifest, None);
+        assert_ne!(catalog.dependency_revision(), revision);
+        let revision = catalog.dependency_revision();
+        catalog.remove(&entry);
+        assert_ne!(catalog.dependency_revision(), revision);
+    }
 
     #[test]
     fn observe_tracks_view_roots_across_manifest_paths_and_component_boundaries() {

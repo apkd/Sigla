@@ -223,6 +223,8 @@ impl App {
 
     pub fn new(policy: Policy, cache: PathBuf, workers: usize) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+        let mut startup = crate::telemetry::Startup::new("cache_startup");
+        startup.0.stage("cache_ownership");
         ensure!(workers > 0, "At least one worker is required");
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -247,8 +249,11 @@ impl App {
         ownership
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
+        startup.0.stage("compaction_recovery");
         crate::cache::compaction::recover(&cache)?;
+        startup.0.stage("cache_migration");
         crate::cache_migration::migrate(&cache)?;
+        startup.0.stage("store_initialization");
         crate::memory::start_reclaimer()?;
         let app = Self {
             activity: Arc::new(tokio::sync::RwLock::new(())),
@@ -297,6 +302,7 @@ impl App {
         };
         // Recovery above is mandatory. Retirement and space reclamation are
         // scheduled by start_setup, never part of synchronous construction.
+        startup.ready();
         Ok(app)
     }
     pub fn with_cache_limits(mut self, limits: crate::cache::policy::Limits) -> Self {
@@ -393,6 +399,7 @@ impl App {
                 let retry = std::time::Duration::from_secs(1);
                 let mut next_startup = tokio::time::Instant::now() + retry;
                 let mut pending = Some(disk::StartupMaintenance::default());
+                let sweep = crate::telemetry::operation("startup_cleanup", None, None);
                 loop {
                     let deadline = regular.min(schedule.deadline());
                     let deadline = if pending.is_some() {
@@ -411,11 +418,27 @@ impl App {
                     {
                         let maintenance =
                             crate::telemetry::operation("startup_maintenance", None, None);
+                        if let Some(id) = sweep.id() {
+                            maintenance.link(&id);
+                        }
                         maintenance.stage("retiring_cached_analysis");
                         let delay = match app.maintain_startup(state).await {
                             Ok(done) => {
+                                if shutdown.is_cancelled() {
+                                    maintenance.finish("cancelled");
+                                    return;
+                                }
+                                maintenance.progress(if done {
+                                    crate::telemetry::Progress::Complete
+                                } else {
+                                    state
+                                        .progress
+                                        .unwrap_or(crate::telemetry::Progress::Waiting)
+                                });
                                 maintenance.finish("success");
                                 if done {
+                                    sweep.progress(crate::telemetry::Progress::Complete);
+                                    sweep.clone().finish("success");
                                     pending = None;
                                 }
                                 retry
@@ -1366,6 +1389,7 @@ impl App {
                     }
                 }?;
                 let incomplete = !raw && !pending.is_empty();
+                operation.complete(!incomplete);
                 if incomplete {
                     let eta = remaining
                         .map_or(String::new(), |seconds| format!(" (~{seconds}s remaining)"));
@@ -1829,6 +1853,16 @@ impl ServerHandler for Mcp {
                 }
                 Err(_) => (),
             }
+        }
+        if status == "success"
+            && let Ok(rmcp::model::CallToolResponse::Complete(response)) = &result
+            && let Some(complete) = response
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("complete"))
+                .and_then(serde_json::Value::as_bool)
+        {
+            operation.complete(complete);
         }
         operation.finish(status);
         result

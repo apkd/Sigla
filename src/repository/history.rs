@@ -32,6 +32,24 @@ pub(crate) fn check(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+/// Bridge atomic cancellation into async admission from a blocking Git reader.
+/// Keep the original future queued until admission or cancellation.
+pub(super) fn wait<T>(
+    cancel: &AtomicBool,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    check(cancel)?;
+    futures_executor::block_on(async {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                value = &mut future => { check(cancel)?; return Ok(value); }
+                _ = futures_timer::Delay::new(Duration::from_millis(25)) => check(cancel)?,
+            }
+        }
+    })
+}
+
 pub(super) fn git(store: &Path) -> Command {
     let mut command = materialize::git(store);
     command
@@ -231,13 +249,14 @@ impl Remote {
         target: &materialize::Target,
         lease: &ObjectLease,
         cancel: &AtomicBool,
+        telemetry: &crate::telemetry::Operation,
     ) -> Result<String> {
         check(cancel)?;
         self.session()?;
         let mut session = self.session.take().unwrap();
         let result = super::revision::resolve(&mut session, target, |session, prefix| {
             let mut resolved = None;
-            lease.acquire(|pool, _| {
+            lease.acquire(telemetry, cancel, |pool, _| {
                 let value = super::revision::Prefix {
                     repository: &self.repository,
                     store: pool,
@@ -322,11 +341,28 @@ impl Store {
         let path = PathBuf::from(std::str::from_utf8(&output)?.trim()).canonicalize()?;
         Ok(Self::new(path, None, None, cancel))
     }
+    #[cfg(test)]
     pub fn remote(
         repository: Repository,
         rules: &[super::Rule],
         cache: &Path,
         cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        Self::remote_monitored(
+            repository,
+            rules,
+            cache,
+            cancel,
+            crate::telemetry::Operation::default(),
+        )
+    }
+
+    pub fn remote_monitored(
+        repository: Repository,
+        rules: &[super::Rule],
+        cache: &Path,
+        cancel: Arc<AtomicBool>,
+        operation: crate::telemetry::Operation,
     ) -> Result<Self> {
         check(&cancel)?;
         let private = super::authorize(rules, &repository)?;
@@ -342,10 +378,25 @@ impl Store {
             #[cfg(test)]
             local: None,
         };
-        Self::from_remote(remote, cache, cancel)
+        Self::from_remote_monitored(remote, cache, cancel, operation)
     }
 
-    fn from_remote(mut remote: Remote, cache: &Path, cancel: Arc<AtomicBool>) -> Result<Self> {
+    #[cfg(test)]
+    fn from_remote(remote: Remote, cache: &Path, cancel: Arc<AtomicBool>) -> Result<Self> {
+        Self::from_remote_monitored(
+            remote,
+            cache,
+            cancel,
+            crate::telemetry::Operation::default(),
+        )
+    }
+
+    fn from_remote_monitored(
+        mut remote: Remote,
+        cache: &Path,
+        cancel: Arc<AtomicBool>,
+        operation: crate::telemetry::Operation,
+    ) -> Result<Self> {
         // Access is checked on every request, including pinned warm-cache reads.
         let selector = remote.repository.selector.clone();
         let target = selector
@@ -353,10 +404,23 @@ impl Store {
             .map(materialize::Target::selector)
             .transpose()?
             .unwrap_or(materialize::Target::DefaultBranch);
-        let format = remote.session()?.object_format()?;
-        let lease = super::cache::object_lease(cache, &remote.repository.identity, format)?;
-        let revision = remote.resolve(&target, &lease, &cancel)?;
+        let format = {
+            let _wait = operation.wait("history_connect");
+            remote.session()?.object_format()?
+        };
+        let lease = super::cache::object_lease_monitored(
+            cache,
+            &remote.repository.identity,
+            format,
+            &operation,
+            &cancel,
+        )?;
+        let revision = {
+            let _wait = operation.wait("history_revision_resolution");
+            remote.resolve(&target, &lease, &cancel, &operation)?
+        };
         let mut store = Self::new(lease.path().to_owned(), Some(lease), Some(remote), cancel);
+        store.operation = operation;
         store
             .resolved
             .insert(selector.unwrap_or_else(|| "HEAD".into()), revision);
@@ -412,7 +476,7 @@ impl Store {
     }
     pub fn finish(&self) -> Result<()> {
         if let Some(lease) = &self.lease {
-            lease.publish(&self.complete, &self.boundaries)?;
+            lease.publish_cancellable(&self.complete, &self.boundaries, &self.cancel)?;
         }
         if let Some(remote) = &self.remote {
             tracing::debug!(
@@ -442,6 +506,7 @@ impl Store {
                     .as_ref()
                     .context("Missing repository reader lease")?,
                 &self.cancel,
+                &self.operation,
             )?;
             self.batch = None;
             resolved
@@ -560,9 +625,12 @@ impl Store {
             };
             let start = Instant::now();
             let mut transfer = None;
-            let session = remote.session()?;
+            let session = {
+                let _wait = self.operation.wait("history_connect");
+                remote.session()?
+            };
             let _wait = self.operation.wait("history_git_fetch");
-            let result = lease.acquire(|pool, view| {
+            let result = lease.acquire(&self.operation, &self.cancel, |pool, view| {
                 let measured = materialize::receive_filtered_measured(
                     session,
                     pool,
@@ -570,6 +638,7 @@ impl Store {
                     wants.clone(),
                     &options,
                     remaining,
+                    &self.operation,
                 )?;
                 let bytes = measured.bytes;
                 transfer = Some(measured);
@@ -1052,6 +1121,44 @@ fn calendar(seconds: i64, zone: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn cancellation_removes_a_queued_admission_without_releasing_its_owner() {
+        use std::future::Future;
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let owner = capacity.clone().try_acquire_owned().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (started, queued) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker_capacity = capacity.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let mut admission = Box::pin(worker_capacity.acquire_owned());
+            let mut started = Some(started);
+            let result = wait(
+                &worker_cancel,
+                std::future::poll_fn(|cx| {
+                    let result = admission.as_mut().poll(cx);
+                    if result.is_pending()
+                        && let Some(started) = started.take()
+                    {
+                        started.send(()).unwrap();
+                    }
+                    result
+                }),
+            );
+            finished
+                .send(result.is_err_and(|error| error.is::<crate::diagnostics::Cancelled>()))
+                .unwrap();
+        });
+        queued.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancel.store(true, Ordering::Release);
+        assert!(done.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        assert!(capacity.try_acquire().is_err());
+        drop(owner);
+        assert!(capacity.try_acquire().is_ok());
+    }
     fn command(path: &Path, args: &[&str]) -> String {
         String::from_utf8(
             run(Command::new("git")

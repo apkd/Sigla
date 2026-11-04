@@ -113,11 +113,12 @@ impl App {
                 let (mut store, selector) = if let Some(repository) = repository {
                     let selector = repository.selector.clone();
                     (
-                        crate::repository::history::Store::remote(
+                        crate::repository::history::Store::remote_monitored(
                             repository,
                             rules.as_ref().unwrap(),
                             &app.cache,
                             cancel,
+                            blocking_operation.clone(),
                         )?,
                         selector,
                     )

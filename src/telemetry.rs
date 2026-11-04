@@ -44,6 +44,54 @@ pub enum Diagnostic {
     RequestCancelled,
     Shutdown,
     Superseded,
+    StartupFailure,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Details {
+    #[serde(default)]
+    pub complete: Option<bool>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Progress {
+    Waiting,
+    Advanced,
+    Complete,
+}
+
+pub struct Startup(pub Operation, bool);
+impl Startup {
+    pub fn begin() -> Self {
+        let startup = Self::new("startup");
+        startup.0.version();
+        startup
+    }
+    pub(crate) fn new(kind: &str) -> Self {
+        let operation = operation(kind, None, None);
+        if let Some(inner) = &operation.0 {
+            inner.update(|state| state.record.detailed = true);
+        }
+        operation.stage("configuration");
+        Self(operation, false)
+    }
+    pub fn ready(&mut self) {
+        self.0.clone().finish("success");
+        self.1 = true;
+    }
+}
+impl Drop for Startup {
+    fn drop(&mut self) {
+        if !self.1 {
+            self.0.diagnose(Diagnostic::StartupFailure);
+            self.0.clone().finish("failure");
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +111,8 @@ pub struct Record {
     pub waiting: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<Diagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Details>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +148,8 @@ pub struct Export {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+// Events stay inline in the bounded queue to avoid per-update allocations.
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Operation(Record),
     Disk(DiskSample),
@@ -123,10 +175,16 @@ impl Recorder {
     fn send(&self, event: Event) {
         let bytes = match &event {
             Event::Operation(record) => {
-                256 + record.query.as_ref().map_or(0, String::len)
+                std::mem::size_of::<Record>()
+                    + record.query.as_ref().map_or(0, String::len)
                     + record.kind.len()
                     + record.repository.as_ref().map_or(0, String::len)
                     + record.target.as_ref().map_or(0, String::len)
+                    + record
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.version.as_ref())
+                        .map_or(0, String::len)
                     + record.current_stage.as_ref().map_or(0, String::len)
                     + record.waiting.iter().map(String::len).sum::<usize>()
                     + record
@@ -307,8 +365,10 @@ impl OperationInner {
         }
         state.record.end_ms = Some(end_ms);
         state.record.status = status.to_owned();
-        state.record.detailed =
-            elapsed >= 5_000 || state.wait_ms >= 1_000 || !matches!(status, "success" | "noop");
+        state.record.detailed = state.record.detailed
+            || elapsed >= 5_000
+            || state.wait_ms >= 1_000
+            || !matches!(status, "success" | "noop");
         if state.record.detailed {
             state.record.query = state.query.take();
         } else {
@@ -370,6 +430,7 @@ fn operation_using(
         current_stage: None,
         waiting: Vec::new(),
         diagnostic: None,
+        details: None,
     };
     recorder.send(Event::Operation(record.clone()));
     record.query = query.as_deref().map(preview::summarize);
@@ -417,6 +478,30 @@ fn push_stage(state: &mut Running, stage: Stage, recorder: &Weak<Recorder>) {
 }
 
 impl Operation {
+    pub fn complete(&self, complete: bool) {
+        if let Some(inner) = &self.0 {
+            inner.update(|state| {
+                state.record.details.get_or_insert_default().complete = Some(complete)
+            });
+        }
+    }
+
+    pub fn version(&self) {
+        if let Some(inner) = &self.0 {
+            inner.update(|state| {
+                state.record.details.get_or_insert_default().version =
+                    Some(env!("CARGO_PKG_VERSION").into())
+            });
+        }
+    }
+
+    pub fn progress(&self, progress: Progress) {
+        if let Some(inner) = &self.0 {
+            inner.update(|state| {
+                state.record.details.get_or_insert_default().progress = Some(progress)
+            });
+        }
+    }
     /// Record a verified cause without exposing error messages to monitoring clients.
     pub fn diagnose(&self, diagnostic: Diagnostic) {
         if let Some(inner) = &self.0 {
@@ -689,6 +774,59 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn startup_guard_finishes_once_on_success_or_failure() {
+        for success in [true, false] {
+            let (operation, recorder) = test_operation();
+            operation.version();
+            operation.stage("configuration");
+            {
+                let mut startup = Startup(operation, false);
+                if success {
+                    startup.ready();
+                }
+            }
+            let records = recorder.completed();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.status, if success { "success" } else { "failure" });
+            assert_eq!(
+                record.diagnostic,
+                (!success).then_some(Diagnostic::StartupFailure)
+            );
+            assert!(record.details.as_ref().unwrap().version.is_some());
+            assert!(record.end_ms.is_some());
+        }
+    }
+
+    #[test]
+    fn changing_details_publishes_active_updates_and_preserves_completion() {
+        let (operation, recorder) = test_operation();
+        operation.version();
+        operation.complete(false);
+        operation.progress(Progress::Advanced);
+        let active: Vec<_> = recorder
+            .receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Message::Event(Event::Operation(record), _) => Some(record),
+                _ => None,
+            })
+            .collect();
+        let latest = active.last().unwrap();
+        assert!(latest.end_ms.is_none());
+        let details = latest.details.as_ref().unwrap();
+        assert!(details.version.is_some());
+        assert_eq!(details.complete, Some(false));
+        assert_eq!(details.progress, Some(Progress::Advanced));
+        let expected = details.clone();
+
+        operation.finish("success");
+        let records = recorder.completed();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].details.as_ref(), Some(&expected));
     }
 
     #[test]

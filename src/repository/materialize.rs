@@ -200,8 +200,16 @@ pub(super) fn receive_filtered(
     options: &super::transport::Fetch<'_>,
     remaining: Option<u64>,
 ) -> Result<u64> {
-    receive_filtered_measured(session, store, control, objects, options, remaining)
-        .map(|transfer| transfer.bytes)
+    receive_filtered_measured(
+        session,
+        store,
+        control,
+        objects,
+        options,
+        remaining,
+        &crate::telemetry::Operation::default(),
+    )
+    .map(|transfer| transfer.bytes)
 }
 
 pub(super) fn receive_filtered_measured(
@@ -211,7 +219,9 @@ pub(super) fn receive_filtered_measured(
     objects: Vec<gix_hash::ObjectId>,
     options: &super::transport::Fetch<'_>,
     remaining: Option<u64>,
+    telemetry: &crate::telemetry::Operation,
 ) -> Result<Transfer> {
+    super::history::check(options.cancel)?;
     let scratch = tempfile::tempdir_in(store.join("objects/pack"))?;
     let pack = scratch.path().join("incoming.pack");
     let mut output = LimitedWriter {
@@ -220,6 +230,7 @@ pub(super) fn receive_filtered_measured(
         exceeded: false,
     };
     let mut transfer = Transfer::default();
+    let receiving = telemetry.wait("repository_pack_receive");
     let received = session.pack_filtered(
         objects,
         control,
@@ -229,19 +240,33 @@ pub(super) fn receive_filtered_measured(
             transfer: &mut transfer,
         },
     );
+    drop(receiving);
     ensure!(
         !output.exceeded,
         "Repository transfer limit exceeded; use an exact repository allow entry to remove the cap"
     );
     received?;
+    super::history::check(options.cancel)?;
     output.output.sync_all()?;
+    let indexing = telemetry.wait("repository_pack_index");
     let index = scratch.path().join("incoming.idx");
     let (pack, id) = if options.haves.is_empty() {
-        let result = run(git(store)
-            .args(["index-pack", "--index-version=2", "-o"])
-            .arg(&index)
-            .arg(&pack))?;
-        (pack, String::from_utf8(result)?.trim().to_owned())
+        let result = crate::process::capture_cancellable(
+            git(store)
+                .args(["index-pack", "--index-version=2", "-o"])
+                .arg(&index)
+                .arg(&pack),
+            Duration::from_secs(120),
+            None,
+            None,
+            Some(options.cancel),
+        )?;
+        ensure!(
+            result.status.success(),
+            "Cannot index repository pack: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        (pack, String::from_utf8(result.stdout)?.trim().to_owned())
     } else {
         // Negotiated packs may use bases retained only by this reader's lease.
         // Expanding thin packs requires stdin; ordinary packs index in place.
@@ -273,6 +298,9 @@ pub(super) fn receive_filtered_measured(
             .context("Invalid Git pack receipt")?;
         (indexed, id.to_owned())
     };
+    drop(indexing);
+    super::history::check(options.cancel)?;
+    let _publication = telemetry.wait("repository_pack_publication");
     parse_id(&id)?;
     let destination = store.join("objects/pack").join(format!("pack-{id}"));
     // The marker precedes publication so local inspection never attempts to repair omitted blobs.

@@ -143,6 +143,69 @@ mod refresh_tests {
         assert!(recorder.completed()[0].links.is_empty());
     }
 
+    #[tokio::test]
+    async fn asset_acquisition_wait_does_not_hold_the_index_worker() {
+        use crate::unity::assets::jobs::{Jobs, Request, generation, wait};
+
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut options = options();
+        options
+            .rules
+            .push(crate::repository::Rule::parse_private("https://github.com/owner/*").unwrap());
+        let manager = Manager::new(cache.path().into(), options).unwrap();
+        let branch = Arc::new(Branch::for_test(root.path().into()));
+        let mut branch_state = state();
+        branch_state.prepared.deferred_assets.clear();
+        *branch.state.write().await = Some(branch_state);
+        let held_state = branch.state.write().await;
+
+        let mut workspace = crate::workspace::Workspace::open(
+            root.path().into(),
+            cache.path(),
+            crate::discovery::Policy::new(vec![root.path().into()]).unwrap(),
+            &cache.path().join("analysis"),
+            None,
+            Arc::new(crate::watch::Monitor::default()),
+        )
+        .unwrap();
+        workspace.refresh().unwrap();
+        let expected = generation(&workspace.manifest).unwrap();
+        let assets = cache.path().join("unity-assets/worker");
+        let leases = crate::cache::views::LeaseSet::new(cache.path()).unwrap();
+        leases.retain(&assets).unwrap();
+        let jobs = Jobs::default();
+        let ticket = jobs.start(Request {
+            activity: Arc::new(Arc::new(AsyncRwLock::new(())).read_owned().await),
+            workspace: Arc::new(AsyncMutex::new(Some(workspace))),
+            branch: Some(branch.clone()),
+            remote: Some(manager),
+            root: root.path().into(),
+            cache: assets,
+            records: Arc::new(crate::cache::artifacts::Store::open(cache.path()).unwrap()),
+            expected,
+            revision: Some("commit".into()),
+            refresh: false,
+            leases,
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while branch.acquiring.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Asset acquisition did not reach the held branch state");
+        let permit = tokio::time::timeout(Duration::from_secs(5), jobs.pause())
+            .await
+            .expect("Asset acquisition held the index worker");
+        drop(permit);
+        drop(held_state);
+        tokio::time::timeout(Duration::from_secs(5), wait(ticket))
+            .await
+            .expect("Asset indexing did not finish")
+            .unwrap();
+    }
+
     #[test]
     fn eviction_rechecks_branch_handles_and_identity_after_planning() {
         for existing in [false, true] {
@@ -1516,7 +1579,9 @@ impl Manager {
         prepared.resolved_target = before.prepared.resolved_target.clone();
         before.reuse_omissions(&mut prepared, &self.options.selection.identity);
         if assets {
-            prepared.unavailable.extend(before.prepared.unavailable);
+            prepared
+                .unavailable
+                .extend(before.prepared.unavailable.iter().cloned());
         }
         telemetry.stage("required_input_publication");
         let mut state = {
@@ -1527,6 +1592,23 @@ impl Manager {
         next.schema = 5;
         next.additional.extend(paths);
         next.prepared = prepared;
+        if !assets
+            && before.same_inputs(&next)
+            && fs::read_dir(stage.path())?.next().transpose()?.is_none()
+            && branch.source().is_dir()
+            && next
+                .prepared
+                .directories
+                .iter()
+                .all(|path| branch.source().join(path).is_dir())
+        {
+            next.indexed_revision = state
+                .as_ref()
+                .and_then(|state| state.indexed_revision.clone());
+            branch.persist(&next)?;
+            *state = Some(next);
+            return Ok(());
+        }
         if !assets {
             next.repair = true;
             branch.persist(&next)?;

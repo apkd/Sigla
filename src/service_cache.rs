@@ -110,6 +110,7 @@ pub(super) struct Retirement {
 pub(super) struct StartupMaintenance {
     scopes: Option<VecDeque<([u8; 32], crate::store::shared::WorkspaceInfo)>>,
     cleaned: bool,
+    pub(super) progress: Option<crate::telemetry::Progress>,
 }
 
 #[cfg(test)]
@@ -142,6 +143,20 @@ mod startup_tests {
 
     fn make_app(root: &Path, cache: &Path) -> Arc<App> {
         Arc::new(App::new(Policy::new(vec![root.into()]).unwrap(), cache.into(), 1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_reports_waiting_before_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let app = make_app(root.path(), cache.path());
+        let mut state = StartupMaintenance::default();
+        let active = app.activity.write().await;
+        assert!(!app.maintain_startup(&mut state).await.unwrap());
+        assert_eq!(state.progress, Some(crate::telemetry::Progress::Waiting));
+        drop(active);
+        assert!(app.maintain_startup(&mut state).await.unwrap());
+        assert_eq!(state.progress, Some(crate::telemetry::Progress::Advanced));
     }
 
     #[tokio::test]
@@ -474,6 +489,7 @@ impl App {
     }
 
     fn maintain_startup_step(&self, state: &mut StartupMaintenance) -> Result<bool> {
+        state.progress = Some(crate::telemetry::Progress::Waiting);
         if self.inspection_shutdown.is_cancelled() {
             return Ok(true);
         }
@@ -495,6 +511,9 @@ impl App {
                     Ok::<_, anyhow::Error>(())
                 })();
                 state.cleaned = result.is_ok();
+                if state.cleaned {
+                    state.progress = Some(crate::telemetry::Progress::Advanced);
+                }
                 result
             };
             if state.scopes.is_none() {
@@ -528,7 +547,11 @@ impl App {
         let scopes = state.scopes.as_mut().unwrap();
         let now = crate::cache::now();
         if let Some((key, info)) = scopes.front() {
-            if self.retire_analysis_scope(&database, *key, info, now)?.done {
+            let retirement = self.retire_analysis_scope(&database, *key, info, now)?;
+            if retirement.progress {
+                state.progress = Some(crate::telemetry::Progress::Advanced);
+            }
+            if retirement.done {
                 scopes.pop_front();
             } else {
                 // Large or currently pinned namespaces cannot starve smaller ones.
@@ -539,6 +562,9 @@ impl App {
             return Ok(true);
         }
         let collected = database.collect(now, 128)?;
+        if collected.visited > 0 {
+            state.progress = Some(crate::telemetry::Progress::Advanced);
+        }
         cleanup?;
         Ok(scopes.is_empty() && collected.visited < 128)
     }
@@ -806,10 +832,16 @@ impl App {
     }
 
     fn seed_owners(&self) -> Result<bool> {
+        self.seed_owners_observed(|| {})
+    }
+
+    fn seed_owners_observed(&self, mut observe: impl FnMut()) -> Result<bool> {
         if self.inspection_shutdown.is_cancelled() {
             return Ok(false);
         }
         let mut known = true;
+        let mut missing_manifests = 0u64;
+        let mut changed_dependencies = 0u64;
         for (owner, _, used) in crate::repository::cache::history_owners(&self.cache)? {
             self.owners.lock().unwrap().seed(&owner, None, used);
         }
@@ -831,7 +863,8 @@ impl App {
                     continue;
                 }
                 if let Some(scope) = database.existing(key)? {
-                    let revision = self.owners.lock().unwrap().revision();
+                    let revision = self.owners.lock().unwrap().dependency_revision();
+                    observe();
                     let store = crate::store::Store { scope };
                     let manifest: Option<crate::workspace::Manifest> = store.get_manifest()?;
                     if let Some(manifest) = manifest {
@@ -840,13 +873,15 @@ impl App {
                             continue;
                         }
                         let mut owners = self.owners.lock().unwrap();
-                        if owners.revision() != revision {
+                        if owners.dependency_revision() != revision {
                             known = false;
+                            changed_dependencies += 1;
                             continue;
                         }
                         owners.observe(&info.entry, info.owner.as_deref(), &manifest, None);
                     } else {
                         known = false;
+                        missing_manifests += 1;
                     }
                 }
             }
@@ -858,7 +893,7 @@ impl App {
                 .values()
                 .map(|owner| (owner.entry.clone(), owner.repository.clone()))
                 .collect();
-            (owners.revision(), paths)
+            (owners.dependency_revision(), paths)
         };
         let mut removed = Vec::new();
         for (entry, repository) in paths {
@@ -873,15 +908,23 @@ impl App {
         }
         {
             let mut owners = self.owners.lock().unwrap();
-            if owners.revision() == revision {
+            if owners.dependency_revision() == revision {
                 for entry in removed {
                     owners.remove(&entry);
                 }
             } else {
                 known = false;
+                changed_dependencies += 1;
             }
         }
         self.flush_owners()?;
+        if !known {
+            tracing::info!(
+                missing_manifests,
+                changed_dependencies,
+                "Cache dependency inventory is incomplete"
+            );
+        }
         Ok(known)
     }
 
@@ -1210,14 +1253,34 @@ impl App {
         maintenance_stage(operation, "asset record collection", || {
             self.asset_records.collect(pressure)
         })?;
+        candidates.retain(|candidate| !candidate.expired);
+        let allocation_roots = pressure.then(|| {
+            crate::cache::policy::allocation_roots(&self.owners.lock().unwrap(), &candidates)
+        });
+        let mut measured_costs = None;
         let (mut after, sample) =
             maintenance_stage(operation, "post-collection disk measurement", || {
+                if let Some(roots) = &allocation_roots {
+                    let (allocation, costs) = blobs::allocated_with_owners(
+                        &self.cache,
+                        repository_roots.as_ref().unwrap_or(&BTreeMap::new()),
+                        roots,
+                    )?;
+                    measured_costs = Some(costs);
+                    let bytes = allocation.total_bytes;
+                    return Ok((
+                        bytes,
+                        repository_roots.as_ref().map(|_| MaintenanceDiskSample {
+                            measured_at_ms: crate::telemetry::now_ms(),
+                            allocation,
+                        }),
+                    ));
+                }
                 self.measure_allocated(repository_roots.as_ref())
             })?;
         if sample.is_some() {
             *disk_sample = sample;
         }
-        candidates.retain(|candidate| !candidate.expired);
         let mut remaining = self.cache_limits.reclaim(after, Disk::read(&self.cache)?);
         let mut savings = if remaining > 0 {
             self.analysis_savings(Disk::read(&self.cache)?)?
@@ -1227,7 +1290,16 @@ impl App {
         if remaining > savings {
             let owners = self.owners.lock().unwrap().clone();
             maintenance_stage(operation, "eviction ranking", || {
-                crate::cache::policy::rank(&owners, &mut candidates, crate::cache::now())
+                if let Some(costs) = &measured_costs {
+                    crate::cache::policy::rank_measured(
+                        &mut candidates,
+                        costs,
+                        crate::cache::now(),
+                    );
+                    Ok(())
+                } else {
+                    crate::cache::policy::rank(&owners, &mut candidates, crate::cache::now())
+                }
             })?;
         }
         candidates.retain(|candidate| !candidate.pinned);
@@ -1625,6 +1697,56 @@ mod tests {
         app.collect_views(true).unwrap();
         assert!(managed.is_file());
         assert!(native.is_file());
+    }
+
+    #[test]
+    fn ownership_scan_ignores_usage_but_rejects_dependency_changes() {
+        use crate::{store::Store, workspace::Manifest};
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let manifest = Manifest {
+            root: root.path().into(),
+            ..Manifest::default()
+        };
+        Store::open_workspace(&cache.path().join("analysis"), [0; 32], root.path(), None)
+            .unwrap()
+            .save_manifest(&manifest)
+            .unwrap();
+        app.owners
+            .lock()
+            .unwrap()
+            .observe(root.path(), None, &manifest, None);
+        assert!(
+            app.seed_owners_observed(|| {
+                app.owners
+                    .lock()
+                    .unwrap()
+                    .touch(root.path(), None, &manifest, crate::cache::now());
+            })
+            .unwrap()
+        );
+        let mut newer = manifest.clone();
+        newer
+            .dependencies
+            .insert(cache.path().join("unity-packages/new/source.cs"));
+        assert!(
+            !app.seed_owners_observed(|| {
+                app.owners
+                    .lock()
+                    .unwrap()
+                    .observe(root.path(), None, &newer, None);
+            })
+            .unwrap()
+        );
+        assert!(
+            app.owners
+                .lock()
+                .unwrap()
+                .retains(&cache.path().join("unity-packages/new"))
+        );
+        Store::open_workspace(&cache.path().join("analysis"), [1; 32], root.path(), None).unwrap();
+        assert!(!app.seed_owners().unwrap());
     }
 
     #[test]

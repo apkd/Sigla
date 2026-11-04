@@ -832,9 +832,30 @@ fn link_objects(source: &Path, target: &Path) -> Result<()> {
     sync_dir(&target.join("objects"))
 }
 
+#[cfg(test)]
 pub(super) fn object_lease(cache: &Path, identity: &Identity, format: &str) -> Result<ObjectLease> {
+    object_lease_monitored(
+        cache,
+        identity,
+        format,
+        &crate::telemetry::Operation::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub(super) fn object_lease_monitored(
+    cache: &Path,
+    identity: &Identity,
+    format: &str,
+    telemetry: &crate::telemetry::Operation,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ObjectLease> {
     let pool = Pool::open(cache, identity)?;
-    let operation = futures_executor::block_on(pool.operation.lock());
+    let operation = {
+        let _wait = telemetry.wait("history_pool_admission");
+        super::history::wait(cancel, pool.operation.lock())?
+    };
+    let _setup = telemetry.wait("history_reader_setup");
     private_dir(&pool.root)?;
     pool.recover()?;
     let mut state = pool.state()?;
@@ -899,14 +920,23 @@ impl ObjectLease {
     }
 
     /// Serialize publication with replacement, but never hold the gate while matching.
-    pub fn acquire(&self, fetch: impl FnOnce(&Path, &Path) -> Result<u64>) -> Result<u64> {
-        let _operation = futures_executor::block_on(self.pool.operation.lock());
+    pub fn acquire(
+        &self,
+        telemetry: &crate::telemetry::Operation,
+        cancel: &std::sync::atomic::AtomicBool,
+        fetch: impl FnOnce(&Path, &Path) -> Result<u64>,
+    ) -> Result<u64> {
+        let _operation = {
+            let _wait = telemetry.wait("history_pool_admission");
+            super::history::wait(cancel, self.pool.operation.lock())?
+        };
         self.pool.recover()?;
         let bytes = {
-            let telemetry = crate::telemetry::Operation::default();
-            let _permit = futures_executor::block_on(self.pool.capacity.transfer(&telemetry))?;
+            let _permit = super::history::wait(cancel, self.pool.capacity.transfer(telemetry))??;
+            let _wait = telemetry.wait("history_transfer");
             fetch(&self.pool.root.join("current"), self.view.path())?
         };
+        let _wait = telemetry.wait("history_publication");
         link_objects(&self.pool.root.join("current"), self.view.path())?;
         let mut state = self.pool.state()?;
         state.used = now();
@@ -915,12 +945,26 @@ impl ObjectLease {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub fn publish(
         &self,
         complete: &BTreeSet<String>,
         boundaries: &BTreeSet<String>,
     ) -> Result<()> {
-        let _operation = futures_executor::block_on(self.pool.operation.lock());
+        self.publish_cancellable(
+            complete,
+            boundaries,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    pub fn publish_cancellable(
+        &self,
+        complete: &BTreeSet<String>,
+        boundaries: &BTreeSet<String>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
+        let _operation = super::history::wait(cancel, self.pool.operation.lock())?;
         let current = self.pool.root.join("current");
         // A replacement includes every object pinned before root capture. Readers
         // can also keep older objects: link these back before extending coverage.

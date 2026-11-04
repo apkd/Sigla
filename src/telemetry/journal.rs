@@ -14,7 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAGIC: &[u8; 8] = b"SGMON002";
+const MAGIC: &[u8; 8] = b"SGMON003";
+const V2_MAGIC: &[u8; 8] = b"SGMON002";
 const LEGACY_MAGIC: &[u8; 8] = b"SGMON001";
 // Ten continuation bytes cannot begin a valid Postcard u64 timestamp.
 const SNAPSHOT_MAGIC: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffSGACT002";
@@ -69,6 +70,7 @@ impl From<LegacyRecord> for Record {
             current_stage: record.current_stage,
             waiting: record.waiting,
             diagnostic: None,
+            details: None,
         }
     }
 }
@@ -185,15 +187,16 @@ fn days(directory: &Path) -> Result<Vec<u64>> {
     Ok(days)
 }
 
-fn header(file: &mut File) -> Result<(u64, bool)> {
+fn header(file: &mut File) -> Result<(u64, u8)> {
     let mut bytes = [0; HEADER_BYTES as usize];
     file.read_exact(&mut bytes)?;
-    let legacy = &bytes[..8] == LEGACY_MAGIC;
-    ensure!(
-        legacy || &bytes[..8] == MAGIC,
-        "unsupported monitor journal format"
-    );
-    Ok((u64::from_le_bytes(bytes[8..].try_into().unwrap()), legacy))
+    let version = match &bytes[..8] {
+        magic if magic == LEGACY_MAGIC => 1,
+        magic if magic == V2_MAGIC => 2,
+        magic if magic == MAGIC => 3,
+        _ => anyhow::bail!("unsupported monitor journal format"),
+    };
+    Ok((u64::from_le_bytes(bytes[8..].try_into().unwrap()), version))
 }
 
 fn create_day(path: &Path, generation: u64) -> Result<File> {
@@ -210,7 +213,7 @@ fn create_day(path: &Path, generation: u64) -> Result<File> {
 }
 
 /// A partially written last frame is invisible until it is complete.
-fn read_frame(file: &mut File, legacy: bool) -> Result<Option<(Vec<Event>, u64, usize)>> {
+fn read_frame(file: &mut File, legacy: u8) -> Result<Option<(Vec<Event>, u64, usize)>> {
     let start = file.stream_position()?;
     let length = file.metadata()?.len();
     if length.saturating_sub(start) < FRAME_HEADER_BYTES {
@@ -451,7 +454,7 @@ impl Writer {
                     );
                 }
                 let day = record.start_ms / DAY_MS;
-                if record.status == "noop" && !record.detailed {
+                if record.status == "noop" && !record.detailed && record.details.is_none() {
                     let pending = self.pending.entry(day).or_default();
                     let duration = record
                         .end_ms
@@ -488,9 +491,9 @@ impl Writer {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.prepared.entry(day) {
             file.seek(SeekFrom::Start(0))?;
             let (mut generation, legacy) = header(&mut file)?;
-            if legacy {
+            if legacy < 3 {
                 let next = (generation & !3).saturating_add(4);
-                let discarded_tail = compact(&path, day, file, next, false, true, || Ok(()))?;
+                let discarded_tail = compact(&path, day, file, next, false, legacy, || Ok(()))?;
                 if discarded_tail {
                     self.snapshot.gaps = self.snapshot.gaps.saturating_add(1);
                 }
@@ -498,7 +501,7 @@ impl Writer {
                 (generation, _) = header(&mut file)?;
             }
             let mut complete = HEADER_BYTES;
-            while let Some((_, bytes, _)) = read_frame(&mut file, false)? {
+            while let Some((_, bytes, _)) = read_frame(&mut file, 3)? {
                 complete += bytes;
             }
             // Late completions must make a packed day eligible for retention again.
@@ -698,7 +701,7 @@ fn compact(
     mut input: File,
     generation: u64,
     rollup: bool,
-    legacy: bool,
+    legacy: u8,
     mut yield_work: impl FnMut() -> Result<()>,
 ) -> Result<bool> {
     let temporary = path.with_extension("compact");
@@ -721,7 +724,14 @@ fn compact(
         for event in events {
             match event {
                 Event::Operation(record)
-                    if rollup && !record.detailed && record.status == "success" =>
+                    if rollup
+                        && !record.detailed
+                        && record.status == "success"
+                        && record.details.as_ref().is_none_or(|details| {
+                            details.version.is_none()
+                                && details.complete != Some(false)
+                                && details.progress.is_none()
+                        }) =>
                 {
                     let summary = summaries
                         .entry((record.kind.clone(), record.repository.clone()))
@@ -897,6 +907,7 @@ mod tests {
             current_stage: None,
             waiting: Vec::new(),
             diagnostic: None,
+            details: None,
         }
     }
 
@@ -960,6 +971,110 @@ mod tests {
             Some(super::super::Diagnostic::MaintenanceBusy)
         );
         assert_eq!(result.version, 1);
+    }
+
+    #[test]
+    fn diagnostic_journal_survives_upgrade_and_resumes_from_replacement_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(directory.path()).unwrap();
+        let path = day_path(directory.path(), 1);
+        let mut file = create_day(&path, 0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(V2_MAGIC).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        let mut old_record = record("old", 1, "failure", true);
+        old_record.diagnostic = Some(super::super::Diagnostic::MaintenanceBusy);
+        write_frame(&mut file, &[Event::Operation(old_record.clone())]).unwrap();
+        let old = export(directory.path(), None).unwrap();
+        assert_eq!(old.operations.len(), 1);
+        assert_eq!(old.operations[0].diagnostic, old_record.diagnostic);
+        assert!(old.operations[0].details.is_none());
+
+        let mut new = record("new", 1, "success", false);
+        new.details = Some(super::super::Details {
+            complete: Some(false),
+            version: Some("fixture-version".into()),
+            progress: Some(super::super::Progress::Advanced),
+        });
+        writer.accept(Event::Operation(new.clone()));
+        writer.flush().unwrap();
+        let replacement = export(directory.path(), Some(&old.cursor)).unwrap();
+        assert_eq!(replacement.replace_days, vec![1]);
+        assert_eq!(replacement.operations.len(), 2);
+        assert_eq!(replacement.operations[0].diagnostic, old_record.diagnostic);
+        assert_eq!(replacement.operations[1].details, new.details);
+        let resumed = export(directory.path(), Some(&replacement.cursor)).unwrap();
+        assert!(resumed.replace_days.is_empty());
+        assert!(resumed.operations.is_empty());
+    }
+
+    #[test]
+    fn summaries_keep_operations_with_significant_details() {
+        use super::super::{Details, Progress};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(directory.path()).unwrap();
+        let mut expected = BTreeMap::new();
+        for status in ["success", "noop"] {
+            for (name, details) in [
+                (
+                    "version",
+                    Details {
+                        version: Some("fixture-version".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "incomplete",
+                    Details {
+                        complete: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "progress",
+                    Details {
+                        progress: Some(Progress::Advanced),
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let id = format!("{status}-{name}");
+                let mut value = record(&id, 1, status, false);
+                value.details = Some(details.clone());
+                writer.accept(Event::Operation(value));
+                expected.insert(id, details);
+            }
+            writer.accept(Event::Operation(record(
+                &format!("plain-{status}"),
+                1,
+                status,
+                false,
+            )));
+        }
+        writer.flush().unwrap();
+        let before = export(directory.path(), None).unwrap();
+        writer.retain_one(RETAIN_DAYS + 2, |_| Ok(())).unwrap();
+        let after = export(directory.path(), Some(&before.cursor)).unwrap();
+        assert_eq!(after.replace_days, vec![1]);
+        let kept: BTreeMap<_, _> = after
+            .operations
+            .into_iter()
+            .map(|record| (record.id, record.details.unwrap()))
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(
+            after
+                .summaries
+                .iter()
+                .map(|summary| summary.count)
+                .sum::<u64>(),
+            2
+        );
+        let resumed = export(directory.path(), Some(&after.cursor)).unwrap();
+        assert!(resumed.replace_days.is_empty());
+        assert!(resumed.operations.is_empty());
+        assert!(resumed.summaries.is_empty());
     }
 
     #[test]

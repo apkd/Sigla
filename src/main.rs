@@ -234,6 +234,7 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
         }
         _ => None,
     };
+    let mut startup = sigla::telemetry::Startup::begin();
     let remote = cli.options.validate()?;
     let cache_limits = cli.options.cache_limits();
     let mut policy = Policy::new(cli.options.local_roots())?;
@@ -255,6 +256,7 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
         navigation_workers = workers,
         "Worker pools configured"
     );
+    startup.0.stage("cache setup");
     let app = Arc::new(
         match remote {
             Some(remote) => App::remote(policy, cli.options.cache_dir, workers, remote)?,
@@ -270,6 +272,10 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
         .with_query_workers(query_workers)?
         .with_cache_limits(cache_limits),
     );
+    startup.0.stage("listener setup");
+    if !matches!(cli.command, Command::Serve { .. }) {
+        startup.ready();
+    }
     match cli.command {
         Command::Licenses
         | Command::Metadata { .. }
@@ -353,6 +359,7 @@ async fn run(cli: Cli, matches: clap::ArgMatches) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(listen).await?;
             let listen = listener.local_addr()?;
             tracing::info!(%listen,"Sigla listening at /mcp");
+            startup.ready();
             let inspection = app.start_inspection()?;
             app.start_setup();
             axum::serve(listener, router)

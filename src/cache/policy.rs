@@ -86,7 +86,16 @@ pub(crate) fn rank(
     candidates: &mut [Candidate],
     now: u64,
 ) -> Result<()> {
-    let roots: Vec<_> = candidates
+    let costs = attributed(&allocation_roots(owners, candidates))?;
+    rank_measured(candidates, &costs, now);
+    Ok(())
+}
+
+pub(crate) fn allocation_roots(
+    owners: &super::owners::Catalog,
+    candidates: &[Candidate],
+) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    candidates
         .iter()
         .map(|candidate| {
             let mut views = owners.view_roots(&candidate.owner);
@@ -94,13 +103,18 @@ pub(crate) fn rank(
             views.extend(candidate.git.iter().cloned());
             (candidate.owner.entry.clone(), views)
         })
-        .collect();
-    let costs = attributed(&roots)?;
+        .collect()
+}
+
+pub(crate) fn rank_measured(
+    candidates: &mut [Candidate],
+    costs: &BTreeMap<PathBuf, u64>,
+    now: u64,
+) {
     for candidate in candidates.iter_mut() {
         candidate.bytes = costs[&candidate.owner.entry];
     }
     sort_candidates(candidates, now);
-    Ok(())
 }
 
 fn sort_candidates(candidates: &mut [Candidate], now: u64) {

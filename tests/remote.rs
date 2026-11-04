@@ -687,6 +687,22 @@ fn main() -> Result<()> {
     {
         return ssh();
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__git-job")) {
+        let input = std::env::args_os()
+            .nth(2)
+            .context("Missing Git job input")?;
+        let output = std::env::args_os()
+            .nth(3)
+            .context("Missing Git job output")?;
+        return sigla::repository::job::worker(Path::new(&input), Path::new(&output));
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__generation-check")) {
+        let root = std::env::args_os().nth(2).context("Missing fixture root")?;
+        return check_required_input_generations(Path::new(&root));
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("generation")) {
+        return required_input_generations();
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("unity")) {
         let root = PathBuf::from(
             std::env::args_os()
@@ -716,9 +732,119 @@ fn main() -> Result<()> {
         return acquisition_probe(&root, &binary, count, expect_reuse);
     }
     remote_assets::code_precedes_asset_downloads()?;
+    required_input_generations()?;
     lifecycle()?;
     println!("Remote lifecycle checks passed");
     Ok(())
+}
+
+fn required_input_generations() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let upstream = root.path().join("upstream");
+    fs::create_dir(&upstream)?;
+    git(
+        &upstream,
+        &["init", "--quiet", "--initial-branch=main", "--template="],
+    )?;
+    for args in [
+        ["config", "user.name", "Fixture"],
+        ["config", "user.email", "fixture@example.invalid"],
+        ["config", "uploadpack.allowFilter", "true"],
+        ["config", "uploadpack.allowAnySHA1InWant", "true"],
+    ] {
+        git(&upstream, &args)?;
+    }
+    fs::write(upstream.join("lib.rs"), "pub struct Available;\n")?;
+    fs::write(upstream.join("Module.asset"), "pub struct Required;\n")?;
+    git(&upstream, &["add", "."])?;
+    git(&upstream, &["commit", "--quiet", "-m", "Add inputs"])?;
+    fs::create_dir(root.path().join("bin"))?;
+    std::os::unix::fs::symlink(std::env::current_exe()?, root.path().join("bin/ssh"))?;
+    let status = Command::new(std::env::current_exe()?)
+        .arg("__generation-check")
+        .arg(root.path())
+        .env("SIGLA_TEST_REPOSITORY", &upstream)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.path().join("bin").display(),
+                std::env::var("PATH")?
+            ),
+        )
+        .status()?;
+    ensure!(status.success(), "Required input generation check failed");
+    Ok(())
+}
+
+fn check_required_input_generations(root: &Path) -> Result<()> {
+    use sigla::{
+        config::RemoteOptions,
+        repository::{Repository, Rule, manager::Manager, selection::Selection},
+        telemetry::Operation,
+    };
+    use std::sync::atomic::Ordering;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let options = RemoteOptions {
+            rules: vec![Rule::parse_private("ssh://git@fixture.invalid/repo")?],
+            refresh_interval: Some(Duration::from_secs(3600)),
+            repo_ttl: Duration::from_secs(86400),
+            branch_ttl: Duration::from_secs(86400),
+            unity_versions: Vec::new(),
+            selection: Selection::new(&[], &[])?,
+        };
+        let manager = Manager::new(root.join("cache"), options)?;
+        let repository = Repository::parse("ssh://git@fixture.invalid/repo#refs/heads/main")?
+            .context("Missing fixture repository")?;
+        let branch = manager.resolve(repository).await?;
+        let revision = branch
+            .state
+            .read()
+            .await
+            .as_ref()
+            .context("Missing prepared branch")?
+            .prepared
+            .revision
+            .clone();
+        let operation = Operation::default();
+        let original = branch.generation.load(Ordering::Acquire);
+        manager
+            .require_inputs(&branch, &revision, vec!["Module.asset".into()], &operation)
+            .await?;
+        let published = branch.generation.load(Ordering::Acquire);
+        ensure!(
+            published > original,
+            "New required input did not publish a generation"
+        );
+        let required = branch.source().join("Module.asset");
+        ensure!(required.is_file(), "Required input was not published");
+        manager
+            .require_inputs(&branch, &revision, vec!["Module.asset".into()], &operation)
+            .await?;
+        ensure!(
+            branch.generation.load(Ordering::Acquire) == published,
+            "Duplicate input changed generation"
+        );
+        fs::remove_file(&required)?;
+        manager
+            .require_inputs(&branch, &revision, vec!["Module.asset".into()], &operation)
+            .await?;
+        ensure!(
+            branch.generation.load(Ordering::Acquire) > published,
+            "Repair did not change generation"
+        );
+        ensure!(
+            fs::read_to_string(required)? == "pub struct Required;\n",
+            "Required input was not repaired"
+        );
+        Ok(())
+    })
 }
 
 /// A local Git/SSH fixture for comparing acquisition with different binaries.

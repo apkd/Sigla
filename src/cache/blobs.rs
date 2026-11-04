@@ -622,7 +622,9 @@ pub fn allocated(root: &Path) -> Result<u64> {
             Ok(metadata) => metadata,
             // Background transfers can publish or remove staging files during a scan.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot measure {}", root.display()));
+            }
         };
         if !seen.insert((metadata.dev(), metadata.ino())) {
             return Ok(0);
@@ -639,10 +641,18 @@ pub fn allocated(root: &Path) -> Result<u64> {
                 {
                     return Ok(bytes);
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Cannot enumerate {}", root.display()));
+                }
             };
             for entry in entries {
-                bytes += visit(&entry?.path(), seen)?;
+                bytes += visit(
+                    &entry
+                        .with_context(|| format!("Cannot enumerate {}", root.display()))?
+                        .path(),
+                    seen,
+                )?;
             }
         }
         Ok(bytes)
@@ -658,6 +668,15 @@ pub(crate) fn allocated_attributed(
     root: &Path,
     repository_roots: &BTreeMap<PathBuf, String>,
 ) -> Result<AttributedAllocation> {
+    allocated_with_owners(root, repository_roots, &[]).map(|(allocation, _)| allocation)
+}
+
+/// Collect eviction estimates in the same physical allocation walk.
+pub(crate) fn allocated_with_owners(
+    root: &Path,
+    repository_roots: &BTreeMap<PathBuf, String>,
+    owners: &[(PathBuf, Vec<PathBuf>)],
+) -> Result<(AttributedAllocation, BTreeMap<PathBuf, u64>)> {
     const NONE: u32 = u32::MAX;
 
     struct Tags {
@@ -740,23 +759,61 @@ pub(crate) fn allocated_attributed(
 
     const CATEGORY: u32 = 1 << 31;
 
-    struct Inode {
-        bytes: u64,
-        tags: Tags,
+    trait Ownership: Default {
+        fn insert(&mut self, owner: u32);
+        fn share(&self, bytes: u64, totals: &mut [u64]);
+    }
+    impl Default for Tags {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Ownership for Tags {
+        fn insert(&mut self, owner: u32) {
+            Tags::insert(self, owner);
+        }
+        fn share(&self, bytes: u64, totals: &mut [u64]) {
+            let count = self.len() as u64;
+            if count != 0 {
+                self.for_each(|owner| totals[owner as usize] += bytes / count);
+            }
+        }
+    }
+    impl Ownership for () {
+        fn insert(&mut self, _: u32) {}
+        fn share(&self, _: u64, _: &mut [u64]) {}
     }
 
-    fn record(
+    struct Inode<T> {
+        bytes: u64,
+        tags: Tags,
+        owners: T,
+    }
+
+    fn record<T: Ownership>(
+        path: &Path,
         metadata: &fs::Metadata,
         category: u32,
         repository: Option<u32>,
-        inodes: &mut BTreeMap<(u64, u64), Inode>,
+        inodes: &mut BTreeMap<(u64, u64), Inode<T>>,
+        owner_roots: &BTreeMap<PathBuf, Vec<u32>>,
     ) {
         let inode = inodes
             .entry((metadata.dev(), metadata.ino()))
             .or_insert_with(|| Inode {
                 bytes: metadata.blocks() * 512,
                 tags: Tags::new(),
+                owners: T::default(),
             });
+        if !owner_roots.is_empty() {
+            for ancestor in path.ancestors() {
+                if let Some(owners) = owner_roots.get(ancestor) {
+                    for &owner in owners {
+                        inode.owners.insert(owner);
+                    }
+                }
+            }
+        }
         if let Some(repository) = repository {
             if inode.tags.first == NONE || inode.tags.first & CATEGORY != 0 {
                 inode.tags.clear();
@@ -767,20 +824,23 @@ pub(crate) fn allocated_attributed(
         }
     }
 
-    fn visit(
+    fn visit<T: Ownership>(
         path: &Path,
         category: u32,
         inherited_repository: Option<u32>,
         repository_roots: &BTreeMap<PathBuf, u32>,
-        inodes: &mut BTreeMap<(u64, u64), Inode>,
+        inodes: &mut BTreeMap<(u64, u64), Inode<T>>,
+        owner_roots: &BTreeMap<PathBuf, Vec<u32>>,
     ) -> Result<()> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot measure {}", path.display()));
+            }
         };
         let repository = repository_roots.get(path).copied().or(inherited_repository);
-        record(&metadata, category, repository, inodes);
+        record(path, &metadata, category, repository, inodes, owner_roots);
         if metadata.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
@@ -791,15 +851,21 @@ pub(crate) fn allocated_attributed(
                 {
                     return Ok(());
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Cannot enumerate {}", path.display()));
+                }
             };
             for entry in entries {
                 visit(
-                    &entry?.path(),
+                    &entry
+                        .with_context(|| format!("Cannot enumerate {}", path.display()))?
+                        .path(),
                     category,
                     repository,
                     repository_roots,
                     inodes,
+                    owner_roots,
                 )?;
             }
         }
@@ -824,85 +890,138 @@ pub(crate) fn allocated_attributed(
         Ok(id)
     }
 
-    let mut repository_names: Vec<_> = repository_roots
-        .values()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    ensure!(
-        repository_names.len() < CATEGORY as usize,
-        "Too many disk attribution labels"
-    );
-    let repository_ids: BTreeMap<_, _> = repository_names
-        .iter()
-        .enumerate()
-        .map(|(id, name)| (name.clone(), id as u32))
-        .collect();
-    let repository_roots: BTreeMap<_, _> = repository_roots
-        .iter()
-        .map(|(path, name)| (path.clone(), repository_ids[name]))
-        .collect();
+    fn measure<T: Ownership>(
+        root: &Path,
+        repository_roots: &BTreeMap<PathBuf, String>,
+        owners: &[(PathBuf, Vec<PathBuf>)],
+    ) -> Result<(AttributedAllocation, BTreeMap<PathBuf, u64>)> {
+        let mut repository_names: Vec<_> = repository_roots
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        ensure!(
+            repository_names.len() < CATEGORY as usize,
+            "Too many disk attribution labels"
+        );
+        let repository_ids: BTreeMap<_, _> = repository_names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| (name.clone(), id as u32))
+            .collect();
+        let repository_roots: BTreeMap<_, _> = repository_roots
+            .iter()
+            .map(|(path, name)| (path.clone(), repository_ids[name]))
+            .collect();
 
-    let root_metadata = match fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AttributedAllocation::default());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let mut category_names = Vec::new();
-    let mut category_ids = BTreeMap::new();
-    let other = intern("other".to_owned(), &mut category_names, &mut category_ids)?;
-    let root_repository = repository_roots.get(root).copied();
-    let mut inodes = BTreeMap::new();
-    record(&root_metadata, other, root_repository, &mut inodes);
-    let mut repo_bytes = vec![0u64; repository_names.len()];
-    let mut shared_bytes = vec![0u64; category_names.len()];
-    if root_metadata.is_dir() {
-        let mut entries = match fs::read_dir(root) {
-            Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-                    && root.ends_with("work") =>
-            {
-                Vec::new()
+        let mut owner_roots = BTreeMap::<PathBuf, Vec<u32>>::new();
+        ensure!(owners.len() < NONE as usize, "Too many allocation owners");
+        for (index, (_, paths)) in owners.iter().enumerate() {
+            for path in paths {
+                ensure!(
+                    path.starts_with(root),
+                    "Allocation owner lies outside the cache"
+                );
+                owner_roots
+                    .entry(path.clone())
+                    .or_default()
+                    .push(index as u32);
             }
-            Err(error) => return Err(error.into()),
-        };
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let category_name = entry.file_name().to_string_lossy().into_owned();
-            let category = intern(category_name, &mut category_names, &mut category_ids)?;
-            shared_bytes.resize(category_names.len(), 0);
-            visit(
-                &entry.path(),
-                category,
-                root_repository,
-                &repository_roots,
-                &mut inodes,
-            )?;
         }
-    }
-    let mut allocation = AttributedAllocation::default();
-    for inode in inodes.values() {
-        allocation.total_bytes += inode.bytes;
-        let bytes = if inode.tags.first & CATEGORY != 0 {
-            &mut shared_bytes
-        } else {
-            &mut repo_bytes
+        let mut owner_bytes = vec![0; owners.len()];
+        let root_metadata = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((
+                    AttributedAllocation::default(),
+                    owners.iter().map(|(owner, _)| (owner.clone(), 0)).collect(),
+                ));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot measure {}", root.display()));
+            }
         };
-        let count = inode.tags.len() as u64;
-        let mut remainder = inode.bytes % count;
-        inode.tags.for_each(|tag| {
-            bytes[(tag & !CATEGORY) as usize] += inode.bytes / count + u64::from(remainder > 0);
-            remainder = remainder.saturating_sub(1);
-        });
+        let mut category_names = Vec::new();
+        let mut category_ids = BTreeMap::new();
+        let other = intern("other".to_owned(), &mut category_names, &mut category_ids)?;
+        let root_repository = repository_roots.get(root).copied();
+        let mut inodes = BTreeMap::<(u64, u64), Inode<T>>::new();
+        record(
+            root,
+            &root_metadata,
+            other,
+            root_repository,
+            &mut inodes,
+            &owner_roots,
+        );
+        let mut repo_bytes = vec![0u64; repository_names.len()];
+        let mut shared_bytes = vec![0u64; category_names.len()];
+        if root_metadata.is_dir() {
+            let mut entries = match fs::read_dir(root) {
+                Ok(entries) => entries
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .with_context(|| format!("Cannot enumerate {}", root.display()))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && root.ends_with("work") =>
+                {
+                    Vec::new()
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Cannot enumerate {}", root.display()));
+                }
+            };
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let category_name = entry.file_name().to_string_lossy().into_owned();
+                let category = intern(category_name, &mut category_names, &mut category_ids)?;
+                shared_bytes.resize(category_names.len(), 0);
+                visit(
+                    &entry.path(),
+                    category,
+                    root_repository,
+                    &repository_roots,
+                    &mut inodes,
+                    &owner_roots,
+                )?;
+            }
+        }
+        let mut allocation = AttributedAllocation::default();
+        for inode in inodes.values() {
+            allocation.total_bytes += inode.bytes;
+            inode.owners.share(inode.bytes, &mut owner_bytes);
+            let bytes = if inode.tags.first & CATEGORY != 0 {
+                &mut shared_bytes
+            } else {
+                &mut repo_bytes
+            };
+            let count = inode.tags.len() as u64;
+            let mut remainder = inode.bytes % count;
+            inode.tags.for_each(|tag| {
+                bytes[(tag & !CATEGORY) as usize] += inode.bytes / count + u64::from(remainder > 0);
+                remainder = remainder.saturating_sub(1);
+            });
+        }
+        allocation.repositories = repository_names.drain(..).zip(repo_bytes).collect();
+        allocation.shared = category_names.into_iter().zip(shared_bytes).collect();
+        Ok((
+            allocation,
+            owners
+                .iter()
+                .map(|(owner, _)| owner.clone())
+                .zip(owner_bytes)
+                .collect(),
+        ))
     }
-    allocation.repositories = repository_names.drain(..).zip(repo_bytes).collect();
-    allocation.shared = category_names.into_iter().zip(shared_bytes).collect();
-    Ok(allocation)
+    // Ordinary monitoring keeps the original per-inode memory footprint.
+    if owners.is_empty() {
+        measure::<()>(root, repository_roots, owners)
+    } else {
+        measure::<Tags>(root, repository_roots, owners)
+    }
 }
 
 #[cfg(test)]
@@ -942,6 +1061,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn allocation_reports_inaccessible_paths_within_its_root() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        struct Restricted(PathBuf);
+        impl Restricted {
+            fn new(path: PathBuf) -> Self {
+                fs::create_dir_all(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+                Self(path)
+            }
+        }
+        impl Drop for Restricted {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+
+        fn assert_permission_error(error: anyhow::Error, path: &Path) {
+            assert!(format!("{error:#}").contains(&path.display().to_string()));
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            }));
+        }
+
+        let mount = tempfile::tempdir().unwrap();
+        let cache = mount.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("data"), vec![42; 8192]).unwrap();
+        let sibling = Restricted::new(mount.path().join("lost+found"));
+
+        let bytes = allocated(&cache).unwrap();
+        let allocation = allocated_attributed(&cache, &BTreeMap::new()).unwrap();
+        assert!(bytes > 0);
+        assert_eq!(allocation.total_bytes, bytes);
+        assert_permission_error(allocated(mount.path()).unwrap_err(), &sibling.0);
+        assert_permission_error(
+            allocated_attributed(mount.path(), &BTreeMap::new()).unwrap_err(),
+            &sibling.0,
+        );
+
+        let blocked = Restricted::new(cache.join("unreadable"));
+        assert_permission_error(allocated(&cache).unwrap_err(), &blocked.0);
+        assert_permission_error(
+            allocated_attributed(&cache, &BTreeMap::new()).unwrap_err(),
+            &blocked.0,
+        );
+    }
 
     #[test]
     fn attributed_allocation_merges_branches_and_counts_hardlinks_once() {
@@ -1036,6 +1208,54 @@ mod tests {
     }
 
     #[test]
+    fn combined_owner_costs_match_independent_attribution() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path();
+        let repo_a = root.join("repositories/a");
+        let repo_b = root.join("repositories/b");
+        let nested = repo_a.join("nested");
+        let shared = root.join("blobs");
+        let unowned = root.join("other");
+        for path in [&nested, &repo_b, &shared, &unowned] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let object = shared.join("object");
+        fs::write(&object, vec![42; 8192]).unwrap();
+        fs::hard_link(&object, nested.join("first")).unwrap();
+        fs::hard_link(&object, repo_a.join("second")).unwrap();
+        fs::hard_link(&object, repo_b.join("third")).unwrap();
+        fs::hard_link(&object, unowned.join("alias")).unwrap();
+        fs::write(nested.join("unique"), vec![7; 4096]).unwrap();
+        fs::write(unowned.join("unowned"), vec![9; 4096]).unwrap();
+        std::os::unix::fs::symlink(&repo_a, root.join("repo-link")).unwrap();
+
+        let repositories = BTreeMap::from([
+            (repo_a.clone(), "repository-a".into()),
+            (repo_b.clone(), "repository-b".into()),
+        ]);
+        let owners = vec![
+            (
+                root.join("owner-a"),
+                vec![repo_a.clone(), nested.clone(), repo_a.clone()],
+            ),
+            (root.join("owner-b"), vec![nested.clone(), repo_b.clone()]),
+            (root.join("owner-c"), vec![repo_b.clone(), shared.clone()]),
+            (root.join("owner-d"), vec![shared.clone()]),
+            (root.join("owner-missing"), vec![root.join("absent")]),
+        ];
+        let expected = crate::cache::policy::attributed(&owners).unwrap();
+        let original = allocated_attributed(root, &repositories).unwrap();
+        let (combined, actual) = allocated_with_owners(root, &repositories, &owners).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(combined.total_bytes, allocated(root).unwrap());
+        assert_eq!(combined.total_bytes, original.total_bytes);
+        assert_eq!(combined.repositories, original.repositories);
+        assert_eq!(combined.shared, original.shared);
+        assert_eq!(actual[&root.join("owner-missing")], 0);
+    }
+
+    #[test]
     #[ignore = "measures physical allocation traversal overhead"]
     fn attributed_allocation_performance_probe() {
         let cache = tempfile::tempdir().unwrap();
@@ -1046,8 +1266,14 @@ mod tests {
             fs::write(source.join(format!("{index}.bin")), [42; 512]).unwrap();
         }
         let roots = BTreeMap::from([(repository, "synthetic".to_owned())]);
+        let owners = vec![
+            (cache.path().join("owner-a"), vec![source.clone()]),
+            (cache.path().join("owner-b"), vec![source.clone()]),
+        ];
         let mut baseline = Vec::new();
         let mut attributed = Vec::new();
+        let mut separate = Vec::new();
+        let mut combined = Vec::new();
         for _ in 0..3 {
             let start = std::time::Instant::now();
             let total = allocated(cache.path()).unwrap();
@@ -1057,14 +1283,33 @@ mod tests {
             let sample = allocated_attributed(cache.path(), &roots).unwrap();
             attributed.push(start.elapsed());
             assert_eq!(sample.total_bytes, total);
+
+            let start = std::time::Instant::now();
+            let separate_allocation = allocated_attributed(cache.path(), &roots).unwrap();
+            let separate_costs = crate::cache::policy::attributed(&owners).unwrap();
+            separate.push(start.elapsed());
+
+            let start = std::time::Instant::now();
+            let (combined_allocation, combined_costs) =
+                allocated_with_owners(cache.path(), &roots, &owners).unwrap();
+            combined.push(start.elapsed());
+            assert_eq!(
+                combined_allocation.total_bytes,
+                separate_allocation.total_bytes
+            );
+            assert_eq!(combined_costs, separate_costs);
         }
         baseline.sort();
         attributed.sort();
+        separate.sort();
+        combined.sort();
         eprintln!(
-            "10k-file scan median: allocated={:?}, attributed={:?}, ratio={:.2}x",
+            "10k-file scan median: allocated={:?}, attributed={:?}, ratio={:.2}x, separate={:?}, combined={:?}",
             baseline[1],
             attributed[1],
             attributed[1].as_secs_f64() / baseline[1].as_secs_f64(),
+            separate[1],
+            combined[1],
         );
     }
 

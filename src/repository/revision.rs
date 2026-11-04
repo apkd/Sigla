@@ -199,6 +199,7 @@ impl Prefix<'_> {
                             cancel: self.cancel,
                         },
                         self.remaining,
+                        &crate::telemetry::Operation::default(),
                     );
                     match result {
                         Ok(transfer) => {

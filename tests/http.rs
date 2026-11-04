@@ -7,6 +7,46 @@ use sigla::{
 };
 use std::sync::Arc;
 
+#[test]
+fn listener_failure_preserves_startup_details() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let monitor = root.path().join("monitor");
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sigla"))
+        .args(["serve", "--listen"])
+        .arg(occupied.local_addr().unwrap().to_string())
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("--monitor-dir")
+        .arg(&monitor)
+        .arg("--root")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let export = sigla::telemetry::export(&monitor, None).unwrap();
+    let startup = export
+        .operations
+        .iter()
+        .find(|record| record.kind == "startup")
+        .unwrap();
+    assert_eq!(startup.status, "failure");
+    assert_eq!(
+        startup.diagnostic,
+        Some(sigla::telemetry::Diagnostic::StartupFailure)
+    );
+    assert!(startup.details.as_ref().unwrap().version.is_some());
+    assert!(!startup.stages.is_empty());
+    let cache = export
+        .operations
+        .iter()
+        .find(|record| record.kind == "cache_startup")
+        .unwrap();
+    assert_eq!(cache.status, "success");
+    assert!(!cache.stages.is_empty());
+}
+
 #[tokio::test]
 async fn http_contract_and_origin_validation() {
     let root = tempfile::tempdir().unwrap();
