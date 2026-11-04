@@ -65,6 +65,7 @@ async fn configuration_documents_are_delivered_with_and_without_build_projects()
             let offset = source.find("CoverageMarker").unwrap();
             let line = source[..offset].bytes().filter(|&b| b == b'\n').count() + 1;
             assert!(text.contains(&format!("{path}:{line}")), "{text}");
+            assert_eq!(app.view(project, path, "raw").await.unwrap(), source);
             for mode in ["exact", "minified"] {
                 let viewed = app.view(project, path, mode).await.unwrap();
                 assert!(viewed.contains(source), "{path}: {viewed}");
@@ -192,6 +193,61 @@ async fn document_discovery_preserves_directory_and_symlink_exclusions() {
 }
 
 #[tokio::test]
+async fn encoded_documents_are_viewable_and_binary_names_are_not_text() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let source = "\"welcome\" = \"Café EncodedMarker\";\r\n";
+    for (path, little) in [
+        ("en.lproj/Localizable.strings", true),
+        ("Info.plist", false),
+    ] {
+        write(root.path(), path, "");
+        let bytes: Vec<_> = if little { [0xff, 0xfe] } else { [0xfe, 0xff] }
+            .into_iter()
+            .chain(source.encode_utf16().flat_map(|word| {
+                if little {
+                    word.to_le_bytes()
+                } else {
+                    word.to_be_bytes()
+                }
+            }))
+            .collect();
+        std::fs::write(root.path().join(path), bytes).unwrap();
+    }
+    for (path, bytes) in [
+        ("compiled.plist", b"bplist00BinaryMarker".as_slice()),
+        ("compiled.strings", b"bplist00BinaryMarker".as_slice()),
+        ("video.ts", b"BinaryMarker\0\x47\xff".as_slice()),
+        ("resources.res", b"\0\xffBinaryMarker".as_slice()),
+    ] {
+        std::fs::write(root.path().join(path), bytes).unwrap();
+    }
+    let app = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    for path in ["en.lproj/Localizable.strings", "Info.plist"] {
+        assert_eq!(app.view(project, path, "raw").await.unwrap(), source);
+        let found = app
+            .search(project, &format!("text:EncodedMarker path:{path}"))
+            .await
+            .unwrap();
+        assert!(found.contains(&format!("{path}:1")), "{found}");
+    }
+    assert_eq!(
+        app.search(project, "text:BinaryMarker").await.unwrap(),
+        "No matches."
+    );
+    for path in [
+        "compiled.plist",
+        "compiled.strings",
+        "video.ts",
+        "resources.res",
+    ] {
+        assert!(app.view(project, path, "raw").await.is_err(), "{path}");
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn new_document_files_and_hidden_directories_refresh_without_restarting() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -204,6 +260,8 @@ async fn new_document_files_and_hidden_directories_refresh_without_restarting() 
     );
     for (path, first, second) in [
         ("scripts/new.lua", "LuaBefore", "LuaAfter"),
+        ("src/new.swift", "SwiftBefore", "SwiftAfter"),
+        ("src/new.ts", "TypeScriptBefore", "TypeScriptAfter"),
         (".agents/skills/new/SKILL.md", "SkillBefore", "SkillAfter"),
         ("config/new.json", "JsonBefore", "JsonAfter"),
     ] {
@@ -271,7 +329,7 @@ async fn old_discovery_policy_rediscovers_unchanged_documents_on_reopen() {
     // Emulate the previous discovery policy without changing any source or directory stamp.
     let old_policy = *blake3::hash(
         &serde_json::to_vec(&(
-            10u32,
+            11u32,
             &policy.roots,
             policy.unity_platform,
             Option::<()>::None,

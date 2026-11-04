@@ -215,6 +215,7 @@ pub(crate) fn decode_owned(bytes: Vec<u8>, language: Language) -> anyhow::Result
             if text.starts_with('\u{feff}') {
                 text.drain(..'\u{feff}'.len_utf8());
             }
+            validate_document(text.as_bytes(), language)?;
             Ok(text)
         }
         Err(error) => decode(error.as_bytes(), language),
@@ -224,12 +225,35 @@ pub(crate) fn decode_owned(bytes: Vec<u8>, language: Language) -> anyhow::Result
 /// Preserve authored UTF-8 text, including its byte order mark, for raw views.
 pub(crate) fn decode_raw(bytes: Vec<u8>, language: Language) -> anyhow::Result<String> {
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(text),
+        Ok(text) => {
+            validate_document(text.as_bytes(), language)?;
+            Ok(text)
+        }
         Err(error) => decode(error.as_bytes(), language),
     }
 }
 
 pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
+    let text = decode_encoding(bytes, language)?;
+    validate_document(text.as_bytes(), language)?;
+    Ok(text)
+}
+
+fn validate_document(bytes: &[u8], language: Language) -> anyhow::Result<()> {
+    if language.document() {
+        let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+        anyhow::ensure!(
+            !bytes.starts_with(b"bplist00")
+                && !bytes
+                    .iter()
+                    .any(|&b| b.is_ascii_control() && !matches!(b, b'\t'..=b'\r')),
+            "Binary document contents are unsupported"
+        );
+    }
+    Ok(())
+}
+
+fn decode_encoding(bytes: &[u8], language: Language) -> anyhow::Result<String> {
     if language != Language::Rust
         && (bytes.starts_with(&[0xff, 0xfe, 0, 0]) || bytes.starts_with(&[0, 0, 0xfe, 0xff]))
     {
@@ -280,6 +304,7 @@ pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
                 Err(error.into())
             }
             Err(_) => {
+                validate_document(bytes, language)?;
                 let mut detector = chardetng::EncodingDetector::new();
                 detector.feed(bytes, true);
                 let encoding = detector.guess(None, false);
@@ -301,6 +326,60 @@ pub fn decode(bytes: &[u8], language: Language) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn documents_preserve_encoded_text_and_reject_binary_contents() {
+        use super::{Language, decode, decode_owned, decode_raw};
+        let text = "\"Café\" = \"128 × 128 pixels\";\r\n\t\u{c}";
+        let encodings = [
+            text.as_bytes().to_vec(),
+            format!("\u{feff}{text}").into_bytes(),
+            [0xff, 0xfe]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+                .collect(),
+            [0xfe, 0xff]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+                .collect(),
+            [0xff, 0xfe, 0, 0]
+                .into_iter()
+                .chain(text.chars().flat_map(|c| (c as u32).to_le_bytes()))
+                .collect(),
+            [0, 0, 0xfe, 0xff]
+                .into_iter()
+                .chain(text.chars().flat_map(|c| (c as u32).to_be_bytes()))
+                .collect(),
+            text.chars().map(|c| c as u8).collect(),
+        ];
+        for language in [Language::Text, Language::Markdown] {
+            for bytes in &encodings {
+                assert_eq!(decode(bytes, language).unwrap(), text);
+                assert_eq!(decode_owned(bytes.clone(), language).unwrap(), text);
+                let raw = decode_raw(bytes.clone(), language).unwrap();
+                assert_eq!(raw.strip_prefix('\u{feff}').unwrap_or(&raw), text);
+            }
+            let mut late_binary = vec![b'a'; 16 * 1024];
+            late_binary.push(0);
+            for bytes in [
+                b"bplist00contents".to_vec(),
+                b"\xef\xbb\xbfbplist00contents".to_vec(),
+                vec![0xff, 0xfe, b'a', 0, 0, 0],
+                vec![0xff, 0xfe, 0],
+                vec![0xfe, 0xff, 0xd8, 0],
+                vec![0xff, b'a', 0x1b],
+                late_binary,
+            ] {
+                assert!(decode(&bytes, language).is_err());
+                assert!(decode_owned(bytes.clone(), language).is_err());
+                assert!(decode_raw(bytes, language).is_err());
+            }
+        }
+        assert_eq!(
+            decode_raw(format!("\u{feff}{text}").into_bytes(), Language::Text).unwrap(),
+            format!("\u{feff}{text}")
+        );
+    }
+
     #[test]
     fn owned_source_decoding_preserves_encoding_rules() {
         let text = "class Café {}";

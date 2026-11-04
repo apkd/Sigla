@@ -482,13 +482,16 @@ fn lifecycle() -> Result<()> {
             !error && found.contains(path),
             "Remote document not indexed: {found}"
         );
-        for mode in ["exact", "minified"] {
+        for mode in ["exact", "minified", "raw"] {
             let (error, viewed) =
                 server.call("view", json!({"codebase":main,"path":path,"mode":mode}))?;
             ensure!(
                 !error && viewed.contains(source),
                 "Remote document not delivered intact: {path}: {viewed}"
             );
+            if mode == "raw" {
+                ensure!(viewed == source, "Raw document was reformatted: {path}");
+            }
         }
     }
     for query in ["function:coverage_lua", "uses:coverage_lua"] {

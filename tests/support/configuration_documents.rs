@@ -57,4 +57,126 @@ pub const FILES: &[(&str, &str)] = &[
         ".agents/skills/review/SKILL.md",
         "# Synthetic instructions\n\nCoverageMarker: inspect tests.\n",
     ),
+    (
+        "apple/Sources/Example.swift",
+        "let message = \"CoverageMarker\"\n",
+    ),
+    (
+        "apple/Modules/Example.swiftinterface",
+        "public let message: Swift.String = \"CoverageMarker\"\n",
+    ),
+    (
+        "apple/Sources/Example.m",
+        "NSString *message = @\"CoverageMarker\";\n",
+    ),
+    (
+        "apple/Sources/Example.mm",
+        "const char *message = \"CoverageMarker\";\n",
+    ),
+    (
+        "apple/Shaders/Example.metal",
+        "constant char message[] = \"CoverageMarker\";\n",
+    ),
+    (
+        "apple/Example.xcodeproj/project.pbxproj",
+        "// !$*UTF8*$!\n{ message = CoverageMarker; }\n",
+    ),
+    (
+        "apple/Info.plist",
+        "<plist><dict><key>name</key><string>CoverageMarker</string></dict></plist>\n",
+    ),
+    (
+        "apple/Config/Build.xcconfig",
+        "PRODUCT_NAME = CoverageMarker\n",
+    ),
+    (
+        "apple/Config/App.entitlements",
+        "<plist><dict><key>CoverageMarker</key><true/></dict></plist>\n",
+    ),
+    (
+        "apple/en.lproj/Localizable.strings",
+        "\"message\" = \"CoverageMarker\";\n",
+    ),
+    (
+        "apple/en.lproj/Localizable.stringsdict",
+        "<plist><dict><key>CoverageMarker</key><dict/></dict></plist>\n",
+    ),
+    (
+        "apple/Localizable.xcstrings",
+        "{\"strings\":{\"CoverageMarker\":{}}}\n",
+    ),
+    (
+        "apple/Views/Main.storyboard",
+        "<document><view id=\"CoverageMarker\"/></document>\n",
+    ),
+    (
+        "apple/Views/Main.xib",
+        "<document><view id=\"CoverageMarker\"/></document>\n",
+    ),
+    (
+        "apple/PrivacyInfo.xcprivacy",
+        "<plist><dict><key>CoverageMarker</key><true/></dict></plist>\n",
+    ),
+    (
+        "apple/Example.xcodeproj/xcshareddata/xcschemes/Example.xcscheme",
+        "<Scheme name=\"CoverageMarker\"/>\n",
+    ),
+    (
+        "apple/Example.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings",
+        "<plist><dict><key>CoverageMarker</key><true/></dict></plist>\n",
+    ),
+    (
+        "apple/Example.xcworkspace/contents.xcworkspacedata",
+        "<Workspace location=\"group:CoverageMarker\"/>\n",
+    ),
+    (
+        "apple/Example.xctestplan",
+        "{\"name\":\"CoverageMarker\"}\n",
+    ),
+    (
+        "apple/Modules/module.modulemap",
+        "module CoverageMarker { header \"example.h\" }\n",
+    ),
+    (
+        "apple/Package.resolved",
+        "{\"originHash\":\"CoverageMarker\",\"pins\":[]}\n",
+    ),
+    (
+        "web/app.ts",
+        "export const marker: string = 'CoverageMarker';\n",
+    ),
+    (
+        "web/App.vue",
+        "<template><p>CoverageMarker</p></template>\n",
+    ),
+    (
+        "web/example.JS.MAP",
+        "{\"version\":3,\"sources\":[\"CoverageMarker\"]}\n",
+    ),
+    ("jvm/Example.kt", "val message = \"CoverageMarker\"\n"),
+    ("scripts/example.rb", "message = 'CoverageMarker'\n"),
+    (
+        "systems/example.zig",
+        "const message = \"CoverageMarker\";\n",
+    ),
+    ("systems/example.res", "let message = \"CoverageMarker\"\n"),
+    (
+        "schemas/example.proto",
+        "syntax = \"proto3\";\nmessage CoverageMarker {}\n",
+    ),
+    ("queries/example.sql", "SELECT 'CoverageMarker';\n"),
+    ("infra/example.tf", "variable \"CoverageMarker\" {}\n"),
+    ("build/rules.bzl", "marker = \"CoverageMarker\"\n"),
+    ("docs/example.mdx", "# CoverageMarker\n\nAn example.\n"),
+    ("data/example.csv", "name,value\nexample,CoverageMarker\n"),
+    (
+        "data/example.ipynb",
+        "{\"cells\":[{\"source\":[\"CoverageMarker\"]}],\"nbformat\":4}\n",
+    ),
+    (
+        "go/go.mod",
+        "module example.invalid/CoverageMarker\n\ngo 1.25\n",
+    ),
+    ("config/.env.example", "MESSAGE=CoverageMarker\n"),
+    ("config/.clang-format", "BasedOnStyle: CoverageMarker\n"),
 ];

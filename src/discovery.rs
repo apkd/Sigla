@@ -156,7 +156,7 @@ impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         hash.update(&serde_json::to_vec(&(
-            11u32,
+            12u32,
             &self.roots,
             self.unity_platform,
             self.remote
