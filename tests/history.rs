@@ -78,13 +78,24 @@ impl Fixture {
         )
     }
     fn commit_modes(&self, files: &[(&str, &str, u32)], parents: &[&str], subject: &str) -> String {
+        self.commit_bytes(
+            &files
+                .iter()
+                .map(|&(path, text, mode)| (path, text.as_bytes(), mode))
+                .collect::<Vec<_>>(),
+            parents,
+            subject,
+        )
+    }
+    fn commit_bytes(
+        &self,
+        files: &[(&str, &[u8], u32)],
+        parents: &[&str],
+        subject: &str,
+    ) -> String {
         git(self.root.path(), &["read-tree", "--empty"], b"");
-        for (path, text, mode) in files {
-            let blob = git(
-                self.root.path(),
-                &["hash-object", "-w", "--stdin"],
-                text.as_bytes(),
-            );
+        for (path, bytes, mode) in files {
+            let blob = git(self.root.path(), &["hash-object", "-w", "--stdin"], bytes);
             // Set committed modes in the index, independently of the worktree
             // and core.filemode (fixtures do not check out their sources).
             git(
@@ -1369,6 +1380,49 @@ async fn anchored_declaration_follows_rename_move_and_omits_sibling_edits() {
         "{forward}"
     );
     assert!(!body(&forward).contains("Other"));
+}
+
+#[tokio::test]
+async fn unreadable_candidate_does_not_abort_known_selected_history() {
+    let f = Fixture::new();
+    let source =
+        "pub fn calculate(value: i32) -> i32 { let adjusted = value + 10; adjusted * value }\n";
+    let renamed = source.replace("calculate(", "compute(");
+    let invalid = b"// invalid UTF-8: \xff\n";
+    let root = f.commit_bytes(
+        &[
+            ("old.rs", source.as_bytes(), 0o100644),
+            ("unrelated.rs", invalid, 0o100644),
+        ],
+        &[],
+        "introduce",
+    );
+    let moved = f.commit_bytes(
+        &[
+            ("new.rs", renamed.as_bytes(), 0o100644),
+            ("unrelated.rs", invalid, 0o100644),
+        ],
+        &[&root],
+        "rename and move",
+    );
+    let edited = renamed.replace("+ 10", "+ 11");
+    let tip = f.commit_bytes(
+        &[
+            ("new.rs", edited.as_bytes(), 0o100644),
+            ("unrelated.rs", invalid, 0o100644),
+        ],
+        &[&moved],
+        "edit selected",
+    );
+
+    let history = f.history(&tip, "log function:compute path:new.rs").await;
+    assert!(ids(&history).contains(&tip.as_str()), "{history}");
+    assert!(history.contains("incomplete:"), "{history}");
+    let error = f
+        .error(&tip, &format!("show {root} file:unrelated.rs"))
+        .await;
+    assert!(!error.is_empty());
+    f.app.shutdown().await;
 }
 
 #[tokio::test]

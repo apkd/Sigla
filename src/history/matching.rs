@@ -402,8 +402,17 @@ impl Tracker {
                     "blob",
                 )?;
                 for (path, blob) in &candidates {
-                    let Some(source) = self.sources.anchor(&mut self.store, path, blob, query)?
-                    else {
+                    let source = match self.sources.anchor(&mut self.store, path, blob, query) {
+                        Err(error)
+                            if query.target.location.is_none()
+                                && error.is::<regions::UnreadableSource>() =>
+                        {
+                            incomplete = Some(error.to_string());
+                            continue;
+                        }
+                        result => result?,
+                    };
+                    let Some(source) = source else {
                         continue;
                     };
                     if let Some(reason) = &source.incomplete {
@@ -889,7 +898,7 @@ impl Tracker {
                 break;
             }
             let other = if same_path {
-                self.sources.get(&mut self.store, path, &entry.id)?
+                self.sources.get(&mut self.store, path, &entry.id)
             } else {
                 prepared.get(
                     &mut self.store,
@@ -898,7 +907,14 @@ impl Tracker {
                         .iter()
                         .take_while(|path| !local_supported || !deferred(path))
                         .map(|path| (path.as_str(), to[*path].id.as_ref())),
-                )?
+                )
+            };
+            let other = match other {
+                Err(error) if error.is::<regions::UnreadableSource>() => {
+                    unresolved = true;
+                    continue;
+                }
+                result => result?,
             };
             let mut ranges = tokens.occurrences(&other.text, &self.store.cancel)?;
             ranges.retain(|r| {
@@ -1061,6 +1077,7 @@ impl Tracker {
         let mut origin = None;
         let mut fragment = None;
         let mut weak = false;
+        let mut unreadable_provenance = false;
         for candidate in &search.scored {
             if direct.is_some_and(|score| candidate.score + SCORE_MARGIN < score) {
                 break;
@@ -1093,9 +1110,18 @@ impl Tracker {
                 if region.kind == "file" && entry.id.as_ref() == old.blob {
                     relation = Relation::Copy;
                 } else if !matches!(region.kind.as_str(), "file" | "text") {
-                    let fate = self.sources.get(&mut self.store, &old.path, &entry.id)?;
+                    let fate = match self.sources.get(&mut self.store, &old.path, &entry.id) {
+                        Err(error) if error.is::<regions::UnreadableSource>() => {
+                            unreadable_provenance = true;
+                            None
+                        }
+                        result => Some(result?),
+                    };
                     let before = self.sources.get(&mut self.store, &old.path, &old.blob)?;
-                    if retained_wrapper(region, old, &entry.id, &fate, &before) {
+                    if fate
+                        .as_ref()
+                        .is_some_and(|fate| retained_wrapper(region, old, &entry.id, fate, &before))
+                    {
                         relation = Relation::Wrapper;
                     }
                 }
@@ -1155,6 +1181,7 @@ impl Tracker {
         // except for the existing local-continuity shortcut. If that shortcut
         // skipped changed paths, only an accepted exact local claim can close it.
         let settled = search.incomplete.is_none()
+            && !unreadable_provenance
             && !region.weak
             && region.guard == 1
             && selected
@@ -1176,6 +1203,7 @@ impl Tracker {
             .map(|(candidate, relation, competition)| Link {
                 from: region.clone(),
                 uncertain: alternatives
+                    || unreadable_provenance
                     || search.incomplete.is_some()
                     || region.weak
                     || candidate.region.weak
@@ -1193,6 +1221,8 @@ impl Tracker {
                     "stronger direct continuation; body origin"
                 } else if search.incomplete.is_some() {
                     "incomplete candidate scope"
+                } else if unreadable_provenance {
+                    "unreadable candidate continuation"
                 } else {
                     candidate.reason
                 },
@@ -1475,13 +1505,20 @@ impl Tracker {
                             let p = &paths[*at];
                             (p.as_str(), to[p].id.as_ref())
                         }),
-                )?
+                )
             } else {
-                sources.get(&mut self.store, path, &entry.id)?
+                sources.get(&mut self.store, path, &entry.id)
             };
             if index >= local_count {
                 files.pop_front();
             }
+            let other = match other {
+                Err(error) if error.is::<regions::UnreadableSource>() => {
+                    search.incomplete = Some(error.to_string());
+                    continue;
+                }
+                result => result?,
+            };
             let scored_start = search.scored.len();
             let work_start = *work;
             if other.incomplete.is_some() {

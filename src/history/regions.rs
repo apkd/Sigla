@@ -26,7 +26,16 @@ use std::{
     },
 };
 
-pub(super) const ADAPTER_VERSION: u32 = 8;
+pub(super) const ADAPTER_VERSION: u32 = 9;
+
+#[derive(Debug)]
+pub(super) struct UnreadableSource(String);
+impl std::fmt::Display for UnreadableSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+impl std::error::Error for UnreadableSource {}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Region {
@@ -408,16 +417,18 @@ impl Sources {
             crate::memory::admit_file(bytes.len() as u64, false, cancel)?
         };
         cancel.check()?;
-        ensure!(
-            !bytes.contains(&0),
-            "binary source at {path}; contents were not followed"
-        );
+        if bytes.contains(&0) {
+            return Err(UnreadableSource(format!(
+                "binary source at {path}; contents were not followed"
+            ))
+            .into());
+        }
         ensure!(
             !bytes.starts_with(b"version https://git-lfs.github.com/spec/"),
             "Git LFS pointer at {path}; payload history is excluded"
         );
         let text: Arc<str> = String::from_utf8(bytes)
-            .with_context(|| format!("non-UTF-8 source at {path}"))?
+            .map_err(|error| UnreadableSource(format!("non-UTF-8 source at {path}: {error}")))?
             .into();
         let started = std::time::Instant::now();
         let facts = if java {
