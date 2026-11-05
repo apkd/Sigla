@@ -143,8 +143,32 @@ pub struct Installed {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Collected {
     pub visited: usize,
+    pub scanned: usize,
     pub objects: usize,
     pub encoded_bytes: u64,
+}
+
+/// One collection pass over a fixed expiry window. Pins passed by the cursor
+/// remain protected and become eligible on a later pass if their owner drops.
+pub struct Collection<'a> {
+    database: &'a Database,
+    cutoff: u64,
+    after: Option<Vec<u8>>,
+    finished: bool,
+}
+
+impl Collection<'_> {
+    pub fn next_batch(&mut self, scan_limit: usize) -> Result<Option<Collected>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let (collected, next) =
+            self.database
+                .collect_before(self.cutoff, scan_limit, self.after.as_deref(), true)?;
+        self.finished = next.is_none();
+        self.after = next;
+        Ok(Some(collected))
+    }
 }
 
 pub(crate) type InspectionVisitor<'a> = dyn FnMut(&WorkspaceInfo, Option<&[u8]>) -> Result<()> + 'a;
@@ -833,23 +857,58 @@ impl Database {
         let Some(cutoff) = now.checked_sub(retention) else {
             return Ok(Collected::default());
         };
+        self.collect_before(cutoff, limit, None, false)
+            .map(|(collected, _)| collected)
+    }
+
+    pub fn collection(&self, now: u64, retention: u64) -> Collection<'_> {
+        let cutoff = now.checked_sub(retention);
+        Collection {
+            database: self,
+            cutoff: cutoff.unwrap_or_default(),
+            after: None,
+            finished: cutoff.is_none(),
+        }
+    }
+
+    fn collect_before(
+        &self,
+        cutoff: u64,
+        limit: usize,
+        after: Option<&[u8]>,
+        bound_scan: bool,
+    ) -> Result<(Collected, Option<Vec<u8>>)> {
+        ensure!(limit > 0, "Collection batch must be nonzero");
         let pins = self.pins.lock().unwrap();
         let mut tx = self.write()?;
         let end = unused_key(&[u8::MAX; 32], cutoff);
-        let mut unused: Vec<(Vec<u8>, ObjectId)> = self
+        let start = after.map_or(Included(UNUSED), Excluded);
+        let mut unused = Vec::<(Vec<u8>, ObjectId)>::new();
+        let mut scanned = 0;
+        let mut next = None;
+        for row in self
             .control
-            .range(&tx, &(Included(UNUSED), Included(end.as_slice())))?
-            .map(|row| {
-                let key = row?.0;
-                Ok((key.to_vec(), key[UNUSED.len() + 8..].try_into()?))
-            })
-            .filter(|row| row.as_ref().map_or(true, |(_, id)| !pins.contains_key(id)))
-            .take(limit)
-            .collect::<Result<_>>()?;
+            .range(&tx, &(start, Included(end.as_slice())))?
+        {
+            let key = row?.0;
+            let id = key[UNUSED.len() + 8..].try_into()?;
+            scanned += 1;
+            if !pins.contains_key(&id) {
+                unused.push((key.to_vec(), id));
+            }
+            if bound_scan && scanned == limit {
+                next = Some(key.to_vec());
+                break;
+            }
+            if !bound_scan && unused.len() == limit {
+                break;
+            }
+        }
         // Object records are ordered by ID, independently of retirement time.
         unused.sort_unstable_by_key(|(_, id)| *id);
         let mut result = Collected {
             visited: unused.len(),
+            scanned,
             ..Default::default()
         };
         for (key, id) in &unused {
@@ -889,7 +948,7 @@ impl Database {
         if !unused.is_empty() {
             tx.commit()?;
         }
-        Ok(result)
+        Ok((result, next))
     }
 
     pub fn object_count(&self, tx: &RoTxn<'_>) -> Result<u64> {
@@ -897,11 +956,8 @@ impl Database {
     }
     pub fn collect_unused(&self, now: u64, pressure: bool) -> Result<()> {
         let retention = if pressure { 0 } else { RETENTION_MS };
-        while self
-            .collect_with_retention(now, PRESSURE_BATCH, retention)?
-            .visited
-            == PRESSURE_BATCH
-        {}
+        let mut collection = self.collection(now, retention);
+        while collection.next_batch(PRESSURE_BATCH)?.is_some() {}
         Ok(())
     }
     pub fn binding_count(&self, tx: &RoTxn<'_>, id: &ObjectId) -> Result<Option<u64>> {

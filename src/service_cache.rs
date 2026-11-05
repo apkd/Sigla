@@ -1038,27 +1038,39 @@ impl App {
         Ok(true)
     }
 
-    fn collect_analysis(&self, pressure: bool) -> Result<bool> {
+    fn collect_analysis(
+        &self,
+        pressure: bool,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<bool> {
         // Ordinary passes retire and collect bounded batches. Disk pressure
         // drains all retired workspaces and unused objects.
-        let mut progress = self.maintain_analysis(pressure)?;
+        let stage = if pressure {
+            "analysis retirement"
+        } else {
+            "analysis bounded maintenance"
+        };
+        let mut progress = maintenance_stage(operation, stage, || {
+            self.maintain_analysis(pressure)
+        })?;
         if self.cache.join("analysis").is_dir() {
             let database = crate::store::Database::open(&self.cache.join("analysis"))?;
             if pressure {
-                while !self.inspection_shutdown.is_cancelled() {
-                    let collected = database.collect_with_retention(
-                        crate::cache::now(),
-                        crate::store::shared::PRESSURE_BATCH,
-                        0,
-                    )?;
-                    progress |= collected.objects > 0;
-                    if collected.visited != crate::store::shared::PRESSURE_BATCH {
-                        break;
+                maintenance_stage(operation, "analysis unused object collection", || {
+                    let mut collection = database.collection(crate::cache::now(), 0);
+                    while !self.inspection_shutdown.is_cancelled() {
+                        let Some(collected) =
+                            collection.next_batch(crate::store::shared::PRESSURE_BATCH)?
+                        else {
+                            break;
+                        };
+                        progress |= collected.objects > 0;
+                        std::thread::yield_now();
                     }
-                    std::thread::yield_now();
-                }
+                    Ok(())
+                })?;
             }
-            database.checkpoint()?;
+            maintenance_stage(operation, "analysis checkpoint", || database.checkpoint())?;
         }
         Ok(progress)
     }
@@ -1242,9 +1254,7 @@ impl App {
             }
             outcome.progress |= self.evict_candidate(candidate, false)?;
         }
-        outcome.progress |= maintenance_stage(operation, "analysis collection", || {
-            self.collect_analysis(pressure)
-        })?;
+        outcome.progress |= self.collect_analysis(pressure, operation)?;
         outcome.progress |=
             maintenance_stage(operation, "view collection", || self.collect_views(known))?;
         maintenance_stage(operation, "blob collection", || {
@@ -1327,9 +1337,7 @@ impl App {
             if !evicted {
                 break;
             }
-            outcome.progress |= maintenance_stage(operation, "analysis collection", || {
-                self.collect_analysis(true)
-            })?;
+            outcome.progress |= self.collect_analysis(true, operation)?;
             outcome.progress |=
                 maintenance_stage(operation, "view collection", || self.collect_views(known))?;
             maintenance_stage(operation, "blob collection", || {
@@ -2038,15 +2046,18 @@ mod tests {
         };
         let before = bindings();
         scope.mark_deleting().unwrap();
-        app.collect_analysis(false).unwrap();
+        app.collect_analysis(false, &crate::telemetry::Operation::default())
+            .unwrap();
         let remaining = bindings();
         assert!(remaining > 0 && remaining < before);
-        app.collect_analysis(false).unwrap();
+        app.collect_analysis(false, &crate::telemetry::Operation::default())
+            .unwrap();
         assert!(
             bindings() < remaining,
             "Ordinary passes must resume deletion"
         );
-        app.collect_analysis(true).unwrap();
+        app.collect_analysis(true, &crate::telemetry::Operation::default())
+            .unwrap();
         assert!(database.workspaces().unwrap().is_empty());
     }
     #[test]

@@ -1170,6 +1170,54 @@ fn unused_index_upgrade_resumes_after_reopening() {
 }
 
 #[test]
+fn collection_cursor_bounds_pinned_scans_and_preserves_resurrection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let pinned = scope(&db, 1);
+    let other = scope(&db, 2);
+    let pinned_count = 8u8;
+    let total = 20u8;
+    let names: Vec<_> = (1..=pinned_count).map(|id| format!("f{id}")).collect();
+    for (id, name) in (1..=pinned_count).zip(&names) {
+        put(&pinned, name, 1, id, "Pinned");
+    }
+    clean(
+        &pinned,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let snapshot = pinned.snapshot().unwrap();
+    for name in &names {
+        pinned.detach(name, 100).unwrap();
+    }
+    for id in pinned_count + 1..=total {
+        let name = format!("f{id}");
+        put(&other, &name, 1, id, "Unused");
+        other.detach(&name, 100).unwrap();
+    }
+    let mut collection = db.collection(100, 0);
+    let limit = 3;
+    let first = collection.next_batch(limit).unwrap().unwrap();
+    assert_eq!(first.scanned, limit);
+    assert_eq!(first.objects, 0);
+    let resurrected = total;
+    put(&other, "resurrected", 1, resurrected, "Unused");
+    let mut scanned = first.scanned;
+    let mut objects = 0;
+    while let Some(batch) = collection.next_batch(limit).unwrap() {
+        assert!(batch.scanned <= limit);
+        scanned += batch.scanned;
+        objects += batch.objects;
+    }
+    assert_eq!(scanned, usize::from(total - 1));
+    assert_eq!(objects, usize::from(total - pinned_count - 1));
+    drop(snapshot);
+    db.collect_unused(100, true).unwrap();
+    let tx = other.read().unwrap();
+    assert_eq!(db.object_count(&tx).unwrap(), 1);
+    assert_eq!(db.binding_count(&tx, &[resurrected; 32]).unwrap(), Some(1));
+}
+
+#[test]
 fn weak_registry_does_not_pin_environment() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
