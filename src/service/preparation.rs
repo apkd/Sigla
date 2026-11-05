@@ -295,12 +295,6 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         let outcome = async {
             #[cfg(test)]
             preparing_app.preparation_started.notify_one();
-            // Lock order: workspace -> branch analysis -> branch state.
-            // RequiredInputs releases both branch guards before acquisition.
-            let mut state = {
-                let _wait = operation.wait("workspace_lock");
-                workspace.clone().lock_owned().await
-            };
             if let Some(branch) = &preparing_branch {
                 send.send_replace(Progress::Pending("acquisition"));
                 operation.stage("repository_acquisition");
@@ -312,50 +306,50 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     .await?;
                 send.send_replace(Progress::Pending("preparation"));
             }
-            let mut branch_state = match &preparing_branch {
-                Some(branch) => {
-                    let _wait = operation.wait("branch_analysis");
-                    Some(branch.analyze().await)
-                }
-                None => None,
-            };
             let mut policy = policy;
-            if let Some(gate) = &branch_state {
-                let applied = gate
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
-                ensure!(
-                    !applied.repair,
-                    "Repository materialization requires repair"
-                );
-                policy.remote.as_mut().unwrap().tracked = Arc::new(
-                    applied
-                        .prepared
-                        .tracked
-                        .keys()
-                        .filter(|p| {
-                            !applied.prepared.unavailable.contains(*p)
-                                && !applied.prepared.omitted.contains_key(*p)
-                        })
-                        .cloned()
-                        .collect(),
-                );
-                policy.materialized(
-                    policy.remote.as_ref().unwrap().workspace.clone(),
-                    applied.discovery_identity()?,
-                );
-            }
-            let prepared = loop {
+            let mut discovery_budget = None;
+            let (state, branch_state) = loop {
+                operation.stage("discovery_admission");
+                let (permit, mut state, branch_state) = preparing_app
+                    .admit_work(
+                        workspace.clone(),
+                        preparing_branch.as_ref(),
+                        &preparing_app.preparation_workers,
+                        "discovery_admission",
+                        &operation,
+                    )
+                    .await?;
+                let budget = *discovery_budget.get_or_insert_with(crate::msbuild::Budget::default);
+                if let Some(gate) = &branch_state {
+                    let applied = gate
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
+                    ensure!(
+                        !applied.repair,
+                        "Repository materialization requires repair"
+                    );
+                    policy.remote.as_mut().unwrap().tracked = Arc::new(
+                        applied
+                            .prepared
+                            .tracked
+                            .keys()
+                            .filter(|p| {
+                                !applied.prepared.unavailable.contains(*p)
+                                    && !applied.prepared.omitted.contains_key(*p)
+                            })
+                            .cloned()
+                            .collect(),
+                    );
+                    policy.materialized(
+                        policy.remote.as_ref().unwrap().workspace.clone(),
+                        applied.discovery_identity()?,
+                    );
+                }
                 let app = preparing_app.clone();
-                let entry = entry.clone();
+                let discovery_entry = entry.clone();
                 let cache = cache.clone();
                 let current_policy = policy.clone();
                 let owner = preparing_branch.as_ref().map(|branch| branch.root.clone());
-                operation.stage("discovery_admission");
-                let permit = {
-                    let _wait = operation.wait("discovery_admission");
-                    preparing_app.preparation_workers.clone().acquire_owned().await?
-                };
                 #[cfg(test)]
                 let _discovery_pause = {
                     preparing_app.discovery_started.notify_one();
@@ -366,7 +360,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     let _permit = permit;
                     if state.is_none() {
                         *state = Some(Workspace::open(
-                            entry,
+                            discovery_entry,
                             &cache,
                             current_policy.clone(),
                             &app.cache.join("analysis"),
@@ -377,15 +371,17 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     state.as_mut().unwrap().update_policy(current_policy);
                     let code = state.as_mut().unwrap();
                     let result = code
-                        .prepare()
+                        .prepare_with_budget(budget)
                         .and_then(|p| p.map(|p| code.plan(p)).transpose());
                     crate::memory::reclaim();
                     Ok((state, result))
                 })
                 .await??;
+                #[cfg(test)]
+                drop(_discovery_pause);
                 state = next;
-                match result {
-                    Ok(prepared) => break prepared,
+                let prepared = match result {
+                    Ok(prepared) => prepared,
                     Err(error) => {
                         let Some(required) =
                             error.downcast_ref::<crate::discovery::RequiredInputs>()
@@ -404,7 +400,8 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .prepared
                             .revision
                             .clone();
-                        drop(branch_state.take());
+                        drop(branch_state);
+                        drop(state);
                         send.send_replace(Progress::Pending("acquisition"));
                         operation.stage("required_input_acquisition");
                         preparing_app
@@ -414,38 +411,12 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .require_inputs(branch, &revision, paths, &operation)
                             .await?;
                         send.send_replace(Progress::Pending("preparation"));
-                        let gate = {
-                            let _wait = operation.wait("branch_analysis");
-                            branch.analyze().await
-                        };
-                        let applied = gate
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("Repository inputs are unavailable"))?;
-                        ensure!(
-                            !applied.repair,
-                            "Repository materialization requires repair"
-                        );
-                        policy.remote.as_mut().unwrap().tracked = Arc::new(
-                            applied
-                                .prepared
-                                .tracked
-                                .keys()
-                                .filter(|p| {
-                                    !applied.prepared.unavailable.contains(*p)
-                                        && !applied.prepared.omitted.contains_key(*p)
-                                })
-                                .cloned()
-                                .collect(),
-                        );
-                        policy.materialized(
-                            policy.remote.as_ref().unwrap().workspace.clone(),
-                            applied.discovery_identity()?,
-                        );
-                        branch_state = Some(gate);
+                        continue;
                     }
-                }
-            };
-            if let Some(prepared) = prepared {
+                };
+                let Some(prepared) = prepared else {
+                    break (state, branch_state);
+                };
                 send.send_replace(Progress::Files(Arc::new(Inventory {
                     manifest: prepared.manifest.clone(),
                     context: context(
@@ -455,23 +426,51 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     watch: prepared.watch.clone(),
                 })));
                 let queued = std::time::Instant::now();
+                let manifest = state.as_ref().unwrap().manifest.clone();
+                let generation = preparing_branch.as_ref().map(|branch|
+                    branch.generation.load(std::sync::atomic::Ordering::Acquire));
+                drop(branch_state);
+                drop(state);
                 operation.stage("indexing_admission");
-                let permit = {
-                    let _wait = operation.wait("indexing_admission");
-                    preparing_app.indexing_workers.clone().acquire_owned().await?
-                };
+                let (permit, mut state, branch_state) = preparing_app
+                    .admit_work(
+                        workspace.clone(),
+                        preparing_branch.as_ref(),
+                        &preparing_app.indexing_workers,
+                        "indexing_admission",
+                        &operation,
+                    )
+                    .await?;
+                if !Arc::ptr_eq(&manifest, &state.as_ref().unwrap().manifest)
+                    || generation != preparing_branch.as_ref().map(|branch|
+                    branch.generation.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    // Publication replaced the inputs while indexing was queued.
+                    // Rebuild the plan from the newly admitted repository view.
+                    send.send_replace(Progress::Pending("preparation"));
+                    continue;
+                }
                 tracing::debug!(workspace = %entry.display(), wait_ms = queued.elapsed().as_millis(), "indexing worker admitted");
                 #[cfg(test)]
                 let _pause = preparing_app.indexing_pause.clone().acquire_owned().await?;
                 operation.stage("workspace_indexing");
-                state = tokio::task::spawn_blocking(move || -> Result<_> {
+                let (state, indexed) = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
+                    let changes = prepared.watch.changes();
+                    if changes.any() && !prepared.manifest.changed_sources_current(Some(&changes)) {
+                        return Ok((state, false));
+                    }
                     state.as_mut().unwrap().apply_plan(prepared)?;
                     crate::memory::reclaim();
-                    Ok(state)
+                    Ok((state, true))
                 })
                 .await??;
-            }
+                if !indexed {
+                    send.send_replace(Progress::Pending("preparation"));
+                    continue;
+                }
+                break (state, branch_state);
+            };
 
             let code = state.as_ref().unwrap();
             let inventory = Arc::new(Inventory {

@@ -299,6 +299,13 @@ impl Workspace {
 
     /// Dependency preparation does not consume an indexing worker.
     pub fn prepare(&mut self) -> Result<Option<Preparation>> {
+        self.prepare_with_budget(crate::msbuild::Budget::default())
+    }
+
+    pub(crate) fn prepare_with_budget(
+        &mut self,
+        budget: crate::msbuild::Budget,
+    ) -> Result<Option<Preparation>> {
         let start = std::time::Instant::now();
         let managed = self.policy.managed_root(self.manifest.metadata.keys());
         if !self.initialized {
@@ -358,7 +365,7 @@ impl Workspace {
         let discovery_started = std::time::Instant::now();
         tracing::debug!(workspace = %self.entry.display(), cache_current, policy_current, ?changed_metadata, ?changed_source, "workspace refresh required");
         let discovery = if metadata_changed {
-            discovery::discover_cached(&self.entry, &self.policy, &self.cache)?
+            discovery::discover_with_budget(&self.entry, &self.policy, &self.cache, budget)?
         } else {
             discovery::Discovery {
                 leases: self.leases.clone(),

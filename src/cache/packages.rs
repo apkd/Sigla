@@ -154,7 +154,12 @@ impl View {
     }
 
     /// Called after all sandbox descendants exit, before interpreting their output paths.
-    pub fn seal(&self, host: &Path, integration: &Path) -> Result<()> {
+    pub(crate) fn seal(
+        &self,
+        host: &Path,
+        integration: &Path,
+        deadline: crate::process::Deadline,
+    ) -> Result<()> {
         if fs::read_dir(self.upper())?.next().is_none() {
             return Ok(());
         }
@@ -193,7 +198,7 @@ impl View {
             .arg(self.path())
             .arg(self.upper())
             .arg(&contents);
-        crate::process::run(&mut command, Duration::from_secs(300))?;
+        crate::process::run(&mut command, deadline.remaining(Duration::from_secs(300))?)?;
         self.store.import_tree(&contents)?;
         let generation = stage
             .path()

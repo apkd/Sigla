@@ -251,3 +251,235 @@ async fn cancelled_running_history_keeps_its_permits_until_work_exits() {
     drop((history, workers));
     app.shutdown().await;
 }
+
+async fn remote_preparation_fixture() -> (
+    tempfile::TempDir,
+    Arc<App>,
+    Arc<crate::repository::manager::Branch>,
+    PathBuf,
+) {
+    use crate::repository::{Repository, Rule, materialize::Target};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let cache = tempfile::tempdir().unwrap();
+    let repository = Repository::parse("https://github.com/fixture/repo#refs/heads/main")
+        .unwrap()
+        .unwrap();
+    let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, "main")).unwrap())
+        .to_hex()
+        .to_string();
+    let owner = cache.path().join("repositories").join(key);
+    let source = owner.join("source");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(
+        source.join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("src/lib.rs"), "pub struct Before;").unwrap();
+    let selection = crate::repository::selection::Selection::new(&[], &[]).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let state = serde_json::json!({
+        "schema": 4, "repository": repository.identity, "transport": repository.transport,
+        "branch": "main", "target": Target::Branch("main".into()),
+        "last_use": now, "refreshed": now, "store_created": now,
+        "policy": selection.identity, "repair": false, "indexed_revision": null,
+        "prepared": {"branch": "main", "revision": "a".repeat(40),
+            "selected": {"Cargo.toml": "b", "src/lib.rs": "c"},
+            "tracked": {"Cargo.toml": "b", "src/lib.rs": "c"}, "directories": ["src"]}
+    });
+    std::fs::write(
+        owner.join("state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    let app = Arc::new(
+        App::remote(
+            Policy::new(vec![source.clone()]).unwrap(),
+            cache.path().into(),
+            1,
+            crate::config::RemoteOptions {
+                rules: vec![Rule::parse_private("https://github.com/fixture/*").unwrap()],
+                refresh_interval: Some(Duration::from_secs(3600)),
+                repo_ttl: Duration::from_secs(86400),
+                branch_ttl: Duration::from_secs(86400),
+                unity_versions: vec![],
+                selection,
+            },
+        )
+        .unwrap(),
+    );
+    let branch = app
+        .remote
+        .as_ref()
+        .unwrap()
+        .resolve(repository)
+        .await
+        .unwrap();
+    (cache, app, branch, source)
+}
+
+#[tokio::test]
+async fn queued_remote_discovery_releases_locks_and_does_not_reserve_a_worker() {
+    use std::time::Duration;
+
+    let (_cache, app, branch, source) = remote_preparation_fixture().await;
+    let held = app
+        .preparation_workers
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let pause = app.discovery_pause.clone().acquire_owned().await.unwrap();
+    let request = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.search(
+                "https://github.com/fixture/repo#refs/heads/main",
+                "type:Before",
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), app.admission_started.notified())
+        .await
+        .expect("discovery did not queue");
+    let workspace = app
+        .workspaces
+        .lock()
+        .unwrap()
+        .get(&source)
+        .unwrap()
+        .state
+        .clone();
+    let workspace_guard = workspace
+        .try_lock()
+        .expect("queued discovery retained workspace");
+    let publication = tokio::time::timeout(Duration::from_secs(2), branch.publish())
+        .await
+        .expect("queued discovery retained branch");
+    drop(held);
+    let available = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.preparation_workers.clone().acquire_owned(),
+    )
+    .await
+    .expect("discovery reserved a worker while locks were held")
+    .unwrap();
+    drop(available);
+    drop(publication);
+    drop(workspace_guard);
+    tokio::time::timeout(Duration::from_secs(5), app.discovery_started.notified())
+        .await
+        .expect("discovery did not start");
+    assert!(
+        branch.state.try_write().is_err(),
+        "active discovery must protect the branch"
+    );
+    assert!(
+        workspace.try_lock().is_err(),
+        "active discovery must protect the workspace"
+    );
+    assert_eq!(app.preparation_workers.available_permits(), 0);
+    drop(pause);
+    let result = tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(result.contains("Before"), "{result}");
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_remote_index_rebuilds_plan_after_branch_publication() {
+    use std::time::Duration;
+
+    let (_cache, app, branch, source) = remote_preparation_fixture().await;
+    let held = app.indexing_workers.clone().acquire_owned().await.unwrap();
+    let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
+    let request = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.search(
+                "https://github.com/fixture/repo#refs/heads/main",
+                "type:After",
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), app.admission_started.notified())
+        .await
+        .expect("indexing did not queue");
+    let workspace = app
+        .workspaces
+        .lock()
+        .unwrap()
+        .get(&source)
+        .unwrap()
+        .state
+        .clone();
+    let workspace_guard = workspace
+        .try_lock()
+        .expect("queued indexing retained workspace");
+    let mut publication = tokio::time::timeout(Duration::from_secs(2), branch.publish())
+        .await
+        .expect("queued indexing retained branch");
+    std::fs::write(source.join("src/lib.rs"), "pub struct After;").unwrap();
+    let prepared = &mut publication.as_mut().unwrap().prepared;
+    prepared
+        .selected
+        .insert("src/lib.rs".into(), "changed".into());
+    prepared
+        .tracked
+        .insert("src/lib.rs".into(), "changed".into());
+    branch
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    drop(held);
+    let available = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.indexing_workers.clone().acquire_owned(),
+    )
+    .await
+    .expect("indexing reserved a worker while locks were held")
+    .unwrap();
+    drop(available);
+    drop(publication);
+    drop(workspace_guard);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.indexing_workers.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rebuilt plan did not start indexing");
+    assert!(
+        branch.state.try_write().is_err(),
+        "active indexing must protect the branch"
+    );
+    assert!(
+        workspace.try_lock().is_err(),
+        "active indexing must protect the workspace"
+    );
+    drop(pause);
+    let result = tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(result.contains("After"), "{result}");
+    let old = app
+        .search(
+            "https://github.com/fixture/repo#refs/heads/main",
+            "type:Before",
+        )
+        .await
+        .unwrap();
+    assert!(!old.contains("Before"), "stale plan was indexed: {old}");
+    app.shutdown().await;
+}

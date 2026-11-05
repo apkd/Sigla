@@ -163,10 +163,11 @@ pub fn remove_outputs(writable: &Path) -> Result<()> {
 }
 
 impl Sandbox {
-    pub fn new(
+    pub(crate) fn new(
         context: &crate::discovery::RemoteContext,
         toolchain_roots: &[PathBuf],
         leases: &crate::cache::views::LeaseSet,
+        deadline: crate::process::Deadline,
     ) -> Result<Self> {
         leases.retain(&context.writable)?;
         let mut toolchains = BTreeSet::new();
@@ -181,7 +182,7 @@ impl Sandbox {
                     Command::new("nix-store")
                         .args(["--query", "--requisites"])
                         .arg(store),
-                    Duration::from_secs(30),
+                    deadline.remaining(Duration::from_secs(30))?,
                 )?;
                 for path in std::str::from_utf8(&closure)?.lines() {
                     let path = PathBuf::from(path);

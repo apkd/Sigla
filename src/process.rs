@@ -8,6 +8,28 @@ use std::{
 };
 
 const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct DeadlineExceeded;
+impl std::fmt::Display for DeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Preparation subprocess exceeded its deadline")
+    }
+}
+impl std::error::Error for DeadlineExceeded {}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Deadline(Instant);
+impl Deadline {
+    pub(crate) fn after(duration: Duration) -> Self {
+        Self(Instant::now() + duration)
+    }
+    pub(crate) fn remaining(self, limit: Duration) -> Result<Duration> {
+        let remaining = self.0.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), DeadlineExceeded);
+        Ok(remaining.min(limit))
+    }
+}
 static OWNS_GROUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHILDREN: std::sync::Mutex<std::collections::BTreeSet<i32>> =
@@ -191,9 +213,7 @@ fn capture_input(
             Ok(Some(status)) => break Ok(status),
             Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                break Err(anyhow::anyhow!(
-                    "Preparation subprocess exceeded its deadline"
-                ));
+                break Err(DeadlineExceeded.into());
             }
             Err(error) => break Err(error.into()),
         }

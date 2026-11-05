@@ -129,9 +129,24 @@ fn payload(cache: &Path, major: &str) -> Result<PathBuf> {
 /// Discard after materialization requests; project evaluation can retry within the pass.
 #[derive(Default)]
 pub(crate) struct Session {
+    budget: Budget,
     scopes: BTreeMap<PathBuf, Scope>,
     bootstrap: Option<Result<Bootstrap, std::sync::Arc<anyhow::Error>>>,
     resolved: BTreeMap<Scope, PathBuf>,
+}
+
+/// One deadline across SDK scopes, restores, and required-input retries.
+#[derive(Clone, Copy)]
+pub(crate) struct Budget(process::Deadline);
+impl Default for Budget {
+    fn default() -> Self {
+        Self(process::Deadline::after(Duration::from_secs(300)))
+    }
+}
+impl Budget {
+    fn remaining(self, limit: Duration) -> Result<Duration> {
+        self.0.remaining(limit)
+    }
 }
 
 struct Bootstrap {
@@ -172,14 +187,23 @@ impl std::error::Error for SetupFailure {
 }
 
 pub(crate) fn project_retry_can_help(error: &anyhow::Error) -> bool {
-    !error
-        .chain()
-        .any(|cause| cause.is::<SdkFailure>() || cause.is::<SetupFailure>())
+    !error.chain().any(|cause| {
+        cause.is::<SdkFailure>()
+            || cause.is::<SetupFailure>()
+            || cause.is::<process::DeadlineExceeded>()
+    })
 }
 
 /// Match hostfxr's ancestor search in the environment in which it will run.
 /// Local builds deliberately retain host inputs; remote builds see /workspace.
 impl Session {
+    pub(crate) fn with_budget(budget: Budget) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn scope(
         &mut self,
         entry: &Path,
@@ -284,6 +308,7 @@ pub(crate) fn discover_in(
     metadata: &mut BTreeSet<PathBuf>,
     leases: &crate::cache::views::LeaseSet,
 ) -> Result<Snapshot> {
+    session.budget.remaining(Duration::from_secs(300))?;
     leases.retain(cache)?;
     if let Some(Err(error)) = &session.bootstrap {
         return Err(SetupFailure(error.clone()).into());
@@ -326,7 +351,10 @@ pub(crate) fn discover_in(
             }
             #[cfg(test)]
             INVENTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
-            let sdks = process::run(command(cache).arg("--list-sdks"), Duration::from_secs(30))?;
+            let sdks = process::run(
+                command(cache).arg("--list-sdks"),
+                session.budget.remaining(Duration::from_secs(30))?,
+            )?;
             let installed: Vec<(String, PathBuf)> = std::str::from_utf8(&sdks)?
                 .lines()
                 .filter_map(|line| {
@@ -391,7 +419,9 @@ pub(crate) fn discover_in(
     let host = host_root.join("dotnet");
     let fxr = &bootstrap.fxr;
     let sandbox = remote
-        .map(|context| crate::sandbox::Sandbox::new(context, &bootstrap.roots, leases))
+        .map(|context| {
+            crate::sandbox::Sandbox::new(context, &bootstrap.roots, leases, session.budget.0)
+        })
         .transpose()
         .map_err(|error| SetupFailure(std::sync::Arc::new(error)))?;
     let job = tempfile::Builder::new()
@@ -437,7 +467,12 @@ pub(crate) fn discover_in(
             };
             #[cfg(test)]
             RESOLVER_CALLS.with(|calls| calls.set(calls.get() + 1));
-            let resolution = process::capture(&mut resolve, Duration::from_secs(30), None, None)?;
+            let resolution = process::capture(
+                &mut resolve,
+                session.budget.remaining(Duration::from_secs(30))?,
+                None,
+                None,
+            )?;
             ensure!(
                 resolution.status.success(),
                 "SDK resolver helper failed ({}): {}",
@@ -549,10 +584,16 @@ pub(crate) fn discover_in(
                 command
             }
         };
-        process::run(&mut discovery, Duration::from_secs(120))?;
+        process::run(
+            &mut discovery,
+            session.budget.remaining(Duration::from_secs(120))?,
+        )?;
         match &sandbox {
-            Some(s) => s.packages.seal(&host, &root)?,
-            None => local_packages.as_ref().unwrap().seal(&host, &root)?,
+            Some(s) => s.packages.seal(&host, &root, session.budget.0)?,
+            None => local_packages
+                .as_ref()
+                .unwrap()
+                .seal(&host, &root, session.budget.0)?,
         }
         if let Some(sandbox) = &sandbox {
             sandbox.validate_writes()?;
@@ -635,7 +676,7 @@ pub(crate) fn discover_in(
             let mut log = tempfile::tempfile()?;
             let captured = process::capture(
                 &mut restore,
-                Duration::from_secs(300),
+                session.budget.remaining(Duration::from_secs(300))?,
                 None,
                 Some(log.try_clone()?),
             );
@@ -645,6 +686,9 @@ pub(crate) fn discover_in(
             let result = match captured {
                 Ok(result) => result,
                 Err(error) => {
+                    if error.is::<process::DeadlineExceeded>() {
+                        return Err(error);
+                    }
                     diagnostics.push(format!("Dependency restore could not finish for {}: {error:#}. Using available project details.", entry.display()));
                     continue;
                 }
@@ -821,6 +865,54 @@ fn map_snapshot(snapshot: &mut Snapshot, sandbox: &crate::sandbox::Sandbox) -> R
 
 #[cfg(test)]
 mod diagnostic_tests {
+    #[test]
+    fn exhausted_discovery_budget_preserves_sources_without_starting_helpers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        for directory in ["first", "second"] {
+            let directory = fixture.path().join(directory);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("global.json"), "{}").unwrap();
+            fs::write(directory.join("Project.csproj"), "<Project />").unwrap();
+            fs::write(directory.join("Source.cs"), "class Readable {}").unwrap();
+        }
+        let policy = crate::discovery::Policy::new(vec![fixture.path().into()]).unwrap();
+        INVENTORY_CALLS.set(0);
+        let budget = Budget(process::Deadline::after(Duration::ZERO));
+        for _ in 0..2 {
+            let found = crate::discovery::discover_with_budget(
+                fixture.path(),
+                &policy,
+                cache.path(),
+                budget,
+            )
+            .unwrap();
+            assert_eq!(
+                found
+                    .sources
+                    .iter()
+                    .filter(|source| source.path.ends_with("Source.cs"))
+                    .count(),
+                2
+            );
+            assert!(!found.diagnostics.is_empty());
+            assert!(
+                found
+                    .projects
+                    .iter()
+                    .all(|project| project.assemblies.is_empty())
+            );
+        }
+        assert_eq!(INVENTORY_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn timed_out_helpers_are_not_retried_for_each_project() {
+        let error = process::run(Command::new("sleep").arg("30"), Duration::ZERO).unwrap_err();
+        assert!(error.is::<process::DeadlineExceeded>());
+        assert!(!project_retry_can_help(&error));
+    }
+
     fn scope(
         entry: &Path,
         remote: Option<&crate::discovery::RemoteContext>,

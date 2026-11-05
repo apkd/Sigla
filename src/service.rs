@@ -110,6 +110,24 @@ impl App {
         branch: Option<&Arc<crate::repository::manager::Branch>>,
         operation: &crate::telemetry::Operation,
     ) -> Result<QueryAdmission> {
+        self.admit_work(
+            workspace,
+            branch,
+            &self.workers,
+            "query_admission",
+            operation,
+        )
+        .await
+    }
+
+    async fn admit_work(
+        &self,
+        workspace: Arc<tokio::sync::Mutex<Option<Workspace>>>,
+        branch: Option<&Arc<crate::repository::manager::Branch>>,
+        workers: &Arc<tokio::sync::Semaphore>,
+        stage: &'static str,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<QueryAdmission> {
         loop {
             let state = {
                 let _wait = operation.wait("workspace_lock");
@@ -122,7 +140,7 @@ impl App {
                 }
                 None => None,
             };
-            if let Ok(permit) = self.workers.clone().try_acquire_owned() {
+            if let Ok(permit) = workers.clone().try_acquire_owned() {
                 return Ok((permit, state, branch_state));
             }
             drop(branch_state);
@@ -130,8 +148,8 @@ impl App {
             #[cfg(test)]
             self.admission_started.notify_one();
             let permit = {
-                let _wait = operation.wait("query_admission");
-                self.workers.clone().acquire_owned().await?
+                let _wait = operation.wait(stage);
+                workers.clone().acquire_owned().await?
             };
             if let Ok(state) = workspace.clone().try_lock_owned() {
                 let branch_state = branch
@@ -141,7 +159,7 @@ impl App {
                     return Ok((permit, state, branch_state));
                 }
             }
-            // Return scarce query capacity before joining the lock queues.
+            // Return scarce worker capacity before joining the lock queues.
             // The next iteration awaits a lock; it does not busy-poll.
             drop(permit);
         }

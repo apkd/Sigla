@@ -253,6 +253,15 @@ fn project_failure(error: &anyhow::Error) -> String {
 }
 
 pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Discovery> {
+    discover_with_budget(entry, policy, cache, crate::msbuild::Budget::default())
+}
+
+pub(crate) fn discover_with_budget(
+    entry: &Path,
+    policy: &Policy,
+    cache: &Path,
+    budget: crate::msbuild::Budget,
+) -> Result<Discovery> {
     let entry = policy.canonical(entry)?;
     let root = if entry.is_dir() {
         entry.clone()
@@ -324,7 +333,7 @@ pub fn discover_cached(entry: &Path, policy: &Policy, cache: &Path) -> Result<Di
         }
     }
     if !managed.is_empty() {
-        let mut session = crate::msbuild::Session::default();
+        let mut session = crate::msbuild::Session::with_budget(budget);
         let mut groups = BTreeMap::<_, Vec<PathBuf>>::new();
         let mut fallback = FallbackScan::default();
         for input in managed {
