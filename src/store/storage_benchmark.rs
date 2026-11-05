@@ -164,3 +164,90 @@ fn replay_storage_publication() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "opt-in namespace retirement comparison"]
+fn compare_retirement_batches() -> Result<()> {
+    let files = setting("SIGLA_RETIREMENT_FILES", 20_000)?;
+    let bytes = setting("SIGLA_RETIREMENT_PAYLOAD_BYTES", 4096)?;
+    ensure!(files >= 2, "At least two files are required");
+    ensure!(bytes <= 32 * 1024 * 1024, "Replay object exceeds 32 MiB");
+    let parent = std::env::var_os("SIGLA_STORAGE_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut expected_rows = None;
+    println!(
+        "batch,files,shared_files,membership_rows,total_rows,transactions,elapsed_ms,max_transaction_ms"
+    );
+    for batch in [128, PRESSURE_BATCH] {
+        let directory = tempfile::tempdir_in(&parent)?;
+        let db = Database::open(directory.path())?;
+        let retiring = db.workspace([1; 32], Path::new("/retiring"), None)?;
+        let retained = db.workspace([2; 32], Path::new("/retained"), None)?;
+        let shared = files / 2;
+        publish(&retiring, files, bytes, false)?;
+        publish(&retained, shared, bytes, true)?;
+        let tx = retiring.read()?;
+        let members = db
+            .members
+            .prefix_iter(&tx, &retiring.id.to_be_bytes())?
+            .move_between_keys()
+            .try_fold(0, |count, row| -> Result<usize> {
+                row?;
+                Ok(count + 1)
+            })?;
+        let bindings = retiring.files_after(&tx, None, files + 1)?.len();
+        ensure!(bindings == files, "Missing retirement bindings");
+        let rows = (members, bindings);
+        if let Some(expected) = expected_rows {
+            ensure!(rows == expected, "Replay namespaces differ");
+        } else {
+            expected_rows = Some(rows);
+        }
+        drop(tx);
+        retiring.mark_deleting()?;
+        let before = db.env.read_txn()?.id();
+        let started = Instant::now();
+        let mut transactions = 0;
+        let mut max_transaction = std::time::Duration::ZERO;
+        loop {
+            let transaction = Instant::now();
+            let done = retiring.delete_batch(100, batch)?;
+            max_transaction = max_transaction.max(transaction.elapsed());
+            transactions += 1;
+            if done {
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        let commits = db.env.read_txn()?.id() - before;
+        ensure!(
+            commits == transactions,
+            "Unexpected retirement transaction count"
+        );
+        ensure!(
+            db.namespace([1; 32], retiring.id)?.is_none(),
+            "Retired namespace survived"
+        );
+        db.collect_unused(100, true)?;
+        let tx = retained.read()?;
+        ensure!(
+            db.object_count(&tx)? == shared as u64,
+            "Unexpected retained object count"
+        );
+        for index in 0..files {
+            let expected = (index < shared).then_some(1);
+            ensure!(
+                db.binding_count(&tx, &identity(index))? == expected,
+                "Incorrect object retention"
+            );
+        }
+        println!(
+            "{batch},{files},{shared},{members},{},{transactions},{},{}",
+            members + bindings,
+            elapsed.as_millis(),
+            max_transaction.as_millis()
+        );
+    }
+    Ok(())
+}
