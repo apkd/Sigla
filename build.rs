@@ -141,6 +141,8 @@ fn cargo_notices(output: &Path) -> Result<Vec<licenses::Notice>> {
 struct NativeSource {
     version: Option<String>,
     url: String,
+    #[serde(default)]
+    mirrors: Vec<String>,
     sha256: String,
 }
 
@@ -153,8 +155,9 @@ fn archive_source(
     let archive = output.join(format!("{}.tar", source.sha256));
     let temporary = archive.with_extension("tmp");
     if !archive.exists() {
-        ensure!(
-            Command::new("curl")
+        let mut downloaded = false;
+        for url in std::iter::once(&source.url).chain(&source.mirrors) {
+            if Command::new("curl")
                 .args([
                     "-fsSL",
                     "--connect-timeout",
@@ -162,15 +165,19 @@ fn archive_source(
                     "--max-time",
                     "120",
                     "--retry",
-                    "3"
+                    "3",
                 ])
-                .arg(&source.url)
+                .arg(url)
                 .arg("-o")
                 .arg(&temporary)
                 .status()?
-                .success(),
-            "Cannot download {name}"
-        );
+                .success()
+            {
+                downloaded = true;
+                break;
+            }
+        }
+        ensure!(downloaded, "Cannot download {name}");
     }
     let bytes = fs::read(if archive.exists() {
         &archive
@@ -256,6 +263,7 @@ fn build_licenses(output: &Path) -> Result<()> {
     let source = NativeSource {
         version: Some(release.into()),
         url,
+        mirrors: Vec::new(),
         sha256: checksum
             .split_whitespace()
             .next()

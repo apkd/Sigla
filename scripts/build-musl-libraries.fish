@@ -20,13 +20,19 @@ set -l host (uname -m)-linux-musl
 mkdir -p $prefix $work
 or exit 1
 function unpack --argument-names name --inherit-variable work --inherit-variable sources
-    set -l url (jq -er --arg name $name '.[$name].url' $sources)
+    set -l urls (jq -er --arg name $name '.[$name] | .url, .mirrors[]?' $sources)
     or exit 1
     set -l checksum (jq -er --arg name $name '.[$name].sha256' $sources)
     or exit 1
-    echo "Downloading $name from $url"
-    curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 10 $url -o "$work/$name.tar"
-    or exit 1
+    set -l downloaded false
+    for url in $urls
+        echo "Downloading $name from $url"
+        if curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 10 $url -o "$work/$name.tar"
+            set downloaded true
+            break
+        end
+    end
+    test $downloaded = true; or exit 1
     printf '%s  %s\n' $checksum "$work/$name.tar" | sha256sum -c -
     or exit 1
     mkdir "$work/$name"
