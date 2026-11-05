@@ -34,7 +34,7 @@ impl Selection {
         Ok(Self {
             includes: compile(includes)?,
             excludes: compile(excludes)?,
-            identity: blake3::hash(&serde_json::to_vec(&(8u32, includes, excludes))?)
+            identity: blake3::hash(&serde_json::to_vec(&(9u32, includes, excludes))?)
                 .to_hex()
                 .to_string(),
             patterns: (includes.to_vec(), excludes.to_vec()),
@@ -249,6 +249,8 @@ mod tests {
             "scripts/plugin.lua",
             "scripts/PLUGIN.LUA",
             "scripts/helper.py",
+            "scripts/build.sc",
+            "scripts/Instrument.SC",
             "queries/filter.jq",
             "queries/metrics.logql",
             "patches/change.patch",
@@ -262,6 +264,8 @@ mod tests {
             "game/Assets/Plugin.dll",
             "rust/target/Generated.rs",
             "data/arbitrary.bin",
+            "Houdini/Terrain.0.bgeo.sc",
+            "Houdini/Terrain.GEO.SC",
         ] {
             assert!(!selection.selected(path), "{path}");
         }

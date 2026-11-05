@@ -14,6 +14,18 @@ pub fn language(path: &Path) -> Option<Language> {
 }
 
 pub(crate) fn language_name(name: &str, lowercase_extension: &str) -> Option<Language> {
+    // Houdini compressed geometry shares the final suffix with text scripts.
+    if lowercase_extension == "sc"
+        && Path::new(name)
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("bgeo") || extension.eq_ignore_ascii_case("geo")
+            })
+    {
+        return None;
+    }
     if lowercase_extension == "md" {
         return Some(Language::Markdown);
     }

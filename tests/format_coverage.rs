@@ -125,6 +125,17 @@ async fn document_discovery_preserves_directory_and_symlink_exclusions() {
     write(root.path(), "scripts/visible.LUA", "VisibleMarker\n");
     write(
         root.path(),
+        "scripts/visible.SC",
+        "println(\"VisibleMarker\")\n",
+    );
+    let native_schema = "{\"name\": \"VisibleMarker\"}\n";
+    write(
+        root.path(),
+        "Packages/plugin/Native~/Abi/schema.json",
+        native_schema,
+    );
+    write(
+        root.path(),
         ".agents/skills/review/SKILL.md",
         "VisibleMarker\n",
     );
@@ -142,6 +153,8 @@ async fn document_discovery_preserves_directory_and_symlink_exclusions() {
         "Samples~/omitted.lua",
         ".agents/.cache/omitted.lua",
         "assets/omitted.png",
+        "assets/omitted.bgeo.sc",
+        "assets/omitted.GEO.SC",
     ];
     for path in excluded {
         write(root.path(), path, "ExcludedMarker\n");
@@ -162,6 +175,14 @@ async fn document_discovery_preserves_directory_and_symlink_exclusions() {
     let project = root.path().to_str().unwrap();
     let visible = app.search(project, "text:\"VisibleMarker\"").await.unwrap();
     assert!(visible.contains("visible.LUA"), "{visible}");
+    assert!(visible.contains("visible.SC"), "{visible}");
+    assert!(visible.contains("Native~/Abi/schema.json"), "{visible}");
+    assert_eq!(
+        app.view(project, "Packages/plugin/Native~/Abi/schema.json", "raw")
+            .await
+            .unwrap(),
+        native_schema,
+    );
     assert!(
         visible.contains(".agents/skills/review/SKILL.md"),
         "{visible}"

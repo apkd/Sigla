@@ -156,7 +156,7 @@ impl Policy {
     pub fn identity(&self) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         hash.update(&serde_json::to_vec(&(
-            12u32,
+            13u32,
             &self.roots,
             self.unity_platform,
             self.remote
@@ -580,9 +580,10 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
             } else if kind.is_file() {
                 let Some(language) = crate::native::language(&path).or_else(|| {
                     (path.starts_with(&result.root)
-                        && !path
-                            .components()
-                            .any(|c| c.as_os_str().to_string_lossy().ends_with('~')))
+                        && !path.components().any(|c| {
+                            let name = c.as_os_str().to_string_lossy();
+                            name.ends_with('~') && !name.eq_ignore_ascii_case("Native~")
+                        }))
                     .then(|| crate::documents::language(&path))
                     .flatten()
                 }) else {
