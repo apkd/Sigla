@@ -295,6 +295,11 @@ impl Store {
             Ok(stats)
         })?;
         let started = Instant::now();
+        // Persist shard names once per import, including blobs reused from a
+        // concurrent importer. That importer may not have reached this sync yet.
+        if !files.is_empty() {
+            File::open(&self.root)?.sync_all()?;
+        }
         for shard in shards.into_inner().unwrap() {
             File::open(shard)?.sync_all()?;
         }
@@ -311,6 +316,7 @@ impl Store {
         let mut stats = ImportStats::default();
         self.import_owned(path, &mut stats, &shards)?;
         let started = Instant::now();
+        File::open(&self.root)?.sync_all()?;
         for shard in shards.into_inner().unwrap() {
             File::open(shard)?.sync_all()?;
         }
@@ -365,9 +371,6 @@ impl Store {
             let mut ready = shards.lock().unwrap();
             if !ready.contains(parent) {
                 fs::create_dir_all(parent)?;
-                let before = Instant::now();
-                File::open(&self.root)?.sync_all()?;
-                sync += before.elapsed();
                 ready.insert(parent.to_owned());
             }
         }
@@ -1388,6 +1391,48 @@ mod tests {
         assert!(root.join("empty/nested").is_dir());
         store.import_tree(&root).unwrap();
         assert_eq!(store.collect().unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_owned_imports_keep_shared_files_after_reopen() {
+        let cache = tempfile::tempdir().unwrap();
+        let stages = [cache.path().join("first"), cache.path().join("second")];
+        for stage in &stages {
+            fs::create_dir(stage).unwrap();
+            for index in 0..64 {
+                fs::write(stage.join(index.to_string()), format!("contents {index}")).unwrap();
+            }
+        }
+        {
+            let store = Store::open(cache.path()).unwrap();
+            let start = std::sync::Barrier::new(stages.len());
+            std::thread::scope(|threads| {
+                for stage in &stages {
+                    let store = &store;
+                    let start = &start;
+                    threads.spawn(move || {
+                        start.wait();
+                        store.import_owned_tree(stage).unwrap();
+                    });
+                }
+            });
+        }
+        let store = Store::open(cache.path()).unwrap();
+        assert_eq!(store.collect().unwrap(), 0);
+        for index in 0..64 {
+            let first = stages[0].join(index.to_string());
+            let second = stages[1].join(index.to_string());
+            assert_eq!(
+                fs::read_to_string(&first).unwrap(),
+                format!("contents {index}")
+            );
+            assert_eq!(
+                fs::metadata(&first).unwrap().ino(),
+                fs::metadata(&second).unwrap().ino()
+            );
+            assert!(store.file_identity(&first).unwrap().is_some());
+            assert!(store.file_identity(&second).unwrap().is_some());
+        }
     }
 
     #[test]

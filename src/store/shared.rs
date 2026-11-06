@@ -777,7 +777,14 @@ impl Database {
         }
         Ok(())
     }
-    fn adjust(&self, tx: &mut RwTxn<'_>, id: &ObjectId, add: bool, now: u64) -> Result<()> {
+    fn adjust(
+        &self,
+        tx: &mut RwTxn<'_>,
+        id: &ObjectId,
+        add: bool,
+        count: u64,
+        now: u64,
+    ) -> Result<()> {
         let mut live = self
             .live(tx, id)?
             .context("Binding points to missing object")?;
@@ -787,13 +794,13 @@ impl Database {
             }
             live.bindings = live
                 .bindings
-                .checked_add(1)
+                .checked_add(count)
                 .context("Object binding count overflow")?;
             live.unused_since = None;
         } else {
             live.bindings = live
                 .bindings
-                .checked_sub(1)
+                .checked_sub(count)
                 .context("Object binding count underflow")?;
             if live.bindings == 0 {
                 live.unused_since = Some(now);
@@ -1537,9 +1544,9 @@ impl Scope {
         if changed {
             if let Some(old) = &old {
                 self.member(tx, file, &old.object, false)?;
-                self.database.adjust(tx, &old.object, false, now)?;
+                self.database.adjust(tx, &old.object, false, 1, now)?;
             }
-            self.database.adjust(tx, object, true, now)?;
+            self.database.adjust(tx, object, true, 1, now)?;
         }
         self.member(tx, file, object, true)?;
         let bytes = self.database.live(tx, object)?.unwrap().encoded_bytes;
@@ -1600,7 +1607,7 @@ impl Scope {
             self.database
                 .bindings
                 .delete(tx, &scope_key(self.id, file.as_bytes()))?;
-            self.database.adjust(tx, &binding.object, false, now)?;
+            self.database.adjust(tx, &binding.object, false, 1, now)?;
         }
         Ok(())
     }
@@ -1920,15 +1927,26 @@ impl Scope {
                 return Ok(false);
             }
         }
-        let files = self.files_after(&tx, None, remaining)?;
-        for file in files {
-            let binding = self
-                .binding(&tx, &file)?
-                .context("Binding disappeared inside transaction")?;
-            self.database
-                .bindings
-                .delete(&mut tx, &scope_key(self.id, file.as_bytes()))?;
-            self.database.adjust(&mut tx, &binding.object, false, now)?;
+        let bindings = self
+            .database
+            .bindings
+            .prefix_iter(&tx, &self.id.to_be_bytes())?
+            .take(remaining)
+            .map(|row| {
+                let (key, value) = row?;
+                std::str::from_utf8(&key[8..])?;
+                Ok((key.to_vec(), decode::<Binding>(value)?.object))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut released = BTreeMap::<ObjectId, u64>::new();
+        for (key, object) in bindings {
+            self.database.bindings.delete(&mut tx, &key)?;
+            *released.entry(object).or_default() += 1;
+        }
+        // Shared objects need one liveness update per batch. ID order also
+        // groups writes to neighboring object pages on slower storage.
+        for (object, count) in released {
+            self.database.adjust(&mut tx, &object, false, count, now)?;
         }
         let done = self.files_after(&tx, None, 1)?.is_empty();
         if done {
