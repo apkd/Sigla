@@ -1945,24 +1945,29 @@ mod tests {
         use serde_json::{Value, json};
 
         #[derive(Clone)]
-        struct Logs(Arc<Mutex<Vec<u8>>>);
+        struct Logs(std::sync::Weak<Mutex<Vec<u8>>>);
         impl std::io::Write for Logs {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
+                if let Some(logs) = self.0.upgrade() {
+                    logs.lock().unwrap().extend_from_slice(bytes);
+                }
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
-        let logs = Logs(Arc::new(Mutex::new(Vec::new())));
-        let writer = logs.clone();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = Logs(Arc::downgrade(&logs));
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is shared by all test threads. Give every thread
+        // the same subscriber so an untraced request cannot disable our spans.
+        // The writer keeps only a weak reference, ending capture with this test.
+        tracing::subscriber::set_global_default(subscriber).unwrap();
 
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -2048,10 +2053,10 @@ mod tests {
         }
         client.cancel().await.unwrap();
         server.cancel().await.unwrap();
-        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let captured = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         let failure = captured
             .lines()
-            .find(|line| line.contains("Tool request failed"))
+            .find(|line| line.contains("Tool request failed") && line.contains(project))
             .unwrap();
         assert!(failure.contains("request_id="), "{failure}");
         assert!(failure.contains("stage="), "{failure}");
