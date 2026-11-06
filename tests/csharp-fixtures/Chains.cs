@@ -30,8 +30,16 @@ public class Bag<T> : IBag<T> { }
 public class Plain { public void Finish() { } }
 public class Lifted { public void Finish() { } }
 public class Counted { public int Count => 0; }
+public class Constructed
+{
+    public Constructed(Func<Pool, Pool> transform) { }
+    public void Finish() { }
+}
 public static class Tasks
 {
+    static int Scalar() => 1;
+    static void Consume(Func<Pool> factory) { }
+    static void Consume(Func<string> factory) { }
     static T Merge<T>(T first, T second) => first;
     static T First<T>(IBag<T> bag) => default!;
     static T Pack<T>(params T[] items) => default!;
@@ -52,6 +60,10 @@ public static class Tasks
     }
     public static void Inference(Derived derived, Base basis, Bag<Pool> bag, Pool[] pools, Counted counted, Enemy enemy)
     {
+        var constructed = new Constructed(pool => pool);
+        constructed./*bind:constructed-local*/Finish();
+        var count = Scalar();
+        Consume(() => count./*bind:scalar-initializer*/ToString());
         Merge(derived, basis)./*bind:lower-bound*/Run();
         First(bag)./*bind:interface-projection*/Initialize();
         Pack(pools)./*bind:params-array*/Initialize();

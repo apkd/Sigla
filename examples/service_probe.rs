@@ -5,6 +5,8 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 #[derive(Deserialize)]
 struct Workload {
     roots: Vec<PathBuf>,
+    #[serde(default)]
+    unity_editors: Option<PathBuf>,
     cache: PathBuf,
     cases: Vec<Case>,
     repeats: usize,
@@ -72,11 +74,10 @@ async fn main() -> Result<()> {
         .context("Expected workload JSON file")?;
     let workload: Workload = serde_json::from_slice(&std::fs::read(path)?)?;
     sigla::service::App::configure_cache_memory(workload.cache_memory_mib)?;
-    let app = Arc::new(sigla::service::App::new(
-        sigla::discovery::Policy::new(workload.roots)?,
-        workload.cache,
-        2,
-    )?);
+    let mut policy = sigla::discovery::Policy::new(workload.roots)?;
+    policy.unity_editors = workload.unity_editors;
+    let app = Arc::new(sigla::service::App::new(policy, workload.cache, 2)?);
+    let result = async {
     for iteration in 0..workload.repeats {
         for cases in workload.cases.chunks(workload.concurrency.max(1)) {
             let mut jobs = tokio::task::JoinSet::new();
@@ -119,4 +120,7 @@ async fn main() -> Result<()> {
         println!("{sample}");
     }
     Ok(())
+    }.await;
+    app.shutdown().await;
+    result
 }

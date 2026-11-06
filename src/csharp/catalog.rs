@@ -49,10 +49,12 @@ pub(crate) struct Catalog {
     headers: HashMap<String, Arc<DeclarationFile>>,
     bytes: usize,
     lookups: HashMap<(String, usize, DeclarationLookup), Vec<Symbol>>,
+    symbols: HashMap<(String, usize, u32), Symbol>,
+    symbol_bytes: usize,
     imports: HashMap<String, Vec<super::syntax::Import>>,
     globals: Option<HashMap<usize, Vec<super::syntax::Import>>>,
     assemblies: Option<HashMap<String, Vec<String>>>,
-    forwarders: HashMap<String, Vec<(String, String)>>,
+    forwarders: HashMap<String, HashMap<String, Vec<String>>>,
     pub work: usize,
 }
 impl Catalog {
@@ -95,24 +97,26 @@ impl Catalog {
             {
                 files.insert(file.clone());
                 if !self.forwarders.contains_key(&file) {
-                    self.forwarders.insert(
-                        file.clone(),
-                        view.store.assembly_forwarders(view.tx, &file)?,
-                    );
-                }
-                for (name, destination) in &self.forwarders[&file] {
-                    let name = name
-                        .split('.')
-                        .map(|n| n.split('`').next().unwrap_or(n))
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    if qualified == name
-                        || qualified
-                            .strip_prefix(&name)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                    {
-                        pending.push(destination.clone());
+                    let mut forwarders = HashMap::<String, Vec<String>>::new();
+                    for (name, destination) in view.store.assembly_forwarders(view.tx, &file)? {
+                        let name = name
+                            .split('.')
+                            .map(|n| n.split('`').next().unwrap_or(n))
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        forwarders.entry(name).or_default().push(destination);
                     }
+                    self.forwarders.insert(file.clone(), forwarders);
+                }
+                let mut name = qualified;
+                loop {
+                    if let Some(destinations) = self.forwarders[&file].get(name) {
+                        pending.extend(destinations.iter().cloned());
+                    }
+                    let Some((parent, _)) = name.rsplit_once('.') else {
+                        break;
+                    };
+                    name = parent;
                 }
             }
         }
@@ -213,13 +217,30 @@ impl Catalog {
         project: usize,
         index: u32,
     ) -> Result<Symbol> {
+        let key = (file.to_owned(), project, index);
+        if let Some(symbol) = self.symbols.get(&key).cloned() {
+            self.check(view)?;
+            return Ok(symbol);
+        }
         let facts = self.declaration(view, file, index)?;
         let position = facts
             .headers
             .iter()
             .position(|h| h.declaration == index)
             .ok_or_else(|| anyhow::anyhow!("Missing declaration index"))?;
-        self.symbol_with_facts(view, file, project, position as u32, facts)
+        let symbol = self.symbol_with_facts(view, file, project, position as u32, facts)?;
+        // Declaration allocations already belong to the header budget. Bound the
+        // additional keys and identities independently; a full memo stays optional.
+        let bytes = 128
+            + std::mem::size_of::<Symbol>()
+            + 2 * file.len()
+            + symbol.id.context.len()
+            + symbol.id.key.len();
+        if self.symbol_bytes.saturating_add(bytes) <= 4 * 1024 * 1024 {
+            self.symbol_bytes += bytes;
+            self.symbols.insert(key, symbol.clone());
+        }
+        Ok(symbol)
     }
     fn declaration(
         &mut self,
@@ -418,4 +439,91 @@ fn visible(manifest: &Manifest, from: usize, to: usize) -> bool {
             .references
             .iter()
             .any(|reference| reference.visible(&manifest.projects[to].identity))
+}
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+
+    #[test]
+    fn generic_outer_forwarding_preserves_nested_types_and_name_boundaries() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = Store::open_workspace(root.path(), [1; 32], root.path(), None)?;
+        let mut manifest = Manifest::default();
+        for (index, (assembly, forwarders)) in [
+            (
+                "Origin",
+                vec![
+                    ("Example.Outer`1", "Middle"),
+                    ("Example.Other", "Unrelated"),
+                ],
+            ),
+            (
+                "Middle",
+                vec![
+                    ("Example.Outer`1.Inner`1", "Destination"),
+                    ("Example.Outer`1", "Origin"),
+                ],
+            ),
+            ("Destination", vec![]),
+            ("Unrelated", vec![]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = root.path().join(format!("{assembly}.dll"));
+            store.install(
+                assembly,
+                &0u8,
+                [index as u8; 32],
+                || Ok(()),
+                || {
+                    Ok(crate::store::FileData {
+                        source: String::new(),
+                        assembly: Some(assembly.into()),
+                        facts: crate::model::Facts {
+                            csharp: Some(super::super::syntax::FileSyntax {
+                                forwarders: forwarders
+                                    .into_iter()
+                                    .map(|(name, destination)| (name.into(), destination.into()))
+                                    .collect(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    })
+                },
+            )?;
+            manifest.files.insert(
+                assembly.into(),
+                crate::workspace::FileEntry {
+                    stamp: crate::workspace::Stamp::read_metadata(&path)?,
+                    path,
+                    display: assembly.into(),
+                    language: Language::CSharp,
+                    memberships: Vec::new(),
+                    modules: Vec::new(),
+                    metadata: true,
+                },
+            );
+        }
+        let tx = store.read()?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let view = View {
+            store: &store,
+            tx: &tx,
+            manifest: &manifest,
+            cancel: &cancel,
+        };
+        let mut catalog = Catalog::default();
+        let (scopes, _) = catalog.assembly_scope(&view, "Origin", "Example.Outer.Inner.Leaf")?;
+        assert_eq!(
+            scopes,
+            BTreeSet::from(["Origin".into(), "Middle".into(), "Destination".into()])
+        );
+        let (scopes, _) = catalog.assembly_scope(&view, "Origin", "Example.Outer.InnerPeer")?;
+        assert_eq!(scopes, BTreeSet::from(["Origin".into(), "Middle".into()]));
+        let (scopes, _) = catalog.assembly_scope(&view, "Origin", "Example.OuterPeer")?;
+        assert_eq!(scopes, BTreeSet::from(["Origin".into()]));
+        Ok(())
+    }
 }

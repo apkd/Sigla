@@ -80,6 +80,47 @@ class Usage<T> : Base { void Run(Items items, Derived derived) {
 }
 
 #[tokio::test]
+async fn repeated_scalar_inference_stays_bounded_across_overloads() {
+    let alternatives: String = (0..24)
+        .map(|index| format!("class Other{index} {{}}\n"))
+        .collect();
+    let overloads: String = (0..24)
+        .map(|index| format!("public static int Mix(Other{index} a, Other{index} b) => 0;\n"))
+        .collect();
+    check(
+        &format!(
+            r#"
+{alternatives}
+class Numbers {{
+ public static int Mix(int a, int b) => a;
+ {overloads}
+}}
+class Target {{ public static void Complete(int value) {{}} }}
+class Usage {{ void Run() {{
+ var first = Numbers.Mix(1, 2);
+ var second = Numbers.Mix(first, first);
+ var third = Numbers.Mix(second, second);
+ var fourth = Numbers.Mix(third, third);
+ Target./*bounded*/Complete(fourth);
+}} void WithUnknownArithmetic() {{
+ var first = Numbers.Mix(1 + 2, 2 + 3);
+ var second = Numbers.Mix(first, first);
+ var third = Numbers.Mix(second, second);
+ var fourth = Numbers.Mix(third, third);
+ Target./*unknown-bounded*/Complete(fourth);
+}} }}
+"#
+        ),
+        &[
+            ("/*bounded*/", "Target.Complete"),
+            // Unsupported arithmetic must stay uncertain without exhausting work.
+            ("/*unknown-bounded*/", "No matches."),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn implicit_iteration_await_and_disposal_calls_are_retrievable() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -404,6 +445,10 @@ async fn indexers_patterns_out_variables_and_contextual_new_keep_declared_types(
         r#"
 class Item { public void Run() {} }
 class Bag { public Item this[int index] => null; }
+class Holder {
+ public Holder(int count) {}
+ public void Run() {}
+}
 class Task {
  bool TryGet(out Item item) { item = null; return true; }
  Item Accept(Item item) => item;
@@ -415,6 +460,8 @@ class Task {
   found./*out-variable*/Run();
   Accept(new())./*target-new*/Run();
   found?./*conditional*/Run();
+  var holder = new Holder(1);
+  holder./*constructed-local*/Run();
  }
 }
 "#,
@@ -426,6 +473,7 @@ class Task {
             ("/*out-variable*/", "Item.Run"),
             ("/*target-new*/", "Item.Run"),
             ("/*conditional*/", "Item.Run"),
+            ("/*constructed-local*/", "Holder.Run"),
         ],
     )
     .await;

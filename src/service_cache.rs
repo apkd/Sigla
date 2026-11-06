@@ -1050,9 +1050,8 @@ impl App {
         } else {
             "analysis bounded maintenance"
         };
-        let mut progress = maintenance_stage(operation, stage, || {
-            self.maintain_analysis(pressure)
-        })?;
+        let mut progress =
+            maintenance_stage(operation, stage, || self.maintain_analysis(pressure))?;
         if self.cache.join("analysis").is_dir() {
             let database = crate::store::Database::open(&self.cache.join("analysis"))?;
             if pressure {

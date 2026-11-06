@@ -36,6 +36,8 @@ pub(crate) struct Binder {
     catalog: Catalog,
     definitions: HashMap<DefinitionId, Symbol>,
     observed: Vec<(ExprId, Bound)>,
+    scalar_locals: HashMap<(usize, usize), Type>,
+    occurrence_position: usize,
     #[cfg(test)]
     pub(super) trace_type: Option<Type>,
     #[cfg(test)]
@@ -890,6 +892,7 @@ impl Binder {
         self.catalog.work = work;
         self.definitions.clear();
         self.observed.clear();
+        self.scalar_locals.clear();
     }
 
     pub fn resolve(
@@ -901,7 +904,37 @@ impl Binder {
         construction: bool,
         occurrence_name: &str,
     ) -> Result<Vec<(Symbol, bool)>> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        let before = self.catalog.work;
+        let result =
+            self.resolve_occurrence(view, file, project, position, construction, occurrence_name);
+        if let Some(started) = started {
+            tracing::debug!(
+                file = %view.manifest.files[file].path.display(),
+                project,
+                position,
+                occurrence_name,
+                work = self.catalog.work.saturating_sub(before),
+                total_work = self.catalog.work,
+                elapsed_us = started.elapsed().as_micros(),
+                success = result.is_ok(),
+                "C# occurrence binding completed"
+            );
+        }
+        result
+    }
+
+    fn resolve_occurrence(
+        &mut self,
+        view: &View<'_>,
+        file: &str,
+        project: usize,
+        position: usize,
+        construction: bool,
+        occurrence_name: &str,
+    ) -> Result<Vec<(Symbol, bool)>> {
         self.release_occurrence();
+        self.occurrence_position = position;
         self.catalog.check(view)?;
         let key = *blake3::hash(&postcard::to_allocvec(&(
             view.manifest.environment,
@@ -1232,10 +1265,56 @@ impl Binder {
                     if matches!(local.ty, WrittenType::Inferred)
                         && let Some(value) = local.value
                     {
-                        ty = self
-                            .expression(view, context, body, value, None, locals, depth + 1)?
-                            .ty
-                            .unwrap_or(Type::Unsupported);
+                        let initializer = &body.expressions[value as usize];
+                        // Rejected overloads discard their observations. Only reuse
+                        // types whose initializer cannot contain the requested site,
+                        // and whose inference has no candidate-specific lambda locals.
+                        let scalar_key = (locals.is_empty()
+                            && local.out_argument.is_none()
+                            && !initializer.span.contains(&self.occurrence_position))
+                        .then_some((local.span.start, depth));
+                        let cached =
+                            scalar_key.and_then(|key| self.scalar_locals.get(&key).cloned());
+                        let cache_miss = cached.is_none();
+                        ty = if let Some(cached) = cached {
+                            cached
+                        } else {
+                            match &initializer.kind {
+                                // An explicit construction fixes the local's type. Binding
+                                // its constructor arguments again cannot change that type.
+                                ExpressionKind::New { ty, .. }
+                                    if !matches!(ty, WrittenType::Inferred)
+                                        && local.out_argument.is_none()
+                                        && !initializer
+                                            .span
+                                            .contains(&self.occurrence_position)
+                                        && depth < 48 =>
+                                {
+                                    self.resolve_type(view, ty, context, depth + 2)?
+                                }
+                                _ => self
+                                    .expression(
+                                        view,
+                                        context,
+                                        body,
+                                        value,
+                                        None,
+                                        locals,
+                                        depth + 1,
+                                    )?
+                                    .ty
+                                    .unwrap_or(Type::Unsupported),
+                            }
+                        };
+                        // These variants retain no heap data, keeping the memo small
+                        // even when overloaded calls repeatedly fail to infer a type.
+                        if cache_miss
+                            && self.scalar_locals.len() < 1024
+                            && let Some(key) = scalar_key
+                            && matches!(ty, Type::Primitive(_) | Type::Unsupported)
+                        {
+                            self.scalar_locals.insert(key, ty.clone());
+                        }
                         if local.iteration {
                             ty = self.element_type(view, &ty, context.project, depth + 1)?;
                         }
@@ -2881,6 +2960,38 @@ mod resource_tests {
             assert_eq!(result.len(), 1);
             assert!(!result[0].1);
             assert_eq!(result[0].0.declaration().owner, name);
+            let symbol = &result[0].0;
+            let mut catalog = Catalog::default();
+            let first = catalog
+                .symbol(&view, file, symbol.project, symbol.header().declaration)
+                .unwrap();
+            let initial_work = catalog.work;
+            let repeated = catalog
+                .symbol(&view, file, symbol.project, symbol.header().declaration)
+                .unwrap();
+            assert_eq!(first.id, repeated.id);
+            assert!(
+                catalog.work - initial_work < initial_work,
+                "Repeated symbols should reuse their owner identities"
+            );
+            let cancelled = tokio_util::sync::CancellationToken::new();
+            cancelled.cancel();
+            let cancelled_view = View {
+                cancel: &cancelled,
+                ..view
+            };
+            assert!(
+                catalog
+                    .symbol(
+                        &cancelled_view,
+                        file,
+                        symbol.project,
+                        symbol.header().declaration
+                    )
+                    .err()
+                    .unwrap()
+                    .is::<crate::diagnostics::Cancelled>()
+            );
             assert!(
                 binder
                     .definitions

@@ -855,6 +855,9 @@ impl Drop for Workspace {
 }
 
 #[cfg(test)]
+#[path = "workspace_binding_probe.rs"]
+mod binding_probe;
+#[cfg(test)]
 #[path = "store/workspace_tests.rs"]
 mod storage_tests;
 #[cfg(test)]

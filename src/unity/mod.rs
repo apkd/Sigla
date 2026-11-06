@@ -8,6 +8,8 @@ mod settings;
 pub(crate) mod symbols;
 mod version;
 pub(crate) use graph::discover;
+#[cfg(test)]
+pub(crate) use graph::discover_with_editor;
 pub use version::{ReleaseBranch, UnityVersion};
 
 fn package_version(value: &str) -> Option<semver::Version> {

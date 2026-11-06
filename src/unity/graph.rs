@@ -79,7 +79,7 @@ pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discove
     discover_with_editor(root, policy, cache, result, &editor)
 }
 
-fn discover_with_editor(
+pub(crate) fn discover_with_editor(
     root: &Path,
     policy: &Policy,
     cache: &Path,
