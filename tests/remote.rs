@@ -802,7 +802,7 @@ fn check_required_input_generations(root: &Path) -> Result<()> {
         let manager = Manager::new(root.join("cache"), options)?;
         let repository = Repository::parse("ssh://git@fixture.invalid/repo#refs/heads/main")?
             .context("Missing fixture repository")?;
-        let branch = manager.resolve(repository).await?;
+        let branch = manager.resolve(repository.clone()).await?;
         let revision = branch
             .state
             .read()
@@ -840,8 +840,16 @@ fn check_required_input_generations(root: &Path) -> Result<()> {
             "Repair did not change generation"
         );
         ensure!(
-            fs::read_to_string(required)? == "pub struct Required;\n",
+            fs::read_to_string(&required)? == "pub struct Required;\n",
             "Required input was not repaired"
+        );
+        manager.resolve(repository.clone()).await?;
+        manager.resolve(repository.clone()).await?;
+        fs::remove_file(&required)?;
+        manager.resolve(repository).await?;
+        ensure!(
+            fs::read_to_string(&required)? == "pub struct Required;\n",
+            "Warm resolution did not repair a missing source"
         );
         Ok(())
     })

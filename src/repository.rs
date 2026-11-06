@@ -17,6 +17,7 @@ pub mod rebuild;
 pub(crate) mod retention;
 mod revision;
 pub mod selection;
+mod source_validation;
 pub mod transport;
 
 const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`, `#tag`, a full `#commit` ID, or a unique commit prefix of at least 7 hex characters";

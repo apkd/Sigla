@@ -61,6 +61,7 @@ mod refresh_tests {
             telemetry_id: Mutex::new(None),
             retry_after: AtomicU64::new(0),
             acquiring: AsyncMutex::new(()),
+            sources: Mutex::new(None),
             inventory: watch::channel(None).0,
         }
     }
@@ -677,10 +678,19 @@ pub struct Branch {
     telemetry_id: Mutex<Option<String>>,
     retry_after: AtomicU64,
     acquiring: AsyncMutex<()>,
+    sources: Mutex<Option<super::source_validation::Sources>>,
     pub(crate) inventory: watch::Sender<Option<Arc<Inventory>>>,
 }
 
 impl Branch {
+    pub(super) fn sources_current(&self, prepared: &Prepared) -> bool {
+        self.sources
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| super::source_validation::Sources::new(&self.source(), prepared))
+            .current(prepared)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf) -> Self {
         Self {
@@ -698,6 +708,7 @@ impl Branch {
             telemetry_id: Mutex::new(None),
             retry_after: AtomicU64::new(0),
             acquiring: AsyncMutex::new(()),
+            sources: Mutex::new(None),
             inventory: watch::channel(None).0,
         }
     }
@@ -725,6 +736,7 @@ impl Branch {
     pub(crate) async fn publish(&self) -> PublicationGuard {
         let analysis = self.analysis.clone().write_owned().await;
         let state = self.state.clone().write_owned().await;
+        self.sources.lock().unwrap().take();
         PublicationGuard {
             state,
             _analysis: analysis,
@@ -1349,6 +1361,7 @@ impl Manager {
                     telemetry_id: Mutex::new(None),
                     retry_after: AtomicU64::new(0),
                     acquiring: AsyncMutex::new(()),
+                    sources: Mutex::new(None),
                     inventory: watch::channel(None).0,
                 });
                 branches.insert(key, branch.clone());
@@ -1360,9 +1373,7 @@ impl Manager {
             !s.repair
                 && branch.source().is_dir()
                 && s.policy == self.options.selection.identity
-                && s.prepared.selected.keys().all(|p| {
-                    s.prepared.unavailable.contains(p) || branch.source().join(p).is_file()
-                })
+                && branch.sources_current(&s.prepared)
         });
         let due = state.as_ref().is_none_or(|s| {
             branch.refresh_due(&self.options, s.refreshed, now(), Some(&s.prepared))
