@@ -14,6 +14,8 @@ pub(crate) struct Policy {
     pub rules: Vec<Rule>,
     pub repo_ttl: Duration,
     pub branch_ttl: Duration,
+    #[serde(default)]
+    pub selection_identity: String,
 }
 impl From<&crate::config::RemoteOptions> for Policy {
     fn from(options: &crate::config::RemoteOptions) -> Self {
@@ -21,6 +23,7 @@ impl From<&crate::config::RemoteOptions> for Policy {
             rules: options.rules.clone(),
             repo_ttl: options.repo_ttl,
             branch_ttl: options.branch_ttl,
+            selection_identity: options.selection.identity.clone(),
         }
     }
 }
@@ -55,7 +58,7 @@ impl Policy {
         &self,
         cache: &Path,
         state: &State,
-        default_ready: impl FnOnce(&Identity, &str) -> Result<bool>,
+        default_ready: impl Fn(&Identity, &str) -> Result<bool>,
     ) -> Result<(Option<String>, Duration)> {
         let default: Option<DefaultBranch> =
             match fs::read(cache.join("defaults").join(state.repository.storage_key())) {
@@ -77,7 +80,12 @@ impl Policy {
             selector: None,
         };
         let exact = self.rules.iter().any(|rule| rule.exact_match(&repository));
-        let protection = if !exact {
+        let protection = if !exact
+            || (is_default
+                && !self.selection_identity.is_empty()
+                && state.policy != self.selection_identity
+                && default_ready(&state.repository, &default.as_ref().unwrap().branch)?)
+        {
             None
         } else if is_default {
             Some("explicitly allowed default branch")

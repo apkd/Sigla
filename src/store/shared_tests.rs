@@ -626,13 +626,21 @@ fn replacing_a_workspace_retires_only_its_previous_source_group() {
             ..manifest.clone()
         })
         .unwrap();
-    let replacement = open(3);
+    let other_policy = open(3);
+    other_policy
+        .save_manifest(&crate::workspace::Manifest {
+            discovery_policy: [1; 32],
+            ..manifest.clone()
+        })
+        .unwrap();
+    let replacement = open(4);
     replacement.save_manifest(&manifest).unwrap();
     assert_eq!(
         old.scope.info(&old.read().unwrap()).unwrap().phase,
         Phase::Deleting
     );
     assert!(native.scope.query_read().is_ok());
+    assert!(other_policy.scope.query_read().is_ok());
     assert!(replacement.scope.query_read().is_ok());
     assert!(snapshot.scope.query_read().is_ok());
 }
@@ -650,7 +658,7 @@ fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
         &crate::store::ManifestRecord {
             version: "previous-discovery-layout",
             group: None,
-            policy: [0; 32],
+            policy: [9; 32],
             data: b"opaque old manifest",
         },
         &mut bytes,

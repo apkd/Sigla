@@ -1808,7 +1808,9 @@ mod tests {
             target: Some(Target::Branch(branch.into())),
             last_use,
             refreshed: last_use,
-            policy: String::new(),
+            policy: crate::repository::selection::Selection::new(&[], &[])
+                .unwrap()
+                .identity,
             indexed_revision: Some(revision.clone()),
             repair: false,
             additional: Default::default(),
@@ -2385,6 +2387,50 @@ mod tests {
         assert_eq!(
             fs::read(cache.path().join("owners.json")).unwrap(),
             owners_before
+        );
+    }
+
+    #[test]
+    fn old_selection_defaults_stay_protected_until_current_index_is_ready() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(
+            cache.path(),
+            vec![Rule::parse_private("https://github.com/example/keep").unwrap()],
+        );
+        let current = seed(cache.path(), "keep", "main", "main", 1);
+        let previous = cache.path().join("repositories/previous-selection");
+        fs::create_dir_all(previous.join("source")).unwrap();
+        let mut state: State =
+            serde_json::from_slice(&fs::read(current.join("state.json")).unwrap()).unwrap();
+        let mut old = state.clone();
+        old.policy = "previous-selection".into();
+        write_json(&previous.join("state.json"), &old).unwrap();
+        let manager = app.remote.as_ref().unwrap();
+        for (indexed, repair, protected) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            state.indexed_revision = indexed.then(|| state.prepared.revision.clone());
+            state.repair = repair;
+            write_json(&current.join("state.json"), &state).unwrap();
+            assert_eq!(manager.retention(&old).unwrap().0, protected);
+            assert!(manager.retention(&state).unwrap().0);
+            app.seed_owners().unwrap();
+            let candidates = app.candidates().unwrap();
+            assert_eq!(
+                candidates
+                    .iter()
+                    .find(|c| c.owner.entry == previous.join("source"))
+                    .unwrap()
+                    .pinned,
+                protected
+            );
+        }
+        fs::remove_file(current.join("state.json")).unwrap();
+        assert!(
+            manager.retention(&old).unwrap().0,
+            "Keep the fallback if its replacement disappears"
         );
     }
 

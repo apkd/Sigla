@@ -42,12 +42,17 @@ fn manifest_payload(bytes: &[u8]) -> Result<Option<&[u8]>> {
         .flatten())
 }
 
-fn manifest_group(bytes: &[u8]) -> Result<Option<(Option<crate::native::Group>, [u8; 32])>> {
+fn replaced_manifest(bytes: &[u8], manifest: &crate::workspace::Manifest) -> Result<bool> {
     if let Some(bytes) = bytes.strip_prefix(MANIFEST_PREFIX) {
         let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
-        return Ok(Some((record.group, record.policy)));
+        return Ok(record.group == manifest.source_group
+            && (record.policy == manifest.discovery_policy
+                || record.version != env!("SIGLA_WORKSPACE_FINGERPRINT")));
     }
-    Ok(inspect_manifest(bytes)?.map(|manifest| (manifest.source_group, manifest.discovery_policy)))
+    Ok(inspect_manifest(bytes)?.is_some_and(|previous| {
+        previous.source_group == manifest.source_group
+            && previous.discovery_policy == manifest.discovery_policy
+    }))
 }
 
 pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<Option<crate::workspace::Manifest>> {
@@ -177,9 +182,10 @@ impl Store {
             &mut bytes,
         )?;
         self.scope.finish_refresh(&bytes, &keep, now())?;
-        self.scope.retire_previous(|bytes| {
-            Ok(manifest_group(bytes)? == Some((manifest.source_group, manifest.discovery_policy)))
-        })
+        // Incompatible layouts cannot serve another discovery policy in
+        // this process. Retire them once this source group has a replacement.
+        self.scope
+            .retire_previous(|bytes| replaced_manifest(bytes, manifest))
     }
     pub fn remove(&self, file: &str) -> Result<()> {
         self.scope.detach(file, now())

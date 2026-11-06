@@ -49,6 +49,8 @@ pub(crate) fn retention_candidates(
                 policy.decision(cache, state, |identity, branch| {
                     Ok(states.values().any(|s| {
                         &s.repository == identity
+                            && (policy.selection_identity.is_empty()
+                                || s.policy == policy.selection_identity)
                             && s.prepared.branch.as_deref() == Some(branch)
                             && !s.repair
                             && s.indexed_revision.as_ref() == Some(&s.prepared.revision)

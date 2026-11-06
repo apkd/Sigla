@@ -830,6 +830,7 @@ impl Manager {
         // Named selectors and explicit refs can both resolve to the actual default.
         Ok(self.cached()?.iter().any(|(_, state)| {
             &state.repository == identity
+                && state.policy == self.options.selection.identity
                 && state.prepared.branch.as_deref() == Some(branch)
                 && !state.repair
                 && state.indexed_revision.as_ref() == Some(&state.prepared.revision)
