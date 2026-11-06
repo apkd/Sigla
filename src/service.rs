@@ -2297,9 +2297,11 @@ mod tests {
         .unwrap();
         assert!(code.contains("Available") && !code.contains("Index incomplete:"));
         drop(shader);
+        // The short budget above tests partial results. Released workers may
+        // take longer on busy runners, so completion checks wait explicitly.
         let shader = tokio::time::timeout(
             Duration::from_secs(5),
-            app.search(path, "function:shader_ready lang:hlsl"),
+            app.search(path, "function:shader_ready lang:hlsl wait:complete"),
         )
         .await
         .unwrap()
@@ -2309,7 +2311,7 @@ mod tests {
         waiting.abort();
         drop(native);
         assert!(
-            app.search(path, "function:native_ready lang:cpp")
+            app.search(path, "function:native_ready lang:cpp wait:complete")
                 .await
                 .unwrap()
                 .contains("native_ready")
@@ -2326,7 +2328,10 @@ mod tests {
         let broad = app.search(path, "symbol:*").await.unwrap();
         assert!(!broad.contains("intermediate"), "{broad}");
         drop(pause);
-        let current = app.search(path, "function:* lang:cpp").await.unwrap();
+        let current = app
+            .search(path, "function:* lang:cpp wait:complete")
+            .await
+            .unwrap();
         assert!(
             current.contains("newest")
                 && !current.contains("intermediate")
