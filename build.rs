@@ -577,6 +577,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Streaming trusted metadata and owned imports preserve discovery inputs.
+        (
+            "938fce78445444dec3c2590f301570b2a4b8d53e0dc1c17335dda1debe24e97e",
+            "2ef6ad75638363b5d517f6fcdaa4b77e739eb288f07817abc41a32b8e081babf",
+        ),
         // Test-module placement preserves discovery and record identities.
         (
             "edd8a473c52a6e2dd885f253f5969356f759c7566b00b684b49be44d12a35ac3",
@@ -639,6 +644,11 @@ fn main() {
     // query and memory changes: shared Arcs serialize as the same values,
     // and loading discards unused destination paths from old null references.
     let asset_aliases: &[(&str, &str)] = &[
+        // Job trimming and streaming generation hashes preserve asset snapshots.
+        (
+            "2d7e10b4d22fdf5b6d4601d3a4930111099a7b165996bb5bc298c0e39c1e16bf",
+            "ce2f855b02c5e33c1e2a7ab82ed6dd08b860a7b8d32d304cd25f380fbc44c367",
+        ),
         // Test-module placement preserves asset data and dependencies.
         (
             "ec70086245ac65191f96bc784e2a51b8880e6fd3abc41a47f1c71d8d4ee4e47f",

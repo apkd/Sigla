@@ -48,6 +48,16 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
         scope.spawn(move || {
             let _ = send.send(server.query(project, "type:Available lang:rust"));
         });
+        let (error, result) = receive.recv_timeout(Duration::from_secs(10))??;
+        ensure!(
+            !error && result.contains("Available"),
+            "Code search waited for optional assets: {result}"
+        );
+        ensure!(
+            !root.path().join("lfs-started").exists(),
+            "Code search started an unrelated asset download"
+        );
+        scope.spawn(move || server.call("view", json!({"codebase":project,"path":"Object.asset"})));
         let started = Instant::now();
         while !root.path().join("lfs-started").exists() {
             ensure!(
@@ -56,11 +66,6 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (error, result) = receive.recv_timeout(Duration::from_secs(5))??;
-        ensure!(
-            !error && result.contains("Available"),
-            "Code search waited for optional assets: {result}"
-        );
         let (error, result) = server.query(project, "type:Available lang:rust")?;
         ensure!(
             !error && result.contains("Available"),

@@ -29,6 +29,7 @@ struct WorkspaceSlot {
     preparing: Option<preparation::Ticket>,
     used: Instant,
 }
+const WORKSPACE_CACHE_ENTRIES: usize = 256;
 #[derive(Clone, Debug)]
 enum Request {
     Search(String),
@@ -49,6 +50,7 @@ pub struct App {
     workers: Arc<tokio::sync::Semaphore>,
     history_workers: Arc<tokio::sync::Semaphore>,
     preparation_workers: Arc<tokio::sync::Semaphore>,
+    preparation_lifecycle: Arc<tokio::sync::Semaphore>,
     indexing_workers: Arc<tokio::sync::Semaphore>,
     navigation_workers: Arc<tokio::sync::Semaphore>,
     index_wait: std::time::Duration,
@@ -61,6 +63,7 @@ pub struct App {
     upstream: Option<crate::upstream::Upstream>,
     startup: Mutex<Option<Startup>>,
     maintenance: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cache_trim: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stateless_summaries: crate::summary::Stateless,
     activity: Arc<tokio::sync::RwLock<()>>,
     blobs: Arc<crate::cache::blobs::Store>,
@@ -76,7 +79,11 @@ pub struct App {
     #[cfg(test)]
     indexing_pause: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
+    indexing_started: tokio::sync::Notify,
+    #[cfg(test)]
     admission_started: tokio::sync::Notify,
+    #[cfg(test)]
+    preparation_admission_started: tokio::sync::Notify,
     #[cfg(test)]
     history_started: tokio::sync::Notify,
     #[cfg(test)]
@@ -194,6 +201,7 @@ impl App {
             _ = cancel.cancelled() => Err(crate::diagnostics::Cancelled.into()),
             result = self.dispatch_with_upstream(path, request, upstream, operation.clone()) => result,
         };
+        self.trim_idle_after_completion().await;
         if let Err(error) = &result
             && let Some(diagnostic) = crate::diagnostics::monitoring(error)
         {
@@ -210,33 +218,85 @@ impl App {
         loop {
             let retired = {
                 let mut registry = self.workspaces.lock().unwrap();
-                let bytes: usize = registry
-                    .values()
-                    .filter_map(|slot| {
-                        slot.state.try_lock().ok().map(|state| {
-                            state
-                                .as_ref()
-                                .map_or(0, |workspace| workspace.retained_bytes)
-                        })
-                    })
-                    .sum();
-                if bytes <= workspace_budget {
-                    return;
+                let mut bytes = 0usize;
+                for slot in registry.values() {
+                    let state = slot.state.try_lock().ok();
+                    let workspace = state.as_ref().and_then(|state| state.as_ref());
+                    let manifest = workspace.map(|workspace| &workspace.manifest);
+                    bytes = bytes
+                        .saturating_add(workspace.map_or(0, |workspace| workspace.retained_bytes));
+                    if let Some(ticket) = &slot.preparing {
+                        bytes = bytes.saturating_add(
+                            usize::try_from(ticket.retained_heap_bytes(manifest).0)
+                                .unwrap_or(usize::MAX),
+                        );
+                    }
                 }
-                let oldest = registry
-                    .iter()
-                    .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
-                    .min_by_key(|(_, slot)| slot.used)
-                    .map(|(path, _)| path.clone());
-                oldest.and_then(|path| registry.remove(&path))
+                if bytes <= workspace_budget && registry.len() <= WORKSPACE_CACHE_ENTRIES {
+                    None
+                } else {
+                    let oldest = registry
+                        .iter()
+                        .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
+                        .min_by_key(|(_, slot)| slot.used)
+                        .map(|(path, _)| path.clone());
+                    oldest.and_then(|path| registry.remove(&path))
+                }
             };
-            if retired.is_none() {
-                return;
-            }
+            let Some(retired) = retired else { break };
             // Drop cached heap outside the registry lock.
             drop(retired);
             crate::memory::reclaim();
         }
+        if let Some(remote) = &self.remote
+            && let Err(error) = remote.trim_unreferenced(|source| {
+                self.workspaces
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .any(|entry| entry.starts_with(source))
+            })
+        {
+            tracing::warn!(%error, "Cannot trim unreferenced repository branches");
+        }
+    }
+
+    async fn trim_idle_after_completion(self: &Arc<Self>) {
+        let app = self.clone();
+        let _ = tokio::task::spawn_blocking(move || app.trim_idle()).await;
+    }
+
+    pub(super) fn workspace_cache_usage(&self) -> crate::memory::CacheUsage {
+        let registry = self.workspaces.lock().unwrap();
+        let mut usage = crate::memory::CacheUsage {
+            entries: registry.len(),
+            ..Default::default()
+        };
+        for slot in registry.values() {
+            let state_pinned = Arc::strong_count(&slot.state) > 1;
+            let active = state_pinned
+                || slot
+                    .preparing
+                    .as_ref()
+                    .is_some_and(preparation::Ticket::running);
+            if active {
+                usage.active_entries += 1;
+            }
+            let state = slot.state.try_lock().ok();
+            let workspace = state.as_ref().and_then(|state| state.as_ref());
+            let workspace_bytes = workspace.map_or(0, |workspace| workspace.retained_bytes);
+            usage.retained_bytes += workspace_bytes as u64;
+            if state_pinned {
+                usage.pinned_bytes += workspace_bytes as u64;
+            }
+            if let Some(ticket) = &slot.preparing {
+                let (retained, pinned) =
+                    ticket.retained_heap_bytes(workspace.map(|workspace| &workspace.manifest));
+                usage.retained_bytes += retained;
+                usage.pinned_bytes += if state_pinned { retained } else { pinned };
+            }
+        }
+        usage
     }
 
     pub fn new(policy: Policy, cache: PathBuf, workers: usize) -> Result<Self> {
@@ -288,6 +348,7 @@ impl App {
                 workers.saturating_sub(1).max(1),
             )),
             preparation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
+            preparation_lifecycle: Arc::new(tokio::sync::Semaphore::new(workers)),
             indexing_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             navigation_workers: Arc::new(tokio::sync::Semaphore::new(workers)),
             index_wait: std::time::Duration::from_secs(90),
@@ -302,6 +363,7 @@ impl App {
             upstream: None,
             startup: Mutex::new(None),
             maintenance: Mutex::new(None),
+            cache_trim: Mutex::new(None),
             stateless_summaries: Default::default(),
             #[cfg(test)]
             preparation_started: tokio::sync::Notify::new(),
@@ -312,7 +374,11 @@ impl App {
             #[cfg(test)]
             indexing_pause: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
+            indexing_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
             admission_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            preparation_admission_started: tokio::sync::Notify::new(),
             #[cfg(test)]
             history_started: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -369,13 +435,19 @@ impl App {
         self.sources.shutdown();
         // Do not abort a spawn_blocking maintenance batch: join it while its
         // activity guard and cache ownership still protect the environment.
-        let maintenance = {
+        let (maintenance, cache_trim) = {
             // Pair with start_setup's registration order, including a racing setup.
             let _startup = self.startup.lock().unwrap();
-            self.maintenance.lock().unwrap().take()
+            (
+                self.maintenance.lock().unwrap().take(),
+                self.cache_trim.lock().unwrap().take(),
+            )
         };
         if let Some(maintenance) = maintenance {
             let _ = maintenance.await;
+        }
+        if let Some(cache_trim) = cache_trim {
+            let _ = cache_trim.await;
         }
         let _idle = self.activity.write().await;
         if let Err(error) = self.owners.lock().unwrap().flush() {
@@ -526,6 +598,27 @@ impl App {
             });
             *self.maintenance.lock().unwrap() = Some(maintenance);
         }
+        let weak = Arc::downgrade(self);
+        let shutdown = self.inspection_shutdown.clone();
+        let trim = tokio::spawn(async move {
+            let period = std::time::Duration::from_secs(30);
+            let start = tokio::time::Instant::now() + period;
+            let mut ticks = tokio::time::interval_at(start, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return,
+                    _ = ticks.tick() => (),
+                }
+                let Some(app) = weak.upgrade() else { return };
+                let result = tokio::task::spawn_blocking(move || app.trim_idle()).await;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Periodic cache trimming failed");
+                }
+            }
+        });
+        *self.cache_trim.lock().unwrap() = Some(trim);
         let cache = self.cache.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -735,8 +828,9 @@ impl App {
                 self.upstream.as_ref(),
                 crate::telemetry::Operation::default(),
             )
-            .await?;
-        Ok(crate::summary::Session::default().present(result))
+            .await;
+        self.trim_idle_after_completion().await;
+        Ok(crate::summary::Session::default().present(result?))
     }
     async fn dispatch_with_upstream(
         self: &Arc<Self>,
@@ -999,8 +1093,8 @@ impl App {
                     ));
                 }
                 let state = slot.state.clone();
-                let ticket = slot.preparing.as_ref().unwrap().clone();
-                while registry.len() > 256 {
+                let preparation = slot.preparing.as_ref().unwrap().clone();
+                while registry.len() > WORKSPACE_CACHE_ENTRIES {
                     let oldest = registry
                         .iter()
                         .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
@@ -1011,7 +1105,7 @@ impl App {
                     };
                     retired.push(registry.remove(&oldest));
                 }
-                (state, ticket, retired)
+                (state, preparation, retired)
             };
             drop(retired);
             tracing::Span::current().record("shared_job", preparation.id());
@@ -1171,25 +1265,28 @@ impl App {
         };
         let asset_generation =
             crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?;
-        let ticket = self.start_assets(indexes::AssetRequest {
-            workspace: asset_workspace.clone(),
-            branch: branch.clone(),
-            manifest: &state.as_ref().unwrap().manifest,
-            revision: context.as_ref().map(|(_, _, revision, _)| revision.clone()),
-            refresh: asset_request && branch.is_none(),
-            assets_pending: branch_state
-                .as_ref()
-                .and_then(|s| s.as_ref())
-                .is_some_and(|s| !s.prepared.deferred_assets.is_empty()),
-            activity: activity.clone(),
-        })?;
-        if let Some(job_id) = ticket.telemetry_id() {
+        let ticket = asset_request
+            .then(|| {
+                self.start_assets(indexes::AssetRequest {
+                    workspace: asset_workspace.clone(),
+                    branch: branch.clone(),
+                    manifest: &state.as_ref().unwrap().manifest,
+                    revision: context.as_ref().map(|(_, _, revision, _)| revision.clone()),
+                    refresh: asset_request && branch.is_none(),
+                    assets_pending: branch_state
+                        .as_ref()
+                        .and_then(|s| s.as_ref())
+                        .is_some_and(|s| !s.prepared.deferred_assets.is_empty()),
+                    activity: activity.clone(),
+                })
+            })
+            .transpose()?;
+        if let Some(job_id) = ticket.as_ref().and_then(|ticket| ticket.telemetry_id()) {
             operation.link(&job_id);
         }
-        let ticket = asset_request.then_some(ticket);
         let needed = indexes::groups(&request, query.as_ref(), &state.as_ref().unwrap().manifest);
         let mut source_tickets = std::collections::BTreeMap::new();
-        for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
+        for &group in needed.keys() {
             let code = state.as_ref().unwrap();
             source_tickets.insert(
                 group,
@@ -1431,7 +1528,6 @@ impl App {
             })();
             drop(ticket);
             drop(source_tickets);
-            app.trim_idle();
             if cancel.is_cancelled() {
                 blocking_operation.diagnose(crate::telemetry::Diagnostic::RequestCancelled);
                 blocking_operation.finish("cancelled");
@@ -2272,6 +2368,11 @@ mod tests {
         app.search(path, "type:Available lang:rust wait:complete")
             .await
             .unwrap();
+        assert_eq!(
+            app.sources.stats().entries,
+            0,
+            "Code queries must not queue unrelated language indexes"
+        );
         let broad = app
             .dispatch(path, Request::Search("symbol:*".into()))
             .await
@@ -2485,6 +2586,11 @@ mod tests {
         app.search(path, "type:Available lang:rust wait:complete")
             .await
             .unwrap();
+        assert_eq!(
+            app.assets.stats().entries,
+            0,
+            "Code queries must not queue asset indexing"
+        );
         for (query, has_code) in [("text:Available", true), ("instance:*", false)] {
             let mut waiting = Box::pin(app.dispatch(path, Request::Search(query.into())));
             assert!(

@@ -9,6 +9,31 @@ use std::time::Instant;
 
 type Export = (ObjectId, Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>);
 
+#[test]
+#[ignore = "requires SIGLA_METADATA_ARCHIVE pointing to a downloaded editor bundle"]
+fn materialization_benchmark() -> Result<()> {
+    let archive =
+        PathBuf::from(std::env::var_os("SIGLA_METADATA_ARCHIVE").context("Missing archive")?);
+    let parent = std::env::var_os("SIGLA_METADATA_BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = tempfile::tempdir_in(parent)?;
+    let output = directory.path().join("contents");
+    let start = Instant::now();
+    let manifest = super::unpack(&archive, &output, None)?;
+    let unpack = start.elapsed();
+    let start = Instant::now();
+    crate::cache::blobs::Store::open(directory.path())?.import_owned_tree(&output)?;
+    let import = start.elapsed();
+    eprintln!(
+        "entries={} unpack_ms={} import_ms={}",
+        manifest.entries.len(),
+        unpack.as_millis(),
+        import.as_millis()
+    );
+    Ok(())
+}
+
 fn convert((id, names, mut records): Export) -> Result<Analysis> {
     let names: Names = binary::decode(&names)?;
     let mut data: FileData = binary::decode(&records[&vec![1]])?;

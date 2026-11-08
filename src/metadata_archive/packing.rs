@@ -1,6 +1,9 @@
 //! Transport packs preserve the original compressed bundles and analysis identities.
 use super::*;
-use std::{collections::BTreeSet, io::Write};
+use std::{
+    collections::BTreeSet,
+    io::{Read, Write},
+};
 
 pub(super) const MAX_PACK: u64 = 8 * 1024 * 1024;
 const MAX_EXTRA: u64 = 512 * 1024;
@@ -262,8 +265,23 @@ pub(super) fn unpack(path: &Path, output: &Path, pack: &Pack, catalog: &Catalog)
             .write(true)
             .create_new(true)
             .open(&destination)?;
-        std::io::copy(&mut entry, &mut file)?;
-        bundle::verify_digest(&destination, artifact)?;
+        // Validate membership as bytes are copied, before publishing the pack.
+        let mut hash = blake3::Hasher::new();
+        let mut buffer = [0; 128 * 1024];
+        let mut copied = 0u64;
+        loop {
+            let count = entry.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            file.write_all(&buffer[..count])?;
+            hash.update(&buffer[..count]);
+            copied += count as u64;
+        }
+        ensure!(
+            copied == artifact.size && hash.finalize().as_bytes() == &artifact.hash,
+            "Pack member digest or size mismatch"
+        );
     }
     ensure!(pending.is_empty(), "Pack is missing members");
     Ok(())

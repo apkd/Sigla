@@ -13,6 +13,145 @@ fn fixture(workers: usize) -> (tempfile::TempDir, tempfile::TempDir, App) {
     (root, cache, app)
 }
 
+#[test]
+fn workspace_registry_trims_after_active_pins_drain() {
+    let (root, _cache, app) = fixture(1);
+    let pins: Vec<_> = (0..WORKSPACE_CACHE_ENTRIES + 1)
+        .map(|_| Arc::new(tokio::sync::Mutex::new(None)))
+        .collect();
+    {
+        let mut registry = app.workspaces.lock().unwrap();
+        for (index, state) in pins.iter().enumerate() {
+            registry.insert(
+                root.path().join(format!("workspace-{index}")),
+                WorkspaceSlot {
+                    state: state.clone(),
+                    preparing: None,
+                    used: Instant::now(),
+                },
+            );
+        }
+    }
+
+    app.trim_idle();
+    assert_eq!(
+        app.workspaces.lock().unwrap().len(),
+        WORKSPACE_CACHE_ENTRIES + 1
+    );
+    drop(pins);
+    app.trim_idle();
+    assert_eq!(
+        app.workspaces.lock().unwrap().len(),
+        WORKSPACE_CACHE_ENTRIES
+    );
+}
+
+#[tokio::test]
+async fn request_completion_trims_idle_workspace_registry() {
+    let (root, _cache, app) = fixture(1);
+    let app = Arc::new(app);
+    {
+        let mut registry = app.workspaces.lock().unwrap();
+        for index in 0..WORKSPACE_CACHE_ENTRIES + 1 {
+            registry.insert(
+                root.path().join(format!("workspace-{index}")),
+                WorkspaceSlot {
+                    state: Arc::new(tokio::sync::Mutex::new(None)),
+                    preparing: None,
+                    used: Instant::now(),
+                },
+            );
+        }
+    }
+
+    assert!(
+        app.dispatch("", Request::Search("type:Anything".into()))
+            .await
+            .is_err()
+    );
+    assert!(app.workspaces.lock().unwrap().len() <= WORKSPACE_CACHE_ENTRIES);
+}
+
+#[test]
+fn workspace_cache_usage_reports_active_pins() {
+    let (root, _cache, app) = fixture(1);
+    let state = Arc::new(tokio::sync::Mutex::new(None));
+    app.workspaces.lock().unwrap().insert(
+        root.path().into(),
+        WorkspaceSlot {
+            state: state.clone(),
+            preparing: None,
+            used: Instant::now(),
+        },
+    );
+
+    let usage = app.workspace_cache_usage();
+    assert_eq!(usage.entries, 1);
+    assert_eq!(usage.active_entries, 1);
+    assert_eq!(usage.retained_bytes, 0);
+    assert_eq!(usage.pinned_bytes, 0);
+    drop(state);
+    assert_eq!(app.workspace_cache_usage().active_entries, 0);
+}
+
+#[tokio::test]
+async fn preparation_lifecycle_bounds_plans_waiting_for_indexing() {
+    use std::time::Duration;
+
+    let (root, _cache, app) = fixture(1);
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(root.path().join("first.rs"), "pub struct First;").unwrap();
+    std::fs::write(nested.join("second.rs"), "pub struct Second;").unwrap();
+    let app = Arc::new(app);
+    let indexing_gate = app.indexing_pause.clone().acquire_owned().await.unwrap();
+    let first = {
+        let app = app.clone();
+        let path = root.path().to_string_lossy().into_owned();
+        tokio::spawn(async move { app.search(&path, "type:First").await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), app.indexing_started.notified())
+        .await
+        .expect("first plan did not reach indexing");
+    assert_eq!(app.preparation_lifecycle.available_permits(), 0);
+
+    let second = {
+        let app = app.clone();
+        let path = nested.to_string_lossy().into_owned();
+        tokio::spawn(async move { app.search(&path, "type:Second").await })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        app.preparation_admission_started.notified(),
+    )
+    .await
+    .expect("second preparation did not wait for lifecycle capacity");
+    {
+        let registry = app.workspaces.lock().unwrap();
+        let slot = registry.get(&nested).unwrap();
+        assert!(
+            slot.preparing.as_ref().unwrap().discovering(),
+            "queued preparation must remain before discovery"
+        );
+        assert!(slot.state.try_lock().unwrap().is_none());
+    }
+
+    drop(indexing_gate);
+    let first = tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.contains("First"), "{first}");
+    assert!(second.contains("Second"), "{second}");
+    assert_eq!(app.preparation_lifecycle.available_permits(), 1);
+}
+
 #[tokio::test]
 async fn waiting_for_a_worker_releases_workspace_and_branch_locks() {
     let (root, _cache, app) = fixture(1);

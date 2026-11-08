@@ -429,6 +429,65 @@ fn producer_rejects_invalid_analysis_records() {
 }
 
 #[test]
+fn consumer_copies_analysis_while_producer_verification_checks_its_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bundle.tar.zst");
+    let mut encoded = records::encode(FileData {
+        source: "class C {}".into(),
+        facts: Default::default(),
+        assembly: None,
+    })
+    .unwrap();
+    encoded.records.insert(vec![1], vec![255]);
+    let analysis =
+        envelope(&binary::encode(&vec![([1u8; 32], binary::encode(&encoded).unwrap())]).unwrap());
+    let hash = *blake3::hash(&analysis).as_bytes();
+    let manifest = Manifest {
+        origin: origin(),
+        entries: ["Code.cs.analysis", "nested/Copy.cs.analysis"]
+            .into_iter()
+            .map(|path| Entry {
+                path: path.into(),
+                hash,
+                size: analysis.len() as u64,
+                group: "analysis".into(),
+            })
+            .collect(),
+        packages: vec![],
+        package_names: vec![],
+        recommended: BTreeMap::new(),
+    };
+    let mut tar =
+        tar::Builder::new(zstd::Encoder::new(fs::File::create(&path).unwrap(), 1).unwrap());
+    for (name, bytes) in [
+        (
+            "manifest.bin".to_owned(),
+            envelope(&binary::encode(&manifest).unwrap()),
+        ),
+        (format!("objects/{}", hex(&hash)), analysis.clone()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, name, bytes.as_slice())
+            .unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    bundle::unpack(&path, output.path(), None).unwrap();
+    assert_eq!(
+        fs::read(output.path().join("Code.cs.analysis")).unwrap(),
+        analysis
+    );
+    assert_eq!(
+        fs::read(output.path().join("nested/Copy.cs.analysis")).unwrap(),
+        analysis
+    );
+    assert!(bundle::verify(&path, None).is_err());
+}
+
+#[test]
 fn verification_rejects_conflicting_file_and_directory_paths() {
     let dir = tempfile::tempdir().unwrap();
     let mut builder = bundle::Builder::new(origin(), vec![vec![]]).unwrap();
@@ -622,6 +681,8 @@ fn bundles_reject_missing_duplicate_and_escaping_objects() {
             .unwrap();
         tar.into_inner().unwrap().finish().unwrap().flush().unwrap();
         assert!(bundle::verify(&path, None).is_err());
+        let extracted = tempfile::tempdir().unwrap();
+        assert!(bundle::unpack(&path, extracted.path(), None).is_err());
     }
     let mut builder = bundle::Builder::new(origin(), vec![vec![]]).unwrap();
     builder

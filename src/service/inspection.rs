@@ -73,7 +73,7 @@ impl App {
             // database has been closed again.
             let _activity =
                 read.or_else(|| write.map(tokio::sync::OwnedRwLockWriteGuard::downgrade));
-            inspect::build(
+            let mut report = inspect::build(
                 &app.cache,
                 app.cache_configuration(),
                 overrides,
@@ -81,7 +81,19 @@ impl App {
                 active,
                 analysis,
                 true,
-            )
+            )?;
+            if let Some(resources) = &mut report.resources {
+                resources
+                    .retained
+                    .insert("assets".into(), app.assets.stats());
+                resources
+                    .retained
+                    .insert("native".into(), app.sources.stats());
+                resources
+                    .retained
+                    .insert("workspaces".into(), app.workspace_cache_usage());
+            }
+            Ok(report)
         })
         .await?
     }

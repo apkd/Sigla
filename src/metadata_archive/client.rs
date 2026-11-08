@@ -112,12 +112,14 @@ fn current(refresh: bool) -> Result<Arc<Catalog>> {
 }
 pub(super) fn download(repo: &str, release: &str, name: &str, output: &Path) -> Result<()> {
     crate::telemetry::record("metadata_download", Some(repo), Some(name), || {
+        let started = Instant::now();
         let url = format!("https://github.com/{repo}/releases/download/{release}/{name}");
         let response = acquisition::client()?
             .get(acquisition::https(&url)?)
             .send()?
             .error_for_status()?;
         acquisition::transfer(response, &mut fs::File::create(output)?, None)?;
+        tracing::debug!(artifact = %name, elapsed_ms = started.elapsed().as_millis(), "Metadata asset downloaded");
         Ok(())
     })
 }
@@ -147,7 +149,11 @@ pub(super) fn packed_source(
             let path = stage.path().join("pack.tar");
             download(repo, &pack.release, &pack.name, &path)?;
             let output = stage.path().join("contents");
-            packing::unpack(&path, &output, pack, catalog)?;
+            let started = Instant::now();
+            crate::telemetry::record("metadata_pack_unpack", None, Some(&pack.name), || {
+                packing::unpack(&path, &output, pack, catalog)
+            })?;
+            tracing::debug!(artifact = %pack.name, elapsed_ms = started.elapsed().as_millis(), "Metadata pack unpacked");
             fs::rename(output, &contents)?;
         }
         Ok(Some(contents.join(&artifact.name)))
@@ -191,14 +197,24 @@ pub(super) fn materialize(
                 path
             };
             let output = stage.path().join("contents");
-            let manifest = bundle::unpack(&archive, &output, Some(artifact))?;
+            let started = Instant::now();
+            let manifest =
+                crate::telemetry::record("metadata_unpack", None, Some(&artifact.name), || {
+                    bundle::unpack(&archive, &output, Some(artifact))
+                })?;
+            tracing::debug!(artifact = %artifact.name, elapsed_ms = started.elapsed().as_millis(), "Metadata bundle unpacked");
             if manifest.origin.kind == "editor" {
                 save(
                     &output.join("Editor/Data/manifest.bin"),
                     &binary::encode(&manifest)?,
                 )?;
             }
-            crate::cache::blobs::Store::open(cache)?.import_tree(&output)?;
+            let started = Instant::now();
+            let stats =
+                crate::telemetry::record("metadata_import", None, Some(&artifact.name), || {
+                    crate::cache::blobs::Store::open(cache)?.import_owned_tree(&output)
+                })?;
+            tracing::debug!(artifact = %artifact.name, elapsed_ms = started.elapsed().as_millis(), files = stats.files, bytes = stats.hashed_bytes, adopted = stats.adopted, reused = stats.reused, "Metadata bundle imported");
             fs::rename(output, &contents)?;
             Ok(contents)
         })

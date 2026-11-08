@@ -467,6 +467,15 @@ impl Report {
             self.limits.headroom_percent
         );
         if let Some(resources) = &self.resources {
+            for (name, usage) in &resources.retained {
+                text.push_str(&format!(
+                    "{name}: {} estimated retained ({} pinned), {} entries, {} active\n",
+                    size(usage.retained_bytes),
+                    size(usage.pinned_bytes),
+                    usage.entries,
+                    usage.active_entries,
+                ));
+            }
             if let Some(caches) = &resources.caches {
                 text.push_str(&format!(
                     "Index and workspace cache allowance: {} (asset indexes: {}); separate name dictionary: {}; effective memory limit: {}\n",

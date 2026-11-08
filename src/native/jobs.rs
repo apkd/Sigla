@@ -102,13 +102,17 @@ pub fn generation(manifest: &Manifest, group: Group) -> Result<[u8; 32]> {
         .iter()
         .filter(|(_, f)| Group::of(f.language) == Some(group))
         .collect();
-    Ok(*blake3::hash(&postcard::to_allocvec(&(
-        crate::store::ANALYSIS_VERSION,
-        manifest.discovery_policy,
-        &manifest.projects,
-        files,
-    ))?)
-    .as_bytes())
+    let mut hash = blake3::Hasher::new();
+    postcard::to_io(
+        &(
+            crate::store::ANALYSIS_VERSION,
+            manifest.discovery_policy,
+            &manifest.projects,
+            files,
+        ),
+        &mut hash,
+    )?;
+    Ok(*hash.finalize().as_bytes())
 }
 
 pub struct Request {
@@ -136,6 +140,35 @@ impl Jobs {
     pub fn trim_completed(&self) {
         self.trim_to(0);
     }
+    pub fn stats(&self) -> crate::memory::CacheUsage {
+        let jobs = self.running.lock().unwrap();
+        let mut stats = crate::memory::CacheUsage {
+            entries: jobs.len(),
+            ..Default::default()
+        };
+        for job in jobs.values() {
+            let outcome = job.ticket.outcome.borrow();
+            if let Some(result) = outcome.as_ref() {
+                let bytes = job
+                    .ticket
+                    .progress
+                    .retained
+                    .load(Ordering::Relaxed)
+                    .max(256);
+                stats.retained_bytes += bytes;
+                if Arc::strong_count(&job.ticket.outcome) > 1
+                    || result
+                        .as_ref()
+                        .is_ok_and(|snapshot| Arc::strong_count(snapshot) > 1)
+                {
+                    stats.pinned_bytes += bytes;
+                }
+            } else {
+                stats.active_entries += 1;
+            }
+        }
+        stats
+    }
     pub fn trim_to(&self, limit: usize) {
         let mut jobs = self.running.lock().unwrap();
         let mut completed: Vec<_> = jobs
@@ -156,6 +189,7 @@ impl Jobs {
             .collect();
         completed.sort_by_key(|(_, used, _, _)| *used);
         let mut bytes: usize = completed.iter().map(|(_, _, bytes, _)| bytes).sum();
+        let mut retired = Vec::new();
         for (key, _, size, idle) in completed {
             if bytes <= limit {
                 break;
@@ -163,9 +197,11 @@ impl Jobs {
             if !idle {
                 continue;
             }
-            jobs.remove(&key);
+            retired.push(jobs.remove(&key));
             bytes -= size;
         }
+        drop(jobs);
+        drop(retired);
     }
     #[cfg(test)]
     pub async fn pause(&self, group: Group) -> tokio::sync::OwnedSemaphorePermit {
@@ -409,6 +445,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn streamed_generation_preserves_cached_identity() {
+        let manifest = Manifest::default();
+        for group in [Group::Native, Group::Shaders] {
+            let files: BTreeMap<_, _> = manifest
+                .deferred
+                .iter()
+                .filter(|(_, file)| Group::of(file.language) == Some(group))
+                .collect();
+            let bytes = postcard::to_allocvec(&(
+                crate::store::ANALYSIS_VERSION,
+                manifest.discovery_policy,
+                &manifest.projects,
+                files,
+            ))
+            .unwrap();
+            assert_eq!(
+                generation(&manifest, group).unwrap(),
+                *blake3::hash(&bytes).as_bytes()
+            );
+        }
+    }
+
+    #[test]
     fn trimming_keeps_snapshots_pinned_by_tickets_or_queries() {
         let root = tempfile::tempdir().unwrap();
         let snapshot = Arc::new(Snapshot {
@@ -441,10 +500,14 @@ mod tests {
         assert_eq!(jobs.running.lock().unwrap().len(), 1);
         let snapshot = ticket.ready().unwrap().unwrap();
         drop(ticket);
+        assert!(jobs.stats().retained_bytes > 0);
+        assert_eq!(jobs.stats().pinned_bytes, jobs.stats().retained_bytes);
         jobs.trim_completed();
         assert_eq!(jobs.running.lock().unwrap().len(), 1);
         drop(snapshot);
+        assert_eq!(jobs.stats().pinned_bytes, 0);
         jobs.trim_completed();
         assert!(jobs.running.lock().unwrap().is_empty());
+        assert_eq!(jobs.stats().retained_bytes, 0);
     }
 }

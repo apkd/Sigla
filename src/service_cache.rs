@@ -686,14 +686,17 @@ impl App {
         if self.inspection_shutdown.is_cancelled() {
             return Ok(outcome);
         }
-        let Ok(read) = self.activity.clone().try_read_owned() else {
-            outcome.compaction_deferred = Some(CompactionDeferral::Busy);
-            return Ok(outcome);
-        };
         if !self.cache.join("analysis").is_dir() {
             outcome.compaction_deferred = Some(CompactionDeferral::Ineligible);
             return Ok(outcome);
         }
+        let Ok(idle) = self.activity.clone().try_write_owned() else {
+            outcome.compaction_deferred = Some(CompactionDeferral::Busy);
+            return Ok(outcome);
+        };
+        // Confirm the service is idle without waiting, then allow requests
+        // during the expensive copy. Publication takes the exclusive gate again.
+        let read = idle.downgrade();
         let database = crate::store::Database::open(&self.cache.join("analysis"))?;
         let stats = database.disk_stats()?;
         if !stats.eligible() {
@@ -721,6 +724,25 @@ impl App {
                 return Ok(outcome);
             }
         };
+        if self.inspection_shutdown.is_cancelled() {
+            return Ok(outcome);
+        }
+        // Drop only unpinned caches before requesting the exclusive publish gate.
+        // Releasing large indexes and workspaces must not pause foreground work.
+        self.assets.trim_completed();
+        self.sources.trim_completed();
+        let retired = {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            let idle = workspaces
+                .iter()
+                .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
+                .map(|(entry, _)| entry.clone())
+                .collect::<Vec<_>>();
+            idle.into_iter()
+                .filter_map(|entry| workspaces.remove(&entry))
+                .collect::<Vec<_>>()
+        };
+        drop(retired);
         drop(read);
         if self.inspection_shutdown.is_cancelled() {
             return Ok(outcome);
@@ -736,9 +758,6 @@ impl App {
             outcome.compaction_deferred = Some(CompactionDeferral::Changed);
             return Ok(outcome);
         }
-        self.assets.trim_completed();
-        self.sources.trim_completed();
-        self.workspaces.lock().unwrap().clear();
         if Arc::strong_count(&database) != 1 {
             outcome.compaction_deferred = Some(CompactionDeferral::Changed);
             return Ok(outcome);
@@ -1554,7 +1573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_compaction_rechecks_pressure_after_busy_retry() {
+    async fn compaction_skips_copy_when_activity_is_busy_then_retries() {
         use crate::store::shared::{Database, Encoded, Names};
         let cache = tempfile::tempdir().unwrap();
         let mut app = app(cache.path(), vec![]);
@@ -1612,7 +1631,7 @@ mod tests {
         let app = Arc::new(app);
         let active = app.activity.read().await;
         let busy = app.retry_compaction().await.unwrap();
-        assert_eq!(busy.compaction_deferred, Some(CompactionDeferral::Changed));
+        assert_eq!(busy.compaction_deferred, Some(CompactionDeferral::Busy));
         assert!(!busy.progress && busy.pressure);
         assert!(app.activity.try_read().is_ok());
         assert!(!cache.path().join("analysis/data.mdb.compacting").exists());

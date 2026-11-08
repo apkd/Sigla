@@ -8,8 +8,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs,
-    io::{BufWriter, Write},
+    fs::{self, File},
+    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -341,6 +341,88 @@ mod refresh_tests {
             repair: false,
             additional: Default::default(),
         }
+    }
+
+    #[test]
+    fn default_readiness_uses_state_headers_and_checks_index_status() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let root = cache.path().join("repositories");
+
+        let mut ready = state();
+        ready.policy = manager.options.selection.identity.clone();
+        ready.prepared.branch = Some("main".into());
+        ready.indexed_revision = Some(ready.prepared.revision.clone());
+        ready.prepared.selected = (0..2048)
+            .map(|n| (format!("asset-{n}"), "content-hash".into()))
+            .collect();
+        fs::create_dir_all(root.join("ready")).unwrap();
+        write_json(&root.join("ready/state.json"), &ready).unwrap();
+
+        let mut repairing = ready.clone();
+        repairing.repair = true;
+        fs::create_dir_all(root.join("repairing")).unwrap();
+        write_json(&root.join("repairing/state.json"), &repairing).unwrap();
+
+        assert!(manager.default_ready(&ready.repository, "main").unwrap());
+        fs::remove_file(root.join("ready/state.json")).unwrap();
+        assert!(!manager.default_ready(&ready.repository, "main").unwrap());
+        fs::remove_file(root.join("repairing/state.json")).unwrap();
+
+        let mut stale = ready.clone();
+        stale.indexed_revision = Some("older-commit".into());
+        fs::create_dir_all(root.join("stale")).unwrap();
+        write_json(&root.join("stale/state.json"), &stale).unwrap();
+
+        assert!(!manager.default_ready(&ready.repository, "main").unwrap());
+        assert!(!manager.default_ready(&ready.repository, "develop").unwrap());
+    }
+
+    #[test]
+    fn repository_inventory_trimming_preserves_requests_workspaces_and_saved_state() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let mut branch = branch(Target::Branch("main".into()), 2);
+        branch.root = cache.path().join("repositories/branch");
+        fs::create_dir_all(branch.source()).unwrap();
+        let source = branch.source().canonicalize().unwrap();
+        let mut saved = state();
+        saved.last_use = 1;
+        branch.persist(&saved).unwrap();
+        *branch.state.try_write().unwrap() = Some(saved.clone());
+        let branch = Arc::new(branch);
+        manager
+            .branches
+            .lock()
+            .unwrap()
+            .insert("branch".into(), branch.clone());
+        manager.trim_unreferenced(|_| false).unwrap();
+        assert_eq!(manager.branches.lock().unwrap().len(), 1);
+
+        let reader = branch.state.clone().try_read_owned().unwrap();
+        drop(branch);
+        manager.trim_unreferenced(|_| false).unwrap();
+        assert_eq!(manager.branches.lock().unwrap().len(), 1);
+        drop(reader);
+        manager.trim_unreferenced(|path| path == source).unwrap();
+        assert_eq!(manager.branches.lock().unwrap().len(), 1);
+
+        manager.branches.lock().unwrap()["branch"]
+            .retry_after
+            .store(u64::MAX, Ordering::Relaxed);
+        manager.trim_unreferenced(|_| false).unwrap();
+        assert_eq!(manager.branches.lock().unwrap().len(), 1);
+        manager.branches.lock().unwrap()["branch"]
+            .retry_after
+            .store(0, Ordering::Relaxed);
+        manager.trim_unreferenced(|_| false).unwrap();
+        assert!(manager.branches.lock().unwrap().is_empty());
+        let restored: State = serde_json::from_slice(
+            &fs::read(cache.path().join("repositories/branch/state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.last_use, 2);
+        assert!(restored.same_inputs(&saved));
     }
 
     #[test]
@@ -840,13 +922,30 @@ impl Manager {
     }
     fn default_ready(&self, identity: &Identity, branch: &str) -> Result<bool> {
         // Named selectors and explicit refs can both resolve to the actual default.
-        Ok(self.cached()?.iter().any(|(_, state)| {
-            &state.repository == identity
+        let entries = match fs::read_dir(self.cache.join("repositories")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            ensure!(entry.file_type()?.is_dir(), "Invalid selector directory");
+            let path = entry.path().join("state.json");
+            let state = match File::open(path) {
+                Ok(file) => serde_json::from_reader::<_, ReadyState>(BufReader::new(file))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if state.repository == *identity
                 && state.policy == self.options.selection.identity
                 && state.prepared.branch.as_deref() == Some(branch)
                 && !state.repair
-                && state.indexed_revision.as_ref() == Some(&state.prepared.revision)
-        }))
+                && state.indexed_revision.as_deref() == Some(&state.prepared.revision)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     fn previous_default(&self, identity: &Identity, next: Option<&str>) -> Result<Option<String>> {
         let Some(saved) = self.saved_default(identity)? else {
@@ -1163,6 +1262,54 @@ impl Manager {
             }
         }
         Ok(expired)
+    }
+
+    /// Release repository inventories once neither requests nor cached workspaces use them.
+    /// The callback checks the current workspace registry while new branch lookups are excluded.
+    pub(crate) fn trim_unreferenced(&self, retained: impl Fn(&Path) -> bool) -> Result<()> {
+        let mut branches = self.branches.lock().unwrap();
+        let mut retired = Vec::new();
+        let mut failure = None;
+        branches.retain(|_, branch| {
+            if Arc::strong_count(branch) != 1 || now() < branch.retry_after.load(Ordering::Relaxed)
+            {
+                return true;
+            }
+            let source = branch.source();
+            let source = source.canonicalize().unwrap_or(source);
+            if retained(&source) {
+                return true;
+            }
+            let Ok(mut state) = branch.state.try_write() else {
+                return true;
+            };
+            if branch
+                .running
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|job| job.borrow().is_none())
+            {
+                return true;
+            }
+            if let Some(state) = state.as_mut() {
+                let last_use = branch.last_use.load(Ordering::Relaxed);
+                if state.last_use != last_use {
+                    let previous = state.last_use;
+                    state.last_use = last_use;
+                    if let Err(error) = branch.persist(state) {
+                        state.last_use = previous;
+                        failure = Some(error);
+                        return true;
+                    }
+                }
+            }
+            retired.push(branch.clone());
+            false
+        });
+        drop(branches);
+        drop(retired);
+        failure.map_or(Ok(()), Err)
     }
 
     pub fn expire(&self, branch: &Arc<Branch>, retire: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -1904,4 +2051,20 @@ impl Manager {
         branch.inventory.send_replace(None);
         Ok(())
     }
+}
+
+#[derive(Deserialize)]
+struct ReadyState {
+    repository: Identity,
+    policy: String,
+    prepared: ReadyPrepared,
+    indexed_revision: Option<String>,
+    #[serde(default)]
+    repair: bool,
+}
+
+#[derive(Deserialize)]
+struct ReadyPrepared {
+    branch: Option<String>,
+    revision: String,
 }

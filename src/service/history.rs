@@ -143,7 +143,6 @@ impl App {
                     &query,
                     app.history_cache.clone(),
                 );
-                app.trim_idle();
                 if let Some(owner) = &owner {
                     let mut owners = app.owners.lock().unwrap();
                     owners.record_history(owner, crate::cache::now());

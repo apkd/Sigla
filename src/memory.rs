@@ -176,6 +176,17 @@ pub struct Resources {
     pub sources: AdmissionStats,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caches: Option<CacheLimits>,
+    /// Estimates for retained indexes; active construction is not included.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub retained: std::collections::BTreeMap<String, CacheUsage>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CacheUsage {
+    pub entries: usize,
+    pub active_entries: usize,
+    pub retained_bytes: u64,
+    pub pinned_bytes: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -190,6 +201,7 @@ pub fn resources() -> Resources {
     Resources {
         parsing: parsing().stats(),
         sources: sources().stats(),
+        retained: Default::default(),
         caches: Some(CacheLimits {
             memory_limit_bytes: memory_limit(),
             capacity_bytes: cache_budget() as u64,

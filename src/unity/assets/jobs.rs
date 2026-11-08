@@ -83,13 +83,39 @@ impl Default for Jobs {
     }
 }
 pub fn generation(manifest: &Manifest) -> Result<[u8; 32]> {
-    Ok(*blake3::hash(&postcard::to_allocvec(&(
-        env!("SIGLA_ASSET_FINGERPRINT"),
-        manifest,
-    ))?)
-    .as_bytes())
+    let mut hash = blake3::Hasher::new();
+    postcard::to_io(&(env!("SIGLA_ASSET_FINGERPRINT"), manifest), &mut hash)?;
+    Ok(*hash.finalize().as_bytes())
 }
 impl Jobs {
+    pub fn stats(&self) -> crate::memory::CacheUsage {
+        let jobs = self.running.lock().unwrap();
+        let mut stats = crate::memory::CacheUsage {
+            entries: jobs.len(),
+            ..Default::default()
+        };
+        for job in jobs.values() {
+            let outcome = job.ticket.borrow();
+            if let Some(result) = outcome.as_ref() {
+                let bytes = result
+                    .as_ref()
+                    .map_or(256, |index| index.retained_bytes + 256)
+                    as u64;
+                stats.retained_bytes += bytes;
+                if Arc::strong_count(&job.ticket.outcome) > 1
+                    || result
+                        .as_ref()
+                        .is_ok_and(|index| Arc::strong_count(index) > 1)
+                {
+                    stats.pinned_bytes += bytes;
+                }
+            } else {
+                stats.active_entries += 1;
+            }
+        }
+        stats
+    }
+
     pub fn trim_completed(&self) {
         self.trim_to(0);
     }
@@ -279,7 +305,7 @@ impl Jobs {
                     drop(branch_state);
                     drop(state);
                     let started = std::time::Instant::now();
-                    let retained = if same_generation && request.branch.is_none() {
+                    let (retained, stale_previous) = if same_generation && request.branch.is_none() {
                         if let Some(index) = &previous {
                             let checked = std::time::Instant::now();
                             let current = index.current(&building_cancel)?;
@@ -290,17 +316,27 @@ impl Jobs {
                                 elapsed_ms = checked.elapsed().as_millis(),
                                 "Unity retained asset validation"
                             );
-                            current.then(|| index.clone())
+                            if current {
+                                (Some(index.clone()), false)
+                            } else {
+                                (None, true)
+                            }
                         } else {
-                            None
+                            (None, false)
                         }
                     } else {
+                        (None, false)
+                    };
+                    let saved = if retained.is_some() || stale_previous {
                         None
+                    } else {
+                        super::snapshot::load(&request.cache, generation, &building_cancel)?
+                            .map(Arc::new)
                     };
                     let (index, built, origin) = if let Some(previous) = retained {
                         (previous, false, "retained")
-                    } else if let Some(index) = super::snapshot::load(&request.cache, generation, &building_cancel)? {
-                        (Arc::new(index), false, "snapshot")
+                    } else if let Some(index) = saved {
+                        (index, false, "snapshot")
                     } else {
                         (Arc::new(super::build(
                             &request.root,
@@ -424,6 +460,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn streamed_generation_preserves_cached_identity() {
+        let manifest = Manifest::default();
+        let bytes = postcard::to_allocvec(&(env!("SIGLA_ASSET_FINGERPRINT"), &manifest)).unwrap();
+        assert_eq!(
+            generation(&manifest).unwrap(),
+            *blake3::hash(&bytes).as_bytes()
+        );
+    }
+
+    #[test]
     fn trimming_keeps_indexes_pinned_by_tickets_or_queries() {
         let jobs = Jobs::default();
         let ticket = empty();
@@ -441,11 +487,15 @@ mod tests {
         assert_eq!(jobs.running.lock().unwrap().len(), 1);
         let index = ticket.ready_index().unwrap();
         drop(ticket);
+        assert!(jobs.stats().retained_bytes > 0);
+        assert_eq!(jobs.stats().pinned_bytes, jobs.stats().retained_bytes);
         jobs.trim_completed();
         assert_eq!(jobs.running.lock().unwrap().len(), 1);
         drop(index);
+        assert_eq!(jobs.stats().pinned_bytes, 0);
         jobs.trim_completed();
         assert!(jobs.running.lock().unwrap().is_empty());
+        assert_eq!(jobs.stats().retained_bytes, 0);
     }
 
     #[tokio::test]
@@ -560,6 +610,70 @@ mod tests {
             _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
             _dependencies: dependencies,
         }
+    }
+
+    #[tokio::test]
+    async fn stale_same_generation_local_index_skips_saved_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("code.rs"), "pub struct Available;").unwrap();
+        let fixture = completed(root.path(), cache.path()).await;
+        let mut request = fixture.request;
+        request.branch = None;
+        request.revision = None;
+        request.refresh = true;
+        {
+            let mut state = request.workspace.lock().await;
+            let workspace = state.as_mut().unwrap();
+            workspace.refresh().unwrap();
+            request.expected = self::generation(&workspace.manifest).unwrap();
+        }
+
+        let generation =
+            *blake3::hash(&postcard::to_allocvec(&(request.expected, &request.revision)).unwrap())
+                .as_bytes();
+        let mut stale = Index::default();
+        let missing = request.root.join("removed.prefab");
+        std::fs::write(&missing, "removed asset").unwrap();
+        stale.observed.insert(
+            missing.clone(),
+            crate::workspace::Stamp::read_metadata(&missing).unwrap(),
+        );
+        std::fs::remove_file(&missing).unwrap();
+        let (previous_sender, previous_receiver) = watch::channel(Some(Ok(Arc::new(stale))));
+        let previous = Ticket {
+            outcome: Arc::new(previous_receiver),
+            telemetry_id: None,
+        };
+        let jobs = Jobs::default();
+        jobs.running.lock().unwrap().insert(
+            request.root.clone(),
+            Job {
+                generation,
+                ticket: previous,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                used: std::time::Instant::now(),
+                retry_after: std::time::Instant::now(),
+            },
+        );
+
+        let mut saved = Index::default();
+        saved.assets.insert(
+            "snapshot-only".into(),
+            super::super::Asset {
+                project: "project".into(),
+                path: "Assets/SnapshotOnly.prefab".into(),
+                guid: "guid".into(),
+                objects: Vec::new(),
+                content: None,
+                unavailable: None,
+            },
+        );
+        super::super::snapshot::save(&request.cache, generation, &saved).unwrap();
+
+        let result = wait(jobs.start(request)).await.unwrap();
+        assert!(!result.assets.contains_key("snapshot-only"));
+        drop(previous_sender);
     }
 
     #[tokio::test]

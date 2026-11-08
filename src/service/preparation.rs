@@ -9,8 +9,15 @@ pub(super) struct Inventory {
     pub manifest: Arc<Manifest>,
     pub context: Option<RepositoryContext>,
     watch: crate::watch::Snapshot,
+    heap_bytes: std::sync::OnceLock<u64>,
 }
 impl Inventory {
+    fn retained_heap_bytes(&self) -> u64 {
+        *self.heap_bytes.get_or_init(|| {
+            crate::memory::encoded_size(self.manifest.as_ref()).saturating_mul(3) as u64
+        })
+    }
+
     pub async fn current(self: &Arc<Self>) -> Result<bool> {
         let changes = self.watch.changes();
         if !changes.any() {
@@ -63,6 +70,21 @@ impl Ticket {
     }
     pub fn retained_inventory(&self) -> bool {
         matches!(*self.progress.borrow(), Progress::Failed(_, Some(_)))
+    }
+    pub fn retained_heap_bytes(&self, workspace_manifest: Option<&Arc<Manifest>>) -> (u64, u64) {
+        let Progress::Failed(_, Some(inventory)) = &*self.progress.borrow() else {
+            return (0, 0);
+        };
+        if workspace_manifest.is_some_and(|manifest| Arc::ptr_eq(manifest, &inventory.manifest)) {
+            return (0, 0);
+        }
+        let bytes = inventory.retained_heap_bytes();
+        let pinned = if Arc::strong_count(inventory) > 1 {
+            bytes
+        } else {
+            0
+        };
+        (bytes, pinned)
     }
     pub async fn inventory(&mut self) -> Result<Arc<Inventory>> {
         loop {
@@ -292,9 +314,8 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     let telemetry_id = operation.id();
     tokio::spawn(async move {
         tracing::debug!(shared_job = job, workspace = %entry.display(), "Workspace preparation started");
+        let mut lifecycle = None;
         let outcome = async {
-            #[cfg(test)]
-            preparing_app.preparation_started.notify_one();
             if let Some(branch) = &preparing_branch {
                 send.send_replace(Progress::Pending("acquisition"));
                 operation.stage("repository_acquisition");
@@ -306,6 +327,22 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     .await?;
                 send.send_replace(Progress::Pending("preparation"));
             }
+            operation.stage("preparation_admission");
+            send.send_replace(Progress::Pending("preparation_admission"));
+            #[cfg(test)]
+            if preparing_app.preparation_lifecycle.available_permits() == 0 {
+                preparing_app.preparation_admission_started.notify_one();
+            }
+            lifecycle = Some({
+                let _wait = operation.wait("preparation_admission");
+                preparing_app
+                    .preparation_lifecycle
+                    .clone()
+                    .acquire_owned()
+                    .await?
+            });
+            #[cfg(test)]
+            preparing_app.preparation_started.notify_one();
             let mut policy = policy;
             let mut discovery_budget = None;
             let (state, branch_state) = loop {
@@ -424,6 +461,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                         branch_state.as_ref().and_then(|s| s.as_ref()),
                     ),
                     watch: prepared.watch.clone(),
+                    heap_bytes: std::sync::OnceLock::new(),
                 })));
                 let queued = std::time::Instant::now();
                 let manifest = state.as_ref().unwrap().manifest.clone();
@@ -452,7 +490,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 }
                 tracing::debug!(workspace = %entry.display(), wait_ms = queued.elapsed().as_millis(), "indexing worker admitted");
                 #[cfg(test)]
-                let _pause = preparing_app.indexing_pause.clone().acquire_owned().await?;
+                let _pause = {
+                    preparing_app.indexing_started.notify_one();
+                    preparing_app.indexing_pause.clone().acquire_owned().await?
+                };
                 operation.stage("workspace_indexing");
                 let (state, indexed) = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
@@ -480,12 +521,11 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     preparing_branch.as_deref(),
                     branch_state.as_ref().and_then(|s| s.as_ref()),
                 ),
+                heap_bytes: std::sync::OnceLock::new(),
             });
             let generation = preparing_branch
                 .as_ref()
                 .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
-            let assets_pending = branch_state.as_ref().and_then(|s| s.as_ref())
-                .is_some_and(|s| !s.prepared.deferred_assets.is_empty());
             drop(branch_state);
             if let Some(branch) = &preparing_branch {
                 let mut gate = {
@@ -506,35 +546,6 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     tokio::task::spawn_blocking(move || {
                         branch.persist(gate.as_ref().unwrap())
                     }).await??;
-                }
-            }
-            let assets = preparing_app.start_assets(super::indexes::AssetRequest {
-                workspace: workspace.clone(),
-                branch: preparing_branch.clone(),
-                manifest: &code.manifest,
-                revision: inventory
-                    .context
-                    .as_ref()
-                    .map(|(_, _, revision, _)| revision.clone()),
-                refresh: false,
-                assets_pending,
-                activity: preparing_activity.clone(),
-            })?;
-            if let Some(job_id) = assets.telemetry_id() {
-                operation.link(&job_id);
-            }
-            for group in [crate::native::Group::Native, crate::native::Group::Shaders] {
-                let source = preparing_app.sources.start(crate::native::jobs::Request {
-                    activity: preparing_activity.clone(),
-                    workspace: workspace.clone(),
-                    branch: preparing_branch.clone(),
-                    entry: code.entry.clone(),
-                    analysis: preparing_app.cache.join("analysis"),
-                    manifest: code.manifest.clone(),
-                    group,
-                })?;
-                if let Some(job_id) = source.telemetry_id() {
-                    operation.link(&job_id);
                 }
             }
             preparing_app.owners.lock().unwrap().observe(
@@ -565,10 +576,47 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             }
         };
         send.send_replace(progress);
+        drop(workspace);
+        drop(preparing_branch);
+        drop(preparing_activity);
+        drop(lifecycle);
+        preparing_app.trim_idle_after_completion().await;
     });
     Ticket {
         progress: receive,
         id: job,
         telemetry_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_inventory_does_not_double_count_the_workspace_manifest() {
+        let manifest = Arc::new(Manifest::default());
+        let monitor = Arc::new(crate::watch::Monitor::default());
+        let inventory = Arc::new(Inventory {
+            manifest: manifest.clone(),
+            context: None,
+            watch: monitor.snapshot(&Default::default(), 0),
+            heap_bytes: std::sync::OnceLock::new(),
+        });
+        let (_send, progress) = watch::channel(Progress::Failed(
+            Arc::new(anyhow::anyhow!("indexing failed")),
+            Some(inventory),
+        ));
+        let ticket = Ticket {
+            progress,
+            id: 1,
+            telemetry_id: None,
+        };
+
+        assert_eq!(ticket.retained_heap_bytes(Some(&manifest)), (0, 0));
+        assert_eq!(
+            ticket.retained_heap_bytes(None).0,
+            crate::memory::encoded_size(manifest.as_ref()).saturating_mul(3) as u64
+        );
     }
 }

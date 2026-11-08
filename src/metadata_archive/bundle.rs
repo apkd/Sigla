@@ -249,11 +249,13 @@ fn inspect(
     );
     let mut bytes = Vec::new();
     first.read_to_end(&mut bytes)?;
-    let manifest: Manifest = binary::decode(payload(&bytes)?)?;
+    let mut manifest: Manifest = binary::decode(payload(&bytes)?)?;
+    drop(bytes);
     if let Some(expected) = expected {
-        let mut summary = manifest.clone();
-        summary.entries.clear();
-        ensure!(summary == expected.manifest, "Catalog and bundle disagree");
+        let entries = std::mem::take(&mut manifest.entries);
+        let agrees = manifest == expected.manifest;
+        manifest.entries = entries;
+        ensure!(agrees, "Catalog and bundle disagree");
     }
     let mut pending: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
     let mut paths = BTreeSet::new();
@@ -294,6 +296,33 @@ fn inspect(
             targets.iter().all(|e| e.size == item.size()),
             "Object size mismatch"
         );
+        if let Some(destination) = destination {
+            let first = destination.join(&targets[0].path);
+            fs::create_dir_all(first.parent().unwrap())?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&first)?;
+            ensure!(
+                std::io::copy(&mut item, &mut output)? == targets[0].size,
+                "Truncated bundle object"
+            );
+            drop(output);
+            if expected.is_none() {
+                ensure!(digest(&first)? == targets[0].hash, "Object digest mismatch");
+            }
+            for target in &targets[1..] {
+                let path = destination.join(&target.path);
+                fs::create_dir_all(path.parent().unwrap())?;
+                // Independent inodes can be adopted by the owned-tree importer.
+                let mut copy = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                std::io::copy(&mut fs::File::open(&first)?, &mut copy)?;
+            }
+            continue;
+        }
         let mut bytes = Vec::new();
         item.read_to_end(&mut bytes)?;
         ensure!(
@@ -310,15 +339,6 @@ fn inspect(
                         encoded: binary::decode(encoded)?,
                     })?;
                 }
-            }
-            if let Some(destination) = destination {
-                let path = destination.join(&target.path);
-                fs::create_dir_all(path.parent().unwrap())?;
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)?
-                    .write_all(&bytes)?;
             }
         }
     }
