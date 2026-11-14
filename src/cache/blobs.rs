@@ -262,6 +262,7 @@ impl Store {
 
     /// Import a stopped, private stage. Later changes must replace files atomically.
     pub(crate) fn import_owned_tree(&self, root: &Path) -> Result<ImportStats> {
+        let started = Instant::now();
         let _lease = self.lease()?;
         let mut files = Vec::new();
         let mut directories = Vec::new();
@@ -294,7 +295,7 @@ impl Store {
             }
             Ok(stats)
         })?;
-        let started = Instant::now();
+        let syncing = Instant::now();
         // Persist shard names once per import, including blobs reused from a
         // concurrent importer. That importer may not have reached this sync yet.
         if !files.is_empty() {
@@ -306,7 +307,20 @@ impl Store {
         for directory in directories {
             File::open(directory)?.sync_all()?;
         }
-        stats.sync += started.elapsed();
+        stats.sync += syncing.elapsed();
+        tracing::info!(
+            root = %root.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            files = stats.files,
+            hashed_bytes = stats.hashed_bytes,
+            adopted = stats.adopted,
+            reused = stats.reused,
+            fallback = stats.fallback,
+            read_hash_worker_ms = stats.read_hash.as_millis(),
+            publication_worker_ms = stats.publication.as_millis(),
+            sync_work_ms = stats.sync.as_millis(),
+            "Owned cache tree imported"
+        );
         Ok(stats)
     }
 
@@ -620,8 +634,12 @@ pub fn identity(path: &Path, metadata: &fs::Metadata) -> Result<Option<Id>> {
 
 /// Physical allocation, rather than the sum of each hardlinked view's apparent size.
 pub fn allocated(root: &Path) -> Result<u64> {
-    fn visit(root: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result<u64> {
-        let metadata = match fs::symlink_metadata(root) {
+    fn visit(
+        root: &Path,
+        metadata: std::io::Result<fs::Metadata>,
+        seen: &mut BTreeSet<(u64, u64)>,
+    ) -> Result<u64> {
+        let metadata = match metadata {
             Ok(metadata) => metadata,
             // Background transfers can publish or remove staging files during a scan.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -650,17 +668,14 @@ pub fn allocated(root: &Path) -> Result<u64> {
                 }
             };
             for entry in entries {
-                bytes += visit(
-                    &entry
-                        .with_context(|| format!("Cannot enumerate {}", root.display()))?
-                        .path(),
-                    seen,
-                )?;
+                let entry =
+                    entry.with_context(|| format!("Cannot enumerate {}", root.display()))?;
+                bytes += visit(&entry.path(), entry.metadata(), seen)?;
             }
         }
         Ok(bytes)
     }
-    visit(root, &mut BTreeSet::new())
+    visit(root, fs::symlink_metadata(root), &mut BTreeSet::new())
 }
 
 /// Measure physical allocation and attribute each inode once. Repository roots
@@ -829,13 +844,14 @@ pub(crate) fn allocated_with_owners(
 
     fn visit<T: Ownership>(
         path: &Path,
+        metadata: std::io::Result<fs::Metadata>,
         category: u32,
         inherited_repository: Option<u32>,
         repository_roots: &BTreeMap<PathBuf, u32>,
         inodes: &mut BTreeMap<(u64, u64), Inode<T>>,
         owner_roots: &BTreeMap<PathBuf, Vec<u32>>,
     ) -> Result<()> {
-        let metadata = match fs::symlink_metadata(path) {
+        let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
@@ -860,10 +876,11 @@ pub(crate) fn allocated_with_owners(
                 }
             };
             for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("Cannot enumerate {}", path.display()))?;
                 visit(
-                    &entry
-                        .with_context(|| format!("Cannot enumerate {}", path.display()))?
-                        .path(),
+                    &entry.path(),
+                    entry.metadata(),
                     category,
                     repository,
                     repository_roots,
@@ -984,6 +1001,7 @@ pub(crate) fn allocated_with_owners(
                 shared_bytes.resize(category_names.len(), 0);
                 visit(
                     &entry.path(),
+                    entry.metadata(),
                     category,
                     root_repository,
                     &repository_roots,

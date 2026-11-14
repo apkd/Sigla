@@ -9,6 +9,8 @@ use std::{
     fs,
 };
 
+type SelectorStates = BTreeMap<std::path::PathBuf, crate::repository::retention::ProjectedState>;
+
 struct MaintenanceDiskSample {
     measured_at_ms: u64,
     allocation: blobs::AttributedAllocation,
@@ -797,10 +799,17 @@ impl App {
     }
 
     fn repository_disk_roots(&self) -> Result<BTreeMap<std::path::PathBuf, String>> {
+        self.repository_disk_roots_from(&crate::repository::retention::projected(&self.cache)?)
+    }
+
+    fn repository_disk_roots_from(
+        &self,
+        states: &SelectorStates,
+    ) -> Result<BTreeMap<std::path::PathBuf, String>> {
         let mut roots = BTreeMap::new();
-        for (root, state) in crate::repository::retention::cached(&self.cache)? {
+        for (root, state) in states {
             let identity = state.repository.to_string();
-            roots.insert(root, identity.clone());
+            roots.insert(root.clone(), identity.clone());
             roots.insert(
                 self.cache.join("git").join(state.repository.storage_key()),
                 identity,
@@ -816,6 +825,19 @@ impl App {
 
     fn repository_disk_roots_for_telemetry(&self) -> BTreeMap<std::path::PathBuf, String> {
         match self.repository_disk_roots() {
+            Ok(roots) => roots,
+            Err(error) => {
+                tracing::warn!(%error, "Repository disk attribution unavailable; assigning cache usage to shared categories");
+                BTreeMap::new()
+            }
+        }
+    }
+
+    fn repository_disk_roots_for_telemetry_from(
+        &self,
+        states: &SelectorStates,
+    ) -> BTreeMap<std::path::PathBuf, String> {
+        match self.repository_disk_roots_from(states) {
             Ok(roots) => roots,
             Err(error) => {
                 tracing::warn!(%error, "Repository disk attribution unavailable; assigning cache usage to shared categories");
@@ -850,11 +872,20 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn seed_owners(&self) -> Result<bool> {
         self.seed_owners_observed(|| {})
     }
 
-    fn seed_owners_observed(&self, mut observe: impl FnMut()) -> Result<bool> {
+    #[cfg(test)]
+    fn seed_owners_observed(&self, observe: impl FnMut()) -> Result<bool> {
+        self.seed_owners_from(
+            &crate::repository::retention::projected(&self.cache)?,
+            observe,
+        )
+    }
+
+    fn seed_owners_from(&self, states: &SelectorStates, mut observe: impl FnMut()) -> Result<bool> {
         if self.inspection_shutdown.is_cancelled() {
             return Ok(false);
         }
@@ -864,12 +895,12 @@ impl App {
         for (owner, _, used) in crate::repository::cache::history_owners(&self.cache)? {
             self.owners.lock().unwrap().seed(&owner, None, used);
         }
-        if let Some(remote) = &self.remote {
-            for (root, state) in remote.cached()? {
+        if self.remote.is_some() {
+            for (root, state) in states {
                 self.owners
                     .lock()
                     .unwrap()
-                    .seed(&root.join("source"), Some(&root), state.last_use);
+                    .seed(&root.join("source"), Some(root), state.last_use);
             }
         }
         if self.cache.join("analysis").is_dir() {
@@ -955,7 +986,12 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     fn candidates(&self) -> Result<Vec<Candidate>> {
+        self.candidates_from(&crate::repository::retention::projected(&self.cache)?)
+    }
+
+    fn candidates_from(&self, states: &SelectorStates) -> Result<Vec<Candidate>> {
         let owners = self.owners.lock().unwrap().clone();
         crate::cache::policy::retention_candidates(
             &self.cache,
@@ -965,6 +1001,7 @@ impl App {
                 .map(|remote| crate::repository::retention::Policy::from(&remote.options))
                 .as_ref(),
             crate::cache::now(),
+            states,
         )
     }
 
@@ -1256,16 +1293,22 @@ impl App {
             retired.dispose()?;
             outcome.progress = true;
         }
-        let known = maintenance_stage(operation, "ownership scan", || self.seed_owners())?;
-        let repository_roots =
-            crate::telemetry::enabled().then(|| self.repository_disk_roots_for_telemetry());
+        let states = maintenance_stage(operation, "selector scan", || {
+            crate::repository::retention::projected(&self.cache)
+        })?;
+        let known = maintenance_stage(operation, "ownership scan", || {
+            self.seed_owners_from(&states, || {})
+        })?;
+        let repository_roots = crate::telemetry::enabled()
+            .then(|| self.repository_disk_roots_for_telemetry_from(&states));
         let before = maintenance_stage(operation, "disk measurement", || {
             blobs::allocated(&self.cache)
         })?;
         let disk = Disk::read(&self.cache)?;
         let pressure = self.cache_limits.pressured(before, disk);
-        let mut candidates =
-            maintenance_stage(operation, "eviction planning", || self.candidates())?;
+        let mut candidates = maintenance_stage(operation, "eviction planning", || {
+            self.candidates_from(&states)
+        })?;
         for candidate in candidates.iter().filter(|candidate| candidate.expired) {
             if self.inspection_shutdown.is_cancelled() {
                 return Ok(outcome);

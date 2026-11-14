@@ -104,7 +104,7 @@ pub(crate) fn seed_repositories(cache: &Path, owners: &mut Catalog) -> Result<()
     for (owner, _, used) in crate::repository::cache::history_owners(cache)? {
         owners.seed(&owner, None, used);
     }
-    for (root, state) in crate::repository::retention::cached(cache)? {
+    for (root, state) in crate::repository::retention::projected(cache)? {
         owners.seed(&root.join("source"), Some(&root), state.last_use);
     }
     Ok(())
@@ -225,7 +225,7 @@ pub(crate) fn build(
 ) -> Result<Report> {
     let now = super::now();
     let limits = overrides.apply(config.limits)?;
-    let states = crate::repository::retention::cached(cache)?;
+    let states = crate::repository::retention::projected(cache)?;
     let history = crate::repository::cache::history_owners(cache)?;
     for (owner, _, used) in &history {
         owners.seed(owner, None, *used);
@@ -245,7 +245,8 @@ pub(crate) fn build(
     owners
         .entries
         .retain(|_, owner| owner.repository.as_deref().unwrap_or(&owner.entry).exists());
-    let candidates = policy::candidates(cache, &owners, config.repositories.as_ref(), now)?;
+    let candidates =
+        policy::candidates(cache, &owners, config.repositories.as_ref(), now, &states)?;
     let footprint = footprint(cache)?;
     let disk = Disk::read(cache)?;
     let analysis = analysis.map(|a| a.stats);

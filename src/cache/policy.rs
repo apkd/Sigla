@@ -26,8 +26,9 @@ pub(crate) fn candidates(
     owners: &super::owners::Catalog,
     policy: Option<&crate::repository::retention::Policy>,
     now: u64,
+    states: &BTreeMap<PathBuf, crate::repository::retention::ProjectedState>,
 ) -> Result<Vec<Candidate>> {
-    let mut result = retention_candidates(cache, owners, policy, now)?;
+    let mut result = retention_candidates(cache, owners, policy, now, states)?;
     rank(owners, &mut result, now)?;
     Ok(result)
 }
@@ -37,8 +38,8 @@ pub(crate) fn retention_candidates(
     owners: &super::owners::Catalog,
     policy: Option<&crate::repository::retention::Policy>,
     now: u64,
+    states: &BTreeMap<PathBuf, crate::repository::retention::ProjectedState>,
 ) -> Result<Vec<Candidate>> {
-    let states = crate::repository::retention::cached(cache)?;
     let mut result = Vec::new();
     for owner in owners.entries.values() {
         let (protection, ttl) = match (&owner.repository, policy) {
@@ -46,7 +47,7 @@ pub(crate) fn retention_candidates(
                 let Some(state) = states.get(root) else {
                     continue;
                 };
-                policy.decision(cache, state, |identity, branch| {
+                policy.projected_decision(cache, state, |identity, branch| {
                     Ok(states.values().any(|s| {
                         &s.repository == identity
                             && (policy.selection_identity.is_empty()
