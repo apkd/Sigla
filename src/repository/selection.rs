@@ -34,7 +34,7 @@ impl Selection {
         Ok(Self {
             includes: compile(includes)?,
             excludes: compile(excludes)?,
-            identity: blake3::hash(&serde_json::to_vec(&(9u32, includes, excludes))?)
+            identity: blake3::hash(&postcard::to_allocvec(&(9u32, includes, excludes))?)
                 .to_hex()
                 .to_string(),
             patterns: (includes.to_vec(), excludes.to_vec()),

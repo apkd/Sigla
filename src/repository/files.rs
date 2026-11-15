@@ -1,6 +1,9 @@
 //! Weak Git-object aliases to immutable files. Alias records never retain blobs.
 use super::materialize::{Metrics, Prepared, Request};
-use crate::cache::blobs::{Id, Linked, Store};
+use crate::cache::{
+    blobs::{Id, Linked, Store},
+    records,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,14 +18,13 @@ const MAX_ENTRIES: usize = MAX_BYTES as usize / 192;
 
 #[derive(Serialize, Deserialize)]
 struct Catalog {
-    version: u32,
     entries: BTreeMap<String, String>,
     checksum: String,
 }
 
 fn checksum(entries: &BTreeMap<String, String>) -> Result<String> {
     let mut hash = blake3::Hasher::new();
-    serde_json::to_writer(&mut hash, entries)?;
+    postcard::to_io(entries, &mut hash)?;
     Ok(hash.finalize().to_hex().to_string())
 }
 
@@ -54,20 +56,11 @@ fn decode(key: &str, value: &str) -> Option<(Id, u32)> {
     Some((*blake3::Hash::from_hex(value).ok()?.as_bytes(), mode))
 }
 
-fn read(root: &Path) -> BTreeMap<String, String> {
+pub(super) fn read(root: &Path) -> BTreeMap<String, String> {
     let load = || -> Result<Catalog> {
-        let file = File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(root.join("files.json"))?;
-        let metadata = file.metadata()?;
+        let catalog: Catalog = records::read(&root.join("files.bin"), MAX_BYTES)?;
         ensure!(
-            metadata.is_file() && metadata.len() <= MAX_BYTES,
-            "Invalid Git file aliases"
-        );
-        let catalog: Catalog = serde_json::from_reader(std::io::BufReader::new(file))?;
-        ensure!(
-            catalog.version == 1 && catalog.entries.len() <= MAX_ENTRIES,
+            catalog.entries.len() <= MAX_ENTRIES,
             "Unsupported Git file aliases"
         );
         ensure!(
@@ -94,10 +87,9 @@ fn publish(root: &Path, mut entries: BTreeMap<String, String>) -> Result<()> {
     while entries.len() > MAX_ENTRIES {
         entries.pop_first();
     }
-    super::manager::write_json(
-        &root.join("files.json"),
+    records::write(
+        &root.join("files.bin"),
         &Catalog {
-            version: 1,
             checksum: checksum(&entries)?,
             entries,
         },
@@ -184,7 +176,7 @@ pub(super) fn record(root: &Path, cache: &Path, prepared: &Prepared, staging: &P
 }
 
 pub(super) fn prune(root: &Path, cache: &Path) -> Result<()> {
-    if !root.join("files.json").is_file() {
+    if !root.join("files.bin").is_file() {
         return Ok(());
     }
     let files = Store::open(cache)?;
@@ -262,20 +254,16 @@ mod tests {
             );
         }
         let mut corrupt: Catalog =
-            serde_json::from_slice(&fs::read(root.path().join("files.json")).unwrap()).unwrap();
+            records::read(&root.path().join("files.bin"), MAX_BYTES).unwrap();
         let values: Vec<_> = corrupt.entries.values().cloned().collect();
         for (entry, value) in corrupt.entries.values_mut().zip(values.into_iter().rev()) {
             *entry = value;
         }
-        super::super::manager::write_json(&root.path().join("files.json"), &corrupt).unwrap();
+        records::write(&root.path().join("files.bin"), &corrupt).unwrap();
         assert!(read(root.path()).is_empty());
-        fs::write(
-            root.path().join("files.json"),
-            br#"{"version":999,"entries":{}}"#,
-        )
-        .unwrap();
+        fs::write(root.path().join("files.bin"), b"incomplete publication").unwrap();
         assert!(read(root.path()).is_empty());
-        File::create(root.path().join("files.json"))
+        File::create(root.path().join("files.bin"))
             .unwrap()
             .set_len(MAX_BYTES + 1)
             .unwrap();

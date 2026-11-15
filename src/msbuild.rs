@@ -279,9 +279,7 @@ pub(crate) fn environment_identity() -> Result<Vec<u8>> {
             .filter_map(|host| host.parent())
             .chain(roots.iter().flatten().map(PathBuf::as_path)),
     );
-    Ok(serde_json::to_vec(&(
-        path, host, resolved, stamp, roots, inventory,
-    ))?)
+    crate::binary::encode(&(path, host, resolved, stamp, roots, inventory))
 }
 
 fn inventory_identity<'a>(
@@ -527,18 +525,15 @@ pub(crate) fn discover_in(
     let state_dir = cache.join("restore-state");
     fs::create_dir_all(&state_dir)?;
     let state_file = state_dir.join(
-        blake3::hash(&serde_json::to_vec(entries)?)
+        blake3::hash(&crate::binary::encode(entries)?)
             .to_hex()
             .as_str(),
     );
     let previous: BTreeMap<String, String> = if state_file.is_file() {
-        fs::read(&state_file)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
-            .unwrap_or_else(|error| {
-                tracing::warn!("Ignoring unreadable restore state: {error:#}");
-                BTreeMap::new()
-            })
+        crate::cache::records::read(&state_file, 64 * 1024 * 1024).unwrap_or_else(|error| {
+            tracing::warn!("Ignoring unreadable restore state: {error:#}");
+            BTreeMap::new()
+        })
     } else {
         BTreeMap::new()
     };
@@ -618,9 +613,7 @@ pub(crate) fn discover_in(
         }
         if !snapshot.needs_restore {
             snapshot.diagnostics.extend(diagnostics);
-            let mut state = tempfile::NamedTempFile::new_in(&state_dir)?;
-            serde_json::to_writer(&mut state, &snapshot.dependency_state)?;
-            state.persist(&state_file)?;
+            crate::cache::records::write(&state_file, &snapshot.dependency_state)?;
             if let Some(sandbox) = &sandbox {
                 sandbox.validate_writes()?;
                 map_snapshot(&mut snapshot, sandbox)?;

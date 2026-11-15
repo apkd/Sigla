@@ -13,11 +13,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-const VERSION: u32 = 4;
-
 #[derive(Serialize, Deserialize)]
 struct Cached {
-    version: u32,
     parsed: Parsed,
     unavailable: Option<String>,
 }
@@ -54,7 +51,6 @@ fn load(
         id
     };
     let key = blake3::hash(&postcard::to_allocvec(&(
-        VERSION,
         env!("SIGLA_ASSET_RECORD_FINGERPRINT"),
         identity,
     ))?)
@@ -67,7 +63,7 @@ fn load(
     }
     let cached = read::<Cached>(&record, cancel)
         .ok()
-        .filter(|c| c.version == VERSION && (c.unavailable.is_some() || text.is_file()));
+        .filter(|c| c.unavailable.is_some() || text.is_file());
     cancel.check()?;
     let cached = if let Some(cached) = cached {
         cached
@@ -107,7 +103,6 @@ fn load(
             }
         }
         let cached = Cached {
-            version: VERSION,
             parsed,
             unavailable,
         };

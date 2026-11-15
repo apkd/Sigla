@@ -223,8 +223,11 @@ impl App {
                     let state = slot.state.try_lock().ok();
                     let workspace = state.as_ref().and_then(|state| state.as_ref());
                     let manifest = workspace.map(|workspace| &workspace.manifest);
-                    bytes = bytes
-                        .saturating_add(workspace.map_or(0, |workspace| workspace.retained_bytes));
+                    bytes = bytes.saturating_add(workspace.map_or(0, |workspace| {
+                        workspace
+                            .retained_bytes
+                            .saturating_add(workspace.manifest.derived.heap_bytes() as usize)
+                    }));
                     if let Some(ticket) = &slot.preparing {
                         bytes = bytes.saturating_add(
                             usize::try_from(ticket.retained_heap_bytes(manifest).0)
@@ -284,10 +287,12 @@ impl App {
             }
             let state = slot.state.try_lock().ok();
             let workspace = state.as_ref().and_then(|state| state.as_ref());
-            let workspace_bytes = workspace.map_or(0, |workspace| workspace.retained_bytes);
-            usage.retained_bytes += workspace_bytes as u64;
+            let workspace_bytes = workspace.map_or(0, |workspace| {
+                workspace.retained_bytes as u64 + workspace.manifest.derived.heap_bytes()
+            });
+            usage.retained_bytes += workspace_bytes;
             if state_pinned {
-                usage.pinned_bytes += workspace_bytes as u64;
+                usage.pinned_bytes += workspace_bytes;
             }
             if let Some(ticket) = &slot.preparing {
                 let (retained, pinned) =
@@ -323,14 +328,20 @@ impl App {
             .read(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(cache.join("ownership.lock"))?;
+        ensure!(
+            ownership.metadata()?.is_file(),
+            "Cache ownership lock must be a regular file"
+        );
         ownership
             .try_lock()
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
+        startup.0.stage("cache_initialization");
+        crate::cache::reset::prepare(&cache)?;
+        crate::repository::state_store::recover(&cache)?;
         startup.0.stage("compaction_recovery");
         crate::cache::compaction::recover(&cache)?;
-        startup.0.stage("cache_migration");
-        crate::cache_migration::migrate(&cache)?;
         startup.0.stage("store_initialization");
         crate::memory::start_reclaimer()?;
         let app = Self {
@@ -450,6 +461,11 @@ impl App {
             let _ = cache_trim.await;
         }
         let _idle = self.activity.write().await;
+        if let Some(remote) = &self.remote
+            && let Err(error) = remote.flush_usage().await
+        {
+            tracing::warn!(%error, "Cannot persist repository usage during shutdown");
+        }
         if let Err(error) = self.owners.lock().unwrap().flush() {
             tracing::warn!(%error, "Cannot persist cache usage during shutdown");
         }
@@ -1263,8 +1279,7 @@ impl App {
             }
             Request::Browse(_) => true,
         };
-        let asset_generation =
-            crate::unity::assets::jobs::generation(&state.as_ref().unwrap().manifest)?;
+        let admitted_manifest = state.as_ref().unwrap().manifest.clone();
         let ticket = asset_request
             .then(|| {
                 self.start_assets(indexes::AssetRequest {
@@ -1358,7 +1373,7 @@ impl App {
             "Workspace was retired during admission",
         ))?;
         ensure!(
-            crate::unity::assets::jobs::generation(&current.manifest)? == asset_generation,
+            Arc::ptr_eq(&current.manifest, &admitted_manifest),
             crate::diagnostics::RefreshRequired(
                 "Workspace changed while awaiting admission; retry query"
             )
@@ -1411,6 +1426,7 @@ impl App {
                 let _branch_state = branch_state;
                 let workspace = state.as_mut().unwrap();
                 let store = workspace.store.clone();
+                let base_manifest = workspace.manifest.clone();
                 let mut manifest = workspace.manifest.clone();
                 let asset_only = query.as_ref().is_some_and(|q| {
                     matches!(
@@ -1461,6 +1477,7 @@ impl App {
                     }
                 }
                 let assets = ticket.as_ref().and_then(|ticket| ticket.ready_index());
+                let summary_sources: Vec<_> = ready.iter().map(|(_, snapshot)| Arc::downgrade(snapshot)).collect();
                 if asset_request && assets.is_none() {
                     pending.insert(if ticket.as_ref().and_then(|t| t.ready()).is_some() {
                         "Unity assets (preparation or indexing failed)".into()
@@ -1480,6 +1497,7 @@ impl App {
                     // Pin source snapshots under the publication gate, then
                     // keep them on this thread through rendering and destruction.
                     let mut search = Search::new(&store, &manifest, &cancel)?;
+                    search.with_source_manifest(&base_manifest);
                     for (group, snapshot) in ready {
                         search.with_source(group, snapshot.store.clone())?;
                     }
@@ -1517,10 +1535,8 @@ impl App {
                 if incomplete {
                     result.structured_content = Some(serde_json::json!({"complete": false}));
                 }
-                if let Some((identity, branch, revision, tracked)) = context {
-                    crate::summary::Summary::build(
-                        &identity, &branch, &revision, tracked, root, &manifest,
-                    )
+                if !raw && let Some(context) = context {
+                    inventory.summary(&context, root, &base_manifest, &manifest, &summary_sources)
                     .attach(&mut result);
                 }
                 app.record_usage(&usage_entry, usage_branch.as_deref(), &manifest);
@@ -2460,6 +2476,20 @@ mod tests {
             before,
             "Reopening completed groups must not write analysis"
         );
+        std::fs::remove_file(root.path().join("native.cpp")).unwrap();
+        let current = app.search(path, "symbol:* wait:complete").await.unwrap();
+        assert!(!current.contains("newest") && current.contains("shader_ready"));
+        for (key, info) in database.workspaces().unwrap() {
+            if info.phase == crate::store::shared::Phase::Deleting {
+                continue;
+            }
+            let store = crate::store::Store {
+                scope: database.existing(key).unwrap().unwrap(),
+            };
+            if let Some(manifest) = store.get_manifest::<crate::workspace::Manifest>().unwrap() {
+                assert_ne!(manifest.source_group, Some(Group::Native));
+            }
+        }
         app.shutdown().await;
     }
 
@@ -2718,16 +2748,22 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-
         // Publish another workspace generation while the first asset job is queued.
-        let mut state = workspace
-            .try_lock()
-            .expect("query should be waiting for assets");
+        let mut state = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                if app.assets.stats().entries > 0
+                    && let Ok(state) = workspace.try_lock()
+                {
+                    return std::task::Poll::Ready(state);
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }),
+        )
+        .await
+        .expect("query should release the workspace while waiting for assets");
         let code = state.as_mut().unwrap();
         let previous = crate::unity::assets::jobs::generation(&code.manifest).unwrap();
         std::fs::write(&source, "pub struct ChangedGeneration;").unwrap();
@@ -2755,12 +2791,17 @@ mod tests {
 
     #[tokio::test]
     async fn remote_navigation_does_not_wait_for_indexing_or_retain_queued_branch_guards() {
-        use crate::repository::{Repository, Rule, materialize::Target};
+        use crate::repository::{
+            Repository, Rule,
+            manager::State,
+            materialize::{Prepared, Target},
+        };
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let cache = tempfile::tempdir().unwrap();
+        crate::cache::reset::prepare(cache.path()).unwrap();
         let project = "https://github.com/fixture/repo#refs/heads/main";
         let repository = Repository::parse(project).unwrap().unwrap();
-        let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, "main")).unwrap())
+        let key = blake3::hash(&postcard::to_allocvec(&(&repository.identity, "main")).unwrap())
             .to_hex()
             .to_string();
         let owner = cache.path().join("repositories").join(key);
@@ -2777,19 +2818,36 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let saved = serde_json::json!({
-            "schema": 4, "repository": repository.identity, "transport": repository.transport,
-            "branch": "main", "target": Target::Branch("main".into()),
-            "last_use": now, "refreshed": now, "store_created": now,
-            "policy": selection.identity, "repair": false, "indexed_revision": null,
-            "prepared": {"branch": "main", "revision": "a".repeat(40),
-                "selected": {"Cargo.toml": "b", "src/lib.rs": "c"}, "tracked": {"Cargo.toml": "b", "src/lib.rs": "c"}, "directories": ["src"]}
-        });
-        std::fs::write(
-            owner.join("state.json"),
-            serde_json::to_vec(&saved).unwrap(),
-        )
-        .unwrap();
+        let files = std::collections::BTreeMap::from([
+            ("Cargo.toml".into(), "b".into()),
+            ("src/lib.rs".into(), "c".into()),
+        ]);
+        let saved = State {
+            repository: repository.identity.clone(),
+            transport: repository.transport.clone(),
+            branch: "main".into(),
+            target: Target::Branch("main".into()),
+            last_use: now,
+            refreshed: now,
+            policy: selection.identity.clone(),
+            repair: false,
+            indexed_revision: None,
+            additional: Default::default(),
+            prepared: Prepared {
+                branch: Some("main".into()),
+                revision: "a".repeat(40),
+                selected: files.clone(),
+                tracked: files,
+                directories: ["src".into()].into(),
+                deferred_assets: Default::default(),
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+            },
+        };
+        crate::repository::state_store::write(&owner, &saved).unwrap();
         let app = Arc::new(
             App::remote(
                 Policy::new(vec![source.clone()]).unwrap(),
@@ -3039,6 +3097,7 @@ mod tests {
     fn startup_defers_interrupted_namespace_retirement() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
+        crate::cache::reset::prepare(cache.path()).unwrap();
         let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
         let scope = database.workspace([1; 32], root.path(), None).unwrap();
         scope.mark_deleting().unwrap();

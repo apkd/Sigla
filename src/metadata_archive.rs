@@ -93,20 +93,11 @@ impl Catalog {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
-        if let Some(bytes) = bytes.strip_prefix(b"SIGLACAT2") {
-            return binary::decode(bytes);
-        }
-        #[derive(Deserialize)]
-        struct Legacy {
-            artifacts: Vec<Artifact>,
-            unavailable: Vec<String>,
-        }
-        let legacy: Legacy = binary::decode(bytes)?;
-        Ok(Self {
-            artifacts: legacy.artifacts,
-            unavailable: legacy.unavailable,
-            packs: vec![],
-        })
+        binary::decode(
+            bytes
+                .strip_prefix(b"SIGLACAT2")
+                .context("Unsupported metadata catalog format")?,
+        )
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -129,7 +120,7 @@ fn payload(bytes: &[u8]) -> Result<&[u8]> {
         "Not a Sigla binary record"
     );
     ensure!(
-        crate::store::compatibility::accepts(&bytes[8..72]),
+        &bytes[8..72] == crate::store::ANALYSIS_VERSION.as_bytes(),
         "Metadata archive is incompatible with this Sigla binary; update Sigla and rebuild the archive with the same release"
     );
     let payload = &bytes[HEADER..];
@@ -209,26 +200,16 @@ pub(crate) fn load_analysis(path: &Path) -> Result<Analysis> {
 pub(crate) fn manifest(path: &Path) -> Result<Manifest> {
     binary::decode(payload(&read(path)?)?)
 }
-pub(crate) fn source_analysis(
-    path: &Path,
-    id: &ObjectId,
-    legacy_id: impl FnOnce(&str) -> Result<ObjectId>,
-) -> Result<Option<Encoded>> {
+pub(crate) fn source_analysis(path: &Path, id: &ObjectId) -> Result<Option<Encoded>> {
     let sidecar = PathBuf::from(format!("{}.analysis", path.display()));
     if !sidecar.is_file() {
         return Ok(None);
     }
     let bytes = read(&sidecar)?;
     let records = binary::decode::<Vec<(ObjectId, &[u8])>>(payload(&bytes)?)?;
-    let version = std::str::from_utf8(&bytes[8..72])?;
-    let id = if version == crate::store::ANALYSIS_VERSION {
-        *id
-    } else {
-        legacy_id(version)?
-    };
     records
         .iter()
-        .find(|record| record.0 == id)
+        .find(|record| &record.0 == id)
         .map(|record| binary::decode(record.1))
         .transpose()
 }

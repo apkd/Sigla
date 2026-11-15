@@ -5,6 +5,7 @@ use super::{
     Identity, Repository,
     materialize::{Prepared, Request},
 };
+use crate::cache::records;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -54,12 +55,10 @@ impl Retention {
 }
 #[derive(Serialize, Deserialize)]
 struct State {
-    version: u32,
     repository: Identity,
     replaced: u64,
     used: u64,
     retry_after: u64,
-    #[serde(default)]
     retained: Option<String>,
 }
 struct Pool {
@@ -103,14 +102,6 @@ fn private_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path, max: u64) -> Result<T> {
-    let m = fs::symlink_metadata(path)?;
-    ensure!(
-        m.is_file() && !m.file_type().is_symlink() && m.len() <= max,
-        "Invalid Git cache metadata"
-    );
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
-}
 fn sync_dir(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -132,7 +123,7 @@ fn visit_selectors(cache: &Path, mut visit: impl FnMut(super::manager::State)) -
                     .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_hexdigit())),
             "Invalid selector cache directory"
         );
-        let state = match read_json(&entry.path().join("state.json"), 256 * 1024 * 1024) {
+        let state = match super::state_store::read(&entry.path()) {
             Ok(state) => state,
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
@@ -194,22 +185,18 @@ impl Pool {
         Ok(pool)
     }
     fn state(&self) -> Result<State> {
-        let path = self.root.join("pool.json");
+        let path = self.root.join("pool.bin");
         match fs::symlink_metadata(&path) {
             Ok(_) => {
-                let s: State = read_json(&path, 64 * 1024)?;
-                ensure!(
-                    s.version == 1 && s.repository == self.identity,
-                    "Git pool identity mismatch"
-                );
+                let s: State = records::read(&path, 64 * 1024)?;
+                ensure!(s.repository == self.identity, "Git pool identity mismatch");
                 Ok(s)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Persist the initial clock even when the following acquisition fails.
-                // Otherwise an abandoned pool without pool.json never ages out.
+                // Otherwise an abandoned pool without pool.bin never ages out.
                 let time = now();
                 let state = State {
-                    version: 1,
                     repository: self.identity.clone(),
                     replaced: time,
                     used: time,
@@ -223,7 +210,7 @@ impl Pool {
         }
     }
     fn persist(&self, state: &State) -> Result<()> {
-        super::manager::write_json(&self.root.join("pool.json"), state)?;
+        records::write(&self.root.join("pool.bin"), state)?;
         sync_dir(&self.root)
     }
     fn pending_roots(&self) -> Result<Retention> {
@@ -366,9 +353,9 @@ impl Pool {
                 &fresh
             }
         };
-        let retained = blake3::hash(&serde_json::to_vec(roots)?)
-            .to_hex()
-            .to_string();
+        let mut hash = blake3::Hasher::new();
+        postcard::to_io(roots, &mut hash)?;
+        let retained = hash.finalize().to_hex().to_string();
         if state.retained.as_ref() == Some(&retained) {
             return Ok(());
         }
@@ -382,7 +369,7 @@ impl Pool {
             self.replace(&target)?;
             if let Some(mut coverage) = coverage {
                 coverage.generation = generation(&self.root.join("current"))?;
-                super::manager::write_json(&self.root.join("history.json"), &coverage)?;
+                records::write(&self.root.join("history.bin"), &coverage)?;
             }
             Ok(())
         })();
@@ -603,12 +590,12 @@ fn maintain_pool(
     // Pressure eviction is ranked by the global owner policy. Periodic idle
     // maintenance also handles history-only pools, without preparing a selector.
     if !active
-        && pool.root.join("history.json").is_file()
+        && pool.root.join("history.bin").is_file()
         && !pressure
         && now().saturating_sub(state.used)
             >= idle_lifetime.as_millis().try_into().unwrap_or(u64::MAX)
     {
-        fs::remove_file(pool.root.join("history.json"))?;
+        fs::remove_file(pool.root.join("history.bin"))?;
     }
     let mut roots = match snapshot.filter(|snapshot| snapshot.generation == *operation) {
         Some(snapshot) => snapshot.roots,
@@ -656,8 +643,8 @@ fn maintain_pools(cache: &Path, idle_lifetime: Duration, pressure: bool) -> Resu
     for entry in entries {
         let entry = entry?;
         ensure!(entry.file_type()?.is_dir(), "Invalid Git pool directory");
-        let path = entry.path().join("pool.json");
-        let state: State = match read_json(&path, 64 * 1024) {
+        let path = entry.path().join("pool.bin");
+        let state: State = match records::read(&path, 64 * 1024) {
             Ok(state) => state,
             Err(error)
                 if error
@@ -721,12 +708,9 @@ fn maintain_pools(cache: &Path, idle_lifetime: Duration, pressure: bool) -> Resu
 /// A generation mismatch invalidates claims, never triggers an implicit fetch.
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct HistoryCoverage {
-    version: u32,
     generation: String,
     pub objects: BTreeSet<String>,
-    #[serde(default)]
     pub complete: BTreeSet<String>,
-    #[serde(default)]
     pub boundaries: BTreeSet<String>,
 }
 struct HistoryRoot {
@@ -767,8 +751,8 @@ pub(super) fn generation(store: &Path) -> Result<String> {
 
 impl Pool {
     fn history_coverage(&self) -> Result<Option<HistoryCoverage>> {
-        let path = self.root.join("history.json");
-        let coverage: HistoryCoverage = match read_json(&path, 256 * 1024 * 1024) {
+        let path = self.root.join("history.bin");
+        let coverage: HistoryCoverage = match records::read(&path, 256 * 1024 * 1024) {
             Ok(coverage) => coverage,
             Err(error)
                 if error
@@ -780,8 +764,7 @@ impl Pool {
             Err(error) => return Err(error),
         };
         let current = self.root.join("current");
-        if coverage.version != 1
-            || !current.is_dir()
+        if !current.is_dir()
             || fs::read_to_string(current.join("sigla-generation"))
                 .ok()
                 .as_ref()
@@ -892,11 +875,10 @@ pub(super) fn object_lease_monitored(
     link_objects(&current, view.path())?;
     if pool.history_coverage()?.is_none() {
         let coverage = HistoryCoverage {
-            version: 1,
             generation: generation(&pool.root.join("current"))?,
             ..HistoryCoverage::default()
         };
-        super::manager::write_json(&pool.root.join("history.json"), &coverage)?;
+        records::write(&pool.root.join("history.bin"), &coverage)?;
     }
     let root = Arc::new(HistoryRoot {
         objects: Mutex::new(BTreeSet::new()),
@@ -913,7 +895,7 @@ impl ObjectLease {
         self.view.path()
     }
     pub fn owner(&self) -> PathBuf {
-        self.pool.root.join("history.json")
+        self.pool.root.join("history.bin")
     }
     pub fn retain(&self, id: &str) {
         self.root.objects.lock().unwrap().insert(id.to_owned());
@@ -970,7 +952,6 @@ impl ObjectLease {
         // can also keep older objects: link these back before extending coverage.
         link_objects(self.view.path(), &current)?;
         let mut coverage = self.pool.history_coverage()?.unwrap_or_default();
-        coverage.version = 1;
         coverage.generation = generation(&current)?;
         coverage
             .objects
@@ -980,7 +961,7 @@ impl ObjectLease {
         coverage
             .boundaries
             .retain(|id| !coverage.complete.contains(id));
-        super::manager::write_json(&self.owner(), &coverage)?;
+        records::write(&self.owner(), &coverage)?;
         sync_dir(&self.pool.root)?;
         let mut state = self.pool.state()?;
         state.used = now();
@@ -998,10 +979,10 @@ pub(crate) fn history_owners(cache: &Path) -> Result<Vec<(PathBuf, Identity, u64
     };
     for entry in entries {
         let entry = entry?;
-        if entry.path().join("history.json").is_file() {
-            let state: State = read_json(&entry.path().join("pool.json"), 64 * 1024)?;
+        if entry.path().join("history.bin").is_file() {
+            let state: State = records::read(&entry.path().join("pool.bin"), 64 * 1024)?;
             result.push((
-                entry.path().join("history.json"),
+                entry.path().join("history.bin"),
                 state.repository,
                 state.used,
             ));
@@ -1011,7 +992,7 @@ pub(crate) fn history_owners(cache: &Path) -> Result<Vec<(PathBuf, Identity, u64
 }
 
 pub(crate) fn history_owner(cache: &Path, path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n == "history.json")
+    path.file_name().is_some_and(|n| n == "history.bin")
         && path.parent().is_some_and(|p| {
             p.parent() == Some(cache.join("git").as_path())
                 && p.file_name()
@@ -1037,7 +1018,7 @@ pub(crate) fn active_history(cache: &Path) -> BTreeSet<PathBuf> {
                     .iter()
                     .any(|r| r.strong_count() != 0)
         })
-        .map(|p| p.root.join("history.json"))
+        .map(|p| p.root.join("history.bin"))
         .collect()
 }
 
@@ -1048,7 +1029,7 @@ pub(crate) fn evict_history(owner: &Path) -> Result<bool> {
         .and_then(Path::parent)
         .context("Invalid history owner")?;
     ensure!(history_owner(cache, owner), "Invalid history owner");
-    let state: State = read_json(&root.join("pool.json"), 64 * 1024)?;
+    let state: State = records::read(&root.join("pool.bin"), 64 * 1024)?;
     let pool = Pool::open(cache, &state.repository)?;
     let _operation = futures_executor::block_on(pool.operation.lock());
     if pool

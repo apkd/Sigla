@@ -35,18 +35,7 @@ impl View {
                 .to_hex()
                 .as_str(),
         );
-        let view = Self::open(cache, &root, leases)?;
-        leases.retain(&cache.join("dotnet/packages"))?;
-        let marker = root.join("legacy-imported");
-        if !marker.exists() {
-            let legacy = cache.join("dotnet/packages");
-            if legacy.is_dir() {
-                view.store.import_tree(&legacy)?;
-                view.store.link_tree(&legacy, &view.path())?;
-            }
-            fs::write(marker, b"1")?;
-        }
-        Ok(view)
+        Self::open(cache, &root, leases)
     }
     pub fn open(cache: &Path, root: &Path, leases: &super::views::LeaseSet) -> Result<Self> {
         leases.retain(root)?;
@@ -110,15 +99,18 @@ impl View {
     }
 
     fn recover(&self) -> Result<()> {
-        let journal = self.root.join("package-publish.json");
-        let bytes = match fs::read(&journal) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let journal = self.root.join("package-publish.bin");
+        let publication: Publication = match super::records::read(&journal, 1024 * 1024) {
+            Ok(publication) => publication,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
                 return self.discard_stages();
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
-        let publication: Publication = serde_json::from_slice(&bytes)?;
         ensure!(
             publication.stage.starts_with("package-snapshot-") && !publication.stage.contains('/'),
             "Invalid package publication"
@@ -215,8 +207,8 @@ impl View {
         fs::write(contents.join(GENERATION), &generation)?;
         File::open(contents.join(GENERATION))?.sync_all()?;
         File::open(&contents)?.sync_all()?;
-        crate::repository::manager::write_json(
-            &self.root.join("package-publish.json"),
+        super::records::write(
+            &self.root.join("package-publish.bin"),
             &Publication {
                 stage: generation.clone(),
                 generation,
@@ -306,14 +298,12 @@ mod tests {
             fs::create_dir_all(stage.join("contents")).unwrap();
             fs::write(stage.join("contents").join(GENERATION), b"next").unwrap();
             fs::write(stage.join("contents/published"), b"complete").unwrap();
-            crate::repository::manager::write_json(
-                &root.join("package-publish.json"),
-                &Publication {
-                    stage: "package-snapshot-recovery".into(),
-                    generation: "next".into(),
-                },
-            )
-            .unwrap();
+            let journal = root.join("package-publish.bin");
+            let publication = Publication {
+                stage: "package-snapshot-recovery".into(),
+                generation: "next".into(),
+            };
+            super::super::records::write(&journal, &publication).unwrap();
             if installed {
                 exchange(&stage.join("contents"), &view.path()).unwrap();
             }
@@ -322,7 +312,7 @@ mod tests {
             assert_eq!(recovered.upper().join("written").exists(), !installed);
             assert_eq!(recovered.path().join("published").exists(), installed);
             assert!(!stage.exists());
-            assert!(!root.join("package-publish.json").exists());
+            assert!(!journal.exists());
         }
     }
 

@@ -62,10 +62,6 @@ pub fn local_command(
         }
     }
     packages.mount(&mut command, &packages.path());
-    let legacy = cache.join("packages");
-    if legacy.is_dir() {
-        command.arg("--ro-bind").arg(&legacy).arg(&legacy);
-    }
     command
         .arg("--")
         .arg(host)

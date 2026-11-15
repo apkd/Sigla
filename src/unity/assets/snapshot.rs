@@ -30,7 +30,6 @@ struct Composed {
 }
 #[derive(Serialize, Deserialize)]
 struct Cached {
-    version: String,
     generation: [u8; 32],
     assets: BTreeMap<String, Asset>,
     scripts: BTreeMap<String, Arc<ScriptType>>,
@@ -41,7 +40,6 @@ struct Cached {
 
 #[derive(Serialize)]
 struct Snapshot<'a> {
-    version: &'a str,
     generation: [u8; 32],
     assets: &'a BTreeMap<String, Asset>,
     scripts: &'a BTreeMap<String, Arc<ScriptType>>,
@@ -53,7 +51,6 @@ struct Snapshot<'a> {
 impl<'a> Snapshot<'a> {
     fn new(generation: [u8; 32], index: &'a Index) -> Self {
         Self {
-            version: env!("SIGLA_ASSET_FINGERPRINT"),
             generation,
             assets: &index.assets,
             scripts: &index.scripts,
@@ -130,10 +127,7 @@ pub(super) fn load(
     let result = (|| -> Result<_> {
         let cached: Cached = super::records::read(&path(cache), cancel)?;
         let decoded_ms = started.elapsed().as_millis();
-        ensure!(
-            cached.version == env!("SIGLA_ASSET_FINGERPRINT") && cached.generation == generation,
-            "Asset generation changed"
-        );
+        ensure!(cached.generation == generation, "Asset generation changed");
         let mut index = Index {
             assets: cached.assets,
             scripts: cached.scripts,

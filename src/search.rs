@@ -2,7 +2,7 @@ use crate::{
     model::*,
     query::{Query, Target, name_rank, qualified_name_rank, wildcard},
     store::{FileData, Store},
-    workspace::{FileEntry, Manifest, Membership},
+    workspace::{FileEntry, Manifest, Membership, derived::candidate_files},
 };
 use anyhow::{Context, Result, ensure};
 mod native;
@@ -70,6 +70,7 @@ pub struct Search<'a> {
     store: &'a Store,
     sources: BTreeMap<crate::native::Group, Arc<Store>>,
     manifest: &'a Manifest,
+    source_manifest: &'a Manifest,
     cancel: &'a tokio_util::sync::CancellationToken,
     tx: heed::RoTxn<'a, heed::WithTls>,
     cache: HashMap<String, Arc<FileData>>,
@@ -92,6 +93,7 @@ impl<'a> Search<'a> {
             store,
             sources: BTreeMap::new(),
             manifest,
+            source_manifest: manifest,
             cancel,
             tx: store.query_read()?,
             cache: HashMap::new(),
@@ -106,6 +108,9 @@ impl<'a> Search<'a> {
     }
     pub fn with_assets(&mut self, assets: &'a crate::unity::assets::Index) {
         self.assets = Some(assets);
+    }
+    pub(crate) fn with_source_manifest(&mut self, manifest: &'a Manifest) {
+        self.source_manifest = manifest;
     }
     pub fn with_source(&mut self, group: crate::native::Group, store: Arc<Store>) -> Result<()> {
         store.check_read(&self.tx)?;
@@ -984,6 +989,22 @@ impl<'a> Search<'a> {
             };
             if let Some(files) = files.as_mut() {
                 files.retain(allowed);
+            } else if q.filters.iter().any(|filter| filter.key == "path") {
+                let paths = self.source_manifest.derived.paths(self.source_manifest);
+                let mut selected =
+                    paths.matching(crate::workspace::derived::literal_filter(q), |path| {
+                        q.filters
+                            .iter()
+                            .filter(|filter| filter.key == "path")
+                            .all(|filter| self.path_matches(&filter.value, path) != filter.negate)
+                    });
+                selected.retain(|key| {
+                    self.manifest
+                        .files
+                        .get(key)
+                        .is_some_and(|file| Self::file_language_filters(q, file.language))
+                });
+                files = Some(selected);
             } else {
                 files = Some(
                     self.manifest
@@ -1228,13 +1249,8 @@ impl<'a> Search<'a> {
             };
             let files = self.containment_files(&inside)?;
             let files = self.filtered_files(q, files);
-            let contexts: Vec<_> = self
-                .manifest
-                .files
-                .iter()
-                .filter(|(key, file)| {
-                    !file.metadata && files.as_ref().is_none_or(|files| files.contains(*key))
-                })
+            let contexts: Vec<_> = candidate_files(&self.manifest.files, files.as_ref())
+                .filter(|(_, file)| !file.metadata)
                 .flat_map(|(_, file)| {
                     file.memberships
                         .iter()
@@ -1372,9 +1388,9 @@ impl<'a> Search<'a> {
         let literal = regex::RegexBuilder::new(&regex::escape(&q.target.name))
             .case_insensitive(q.loose)
             .build()?;
-        for (key, file) in &self.manifest.files {
+        for (key, file) in candidate_files(&self.manifest.files, files.as_ref()) {
             self.check()?;
-            if file.metadata || files.as_ref().is_some_and(|files| !files.contains(key)) {
+            if file.metadata {
                 continue;
             }
             if !file
@@ -1860,10 +1876,8 @@ impl<'a> Search<'a> {
             let candidates = self.hierarchy_candidates(&csharp_targets)?;
             let files = self.containment_files(inside)?;
             let files = self.filtered_files(q, files);
-            for (key, file) in &self.manifest.files {
-                if file.language != Language::CSharp
-                    || files.as_ref().is_some_and(|files| !files.contains(key))
-                {
+            for (key, file) in candidate_files(&self.manifest.files, files.as_ref()) {
+                if file.language != Language::CSharp {
                     continue;
                 }
                 let Some(positions) = candidates.get(key) else {

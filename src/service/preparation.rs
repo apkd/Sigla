@@ -10,12 +10,79 @@ pub(super) struct Inventory {
     pub context: Option<RepositoryContext>,
     watch: crate::watch::Snapshot,
     heap_bytes: std::sync::OnceLock<u64>,
+    summaries: Mutex<Vec<CachedSummary>>,
 }
+
+struct CachedSummary {
+    context: RepositoryContext,
+    root: PathBuf,
+    manifest: std::sync::Weak<Manifest>,
+    sources: Vec<std::sync::Weak<crate::native::jobs::Snapshot>>,
+    summary: crate::summary::Summary,
+}
+
 impl Inventory {
+    pub(super) fn summary(
+        &self,
+        context: &RepositoryContext,
+        root: &Path,
+        base: &Arc<Manifest>,
+        manifest: &Manifest,
+        sources: &[std::sync::Weak<crate::native::jobs::Snapshot>],
+    ) -> crate::summary::Summary {
+        let mut cached = self.summaries.lock().unwrap();
+        let base = Arc::downgrade(base);
+        if let Some(saved) = cached.iter().find(|saved| {
+            &saved.context == context
+                && saved.root == root
+                && saved.manifest.ptr_eq(&base)
+                && saved.sources.len() == sources.len()
+                && saved
+                    .sources
+                    .iter()
+                    .zip(sources)
+                    .all(|(left, right)| left.ptr_eq(right))
+        }) {
+            return saved.summary.clone();
+        }
+        let summary = crate::summary::Summary::build(
+            &context.0, &context.1, &context.2, context.3, root, manifest,
+        );
+        if cached.len() == 8 {
+            cached.remove(0);
+        }
+        cached.push(CachedSummary {
+            context: context.clone(),
+            root: root.to_owned(),
+            manifest: base,
+            sources: sources.to_vec(),
+            summary: summary.clone(),
+        });
+        summary
+    }
+
+    fn summary_heap_bytes(&self) -> u64 {
+        self.summaries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|cached| {
+                cached.summary.key.capacity()
+                    + cached.summary.table.capacity()
+                    + cached.root.as_os_str().len()
+                    + cached.context.1.capacity()
+                    + cached.context.2.capacity()
+                    + 256
+                    + cached.sources.capacity()
+                        * std::mem::size_of::<std::sync::Weak<crate::native::jobs::Snapshot>>()
+            })
+            .sum::<usize>() as u64
+    }
+
     fn retained_heap_bytes(&self) -> u64 {
         *self.heap_bytes.get_or_init(|| {
             crate::memory::encoded_size(self.manifest.as_ref()).saturating_mul(3) as u64
-        })
+        }) + self.manifest.derived.heap_bytes()
     }
 
     pub async fn current(self: &Arc<Self>) -> Result<bool> {
@@ -72,13 +139,20 @@ impl Ticket {
         matches!(*self.progress.borrow(), Progress::Failed(_, Some(_)))
     }
     pub fn retained_heap_bytes(&self, workspace_manifest: Option<&Arc<Manifest>>) -> (u64, u64) {
-        let Progress::Failed(_, Some(inventory)) = &*self.progress.borrow() else {
-            return (0, 0);
+        let progress = self.progress.borrow();
+        let inventory = match &*progress {
+            Progress::Failed(_, Some(inventory))
+            | Progress::Files(inventory)
+            | Progress::Ready(inventory, _) => inventory,
+            _ => return (0, 0),
         };
-        if workspace_manifest.is_some_and(|manifest| Arc::ptr_eq(manifest, &inventory.manifest)) {
-            return (0, 0);
-        }
-        let bytes = inventory.retained_heap_bytes();
+        let bytes = if workspace_manifest
+            .is_some_and(|manifest| Arc::ptr_eq(manifest, &inventory.manifest))
+        {
+            0
+        } else {
+            inventory.retained_heap_bytes()
+        } + inventory.summary_heap_bytes();
         let pinned = if Arc::strong_count(inventory) > 1 {
             bytes
         } else {
@@ -250,8 +324,9 @@ impl App {
                 assets: None,
                 cancel: &cancel,
             };
+            let raw = matches!(request, super::Request::View(_, crate::navigation::Mode::Raw));
             let assets_pending =
-                !matches!(request, super::Request::View(_, crate::navigation::Mode::Raw))
+                !raw
                 && !indexes::source_only(&request, query.as_ref()) && indexes::has_unity(manifest);
             let mut text = match request {
                 super::Request::History(_) => unreachable!("history bypasses snapshot preparation"),
@@ -268,10 +343,8 @@ impl App {
             if assets_pending {
                 result.structured_content = Some(serde_json::json!({"complete": false}));
             }
-            if let Some((identity, branch, revision, tracked)) = &inventory.context {
-                crate::summary::Summary::build(
-                    identity, branch, revision, *tracked, &root, manifest,
-                )
+            if !raw && let Some(context) = &inventory.context {
+                inventory.summary(context, &root, manifest, manifest, &[])
                 .attach(&mut result);
             }
             app.record_usage(&usage.0, usage.1.as_deref(), manifest);
@@ -462,6 +535,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     ),
                     watch: prepared.watch.clone(),
                     heap_bytes: std::sync::OnceLock::new(),
+                    summaries: Mutex::new(Vec::new()),
                 })));
                 let queued = std::time::Instant::now();
                 let manifest = state.as_ref().unwrap().manifest.clone();
@@ -522,6 +596,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     branch_state.as_ref().and_then(|s| s.as_ref()),
                 ),
                 heap_bytes: std::sync::OnceLock::new(),
+                summaries: Mutex::new(Vec::new()),
             });
             let generation = preparing_branch
                 .as_ref()
@@ -544,7 +619,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
                     let branch = branch.clone();
                     tokio::task::spawn_blocking(move || {
-                        branch.persist(gate.as_ref().unwrap())
+                        branch.persist_header(gate.as_ref().unwrap())
                     }).await??;
                 }
             }
@@ -602,6 +677,7 @@ mod tests {
             context: None,
             watch: monitor.snapshot(&Default::default(), 0),
             heap_bytes: std::sync::OnceLock::new(),
+            summaries: Mutex::new(Vec::new()),
         });
         let (_send, progress) = watch::channel(Progress::Failed(
             Arc::new(anyhow::anyhow!("indexing failed")),

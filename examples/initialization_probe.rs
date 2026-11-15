@@ -142,6 +142,7 @@ async fn run(options: Options) -> Result<()> {
         "Benchmark directory must be empty"
     );
     let cache = options.directory.canonicalize()?;
+    sigla::cache::reset::prepare(&cache)?;
     let roots: Vec<_> = (0..options.workspaces)
         .map(|index| cache.join(format!("view{index}")))
         .collect();
@@ -182,6 +183,33 @@ async fn run(options: Options) -> Result<()> {
     }
     let attach = attach.elapsed().as_secs_f64();
     let warm = query(&service, &roots[0]).await?;
+    for (name, text) in [
+        ("exact path", "text:value path:src/item0.rs"),
+        ("directory path", "text:value path:src/"),
+    ] {
+        service.search(roots[0].to_str().unwrap(), text).await?;
+        let start = Instant::now();
+        for _ in 0..10 {
+            service.search(roots[0].to_str().unwrap(), text).await?;
+        }
+        eprintln!(
+            "warm {name}: {:.3} ms/query",
+            start.elapsed().as_secs_f64() * 100.0
+        );
+    }
+    service
+        .view(roots[0].to_str().unwrap(), "src/item0.rs", "raw")
+        .await?;
+    let start = Instant::now();
+    for _ in 0..10 {
+        service
+            .view(roots[0].to_str().unwrap(), "src/item0.rs", "raw")
+            .await?;
+    }
+    eprintln!(
+        "warm raw view: {:.3} ms/query",
+        start.elapsed().as_secs_f64() * 100.0
+    );
     service.shutdown().await;
     drop(service);
     let restarting = Instant::now();

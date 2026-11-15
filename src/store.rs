@@ -1,5 +1,4 @@
 //! Workspace views over shared immutable analysis. See store/shared.rs for ownership.
-pub(crate) mod compatibility;
 mod data;
 pub(crate) mod format;
 pub(crate) mod payload;
@@ -22,49 +21,49 @@ pub(crate) use payload::DeclarationLookup;
 pub use payload::{ANALYSIS_VERSION, canonical_defines, metadata_id, source_id};
 pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-const MANIFEST_PREFIX: &[u8] = b"sigla-manifest-4\0";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ManifestRecord<'a> {
-    version: &'a str,
     group: Option<crate::native::Group>,
     policy: [u8; 32],
     data: &'a [u8],
 }
 
-fn manifest_payload(bytes: &[u8]) -> Result<Option<&[u8]>> {
-    if let Some(bytes) = bytes.strip_prefix(MANIFEST_PREFIX) {
-        let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
-        return Ok((record.version == env!("SIGLA_WORKSPACE_FINGERPRINT")).then_some(record.data));
-    }
-    Ok(compatibility::legacy_workspace()
-        .then(|| bytes.strip_prefix(b"sigla-manifest-3\0"))
-        .flatten())
-}
-
-fn replaced_manifest(bytes: &[u8], manifest: &crate::workspace::Manifest) -> Result<bool> {
-    if let Some(bytes) = bytes.strip_prefix(MANIFEST_PREFIX) {
-        let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
-        return Ok(record.group == manifest.source_group
-            && (record.policy == manifest.discovery_policy
-                || record.version != env!("SIGLA_WORKSPACE_FINGERPRINT")));
-    }
-    Ok(inspect_manifest(bytes)?.is_some_and(|previous| {
-        previous.source_group == manifest.source_group
-            && previous.discovery_policy == manifest.discovery_policy
-    }))
-}
-
-pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<Option<crate::workspace::Manifest>> {
-    manifest_payload(bytes)?
-        .map(|bytes| Ok(postcard::from_bytes(bytes)?))
-        .transpose()
+#[cfg(test)]
+pub(crate) fn inspect_manifest(bytes: &[u8]) -> Result<crate::workspace::Manifest> {
+    let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
+    Ok(postcard::from_bytes(record.data)?)
 }
 
 pub use data::FileData;
 
 pub struct Store {
     pub scope: shared::Scope,
+}
+
+pub(crate) enum DependencyInventory {
+    SourceGroup,
+    Primary(Box<crate::workspace::Manifest>),
+    Unavailable,
+}
+
+pub(crate) fn inspect_dependencies(
+    phase: shared::Phase,
+    bytes: Option<&[u8]>,
+) -> Result<DependencyInventory> {
+    let Some(bytes) = bytes else {
+        return Ok(DependencyInventory::Unavailable);
+    };
+    let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
+    if record.group.is_some() {
+        Ok(DependencyInventory::SourceGroup)
+    } else if phase == shared::Phase::Clean {
+        Ok(DependencyInventory::Primary(Box::new(
+            postcard::from_bytes(record.data)?,
+        )))
+    } else {
+        Ok(DependencyInventory::Unavailable)
+    }
 }
 
 // Existing bounded cross-workspace decode cache, not another unbounded FileData cache.
@@ -152,40 +151,39 @@ impl Store {
         self.scope.clean()
     }
     pub fn get_manifest<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
-        let bytes =
-            match self.scope.manifest()? {
-                Some(bytes) => Some(bytes),
-                None => self.scope.previous_manifest(|bytes| {
-                    Ok(inspect_manifest(bytes)?
-                        .is_some_and(|manifest| manifest.source_group.is_none()))
-                })?,
-            };
+        let bytes = self.scope.manifest()?;
         let Some(bytes) = bytes else {
             return Ok(None);
         };
-        manifest_payload(&bytes)?
-            .map(|bytes| Ok(postcard::from_bytes(bytes)?))
-            .transpose()
+        let record: ManifestRecord<'_> = postcard::from_bytes(&bytes)?;
+        Ok(Some(postcard::from_bytes(record.data)?))
+    }
+    pub(crate) fn dependency_inventory(&self) -> Result<DependencyInventory> {
+        self.scope.inspect_manifest(inspect_dependencies)
     }
     /// Reconcile against persisted bindings, not only the previous in-memory manifest.
     pub fn save_manifest(&self, manifest: &crate::workspace::Manifest) -> Result<()> {
         let keep = manifest.files.keys().cloned().collect();
-        let mut bytes = MANIFEST_PREFIX.to_vec();
         let data = postcard::to_allocvec(manifest)?;
-        postcard::to_io(
-            &ManifestRecord {
-                version: env!("SIGLA_WORKSPACE_FINGERPRINT"),
-                group: manifest.source_group,
-                policy: manifest.discovery_policy,
-                data: &data,
-            },
-            &mut bytes,
-        )?;
+        let bytes = postcard::to_allocvec(&ManifestRecord {
+            group: manifest.source_group,
+            policy: manifest.discovery_policy,
+            data: &data,
+        })?;
         self.scope.finish_refresh(&bytes, &keep, now())?;
-        // Incompatible layouts cannot serve another discovery policy in
-        // this process. Retire them once this source group has a replacement.
-        self.scope
-            .retire_previous(|bytes| replaced_manifest(bytes, manifest))
+        // Retire replaced scopes without affecting other discovery policies.
+        let groups: BTreeSet<_> = manifest
+            .deferred
+            .values()
+            .filter_map(|file| crate::native::Group::of(file.language))
+            .collect();
+        self.scope.retire_matching(|id, bytes| {
+            let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
+            Ok(record.policy == manifest.discovery_policy
+                && (id < self.scope.id && record.group == manifest.source_group
+                    || manifest.source_group.is_none()
+                        && record.group.is_some_and(|group| !groups.contains(&group))))
+        })
     }
     pub fn remove(&self, file: &str) -> Result<()> {
         self.scope.detach(file, now())
@@ -197,10 +195,7 @@ impl Store {
     ) -> Result<Option<Vec<ModuleFile>>> {
         let tx = self.read()?;
         let revision = postcard::to_allocvec(revision)?;
-        let binding = match self.scope.binding(&tx, file)? {
-            Some(binding) => Some(binding),
-            None => self.scope.previous_binding(&tx, file, &revision)?,
-        };
+        let binding = self.scope.binding(&tx, file)?;
         let Some(binding) = binding else {
             return Ok(None);
         };

@@ -1317,11 +1317,9 @@ mod tests {
                 fs::read(upstream_path.join("Renamed.cs")).unwrap()
             );
             super::super::files::prune(root.path(), root.path()).unwrap();
-            let aliases: serde_json::Value =
-                serde_json::from_slice(&fs::read(root.path().join("files.json")).unwrap()).unwrap();
-            assert!(aliases["entries"].as_object().unwrap().is_empty());
+            assert!(super::super::files::read(root.path()).is_empty());
 
-            fs::write(root.path().join("files.json"), "incomplete publication").unwrap();
+            fs::write(root.path().join("files.bin"), "incomplete publication").unwrap();
             request.staging = root.path().join("after-corruption");
             prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
             assert_eq!(
@@ -1748,7 +1746,7 @@ mod tests {
             );
         }
         let saved: Prepared =
-            serde_json::from_slice(&serde_json::to_vec(&sources).unwrap()).unwrap();
+            crate::binary::decode(&crate::binary::encode(&sources).unwrap()).unwrap();
         assert_eq!(saved.deferred_assets, sources.deferred_assets);
         request.previous = sources.selected.clone();
         request.transfer_used = sources.transfer_bytes;
@@ -1811,13 +1809,15 @@ mod tests {
         request.repository = "https://github.com/fixture/repo".into();
         fs::create_dir_all(&request.store).unwrap();
         // The inventory supplies the size, so the fixture needs no giant payload.
-        fs::write(
-            request.store.join(format!("github-tree-{revision}.json")),
-            serde_json::to_vec(&serde_json::json!({"version":1,"sizes":{
-                "Code.cs": fs::metadata(upstream_path.join("Code.cs")).unwrap().len(),
-                "Large.asset": super::super::selection::ASSET_LIMIT + 1
-            }}))
-            .unwrap(),
+        crate::cache::records::write(
+            &request.store.join(format!("github-tree-{revision}.bin")),
+            &(BTreeMap::from([
+                (
+                    "Code.cs",
+                    fs::metadata(upstream_path.join("Code.cs")).unwrap().len(),
+                ),
+                ("Large.asset", super::super::selection::ASSET_LIMIT + 1),
+            ]),),
         )
         .unwrap();
         request.contents = Contents::Inventory;

@@ -1,4 +1,5 @@
 use super::*;
+use std::ops::Bound::Unbounded;
 use std::sync::{
     Barrier,
     atomic::{AtomicUsize, Ordering},
@@ -377,20 +378,14 @@ fn deleting_namespace_resumes_and_never_reuses_numeric_id() {
 }
 
 #[test]
-fn legacy_retirement_and_replacement_survive_restart_between_batches() {
+fn retirement_and_replacement_survive_restart_between_batches() {
     let dir = tempfile::tempdir().unwrap();
     let (old_id, new_id) = {
         let db = Database::open(dir.path()).unwrap();
         let old = scope(&db, 1);
         put(&old, "one", 1, 7, "Shared");
         put(&old, "two", 1, 7, "Shared");
-        let mut tx = db.write().unwrap();
-        let mut info = old.info(&tx).unwrap();
-        info.phase = Phase::Deleting;
-        db.spaces
-            .put(&mut tx, &[1; 32], &encode(&info).unwrap())
-            .unwrap();
-        tx.commit().unwrap();
+        old.mark_deleting().unwrap();
         let new = scope(&db, 1);
         put(&new, "replacement", 1, 7, "Shared");
         clean(&new, &["replacement"]);
@@ -605,7 +600,7 @@ fn input_aliases_follow_shared_object_lifetime() {
 }
 
 #[test]
-fn replacing_a_workspace_retires_only_its_previous_source_group() {
+fn publication_retires_replaced_and_empty_groups_but_preserves_other_policies() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     let root = Path::new("/same-workspace");
@@ -626,6 +621,12 @@ fn replacing_a_workspace_retires_only_its_previous_source_group() {
             ..manifest.clone()
         })
         .unwrap();
+    // A group scope may have been created after the primary scope.
+    old.save_manifest(&manifest).unwrap();
+    assert_eq!(
+        native.scope.info(&native.read().unwrap()).unwrap().phase,
+        Phase::Deleting
+    );
     let other_policy = open(3);
     other_policy
         .save_manifest(&crate::workspace::Manifest {
@@ -639,39 +640,57 @@ fn replacing_a_workspace_retires_only_its_previous_source_group() {
         old.scope.info(&old.read().unwrap()).unwrap().phase,
         Phase::Deleting
     );
-    assert!(native.scope.query_read().is_ok());
     assert!(other_policy.scope.query_read().is_ok());
     assert!(replacement.scope.query_read().is_ok());
     assert!(snapshot.scope.query_read().is_ok());
 }
 
 #[test]
-fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
+fn dependency_scan_skips_group_payloads_even_during_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let store = crate::store::Store {
+        scope: scope(&db, 1),
+    };
+    let bytes = postcard::to_allocvec(&crate::store::ManifestRecord {
+        group: Some(crate::native::Group::Native),
+        policy: [0; 32],
+        data: b"opaque group payload",
+    })
+    .unwrap();
+    store
+        .scope
+        .finish_refresh(&bytes, &BTreeSet::new(), 100)
+        .unwrap();
+    assert!(matches!(
+        store.dependency_inventory().unwrap(),
+        crate::store::DependencyInventory::SourceGroup
+    ));
+    store.begin_refresh().unwrap();
+    assert!(matches!(
+        store.dependency_inventory().unwrap(),
+        crate::store::DependencyInventory::SourceGroup
+    ));
+}
+
+#[test]
+fn replacement_uses_manifest_header_without_decoding_payload() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     let root = Path::new("/workspace");
     let old = crate::store::Store {
         scope: db.workspace([1; 32], root, None).unwrap(),
     };
-    let mut bytes = crate::store::MANIFEST_PREFIX.to_vec();
-    postcard::to_io(
-        &crate::store::ManifestRecord {
-            version: "previous-discovery-layout",
-            group: None,
-            policy: [9; 32],
-            data: b"opaque old manifest",
-        },
-        &mut bytes,
-    )
+    let bytes = postcard::to_allocvec(&crate::store::ManifestRecord {
+        group: None,
+        policy: [0; 32],
+        data: b"opaque manifest",
+    })
     .unwrap();
     old.scope
         .finish_refresh(&bytes, &BTreeSet::new(), 100)
         .unwrap();
-    assert!(
-        old.get_manifest::<crate::workspace::Manifest>()
-            .unwrap()
-            .is_none()
-    );
+    assert!(old.get_manifest::<crate::workspace::Manifest>().is_err());
     let replacement = crate::store::Store {
         scope: db.workspace([2; 32], root, None).unwrap(),
     };
@@ -691,16 +710,11 @@ fn unknown_manifest_layout_can_be_replaced_without_decoding_it() {
 }
 
 #[test]
-fn current_v3_keeps_object_ids_and_rejects_unknown_formats() {
-    let version = crate::store::ANALYSIS_VERSION;
+fn reopening_preserves_objects_and_reuses_them_in_new_scopes() {
     let source = "class Kept {}";
     let language = crate::model::Language::CSharp;
     let id = crate::store::source_id(source, language, &[], "").unwrap();
-    for (format, keep) in [
-        (format!("sigla-shared-3:{version}"), true),
-        (format!("sigla-shared-3:{version}-unknown"), false),
-        (format!("{version}-unknown"), false),
-    ] {
+    {
         let dir = tempfile::tempdir().unwrap();
         {
             let db = Database::open(dir.path()).unwrap();
@@ -715,24 +729,13 @@ fn current_v3_keeps_object_ids_and_rejects_unknown_formats() {
             )
             .unwrap();
             clean(&old, &["file"]);
-            let mut tx = db.env.write_txn().unwrap();
-            db.control
-                .put(&mut tx, b"format", format.as_bytes())
-                .unwrap();
-            tx.commit().unwrap();
         }
         let db = Database::open(dir.path()).unwrap();
         let tx = db.env.read_txn().unwrap();
-        assert_eq!(db.control.get(&tx, b"format").unwrap(), Some(FORMAT));
-        assert!(db.control.get(&tx, b"legacy-until").unwrap().is_none());
-        assert_eq!(db.object_count(&tx).unwrap(), u64::from(keep));
-        assert_eq!(
-            db.record(&tx, &id, &[1]).unwrap(),
-            keep.then_some(b"body".as_slice())
-        );
+        assert_eq!(db.object_count(&tx).unwrap(), 1);
+        assert_eq!(db.record(&tx, &id, &[1]).unwrap(), Some(b"body".as_slice()));
         drop(tx);
-        assert_eq!(db.existing([1; 32]).unwrap().is_some(), keep);
-        if keep {
+        {
             let old = db.existing([1; 32]).unwrap().unwrap();
             let tx = old.query_read().unwrap();
             assert_eq!(old.binding(&tx, "file").unwrap().unwrap().object, id);
@@ -741,7 +744,6 @@ fn current_v3_keeps_object_ids_and_rejects_unknown_formats() {
                 .workspace([2; 32], Path::new("/workspace/1"), None)
                 .unwrap();
             let tx = fresh.read().unwrap();
-            assert!(fresh.previous_binding(&tx, "file", &[1]).unwrap().is_none());
             assert!(
                 fresh
                     .candidates(&tx, "Kept", false, true, |_| false)
@@ -756,91 +758,6 @@ fn current_v3_keeps_object_ids_and_rejects_unknown_formats() {
             assert!(results[0].unwrap().reused);
         }
     }
-}
-
-#[test]
-fn legacy_layout_objects_upgrade_on_use_and_retire_independently() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let db = Database::open(dir.path()).unwrap();
-        let old = scope(&db, 1);
-        put(&old, "file", 1, 7, "Shared");
-        clean(&old, &["file"]);
-        let mut tx = db.env.write_txn().unwrap();
-        let live = db.live(&tx, &[7; 32]).unwrap().unwrap();
-        db.objects
-            .put(
-                &mut tx,
-                &[7; 32],
-                &encode(&LegacyLiveness {
-                    bindings: live.bindings,
-                    unused_since: live.unused_since,
-                    encoded_bytes: live.encoded_bytes,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        db.records
-            .delete(&mut tx, &record_key(&[7; 32], POSTING_NAMES))
-            .unwrap();
-        for table in [db.declarations, db.occurrences, db.globals] {
-            table.clear(&mut tx).unwrap();
-        }
-        db.members.clear(&mut tx).unwrap();
-        db.legacy_postings[0]
-            .put(&mut tx, &scope_key(old.id, b"Shared"), "file")
-            .unwrap();
-        db.control
-            .put(
-                &mut tx,
-                b"format",
-                crate::store::ANALYSIS_VERSION.as_bytes(),
-            )
-            .unwrap();
-        tx.commit().unwrap();
-    }
-    {
-        let db = Database::open(dir.path()).unwrap();
-        let new = db
-            .workspace([2; 32], Path::new("/workspace/1"), None)
-            .unwrap();
-        let old = db.existing([1; 32]).unwrap().unwrap();
-        let tx = new.read().unwrap();
-        let binding = old.binding(&tx, "file").unwrap().unwrap();
-        assert_eq!(
-            new.previous_binding(&tx, "file", &[1]).unwrap(),
-            crate::store::compatibility::legacy_workspace().then_some(binding.clone())
-        );
-        assert_eq!(
-            db.live(&tx, &binding.object).unwrap().unwrap().ordinal,
-            UNINDEXED
-        );
-        drop(tx);
-        let pending = new
-            .prepare_install("file", vec![1], binding.object, 100, || {
-                panic!("Compatible facts must be reused")
-            })
-            .unwrap();
-        assert!(
-            new.install_batch(&[pending], |_| Ok(())).unwrap()[0]
-                .unwrap()
-                .reused
-        );
-        clean(&new, &["file"]);
-    }
-    let db = Database::open(dir.path()).unwrap();
-    let old = db.existing([1; 32]).unwrap().unwrap();
-    old.mark_deleting().unwrap();
-    while !old.delete_batch(100, 1).unwrap() {}
-    db.collect_unused(100, true).unwrap();
-    let new = db.existing([2; 32]).unwrap().unwrap();
-    let tx = new.query_read().unwrap();
-    assert_eq!(
-        new.candidates(&tx, "Shared", false, true, |_| false)
-            .unwrap(),
-        BTreeSet::from(["file".into()])
-    );
-    assert_eq!(db.binding_count(&tx, &[7; 32]).unwrap(), Some(1));
 }
 
 #[test]
@@ -1193,38 +1110,6 @@ fn collection_visits_only_expired_unused_objects_and_preserves_resurrection() {
         a.record(&tx, "resurrected", &[1]).unwrap(),
         Some([3].as_slice())
     );
-}
-
-#[test]
-fn unused_index_upgrade_resumes_after_reopening() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let db = Database::open(dir.path()).unwrap();
-        let a = scope(&db, 1);
-        for id in 1..=4 {
-            put(&a, &format!("f{id}"), 1, id, "Name");
-            if id != 3 {
-                a.detach(&format!("f{id}"), 100).unwrap();
-            }
-        }
-        // Model the old database format, then interrupt its upgrade after one batch.
-        let mut tx = db.env.write_txn().unwrap();
-        {
-            let mut unused = db.control.prefix_iter_mut(&mut tx, UNUSED).unwrap();
-            while unused.next().transpose().unwrap().is_some() {
-                unsafe { unused.del_current().unwrap() };
-            }
-        }
-        db.control.delete(&mut tx, b"unused-index-ready").unwrap();
-        tx.commit().unwrap();
-        assert!(!db.index_unused_batch(2).unwrap());
-    }
-    let db = Database::open(dir.path()).unwrap();
-    db.collect_unused(100, true).unwrap();
-    let a = scope(&db, 1);
-    let tx = a.read().unwrap();
-    assert_eq!(db.object_count(&tx).unwrap(), 1);
-    assert_eq!(a.record(&tx, "f3", &[1]).unwrap(), Some([3].as_slice()));
 }
 
 #[test]

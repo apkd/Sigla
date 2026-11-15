@@ -23,7 +23,7 @@ impl App {
         }
     }
     pub(super) fn save_cache_configuration(&self) -> Result<()> {
-        crate::repository::manager::write_json(
+        crate::cache::records::write(
             &self.cache.join(inspect::CONFIG),
             &self.cache_configuration(),
         )

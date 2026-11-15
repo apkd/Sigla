@@ -13,7 +13,7 @@ use std::{
 };
 
 pub(crate) const SOCKET: &str = "inspect.sock";
-pub(crate) const CONFIG: &str = "cache-policy.json";
+pub(crate) const CONFIG: &str = "cache-policy.bin";
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Configuration {
@@ -124,16 +124,12 @@ impl Analysis {
             if info.phase == crate::store::shared::Phase::Deleting {
                 return Ok(());
             }
-            if let Some(manifest) = bytes
-                .map(crate::store::inspect_manifest)
-                .transpose()?
-                .flatten()
-            {
-                if manifest.source_group.is_none() {
+            match crate::store::inspect_dependencies(info.phase, bytes)? {
+                crate::store::DependencyInventory::Primary(manifest) => {
                     owners.observe(&info.entry, info.owner.as_deref(), &manifest, None);
                 }
-            } else {
-                unknown.push(info.entry.clone());
+                crate::store::DependencyInventory::Unavailable => unknown.push(info.entry.clone()),
+                crate::store::DependencyInventory::SourceGroup => (),
             }
             Ok(())
         })?;
@@ -435,9 +431,13 @@ pub async fn inspect(cache: &Path, overrides: Overrides) -> Result<Report> {
         .context("Cache directory does not exist")?;
     let ownership = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(cache.join("ownership.lock"))
         .context("No Sigla cache ownership file found")?;
+    ensure!(
+        ownership.metadata()?.is_file(),
+        "Cache ownership lock must be a regular file"
+    );
     match ownership.try_lock() {
         Ok(()) => (),
         Err(fs::TryLockError::WouldBlock) => {
@@ -457,10 +457,11 @@ pub async fn inspect(cache: &Path, overrides: Overrides) -> Result<Report> {
     }
     tokio::task::spawn_blocking(move || {
         let _ownership = super::Ownership(ownership);
-        let config = match fs::read(cache.join(CONFIG)) {
-            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+        ensure!(super::reset::current(&cache)?, "Cache format is out of date; start the service to rebuild the cache");
+        let config = match super::records::read(&cache.join(CONFIG), 16 * 1024 * 1024) {
+            Ok(config) => Some(config),
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => None,
+            Err(error) => return Err(error),
         };
         let unknown = config.is_none();
         let mut owners = Catalog::open(&cache)?;
@@ -610,6 +611,64 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_inspection_reads_binary_policy_without_rewriting() {
+        let cache = tempfile::tempdir().unwrap();
+        fs::write(cache.path().join("ownership.lock"), []).unwrap();
+        super::super::reset::prepare(cache.path()).unwrap();
+        let configuration = Configuration {
+            limits: Limits {
+                max_bytes: 3_000_000_000,
+                headroom_percent: 12,
+            },
+            repositories: Some(crate::repository::retention::Policy {
+                rules: vec![
+                    crate::repository::Rule::parse_private("https://github.com/fixture/repo")
+                        .unwrap(),
+                ],
+                repo_ttl: std::time::Duration::from_secs(100),
+                branch_ttl: std::time::Duration::from_secs(50),
+                selection_identity: "selection".into(),
+            }),
+            editors: ["2022.3.0f1".into()].into_iter().collect(),
+        };
+        let path = cache.path().join(CONFIG);
+        super::super::records::write(&path, &configuration).unwrap();
+        let before = fs::read(&path).unwrap();
+        let report = inspect(cache.path(), Overrides::default()).await.unwrap();
+        assert_eq!(report.limits.max_bytes, configuration.limits.max_bytes);
+        assert_eq!(
+            report.limits.headroom_percent,
+            configuration.limits.headroom_percent
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn idle_inspection_rejects_outdated_cache_without_changing_it() {
+        for marker in [None, Some(b"previous".as_slice())] {
+            let cache = tempfile::tempdir().unwrap();
+            fs::write(cache.path().join("ownership.lock"), b"lock").unwrap();
+            let data = cache.path().join("old-state.json");
+            fs::write(&data, b"keep").unwrap();
+            let marker_path = cache.path().join("cache-fingerprint");
+            if let Some(marker) = marker {
+                fs::write(&marker_path, marker).unwrap();
+            }
+            let error = inspect(cache.path(), Overrides::default())
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("start the service"));
+            assert_eq!(fs::read(&data).unwrap(), b"keep");
+            assert_eq!(
+                fs::read(cache.path().join("ownership.lock")).unwrap(),
+                b"lock"
+            );
+            assert_eq!(fs::read(&marker_path).ok().as_deref(), marker);
+        }
+    }
     #[test]
     fn physical_accounting_counts_hardlinks_once_and_excludes_the_blob_anchor_from_savings() {
         let cache = tempfile::tempdir().unwrap();

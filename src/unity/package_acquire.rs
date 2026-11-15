@@ -1,4 +1,4 @@
-use crate::{acquisition, repository::manager::write_json};
+use crate::{acquisition, cache::records};
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use serde::Deserialize;
@@ -65,12 +65,9 @@ fn check(root: &Path, name: &str, version: Option<&str>) -> Result<()> {
 
 pub fn complete(root: &Path, identity: &str) -> bool {
     let read = || -> Result<bool> {
-        let (format, saved): (u32, String) =
-            serde_json::from_slice(&fs::read(root.join("identity.json"))?)?;
-        let inventory: Vec<String> =
-            serde_json::from_slice(&fs::read(root.join("inventory.json"))?)?;
-        Ok(format == 2
-            && saved == identity
+        let saved: String = records::read(&root.join("identity.bin"), 1024 * 1024)?;
+        let inventory: Vec<String> = records::read(&root.join("inventory.bin"), 256 * 1024 * 1024)?;
+        Ok(saved == identity
             && inventory
                 .iter()
                 .all(|p| root.join("contents").join(p).is_file()))
@@ -115,8 +112,8 @@ fn unpack(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     fs::rename(package, &contents)?;
-    write_json(&cache.join("inventory.json"), &inventory)?;
-    write_json(&cache.join("identity.json"), &(2, identity))?;
+    records::write(&cache.join("inventory.bin"), &inventory)?;
+    records::write(&cache.join("identity.bin"), &identity)?;
     Ok(contents)
 }
 
@@ -252,8 +249,14 @@ impl GitSource {
         }
         let repository = crate::repository::Repository::parse(address)?
             .context("Git package requires a supported repository URL")?;
-        let identity =
-            serde_json::to_string(&("git", &repository.identity, commit, &subdirectory))?;
+        let identity = blake3::hash(&crate::binary::encode(&(
+            "git",
+            &repository.identity,
+            commit,
+            &subdirectory,
+        ))?)
+        .to_hex()
+        .to_string();
         Ok(Self {
             repository,
             commit: commit.to_owned(),
@@ -340,9 +343,51 @@ impl GitSource {
                 fs::remove_dir_all(&contents)?;
             }
             fs::rename(package, &contents)?;
-            write_json(&root.join("inventory.json"), &inventory)?;
-            write_json(&root.join("identity.json"), &(2, &self.identity))?;
+            records::write(&root.join("inventory.bin"), &inventory)?;
+            records::write(&root.join("identity.bin"), &self.identity)?;
             Ok(contents)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_package_uses_binary_identity_and_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("contents")).unwrap();
+        fs::write(root.path().join("contents/source.cs"), b"class C {} ").unwrap();
+        let identity = "locked-package";
+        let inventory = vec!["source.cs".to_string()];
+        let identity_path = root.path().join("identity.bin");
+        let inventory_path = root.path().join("inventory.bin");
+        records::write(&identity_path, &identity).unwrap();
+        records::write(&inventory_path, &inventory).unwrap();
+        assert!(complete(root.path(), identity));
+        assert!(!complete(root.path(), "different-package"));
+        fs::remove_file(root.path().join("contents/source.cs")).unwrap();
+        assert!(!complete(root.path(), identity));
+    }
+
+    #[test]
+    fn git_package_identity_tracks_commit_and_subdirectory() {
+        let first = "0123456789abcdef0123456789abcdef01234567";
+        let second = "fedcba9876543210fedcba9876543210fedcba98";
+        let source = |url, commit| GitSource::parse(url, commit).unwrap().identity;
+        let baseline = source("https://github.com/fixture/repo?path=Packages/A", first);
+        assert_eq!(
+            baseline,
+            source("git+https://github.com/fixture/repo?path=Packages/A", first)
+        );
+        assert_ne!(
+            baseline,
+            source("https://github.com/fixture/repo?path=Packages/B", first)
+        );
+        assert_ne!(
+            baseline,
+            source("https://github.com/fixture/repo?path=Packages/A", second)
+        );
     }
 }

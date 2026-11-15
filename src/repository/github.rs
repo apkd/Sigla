@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{BufWriter, Read, Write},
+    io::Read,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -25,7 +25,6 @@ struct Entry {
 }
 #[derive(Deserialize, Serialize)]
 struct Inventory {
-    version: u32,
     sizes: BTreeMap<String, u64>,
 }
 
@@ -37,11 +36,8 @@ pub fn sizes(
     if repository.identity.endpoint != Endpoint::Github {
         return Ok(None);
     }
-    let cache = store.join(format!("github-tree-{revision}.json"));
-    if let Ok(bytes) = std::fs::read(&cache)
-        && let Ok(saved) = serde_json::from_slice::<Inventory>(&bytes)
-        && saved.version == 1
-    {
+    let cache = store.join(format!("github-tree-{revision}.bin"));
+    if let Ok(saved) = crate::cache::records::read::<Inventory>(&cache, u64::MAX) {
         return Ok(Some(saved.sizes));
     }
     let repo = repository.identity.components.join("/");
@@ -84,13 +80,8 @@ pub fn sizes(
             .context("Invalid GitHub file inventory")
     };
     let sizes = inventory(revision, fetch)?;
-    let saved = Inventory { version: 1, sizes };
-    let mut file = tempfile::NamedTempFile::new_in(store)?;
-    let mut writer = BufWriter::new(&mut file);
-    serde_json::to_writer(&mut writer, &saved)?;
-    writer.flush()?;
-    drop(writer);
-    file.persist(cache)?;
+    let saved = Inventory { sizes };
+    crate::cache::records::write(&cache, &saved)?;
     Ok(Some(saved.sizes))
 }
 
@@ -336,6 +327,27 @@ fn insert(sizes: &mut BTreeMap<String, u64>, entry: Entry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_tree_sizes_are_available_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = Repository::parse("https://github.com/example/repo")
+            .unwrap()
+            .unwrap();
+        let revision = "fixture";
+        let expected = BTreeMap::from([("a.cs".to_owned(), 42), ("dir/b.cs".to_owned(), 81)]);
+        crate::cache::records::write(
+            &root.path().join(format!("github-tree-{revision}.bin")),
+            &Inventory {
+                sizes: expected.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sizes(&repository, revision, root.path()).unwrap(),
+            Some(expected)
+        );
+    }
 
     #[test]
     fn commit_api_returns_a_matching_full_identity_and_preserves_failures() {

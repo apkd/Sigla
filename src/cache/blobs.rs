@@ -432,28 +432,6 @@ impl Store {
         stats.publication += started.elapsed().saturating_sub(sync);
         Ok(())
     }
-    pub fn link_tree(&self, source: &Path, destination: &Path) -> Result<()> {
-        let _lease = self.lease()?;
-        fn visit(source: &Path, destination: &Path) -> Result<()> {
-            fs::create_dir_all(destination)?;
-            for entry in fs::read_dir(source)? {
-                let entry = entry?;
-                let target = destination.join(entry.file_name());
-                if entry.file_type()?.is_dir() {
-                    visit(&entry.path(), &target)?;
-                } else {
-                    ensure!(entry.file_type()?.is_file(), "Invalid immutable input");
-                    if !target.exists() {
-                        fs::hard_link(entry.path(), target)?;
-                    }
-                }
-            }
-            File::open(destination)?.sync_all()?;
-            Ok(())
-        }
-        visit(source, destination)
-    }
-
     fn inventory(
         root: &Path,
         files: &mut Vec<PathBuf>,
@@ -638,8 +616,15 @@ pub fn identity(path: &Path, metadata: &fs::Metadata) -> Result<Option<Id>> {
     Ok(None)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ALLOCATION_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Physical allocation, rather than the sum of each hardlinked view's apparent size.
 pub fn allocated(root: &Path) -> Result<u64> {
+    #[cfg(test)]
+    ALLOCATION_WALKS.update(|count| count + 1);
     fn visit(
         root: &Path,
         metadata: std::io::Result<fs::Metadata>,
@@ -701,6 +686,8 @@ pub(crate) fn allocated_with_owners(
     repository_roots: &BTreeMap<PathBuf, String>,
     owners: &[(PathBuf, Vec<PathBuf>)],
 ) -> Result<(AttributedAllocation, BTreeMap<PathBuf, u64>)> {
+    #[cfg(test)]
+    ALLOCATION_WALKS.update(|count| count + 1);
     const NONE: u32 = u32::MAX;
 
     struct Tags {

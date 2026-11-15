@@ -1,10 +1,9 @@
 //! Usage and dependency ownership. Only this small catalog is persisted separately.
-use super::policy::Usage;
+use super::{policy::Usage, records};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -39,11 +38,17 @@ pub(crate) struct Publication {
 }
 impl Catalog {
     pub fn open(cache: &Path) -> Result<Self> {
-        let path = cache.join("owners.json");
-        let entries = match fs::File::open(&path) {
-            Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(error) => return Err(error.into()),
+        let path = cache.join("owners.bin");
+        let entries = match records::read(&path, u64::MAX) {
+            Ok(entries) => entries,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                BTreeMap::new()
+            }
+            Err(error) => return Err(error),
         };
         Ok(Self {
             path,
@@ -60,7 +65,6 @@ impl Catalog {
         manifest: &crate::workspace::Manifest,
         used: Option<u64>,
     ) {
-        self.revision += 1;
         let cache = self.path.parent().unwrap();
         let mut dependencies: BTreeSet<_> = manifest
             .files
@@ -86,9 +90,14 @@ impl Catalog {
             ),
         );
         let repository = repository.map(Path::to_owned);
-        if self.entries.get(entry).is_none_or(|owner| {
+        let changed = self.entries.get(entry).is_none_or(|owner| {
             owner.repository != repository || owner.dependencies != dependencies
-        }) {
+        });
+        if !changed && used.is_none() {
+            return;
+        }
+        self.revision += 1;
+        if changed {
             self.dependency_revision += 1;
         }
         let owner = self
@@ -202,18 +211,10 @@ impl Catalog {
         Ok(())
     }
     pub(crate) fn stage(&self) -> Result<Option<Publication>> {
-        use std::io::Write;
         if !self.dirty {
             return Ok(None);
         }
-        fs::create_dir_all(self.path.parent().unwrap())?;
-        let mut file = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())?;
-        {
-            let mut output = std::io::BufWriter::new(file.as_file_mut());
-            serde_json::to_writer(&mut output, &self.entries)?;
-            output.flush()?;
-        }
-        file.as_file().sync_all()?;
+        let file = records::stage(&self.path, &self.entries)?;
         Ok(Some(Publication {
             revision: self.revision,
             file,
@@ -282,6 +283,8 @@ mod tests {
         catalog.publish(stale).unwrap();
         assert!(catalog.dirty);
         catalog.flush().unwrap();
+        catalog.observe(&entry, None, &manifest, None);
+        assert!(catalog.stage().unwrap().is_none());
         assert_eq!(
             Catalog::open(cache.path()).unwrap().entries[&entry]
                 .usage
@@ -353,7 +356,6 @@ mod tests {
             cache.path().join("dotnet-other/packages/ignored"),
         ]);
         let legacy = cache.path().join("dotnet/packages");
-        expected.insert(legacy.clone());
         for path in [legacy.clone(), legacy.join("package/source.cpp")] {
             manifest.dependencies.insert(path.clone());
             catalog.observe(&entry, None, &manifest, None);

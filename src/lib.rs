@@ -1,7 +1,6 @@
 mod acquisition;
 pub(crate) mod binary;
 pub mod cache;
-mod cache_migration;
 mod cancellation;
 pub mod config;
 pub mod csharp;

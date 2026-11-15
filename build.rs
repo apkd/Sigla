@@ -436,6 +436,7 @@ fn main() {
     let mut workspace = Sha256::new();
     let mut assets = Sha256::new();
     let mut asset_records = Sha256::new();
+    let mut cache_layout = Sha256::new();
     for file in files {
         println!("cargo:rerun-if-changed={}", file.display());
         let name = file.to_string_lossy();
@@ -516,6 +517,19 @@ fn main() {
                 hash.update(&bytes);
             }
         }
+        if name.starts_with("src/cache")
+            || name.starts_with("src/repository")
+            || name == "src/store.rs"
+            || name.starts_with("src/store/")
+            || matches!(
+                name.as_ref(),
+                "src/config.rs" | "src/msbuild.rs" | "src/service/inspection.rs"
+            )
+        {
+            cache_layout.update(name.as_bytes());
+            cache_layout.update([0]);
+            cache_layout.update(&bytes);
+        }
     }
     for file in [
         "managed/Program.cs",
@@ -525,224 +539,22 @@ fn main() {
     ] {
         workspace.update(fs::read(file).unwrap());
     }
-    // Each pair certifies equivalent output for one exact source snapshot.
-    // Unlisted source hashes keep their own identity and invalidate old caches.
-    // 2026-10-13: scope-stack extraction preserves Facts and FileSyntax bytes;
-    // prefix-scan oracle tests also cover recovery, top-level code and directives.
-    let analysis_aliases: &[(&str, &str)] = &[
-        // Move source-read tests after production items for strict Clippy.
-        (
-            "cb50ba5b1f240d9cf70acf196f7db10744a10196c9c1e2b11941d7e777b4c125",
-            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
-        ),
-        // Borrowed source reads leave the stored record format unchanged.
-        (
-            "2c6ce01e18f07e321ac8807bd11110b0c52a2dfd6cc71aab2be8c27f5d7a542f",
-            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
-        ),
-        // Whole-file history validation leaves stored extraction unchanged.
-        (
-            "ae37a2d983a2cc170033623fc6f124731e1f735b0841a80579790ac8c3a441d4",
-            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
-        ),
-        // Typed decoding slices and closure copies preserve extracted records.
-        (
-            "68a677db02c7f51ee2630749b7c9047c8d29df04cf118f32331b6cd30526b15d",
-            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
-        ),
-        // Shared stream cursors and bounded work retain valid extracted records.
-        (
-            "b7d333ec38a4b11155238613efb0d2c67cecae2f2a4401883b980eca13c677cd",
-            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
-        ),
-        // Stream decoding and fingerprint coverage leave extracted records unchanged.
-        (
-            "e0bf102146b0b5c5f0f48fe43ccd8f5f2b5ede0cb49d08a95b215a6c14523af3",
-            "91b922abc95d4695d28d85e606778da6a68880c799c219ad4029b9406da5720e",
-        ),
-        // Admission adds an existing executor dependency without changing records.
-        (
-            "10c610797834103c1b9d2b7377b57b5d8913e9f05e15e35deea5981fca8727eb",
-            "3e651c01b11bb7f42ac56fd730d4129e648006878e5b70c16e5b55b514281f28",
-        ),
-        (
-            "e96765a745ee254ff3a52072cfef53d3ae37d4418b1060000c473f5ac2a1c214",
-            "629b05383367eea33b4dc3d889476d1322538c00db095b6028d7581ec525b2e0",
-        ),
-    ];
-    // Planning reuses stamps only within a pass and retains fresh input fences.
-    // Batched environment reads preserve the hash; archive changes retain valid
-    // inputs and only alter publication or reject conflicting bundle paths.
-    // Transport packs retain the same logical artifacts, analysis and discovery
-    // inputs. Release placement and acquisition retries do not change the graph.
-    // Removing an unused search-result renderer does not change discovery.
-    let workspace_aliases: &[(&str, &str)] = &[
-        // Metadata usage tracking leaves archive contents and discovery unchanged.
-        (
-            "363af54187bdf4dd5213292b5c4545f3305b44fb12a23aaa065f8d604ffbb898",
-            "2ef6ad75638363b5d517f6fcdaa4b77e739eb288f07817abc41a32b8e081babf",
-        ),
-        // Streaming trusted metadata and owned imports preserve discovery inputs.
-        (
-            "938fce78445444dec3c2590f301570b2a4b8d53e0dc1c17335dda1debe24e97e",
-            "2ef6ad75638363b5d517f6fcdaa4b77e739eb288f07817abc41a32b8e081babf",
-        ),
-        // Test-module placement preserves discovery and record identities.
-        (
-            "edd8a473c52a6e2dd885f253f5969356f759c7566b00b684b49be44d12a35ac3",
-            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
-        ),
-        // Source text lookup does not change discovery or persisted records.
-        (
-            "c513520d3badb0131e4b6b80fee6f4e47900a9f72539c68df685d26fae709587",
-            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
-        ),
-        // Whole-file history validation does not participate in discovery.
-        (
-            "75a8e2548bf5c30cc2b034e20078e1c38f1968922f9695bef151f9ac7214b95b",
-            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
-        ),
-        // Decoder and record validation cleanup leaves discovery unchanged.
-        (
-            "255e16b919e7729aa63b0d63e1d548df185f1f638b3ea697a26aa5eede5d9243",
-            "70c5cc4ac529782cfe8fd9dc559070610499a687247dfe5cc1fc460d59679ca7",
-        ),
-        // Decoder safeguards retain the completed discovery graph.
-        (
-            "8706be81a0fe1c76713a24513b1f689911db713f90d97cc967417e7a4a7b7a54",
-            "a75d85f257ecf40eadc848a217961e1687abaebbc976ceaba0fa945ab515757e",
-        ),
-        // Rust module admission changes scheduling, not discovered graphs.
-        (
-            "983e4bb01e38b324e2bd510f818134043945885b72f2494da79d0ce8eb63c6ac",
-            "a75d85f257ecf40eadc848a217961e1687abaebbc976ceaba0fa945ab515757e",
-        ),
-        // Batching missing inputs changes retry count, not completed graphs.
-        (
-            "ba72b80198d72dd262e80ec34c9fdfdd37b3d514f302344a6a19111ea2fe87f4",
-            "5c379c23f178ba88af622b3fafa87083358ff8bd9b08827b6c5377849295bec7",
-        ),
-        // Separate acquisition limits preserve Git package inputs and graphs.
-        (
-            "db0f9ad05ec046aae589a229652f4104ce9b51ae4d4a5ac02275820df4f092ac",
-            "5c379c23f178ba88af622b3fafa87083358ff8bd9b08827b6c5377849295bec7",
-        ),
-        // Monitoring wraps metadata acquisition without changing its results.
-        (
-            "1eb8eea5c9250a83c1af0fafe95af48877fc8c78b9f9c7b14217249483853c96",
-            "41b545ea1eefd8fe8f203afb2cffb377ec9727fa9303d97e8e5f215836bd629a",
-        ),
-        (
-            "c817019d8f730eef42bb3f4ba0f3e544d0aef8f294914a96695dc89638822525",
-            "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
-        ),
-        (
-            "3d502949e13e2973211eccd01d18c70bc072c0723e14bd371cd6afd751b24210",
-            "441f5755af01b491e09beba20b3271ee63d640c3360af7722fc0110b4504e83a",
-        ),
-        (
-            "f68ff5a894c70cd60a7bc188b48e92e99cb043d6126bb2a2248f6b2a7a1667a3",
-            "41b545ea1eefd8fe8f203afb2cffb377ec9727fa9303d97e8e5f215836bd629a",
-        ),
-    ];
-    // The first alias covers equivalent C# extraction. The second covers
-    // query and memory changes: shared Arcs serialize as the same values,
-    // and loading discards unused destination paths from old null references.
-    let asset_aliases: &[(&str, &str)] = &[
-        // Job trimming and streaming generation hashes preserve asset snapshots.
-        (
-            "2d7e10b4d22fdf5b6d4601d3a4930111099a7b165996bb5bc298c0e39c1e16bf",
-            "ce2f855b02c5e33c1e2a7ab82ed6dd08b860a7b8d32d304cd25f380fbc44c367",
-        ),
-        // Test-module placement preserves asset data and dependencies.
-        (
-            "ec70086245ac65191f96bc784e2a51b8880e6fd3abc41a47f1c71d8d4ee4e47f",
-            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
-        ),
-        // Source text lookup does not change asset data or its dependencies.
-        (
-            "e148d84d34a889c7ba7dee3ab2383964f88b29bb2b8da4ba8bec65a285bbcd6d",
-            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
-        ),
-        // Whole-file history validation leaves Unity extraction unchanged.
-        (
-            "703eec02f425de99745600157fad3f87125c6550620a149e49610d368cf5a55e",
-            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
-        ),
-        // Decoder and record validation cleanup preserves asset data.
-        (
-            "ebcb5bb77cc53c8747b6f792fc3b2b74e3dab29541114a3c6939e4900700e895",
-            "983b0744503abab6eafe5c340af7b2bfbb9145041aeb9d822f00789598d4064a",
-        ),
-        // Cancellation, cache ownership and timings leave asset records unchanged.
-        (
-            "a7b3926522dd62496e60de4af1d4575dbeaa76b9fe5ac8fef467ebf58f90ba14",
-            "869730ab76207835787d55eae648d6a036e28062862726a67c18489c83f1b346",
-        ),
-        // Borrowed snapshot fields retain the owned format. Streaming reads and
-        // ticket pins preserve completed indexes; composition round trips agree.
-        (
-            "ea070f539d3d34bea3d1b3d95023417b863aa63969b20b6bef17a2571f091e6a",
-            "869730ab76207835787d55eae648d6a036e28062862726a67c18489c83f1b346",
-        ),
-        (
-            "1b03b0f8d0bb24005b1f0a05be3b608f82606ec512db83aaba97ec4cd8fa130b",
-            "145165ef7429e83ad739ef5d2fa1a944cd40f0f5ab500a66e444414329d5d777",
-        ),
-        (
-            "4e7023452dc7ffc227db9038c975cbe4dae139896728112ea470aedf3924b4b2",
-            "145165ef7429e83ad739ef5d2fa1a944cd40f0f5ab500a66e444414329d5d777",
-        ),
-        // Job telemetry and ticket metadata preserve asset records and publication.
-        (
-            "26a28624ba2bece70d061176d2d39dc606f13e622f677d9b30781ba4d079910f",
-            "5ad4f718fe48de00884cf4f3dbac59e18027bae0fbc56653e0e1d42c723b42e3",
-        ),
-        (
-            "21daf083db5802634df74c925bd21eae66fa116ae7308aa56092014bc6732de6",
-            "2bd548c115a34ba087131a20b944888147f6a6847f8334c13d29dabfe3595787",
-        ),
-        (
-            "333e9021e9eb5d33885b7d170ef38a10789a8bc119098451070885295013b1b3",
-            "5ad4f718fe48de00884cf4f3dbac59e18027bae0fbc56653e0e1d42c723b42e3",
-        ),
-    ];
-    // Content reads skip an unused summary decode; record writers and parsers
-    // are unchanged, so existing records retain their identities.
-    let asset_record_aliases: &[(&str, &str)] = &[
-        // Cancellable content reads retain existing parser and record output.
-        (
-            "7144951c56df962a843143a217233821922003ca9b4b32bf095e5fddc70954a6",
-            "e80e976471351cff9d66e10a7caf210cc8d87dfae64acb26493f128d189619d3",
-        ),
-        // Admission and streaming decode do not change record writers or parsing.
-        (
-            "9452a3c8a7a1c3cc5daf2e7d5e8a7694f06074199f0097edffcc0de0561ccb0a",
-            "e80e976471351cff9d66e10a7caf210cc8d87dfae64acb26493f128d189619d3",
-        ),
-        (
-            "a7d4ff626cdd6e550e6fe9f841794fc702e8224b08b1a630e9c743d908e57125",
-            "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",
-        ),
-        (
-            "2a314d4f98408707b51bcc64bb3fd0bb86c1dd8315db5a79a9768b799c589f82",
-            "7ea7722245f71bfaba49fbbbd82565b4addec86c63b81d19d10c2f9db7cacb76",
-        ),
-    ];
-    for (domain, hash, aliases) in [
-        ("ANALYSIS", analysis, analysis_aliases),
-        ("WORKSPACE", workspace, workspace_aliases),
-        ("ASSET", assets, asset_aliases),
-        ("ASSET_RECORD", asset_records, asset_record_aliases),
+    for (domain, hash) in [
+        ("ANALYSIS", analysis),
+        ("WORKSPACE", workspace),
+        ("ASSET", assets),
+        ("ASSET_RECORD", asset_records),
     ] {
         let source = format!("{:x}", hash.finalize());
-        let version = aliases
-            .iter()
-            .find_map(|(raw, canonical)| (*raw == source.as_str()).then_some(*canonical))
-            .unwrap_or(source.as_str());
+        cache_layout.update(domain.as_bytes());
+        cache_layout.update(source.as_bytes());
         println!("cargo:rustc-env=SIGLA_{domain}_SOURCE_FINGERPRINT={source}");
-        println!("cargo:rustc-env=SIGLA_{domain}_FINGERPRINT={version}");
+        println!("cargo:rustc-env=SIGLA_{domain}_FINGERPRINT={source}");
     }
+    println!(
+        "cargo:rustc-env=SIGLA_CACHE_FINGERPRINT={:x}",
+        cache_layout.finalize()
+    );
     for input in [
         "Cargo.toml",
         "Cargo.lock",

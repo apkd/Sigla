@@ -13,15 +13,12 @@ use heed::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    ops::Bound::{Excluded, Included, Unbounded},
+    ops::Bound::{Excluded, Included},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, LazyLock, Mutex, Weak},
 };
 
 pub type ObjectId = [u8; 32];
-pub(crate) const FORMAT: &[u8] =
-    concat!("sigla-shared-3:", env!("SIGLA_ANALYSIS_FINGERPRINT")).as_bytes();
-const UNINDEXED: u64 = u64::MAX;
 pub const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const BATCH: usize = 128;
 pub(crate) const PRESSURE_BATCH: usize = 4096;
@@ -59,15 +56,10 @@ pub(crate) struct PendingInstall {
     expected: Option<Binding>,
     encoded: Option<Arc<EncodedObject>>,
     input: Option<ObjectId>,
-    index: Option<(Names, Vec<u8>)>,
 }
 impl PendingInstall {
     pub(crate) fn bytes(&self) -> u64 {
         self.encoded.as_ref().map_or(0, |encoded| encoded.1)
-            + self
-                .index
-                .as_ref()
-                .map_or(0, |(_, names)| names.len() as u64)
     }
     pub(crate) fn input(mut self, input: Option<ObjectId>) -> Self {
         self.input = input;
@@ -94,23 +86,12 @@ struct Liveness {
     unused_since: Option<u64>,
     encoded_bytes: u64,
 }
-#[derive(Serialize, Deserialize)]
-struct LegacyLiveness {
-    bindings: u64,
-    unused_since: Option<u64>,
-    encoded_bytes: u64,
-}
 fn decode_live(bytes: &[u8]) -> Result<Liveness> {
-    if let Some(bytes) = bytes.strip_prefix(b"L2") {
-        return decode(bytes);
-    }
-    let old: LegacyLiveness = decode(bytes)?;
-    Ok(Liveness {
-        ordinal: UNINDEXED,
-        bindings: old.bindings,
-        unused_since: old.unused_since,
-        encoded_bytes: old.encoded_bytes,
-    })
+    decode(
+        bytes
+            .strip_prefix(b"L2")
+            .context("Unknown object liveness format")?,
+    )
 }
 fn encode_live(live: &Liveness) -> Result<Vec<u8>> {
     let mut bytes = b"L2".to_vec();
@@ -184,11 +165,6 @@ fn inspect_env(
     let control = env
         .open_database::<Bytes, Bytes>(&tx, Some("control"))?
         .context("Missing analysis control table")?;
-    let format = control.get(&tx, b"format")?;
-    ensure!(
-        format == Some(FORMAT) || format.is_some_and(super::compatibility::accepts),
-        "Unknown analysis format"
-    );
     let spaces = env
         .open_database::<Bytes, Bytes>(&tx, Some("workspaces"))?
         .context("Missing workspace table")?;
@@ -261,8 +237,6 @@ pub struct Database {
     occurrences: Table<Bytes, Bytes>,
     globals: Table<Bytes, Bytes>,
     members: Table<Bytes, Str>,
-    legacy_postings: [Table<Bytes, Str>; 3],
-    legacy_until: u64,
     objects: Table<Bytes, Bytes>,
     records: Table<Bytes, Bytes>,
     builds: Mutex<HashMap<ObjectId, Weak<Mutex<()>>>>,
@@ -309,7 +283,6 @@ pub struct Scope {
     pub id: u64,
     snapshot: Option<Arc<Snapshot>>,
     partitions: Arc<Mutex<Option<Partitions>>>,
-    previous: Vec<u64>,
 }
 type Partitions = (usize, Arc<BTreeSet<u64>>);
 
@@ -438,9 +411,6 @@ impl Database {
         }?;
         let mut tx = env.write_txn()?;
         let control: Table<Bytes, Bytes> = env.create_database(&mut tx, Some("control"))?;
-        let previous_format = control.get(&tx, b"format")?;
-        let compatible = previous_format.is_some_and(super::compatibility::accepts);
-        let obsolete = previous_format != Some(FORMAT) && !compatible;
         let spaces = env.create_database(&mut tx, Some("workspaces"))?;
         let bindings = env.create_database(&mut tx, Some("bindings"))?;
         let objects = env.create_database(&mut tx, Some("objects"))?;
@@ -469,48 +439,6 @@ impl Database {
             .name("members")
             .flags(DatabaseFlags::DUP_SORT)
             .create(&mut tx)?;
-        let mut legacy_postings = Vec::new();
-        for name in ["declarations", "occurrences", "global-import-files"] {
-            legacy_postings.push(
-                env.database_options()
-                    .types::<Bytes, Str>()
-                    .name(name)
-                    .flags(DatabaseFlags::DUP_SORT)
-                    .create(&mut tx)?,
-            );
-        }
-        let legacy_postings: [_; 3] = legacy_postings.try_into().ok().unwrap();
-        if obsolete {
-            control.clear(&mut tx)?;
-            spaces.clear(&mut tx)?;
-            bindings.clear(&mut tx)?;
-            objects.clear(&mut tx)?;
-            records.clear(&mut tx)?;
-            declarations.clear(&mut tx)?;
-            occurrences.clear(&mut tx)?;
-            globals.clear(&mut tx)?;
-            members.clear(&mut tx)?;
-            for table in legacy_postings {
-                table.clear(&mut tx)?;
-            }
-            control.put(&mut tx, b"format", FORMAT)?;
-            control.put(&mut tx, b"unused-index-ready", b"1")?;
-        }
-        if compatible {
-            let until = control
-                .get(&tx, b"next-workspace")?
-                .map(decode::<u64>)
-                .transpose()?
-                .unwrap_or(1);
-            control.put(&mut tx, b"legacy-until", &encode(&until)?)?;
-            control.put(&mut tx, b"format", FORMAT)?;
-        }
-        let legacy_until = control
-            .get(&tx, b"legacy-until")?
-            .map(decode::<u64>)
-            .transpose()?
-            .unwrap_or(0);
-        let needs_unused_index = control.get(&tx, b"unused-index-ready")?.is_none();
         tx.commit()?;
         let db = Arc::new(Self {
             env,
@@ -523,8 +451,6 @@ impl Database {
             occurrences,
             globals,
             members,
-            legacy_postings,
-            legacy_until,
             builds: Mutex::new(HashMap::new()),
             prepared: Mutex::new(HashMap::new()),
             pins: Mutex::new(HashMap::new()),
@@ -534,9 +460,6 @@ impl Database {
             publication_changed: Condvar::new(),
             dictionary_namespace: names::namespace(),
         });
-        if needs_unused_index {
-            while !db.index_unused_batch(PRESSURE_BATCH)? {}
-        }
         opened.insert(path, Arc::downgrade(&db));
         Ok(db)
     }
@@ -561,21 +484,17 @@ impl Database {
             }
         }
         let mut tx = self.write()?;
-        let mut existing = self
+        let existing = self
             .spaces
             .get(&tx, &fingerprint)?
             .map(decode::<WorkspaceInfo>)
             .transpose()?;
-        if let Some(info) = &existing
-            && info.phase == Phase::Deleting
-        {
-            // Upgrade an interrupted retirement written before retired metadata
-            // was separated from the live fingerprint map.
-            self.retire(&mut tx, fingerprint, info.clone())?;
-            existing = None;
-        }
         let info: WorkspaceInfo = match existing {
             Some(info) => {
+                ensure!(
+                    info.phase != Phase::Deleting,
+                    "Invalid live workspace state"
+                );
                 ensure!(
                     info.entry == entry && info.owner.as_deref() == owner,
                     "Workspace identity does not match persisted owner"
@@ -604,17 +523,13 @@ impl Database {
             }
         };
         tx.commit()?;
-        let mut scope = Scope {
+        Ok(Scope {
             database: self.clone(),
             fingerprint,
             id: info.id,
             snapshot: None,
             partitions: Default::default(),
-            previous: Vec::new(),
-        };
-        let tx = self.env.read_txn()?;
-        scope.previous = self.previous_scopes(&tx, entry, owner, scope.id)?;
-        Ok(scope)
+        })
     }
 
     pub fn workspaces(&self) -> Result<Vec<([u8; 32], WorkspaceInfo)>> {
@@ -672,7 +587,6 @@ impl Database {
             id,
             snapshot: None,
             partitions: Default::default(),
-            previous: Vec::new(),
         }))
     }
 
@@ -689,12 +603,6 @@ impl Database {
                     id: info.id,
                     snapshot: None,
                     partitions: Default::default(),
-                    previous: self.previous_scopes(
-                        &tx,
-                        &info.entry,
-                        info.owner.as_deref(),
-                        info.id,
-                    )?,
                 })
             })
             .transpose()
@@ -713,32 +621,6 @@ impl Database {
         gates.insert(object, Arc::downgrade(&gate));
         Ok(gate)
     }
-    fn previous_scopes(
-        &self,
-        tx: &RoTxn<'_>,
-        entry: &Path,
-        owner: Option<&Path>,
-        current: u64,
-    ) -> Result<Vec<u64>> {
-        if self.legacy_until == 0 || !super::compatibility::legacy_workspace() {
-            return Ok(Vec::new());
-        }
-        let mut scopes = Vec::new();
-        for row in self.spaces.iter(tx)? {
-            let info: WorkspaceInfo = decode(row?.1)?;
-            if info.id != current
-                && info.id < self.legacy_until
-                && info.phase == Phase::Clean
-                && info.entry == entry
-                && info.owner.as_deref() == owner
-            {
-                scopes.push(info.id);
-            }
-        }
-        scopes.sort_unstable_by(|a, b| b.cmp(a));
-        Ok(scopes)
-    }
-
     pub fn record<'t>(
         &self,
         tx: &'t RoTxn<'_>,
@@ -809,44 +691,6 @@ impl Database {
         }
         self.objects.put(tx, id, &encode_live(&live)?)?;
         Ok(())
-    }
-
-    /// Upgrade an existing database in bounded, restartable transactions.
-    fn index_unused_batch(&self, limit: usize) -> Result<bool> {
-        let mut tx = self.write()?;
-        if self.control.get(&tx, b"unused-index-ready")?.is_some() {
-            return Ok(true);
-        }
-        let cursor = self.control.get(&tx, b"unused-index-cursor")?;
-        let start = cursor.map_or(Unbounded, Excluded);
-        let rows: Vec<(ObjectId, Liveness)> = self
-            .objects
-            .range(&tx, &(start, Unbounded))?
-            .take(limit)
-            .map(|row| {
-                let (id, live) = row?;
-                Ok((id.try_into()?, decode_live(live)?))
-            })
-            .collect::<Result<_>>()?;
-        for (id, live) in &rows {
-            if live.bindings == 0 {
-                let at = live
-                    .unused_since
-                    .context("Unused object has no retirement time")?;
-                self.control.put(&mut tx, &unused_key(id, at), &[])?;
-            }
-        }
-        let done = rows.len() < limit;
-        if done {
-            self.control.put(&mut tx, b"unused-index-ready", b"1")?;
-            self.control.delete(&mut tx, b"unused-index-cursor")?;
-            self.control.delete(&mut tx, b"gc-cursor")?;
-        } else {
-            self.control
-                .put(&mut tx, b"unused-index-cursor", &rows.last().unwrap().0)?;
-        }
-        tx.commit()?;
-        Ok(done)
     }
 
     /// Visit only expired unused objects; removing their index entries records progress.
@@ -922,13 +766,11 @@ impl Database {
             let live = self
                 .live(&tx, id)?
                 .context("Object disappeared inside transaction")?;
-            if live.ordinal != UNINDEXED {
-                let names: Names = decode(
-                    self.record(&tx, id, POSTING_NAMES)?
-                        .context("Missing posting names")?,
-                )?;
-                self.postings(&mut tx, live.ordinal, &names, false)?;
-            }
+            let names: Names = decode(
+                self.record(&tx, id, POSTING_NAMES)?
+                    .context("Missing posting names")?,
+            )?;
+            self.postings(&mut tx, live.ordinal, &names, false)?;
             let prefix = record_key(id, INPUT_ALIAS);
             let aliases = self
                 .records
@@ -1012,40 +854,6 @@ impl Database {
 }
 
 impl Scope {
-    pub(crate) fn previous_binding(
-        &self,
-        tx: &RoTxn<'_>,
-        file: &str,
-        revision: &[u8],
-    ) -> Result<Option<Binding>> {
-        for &scope in &self.previous {
-            if let Some(value) = self
-                .database
-                .bindings
-                .get(tx, &scope_key(scope, file.as_bytes()))?
-            {
-                let binding: Binding = decode(value)?;
-                if binding.revision == revision {
-                    return Ok(Some(binding));
-                }
-            }
-        }
-        Ok(None)
-    }
-    pub(crate) fn previous_manifest(
-        &self,
-        accept: impl Fn(&[u8]) -> Result<bool>,
-    ) -> Result<Option<Vec<u8>>> {
-        let tx = self.read()?;
-        for &scope in &self.previous {
-            if let Some(bytes) = self.database.control.get(&tx, &manifest_key(scope))?
-                && accept(bytes)?
-            {
-                return Ok(Some(bytes.to_vec()));
-            }
-        }
-        Ok(None)
-    }
     /// Pin immutable objects, not LMDB pages. Reads through this view can use
     /// short transactions while another generation replaces the workspace.
     pub fn snapshot(&self) -> Result<Self> {
@@ -1162,12 +970,6 @@ impl Scope {
         }
         let phase = self.info(tx)?.phase;
         ensure!(
-            self.shared_ready(tx)?,
-            crate::diagnostics::RefreshRequired(
-                "Workspace index upgrade needs a completed refresh"
-            )
-        );
-        ensure!(
             phase != Phase::Dirty,
             crate::diagnostics::RefreshRequired("Workspace needs a completed refresh")
         );
@@ -1188,23 +990,13 @@ impl Scope {
     }
     pub fn clean(&self) -> Result<bool> {
         let tx = self.read()?;
-        Ok(self.info(&tx)?.phase == Phase::Clean && self.shared_ready(&tx)?)
-    }
-    fn shared_ready(&self, tx: &RoTxn<'_>) -> Result<bool> {
-        Ok(self.id >= self.database.legacy_until
-            || self
-                .database
-                .control
-                .get(tx, &scope_key(self.id, b"shared-ready"))?
-                .is_some())
+        Ok(self.info(&tx)?.phase == Phase::Clean)
     }
     pub(crate) fn matches(&self, tx: &RoTxn<'_>, file: &str, revision: &[u8]) -> Result<bool> {
         let Some(binding) = self.binding(tx, file)? else {
             return Ok(false);
         };
-        Ok(binding.revision == revision
-            && (self.id >= self.database.legacy_until
-                || self.indexed(tx, file, &binding.object)?))
+        Ok(binding.revision == revision)
     }
     pub(crate) fn prepare_reuse(
         &self,
@@ -1218,9 +1010,7 @@ impl Scope {
             return Ok(Reuse::Current);
         }
         self.writable(&tx)?;
-        let object = if let Some(binding) = self.previous_binding(&tx, file, &revision)? {
-            Some(binding.object)
-        } else if let Some(input) = input {
+        let object = if let Some(input) = input {
             self.database
                 .control
                 .get(&tx, &record_key(&input, b"input"))?
@@ -1232,12 +1022,8 @@ impl Scope {
         let Some(object) = object else {
             return Ok(Reuse::Missing);
         };
-        if self
-            .database
-            .live(&tx, &object)?
-            .is_none_or(|live| live.ordinal == UNINDEXED)
-        {
-            // Legacy index reconstruction and missing objects need admission.
+        if self.database.live(&tx, &object)?.is_none() {
+            // Missing objects need admission.
             return Ok(Reuse::Missing);
         }
         ensure!(
@@ -1254,7 +1040,6 @@ impl Scope {
             expected: self.binding(&tx, file)?,
             encoded: None,
             input,
-            index: None,
         })))
     }
     pub fn binding(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<Binding>> {
@@ -1345,24 +1130,11 @@ impl Scope {
                 && file.len() <= self.database.env.max_key_size(),
             "File key exceeds LMDB limit"
         );
-        let (expected, present, index) = {
+        let (expected, present) = {
             let tx = self.read()?;
             self.writable(&tx)?;
             let live = self.database.live(&tx, &object)?;
-            let index = if live.as_ref().is_some_and(|live| live.ordinal == UNINDEXED) {
-                let descriptor = self
-                    .database
-                    .record(&tx, &object, &[])?
-                    .context("Missing object descriptor")?;
-                let names = super::format::names(descriptor, |key| {
-                    self.database.record(&tx, &object, key)
-                })?;
-                let bytes = encode(&names)?;
-                Some((names, bytes))
-            } else {
-                None
-            };
-            (self.binding(&tx, file)?, live.is_some(), index)
+            (self.binding(&tx, file)?, live.is_some())
         };
         Ok(PendingInstall {
             file: file.to_owned(),
@@ -1371,7 +1143,6 @@ impl Scope {
             now,
             expected,
             input: None,
-            index,
             encoded: if present {
                 None
             } else {
@@ -1462,7 +1233,6 @@ impl Scope {
             expected,
             encoded,
             input: _,
-            index,
         } = pending;
         let now = *now;
         self.writable(tx)?;
@@ -1493,29 +1263,14 @@ impl Scope {
             return Ok(None);
         }
         self.dirty_in(tx)?;
-        let mut live = if absent {
-            let (value, bytes, _) = encoded.as_deref().unwrap();
+        if absent {
+            let (value, bytes, names) = encoded.as_deref().unwrap();
             self.database.records.put(tx, object, &value.names)?;
             for (key, bytes) in &value.records {
                 self.database
                     .records
                     .put(tx, &record_key(object, key), bytes)?;
             }
-            Liveness {
-                ordinal: UNINDEXED,
-                bindings: 0,
-                unused_since: Some(now),
-                encoded_bytes: *bytes,
-            }
-        } else {
-            self.database.live(tx, object)?.unwrap()
-        };
-        if live.ordinal == UNINDEXED {
-            let names = if let Some((_, _, names)) = encoded.as_deref() {
-                names
-            } else {
-                &index.as_ref().context("Posting names were not prepared")?.0
-            };
             let ordinal = self
                 .database
                 .control
@@ -1523,19 +1278,19 @@ impl Scope {
                 .map(decode::<u64>)
                 .transpose()?
                 .unwrap_or(0);
-            ensure!(ordinal < UNINDEXED, "Object IDs exhausted");
+            ensure!(ordinal < u64::MAX, "Object IDs exhausted");
             self.database.control.put(
                 tx,
                 b"next-object",
                 &encode(&ordinal.checked_add(1).context("Object IDs exhausted")?)?,
             )?;
-            if let Some((_, bytes)) = index {
-                self.database
-                    .records
-                    .put(tx, &record_key(object, POSTING_NAMES), bytes)?;
-            }
             self.database.postings(tx, ordinal, names, true)?;
-            live.ordinal = ordinal;
+            let live = Liveness {
+                ordinal,
+                bindings: 0,
+                unused_since: Some(now),
+                encoded_bytes: *bytes,
+            };
             self.database
                 .objects
                 .put(tx, object, &encode_live(&live)?)?;
@@ -1571,9 +1326,6 @@ impl Scope {
             .live(tx, object)?
             .context("Missing bound object")?
             .ordinal;
-        if ordinal == UNINDEXED {
-            return Ok(false);
-        }
         if let Some(rows) = self
             .database
             .members
@@ -1812,15 +1564,6 @@ impl Scope {
         self.database
             .control
             .put(&mut tx, &manifest_key(self.id), manifest)?;
-        // Remove an old workspace-owned dictionary on its next refresh.
-        self.database
-            .control
-            .delete(&mut tx, &scope_key(self.id, b"vocabulary"))?;
-        if self.id < self.database.legacy_until {
-            self.database
-                .control
-                .put(&mut tx, &scope_key(self.id, b"shared-ready"), b"1")?;
-        }
         info.phase = Phase::Clean;
         self.database
             .spaces
@@ -1829,19 +1572,28 @@ impl Scope {
         Ok(())
     }
     pub fn manifest(&self) -> Result<Option<Vec<u8>>> {
-        let tx = self.read()?;
-        if self.info(&tx)?.phase != Phase::Clean {
-            return Ok(None);
-        }
-        Ok(self
-            .database
-            .control
-            .get(&tx, &manifest_key(self.id))?
-            .map(<[u8]>::to_vec))
+        self.inspect_manifest(|phase, bytes| {
+            Ok((phase == Phase::Clean)
+                .then_some(bytes)
+                .flatten()
+                .map(<[u8]>::to_vec))
+        })
     }
-    /// Retire older versions of this logical workspace after its replacement
-    /// is complete. Payloads stay live through the replacement's bindings.
-    pub(crate) fn retire_previous(&self, equivalent: impl Fn(&[u8]) -> Result<bool>) -> Result<()> {
+    pub(crate) fn inspect_manifest<T>(
+        &self,
+        inspect: impl FnOnce(Phase, Option<&[u8]>) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.read()?;
+        inspect(
+            self.info(&tx)?.phase,
+            self.database.control.get(&tx, &manifest_key(self.id))?,
+        )
+    }
+    /// Retire superseded scopes after publication. Snapshot pins retain live payloads.
+    pub(crate) fn retire_matching(
+        &self,
+        equivalent: impl Fn(u64, &[u8]) -> Result<bool>,
+    ) -> Result<()> {
         let keys = {
             let tx = self.read()?;
             let current = self.info(&tx)?;
@@ -1849,13 +1601,13 @@ impl Scope {
             for row in self.database.spaces.iter(&tx)? {
                 let (key, value) = row?;
                 let info: WorkspaceInfo = decode(value)?;
-                if info.id < self.id
+                if info.id != self.id
                     && info.entry == current.entry
                     && info.owner == current.owner
                     && info.phase != Phase::Deleting
                     && let Some(manifest) =
                         self.database.control.get(&tx, &manifest_key(info.id))?
-                    && equivalent(manifest)?
+                    && equivalent(info.id, manifest)?
                 {
                     keys.push((<[u8; 32]>::try_from(key)?, info.id));
                 }
@@ -1906,26 +1658,21 @@ impl Scope {
         );
         // Shared postings survive workspace retirement. Remove only membership
         // lists; remaining rows are the persistent resume cursor.
-        let mut remaining = limit;
-        let mut tables = vec![self.database.members];
-        if self.id < self.database.legacy_until {
-            tables.extend(self.database.legacy_postings);
+        let keys: Vec<_> = self
+            .database
+            .members
+            .prefix_iter(&tx, &self.id.to_be_bytes())?
+            .move_between_keys()
+            .take(limit)
+            .map(|row| Ok(row?.0.to_vec()))
+            .collect::<Result<_>>()?;
+        for key in &keys {
+            self.database.members.delete(&mut tx, key)?;
         }
-        for table in tables {
-            let keys: Vec<_> = table
-                .prefix_iter(&tx, &self.id.to_be_bytes())?
-                .move_between_keys()
-                .take(remaining)
-                .map(|row| Ok(row?.0.to_vec()))
-                .collect::<Result<_>>()?;
-            for key in &keys {
-                table.delete(&mut tx, key)?;
-            }
-            remaining -= keys.len();
-            if remaining == 0 {
-                tx.commit()?;
-                return Ok(false);
-            }
+        let remaining = limit - keys.len();
+        if remaining == 0 {
+            tx.commit()?;
+            return Ok(false);
         }
         let bindings = self
             .database
@@ -1950,12 +1697,6 @@ impl Scope {
         }
         let done = self.files_after(&tx, None, 1)?.is_empty();
         if done {
-            self.database
-                .control
-                .delete(&mut tx, &scope_key(self.id, b"vocabulary"))?;
-            self.database
-                .control
-                .delete(&mut tx, &scope_key(self.id, b"shared-ready"))?;
             self.database
                 .control
                 .delete(&mut tx, &manifest_key(self.id))?;

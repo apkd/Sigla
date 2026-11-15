@@ -324,6 +324,12 @@ impl Jobs {
                     };
                     let code = state.as_ref().context("Code workspace unavailable")?;
                     ensure!(self::generation(&code.manifest, group)? == generation, "Source indexing superseded");
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        if let Some(scope) = crate::store::Database::open(&analysis)?.existing(fingerprint)? {
+                            scope.mark_deleting()?;
+                        }
+                        Ok(())
+                    }).await??;
                     let snapshot = Arc::new(Snapshot { store: code.store.clone(), manifest: snapshot });
                     progress.retained.store(crate::memory::encoded_size(&snapshot.manifest) as u64 * 3 + 256, Ordering::Relaxed);
                     send.send_replace(Some(Ok(snapshot.clone())));

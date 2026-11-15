@@ -59,9 +59,9 @@ fn git(root: &Path, args: &[&str]) -> Result<()> {
                 sizes.insert(path, fields[3].parse::<u64>()?);
             }
         }
-        fs::write(
-            store.join(format!("github-tree-{revision}.json")),
-            serde_json::to_vec(&json!({"version":1,"sizes":sizes}))?,
+        sigla::cache::records::write(
+            &store.join(format!("github-tree-{revision}.bin")),
+            &(sizes,),
         )?;
     }
     Ok(())
@@ -348,6 +348,8 @@ impl Server {
 
 fn lifecycle() -> Result<()> {
     let root = tempfile::tempdir()?;
+    fs::create_dir_all(root.path().join("cache"))?;
+    sigla::cache::reset::prepare(&root.path().join("cache"))?;
     let upstream = root.path().join("upstream");
     fs::create_dir(&upstream)?;
     git(
@@ -740,6 +742,8 @@ fn main() -> Result<()> {
 
 fn required_input_generations() -> Result<()> {
     let root = tempfile::tempdir()?;
+    fs::create_dir_all(root.path().join("cache"))?;
+    sigla::cache::reset::prepare(&root.path().join("cache"))?;
     let upstream = root.path().join("upstream");
     fs::create_dir(&upstream)?;
     git(
@@ -1075,11 +1079,10 @@ fn verify_acquisition(
     let mut source = None;
     for entry in fs::read_dir(root.join("cache/repositories"))? {
         let entry = entry?;
-        let Ok(bytes) = fs::read(entry.path().join("state.json")) else {
+        let Ok(state) = sigla::repository::state_store::header(&entry.path()) else {
             continue;
         };
-        let state: Value = serde_json::from_slice(&bytes)?;
-        if state["branch"] == branch {
+        if state.branch == branch {
             ensure!(source.is_none(), "Duplicate branch state for {branch}");
             source = Some(entry.path().join("source/src"));
         }

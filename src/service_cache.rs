@@ -165,6 +165,7 @@ mod startup_tests {
     async fn startup_retirement_resumes_after_restart_and_preserves_shared_records() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
+        crate::cache::reset::prepare(cache.path()).unwrap();
         let database = Database::open(&cache.path().join("analysis")).unwrap();
         let retiring = database.workspace([1; 32], root.path(), None).unwrap();
         let live = database.workspace([2; 32], root.path(), None).unwrap();
@@ -328,6 +329,7 @@ mod startup_tests {
     async fn valid_search_does_not_wait_for_retirement_or_optional_disposal() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
+        crate::cache::reset::prepare(cache.path()).unwrap();
         fs::write(root.path().join("lib.rs"), "pub struct Available;").unwrap();
         let analysis = cache.path().join("analysis");
         {
@@ -378,6 +380,7 @@ mod startup_tests {
     async fn setup_services_pending_retirement_before_periodic_disk_maintenance() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
+        crate::cache::reset::prepare(cache.path()).unwrap();
         let database = Database::open(&cache.path().join("analysis")).unwrap();
         let scope = database.workspace([1; 32], root.path(), None).unwrap();
         scope.mark_deleting().unwrap();
@@ -918,22 +921,21 @@ impl App {
                     let revision = self.owners.lock().unwrap().dependency_revision();
                     observe();
                     let store = crate::store::Store { scope };
-                    let manifest: Option<crate::workspace::Manifest> = store.get_manifest()?;
-                    if let Some(manifest) = manifest {
-                        // The primary inventory owns dependencies for every source group.
-                        if manifest.source_group.is_some() {
-                            continue;
+                    match store.dependency_inventory()? {
+                        crate::store::DependencyInventory::SourceGroup => continue,
+                        crate::store::DependencyInventory::Primary(manifest) => {
+                            let mut owners = self.owners.lock().unwrap();
+                            if owners.dependency_revision() != revision {
+                                known = false;
+                                changed_dependencies += 1;
+                                continue;
+                            }
+                            owners.observe(&info.entry, info.owner.as_deref(), &manifest, None);
                         }
-                        let mut owners = self.owners.lock().unwrap();
-                        if owners.dependency_revision() != revision {
+                        crate::store::DependencyInventory::Unavailable => {
                             known = false;
-                            changed_dependencies += 1;
-                            continue;
+                            missing_manifests += 1;
                         }
-                        owners.observe(&info.entry, info.owner.as_deref(), &manifest, None);
-                    } else {
-                        known = false;
-                        missing_manifests += 1;
                     }
                 }
             }
@@ -1281,15 +1283,6 @@ impl App {
                 }
             }
         }
-        let legacy = self.cache.join("dotnet/packages");
-        if legacy.is_dir()
-            && !retained.contains(&legacy)
-            && let Some(retired) =
-                views.try_retire(&legacy, || self.owners.lock().unwrap().retains(&legacy))?
-        {
-            retired.dispose()?;
-            progress = true;
-        }
         Ok(progress)
     }
 
@@ -1330,11 +1323,10 @@ impl App {
         })?;
         let repository_roots = crate::telemetry::enabled()
             .then(|| self.repository_disk_roots_for_telemetry_from(&states));
-        let before = maintenance_stage(operation, "disk measurement", || {
-            blobs::allocated(&self.cache)
-        })?;
         let disk = Disk::read(&self.cache)?;
-        let pressure = self.cache_limits.pressured(before, disk);
+        // Free-space pressure is cheap to observe. Measure the cache itself
+        // after ordinary collection, so quiet passes need only one walk.
+        let pressure = self.cache_limits.pressured(0, disk);
         let mut candidates = maintenance_stage(operation, "eviction planning", || {
             self.candidates_from(&states)
         })?;
@@ -1359,43 +1351,61 @@ impl App {
         outcome.progress |= self.collect_analysis(pressure, operation)?;
         outcome.progress |=
             maintenance_stage(operation, "view collection", || self.collect_views(known))?;
-        maintenance_stage(operation, "blob collection", || {
+        outcome.progress |= maintenance_stage(operation, "blob collection", || {
             self.blobs.collect_with_pressure(pressure)
-        })?;
-        maintenance_stage(operation, "asset record collection", || {
+        })? > 0;
+        outcome.progress |= maintenance_stage(operation, "asset record collection", || {
             self.asset_records.collect(pressure)
-        })?;
+        })? > 0;
         candidates.retain(|candidate| {
             !candidate.expired
                 || crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry)
                     && candidate.owner.entry.exists()
         });
-        let allocation_roots = pressure.then(|| {
-            crate::cache::policy::allocation_roots(&self.owners.lock().unwrap(), &candidates)
-        });
-        let mut measured_costs = None;
-        let (mut after, sample) =
-            maintenance_stage(operation, "post-collection disk measurement", || {
-                if let Some(roots) = &allocation_roots {
-                    let (allocation, costs) = blobs::allocated_with_owners(
-                        &self.cache,
-                        repository_roots.as_ref().unwrap_or(&BTreeMap::new()),
-                        roots,
-                    )?;
-                    measured_costs = Some(costs);
-                    let bytes = allocation.total_bytes;
-                    return Ok((
-                        bytes,
-                        repository_roots.as_ref().map(|_| MaintenanceDiskSample {
-                            measured_at_ms: crate::telemetry::now_ms(),
-                            allocation,
-                        }),
-                    ));
+        let allocation_roots =
+            crate::cache::policy::allocation_roots(&self.owners.lock().unwrap(), &candidates);
+        let measure = |stage| {
+            maintenance_stage(operation, stage, || {
+                blobs::allocated_with_owners(
+                    &self.cache,
+                    repository_roots.as_ref().unwrap_or(&BTreeMap::new()),
+                    &allocation_roots,
+                )
+            })
+        };
+        let (allocation, mut measured_costs) = measure("post-collection disk measurement")?;
+        let mut after = allocation.total_bytes;
+        let before = after;
+        let mut remeasured = false;
+        if repository_roots.is_some() {
+            *disk_sample = Some(MaintenanceDiskSample {
+                measured_at_ms: crate::telemetry::now_ms(),
+                allocation,
+            });
+        }
+        if !pressure && self.cache_limits.pressured(after, Disk::read(&self.cache)?) {
+            let mut changed = self.collect_analysis(true, operation)?;
+            changed |=
+                maintenance_stage(operation, "view collection", || self.collect_views(known))?;
+            changed |= maintenance_stage(operation, "blob collection", || {
+                self.blobs.collect_with_pressure(true)
+            })? > 0;
+            changed |= maintenance_stage(operation, "asset record collection", || {
+                self.asset_records.collect(true)
+            })? > 0;
+            if changed {
+                outcome.progress = true;
+                let (allocation, costs) = measure("post-pressure disk measurement")?;
+                after = allocation.total_bytes;
+                measured_costs = costs;
+                remeasured = true;
+                if repository_roots.is_some() {
+                    *disk_sample = Some(MaintenanceDiskSample {
+                        measured_at_ms: crate::telemetry::now_ms(),
+                        allocation,
+                    });
                 }
-                self.measure_allocated(repository_roots.as_ref())
-            })?;
-        if sample.is_some() {
-            *disk_sample = sample;
+            }
         }
         let mut remaining = self.cache_limits.reclaim(after, Disk::read(&self.cache)?);
         let mut savings = if remaining > 0 {
@@ -1404,18 +1414,13 @@ impl App {
             0
         };
         if remaining > savings {
-            let owners = self.owners.lock().unwrap().clone();
             maintenance_stage(operation, "eviction ranking", || {
-                if let Some(costs) = &measured_costs {
-                    crate::cache::policy::rank_measured(
-                        &mut candidates,
-                        costs,
-                        crate::cache::now(),
-                    );
-                    Ok(())
-                } else {
-                    crate::cache::policy::rank(&owners, &mut candidates, crate::cache::now())
-                }
+                crate::cache::policy::rank_measured(
+                    &mut candidates,
+                    &measured_costs,
+                    crate::cache::now(),
+                );
+                Ok(())
             })?;
         }
         candidates.retain(|candidate| !candidate.pinned);
@@ -1464,6 +1469,7 @@ impl App {
                     self.measure_allocated(repository_roots.as_ref())
                 })?;
             after = measured;
+            remeasured = true;
             if sample.is_some() {
                 *disk_sample = sample;
             }
@@ -1482,6 +1488,7 @@ impl App {
                     self.measure_allocated(repository_roots.as_ref())
                 })?;
             after = measured;
+            remeasured = true;
             if sample.is_some() {
                 *disk_sample = sample;
             }
@@ -1490,7 +1497,7 @@ impl App {
         let disk = Disk::read(&self.cache)?;
         tracing::info!(
             allocated = after,
-            reclaimed = before.saturating_sub(after),
+            measured_reclaimed = ?remeasured.then(|| before.saturating_sub(after)),
             available = disk.available,
             "Disk cache maintenance completed"
         );
@@ -1518,7 +1525,7 @@ mod tests {
     use super::*;
     use crate::repository::{
         Repository, Rule,
-        manager::{State, write_json},
+        manager::State,
         materialize::{Prepared, Target},
     };
 
@@ -1828,14 +1835,13 @@ mod tests {
         let root = cache.join("unity-metadata").join(name);
         fs::create_dir_all(root.join("contents")).unwrap();
         fs::write(root.join("contents/manifest.bin"), vec![1; 512 * 1024]).unwrap();
-        fs::write(
-            root.join("last-use"),
-            serde_json::to_vec(&crate::cache::policy::Usage::new(
+        crate::cache::records::write(
+            &root.join("last-use"),
+            &crate::cache::policy::Usage::new(
                 used.duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64,
-            ))
-            .unwrap(),
+            ),
         )
         .unwrap();
         root
@@ -1939,6 +1945,22 @@ mod tests {
         assert!(app.evict_candidate(&candidate, true).unwrap());
         assert!(!root.exists());
         assert!(!app.owners.lock().unwrap().entries.contains_key(&root));
+    }
+
+    #[test]
+    fn quiet_collection_walks_allocation_once_and_pressure_remeasures() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut app = app(cache.path(), vec![]);
+        let old = metadata_fixture(cache.path(), "old", std::time::SystemTime::now());
+        let before = blobs::ALLOCATION_WALKS.get();
+        let quiet = app.maintain_disk_shared().unwrap();
+        assert!(!quiet.pressure && old.exists());
+        assert_eq!(blobs::ALLOCATION_WALKS.get() - before, 1);
+        app.cache_limits.max_bytes = blobs::allocated(cache.path()).unwrap() - 256 * 1024;
+        let before = blobs::ALLOCATION_WALKS.get();
+        let pressure = app.maintain_disk_shared().unwrap();
+        assert!(pressure.progress && !pressure.pressure && !old.exists());
+        assert!(blobs::ALLOCATION_WALKS.get() - before > 1);
     }
 
     #[test]
@@ -2093,20 +2115,28 @@ mod tests {
             .unwrap()
             .unwrap();
         let key =
-            blake3::hash(&serde_json::to_vec(&(&repository.identity, branch)).unwrap()).to_hex();
+            blake3::hash(&postcard::to_allocvec(&(&repository.identity, branch)).unwrap()).to_hex();
         let root = cache.join("repositories").join(key.as_str());
         fs::create_dir_all(root.join("source")).unwrap();
         fs::write(root.join("source/File.cs"), name.repeat(32 * 1024)).unwrap();
-        write_json(&cache.join("defaults").join(repository.identity.storage_key()), &serde_json::json!({
-            "repository": repository.identity, "branch": default, "refreshed": crate::cache::now(),
-        })).unwrap();
+        crate::cache::records::write(
+            &cache
+                .join("defaults")
+                .join(repository.identity.storage_key()),
+            &(
+                &repository.identity,
+                default,
+                crate::cache::now(),
+                Option::<&str>::None,
+            ),
+        )
+        .unwrap();
         let revision = "a".repeat(40);
         let state = State {
-            schema: 4,
             repository: repository.identity,
             transport: repository.transport,
             branch: branch.into(),
-            target: Some(Target::Branch(branch.into())),
+            target: Target::Branch(branch.into()),
             last_use,
             refreshed: last_use,
             policy: crate::repository::selection::Selection::new(&[], &[])
@@ -2129,7 +2159,7 @@ mod tests {
                 resolved_target: Some(Target::Branch(branch.into())),
             },
         };
-        write_json(&root.join("state.json"), &state).unwrap();
+        crate::repository::state_store::write(&root, &state).unwrap();
         root
     }
 
@@ -2641,8 +2671,8 @@ mod tests {
         app.cache_limits.headroom_percent = 0;
         let app = Arc::new(app);
         let server = app.start_inspection().unwrap();
-        let state_before = fs::read(cold.join("state.json")).unwrap();
-        let owners_before = fs::read(cache.path().join("owners.json")).unwrap();
+        let state_before = fs::read(cold.join("state.bin")).unwrap();
+        let owners_before = fs::read(cache.path().join("owners.bin")).unwrap();
         let report = inspect(cache.path(), Overrides::default()).await.unwrap();
         assert!(report.live_service);
         assert_eq!(
@@ -2658,9 +2688,9 @@ mod tests {
                 .protection
                 .is_some()
         );
-        assert_eq!(fs::read(cold.join("state.json")).unwrap(), state_before);
+        assert_eq!(fs::read(cold.join("state.bin")).unwrap(), state_before);
         assert_eq!(
-            fs::read(cache.path().join("owners.json")).unwrap(),
+            fs::read(cache.path().join("owners.bin")).unwrap(),
             owners_before
         );
         let roomy = inspect(
@@ -2684,9 +2714,9 @@ mod tests {
             offline.preview.eviction_order,
             report.preview.eviction_order
         );
-        assert_eq!(fs::read(cold.join("state.json")).unwrap(), state_before);
+        assert_eq!(fs::read(cold.join("state.bin")).unwrap(), state_before);
         assert_eq!(
-            fs::read(cache.path().join("owners.json")).unwrap(),
+            fs::read(cache.path().join("owners.bin")).unwrap(),
             owners_before
         );
     }
@@ -2701,11 +2731,10 @@ mod tests {
         let current = seed(cache.path(), "keep", "main", "main", 1);
         let previous = cache.path().join("repositories/previous-selection");
         fs::create_dir_all(previous.join("source")).unwrap();
-        let mut state: State =
-            serde_json::from_slice(&fs::read(current.join("state.json")).unwrap()).unwrap();
+        let mut state = crate::repository::state_store::read(&current).unwrap();
         let mut old = state.clone();
         old.policy = "previous-selection".into();
-        write_json(&previous.join("state.json"), &old).unwrap();
+        crate::repository::state_store::write(&previous, &old).unwrap();
         let manager = app.remote.as_ref().unwrap();
         for (indexed, repair, protected) in [
             (false, false, true),
@@ -2714,7 +2743,7 @@ mod tests {
         ] {
             state.indexed_revision = indexed.then(|| state.prepared.revision.clone());
             state.repair = repair;
-            write_json(&current.join("state.json"), &state).unwrap();
+            crate::repository::state_store::update(&current, &state).unwrap();
             assert_eq!(manager.retention(&old).unwrap().0, protected);
             assert!(manager.retention(&state).unwrap().0);
             app.seed_owners().unwrap();
@@ -2728,7 +2757,7 @@ mod tests {
                 protected
             );
         }
-        fs::remove_file(current.join("state.json")).unwrap();
+        fs::remove_file(current.join("state.bin")).unwrap();
         assert!(
             manager.retention(&old).unwrap().0,
             "Keep the fallback if its replacement disappears"
@@ -2745,24 +2774,29 @@ mod tests {
         let old = seed(cache.path(), "keep", "old", "old", 1);
         let new = seed(cache.path(), "keep", "next", "next", 1);
         let manager = app.remote.as_ref().unwrap();
-        let read = |root: &Path| -> State {
-            serde_json::from_slice(&fs::read(root.join("state.json")).unwrap()).unwrap()
-        };
+        let read = |root: &Path| -> State { crate::repository::state_store::read(root).unwrap() };
         let old_state = read(&old);
         let mut new_state = read(&new);
         let defaults = cache
             .path()
             .join("defaults")
             .join(old_state.repository.storage_key());
-        write_json(&defaults, &serde_json::json!({
-            "repository": old_state.repository, "branch": "next", "previous": "old", "refreshed": crate::cache::now()
-        })).unwrap();
+        crate::cache::records::write(
+            &defaults,
+            &(
+                &old_state.repository,
+                "next",
+                crate::cache::now(),
+                Some("old"),
+            ),
+        )
+        .unwrap();
         new_state.indexed_revision = None;
-        write_json(&new.join("state.json"), &new_state).unwrap();
+        crate::repository::state_store::update(&new, &new_state).unwrap();
         assert!(manager.retention(&old_state).unwrap().0);
         assert!(manager.retention(&new_state).unwrap().0);
         new_state.indexed_revision = Some(new_state.prepared.revision.clone());
-        write_json(&new.join("state.json"), &new_state).unwrap();
+        crate::repository::state_store::update(&new, &new_state).unwrap();
         assert!(!manager.retention(&old_state).unwrap().0);
         assert!(manager.retention(&new_state).unwrap().0);
         fs::remove_file(defaults).unwrap();
@@ -2787,10 +2821,9 @@ mod tests {
             crate::cache::now(),
         );
         let manager = app.remote.as_ref().unwrap();
-        let mut state: State =
-            serde_json::from_slice(&fs::read(root.join("state.json")).unwrap()).unwrap();
+        let mut state = crate::repository::state_store::read(&root).unwrap();
         state.policy = manager.options.selection.identity.clone();
-        write_json(&root.join("state.json"), &state).unwrap();
+        crate::repository::state_store::update(&root, &state).unwrap();
         let branch = manager
             .resolve(
                 Repository::parse("https://github.com/example/active#refs/heads/trunk")

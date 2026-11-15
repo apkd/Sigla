@@ -18,6 +18,7 @@ pub(crate) mod retention;
 mod revision;
 pub mod selection;
 mod source_validation;
+pub mod state_store;
 pub mod transport;
 
 const SYNTAX: &str = "Use `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git`, optionally followed by `#branch`, `#tag`, a full `#commit` ID, or a unique commit prefix of at least 7 hex characters";
@@ -50,7 +51,7 @@ impl Identity {
     }
 
     pub fn storage_key(&self) -> String {
-        blake3::hash(&serde_json::to_vec(self).expect("repository identity is serializable"))
+        blake3::hash(&postcard::to_allocvec(self).expect("repository identity is serializable"))
             .to_hex()
             .to_string()
     }

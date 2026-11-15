@@ -19,9 +19,6 @@ const TABLES: &[&str] = &[
     "bindings",
     "objects",
     "records",
-    "declarations",
-    "occurrences",
-    "global-import-files",
     "members",
     "shared-declarations",
     "shared-occurrences",
@@ -60,21 +57,11 @@ fn validate(path: &Path) -> Result<Vec<(String, u64)>> {
     }?;
     let result = (|| -> Result<_> {
         let tx = env.read_txn()?;
-        let control = env
-            .open_database::<Bytes, Bytes>(&tx, Some("control"))?
-            .ok_or_else(|| anyhow::anyhow!("Missing analysis control database"))?;
-        let format = control.get(&tx, b"format")?;
-        let legacy = format.is_some_and(crate::store::compatibility::accepts);
-        ensure!(
-            format == Some(crate::store::shared::FORMAT) || legacy,
-            "Unknown analysis format"
-        );
         let mut counts = Vec::new();
         for &name in TABLES {
-            let Some(table) = env.open_database::<Bytes, Bytes>(&tx, Some(name))? else {
-                ensure!(legacy, "Missing analysis table");
-                continue;
-            };
+            let table = env
+                .open_database::<Bytes, Bytes>(&tx, Some(name))?
+                .ok_or_else(|| anyhow::anyhow!("Missing analysis table"))?;
             counts.push((name.to_owned(), table.len(&tx)?));
         }
         Ok(counts)

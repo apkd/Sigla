@@ -53,9 +53,30 @@ pub(super) fn groups(
         return BTreeMap::new();
     }
     let selection = query.map(Selection::new);
-    let matches = |file: &FileEntry| selected(request, selection.as_ref(), manifest, file);
+    let candidates = selection
+        .as_ref()
+        .filter(|selection| selection.query.filters.iter().any(|f| f.key == "path"))
+        .map(|selection| {
+            manifest.derived.paths(manifest).matching(
+                crate::workspace::derived::literal_filter(selection.query),
+                |path| {
+                    selection
+                        .filters
+                        .iter()
+                        .filter(|(filter, _)| filter.key == "path")
+                        .all(|(filter, glob)| {
+                            path_matches(&filter.value, glob.as_ref(), path) != filter.negate
+                        })
+                },
+            )
+        });
+    let matches =
+        |key: &String, file: &FileEntry| selected(request, selection.as_ref(), manifest, key, file);
     let mut groups = BTreeMap::new();
-    for file in manifest.deferred.values().filter(|f| matches(f)) {
+    for (_, file) in
+        crate::workspace::derived::candidate_files(&manifest.deferred, candidates.as_ref())
+            .filter(|(key, f)| matches(key, f))
+    {
         groups.insert(Group::of(file.language).unwrap(), false);
     }
     let narrowed = match request {
@@ -75,8 +96,10 @@ pub(super) fn groups(
         Request::View(..) => true,
         Request::Browse(path) => !path.is_empty(),
     };
-    let wait =
-        query.is_some_and(|q| q.wait_complete) || narrowed && !manifest.files.values().any(matches);
+    let wait = query.is_some_and(|q| q.wait_complete)
+        || narrowed
+            && !crate::workspace::derived::candidate_files(&manifest.files, candidates.as_ref())
+                .any(|(key, file)| matches(key, file));
     groups.values_mut().for_each(|value| *value = wait);
     groups
 }
@@ -144,6 +167,7 @@ fn selected(
     request: &Request,
     selection: Option<&Selection<'_>>,
     manifest: &Manifest,
+    key: &str,
     file: &FileEntry,
 ) -> bool {
     if file.metadata {
@@ -157,13 +181,23 @@ fn selected(
         if !crate::search::Search::file_language_filters(q, file.language) {
             return false;
         }
-        if !file.memberships.iter().any(|m| {
-            let path = manifest.display(file, m);
+        let needs_path = q.selector == "file"
+            || q.target.location.is_some()
+            || q.filters.iter().any(|f| {
+                f.key == "path"
+                    || f.key == "in"
+                        && !f.negate
+                        && crate::query::Target::parse(&f.value)
+                            .is_ok_and(|target| target.location.is_some())
+            });
+        let paths = needs_path.then(|| manifest.derived.paths(manifest));
+        if !file.memberships.iter().enumerate().any(|(index, m)| {
+            let path = paths.map_or("", |paths| paths.display(key, index));
             selection
                 .filters
                 .iter()
                 .all(|(f, glob)| match f.key.as_str() {
-                    "path" => path_matches(&f.value, glob.as_ref(), &path) != f.negate,
+                    "path" => path_matches(&f.value, glob.as_ref(), path) != f.negate,
                     "project" => {
                         crate::query::wildcard(&f.value, &manifest.projects[m.project].name)
                             != f.negate
@@ -172,20 +206,20 @@ fn selected(
                         .ok()
                         .and_then(|t| t.location)
                         .is_none_or(|loc| {
-                            path.as_ref() == loc.path
+                            path == loc.path
                                 || path
                                     .ends_with(&format!("/{}", loc.path.trim_start_matches("…/")))
                         }),
                     _ => true,
                 })
                 && q.target.location.as_ref().is_none_or(|loc| {
-                    path.as_ref() == loc.path
+                    path == loc.path
                         || path.ends_with(&format!("/{}", loc.path.trim_start_matches("…/")))
                 })
                 && (q.selector != "file"
                     || selection.target.as_ref().is_some_and(|glob| {
                         glob.is_match(if q.target.name.contains('/') {
-                            path.as_ref()
+                            path
                         } else {
                             path.rsplit('/').next().unwrap()
                         })
@@ -409,6 +443,10 @@ mod tests {
                 &[(Native, false)],
             ),
             ("symbol:* path:native/*/engine.cpp", &[(Native, true)]),
+            (
+                "symbol:* path:native/{nested,other}/engine.cpp",
+                &[(Native, true)],
+            ),
             ("symbol:@engine.cpp:1:1", &[(Native, true)]),
             ("symbol:* in:@engine.cpp:1:1", &[(Native, true)]),
             (
@@ -427,6 +465,20 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn changed_publication_rebuilds_paths_for_changed_project_roots() {
+        let original = manifest();
+        assert!(!search("symbol:* path:native/", &original).is_empty());
+        let mut changed = original.clone();
+        changed.projects[0].source_roots = vec![SourceRoot {
+            physical: "native".into(),
+            logical: "moved".into(),
+        }];
+        assert!(search("symbol:* path:native/", &changed).is_empty());
+        assert!(!search("symbol:* path:moved/", &changed).is_empty());
+        assert!(!search("symbol:* path:native/", &original).is_empty());
     }
 
     #[test]

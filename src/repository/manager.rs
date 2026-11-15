@@ -8,8 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::{self, File},
-    io::{BufReader, BufWriter, Write},
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -56,6 +55,7 @@ mod refresh_tests {
             state: Arc::new(AsyncRwLock::new(None)),
             analysis: Arc::new(AsyncRwLock::new(())),
             last_use: AtomicU64::new(last_use),
+            persisted_use: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             running: Mutex::new(None),
             telemetry_id: Mutex::new(None),
@@ -114,7 +114,7 @@ mod refresh_tests {
         let (sender, receiver) = watch::channel(None);
         *branch.running.lock().unwrap() = Some(receiver);
         *branch.telemetry_id.lock().unwrap() = Some("refresh-running".into());
-        let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, "main")).unwrap())
+        let key = blake3::hash(&crate::binary::encode(&(&repository.identity, "main")).unwrap())
             .to_hex()
             .to_string();
         manager.branches.lock().unwrap().insert(key, branch.clone());
@@ -316,11 +316,10 @@ mod refresh_tests {
             .unwrap()
             .unwrap();
         State {
-            schema: 5,
             repository: repository.identity,
             transport: repository.transport,
             branch: "main".into(),
-            target: None,
+            target: Target::Branch("main".into()),
             last_use: 0,
             refreshed: 0,
             policy: "selection".into(),
@@ -357,22 +356,22 @@ mod refresh_tests {
             .map(|n| (format!("asset-{n}"), "content-hash".into()))
             .collect();
         fs::create_dir_all(root.join("ready")).unwrap();
-        write_json(&root.join("ready/state.json"), &ready).unwrap();
+        super::super::state_store::write(&root.join("ready"), &ready).unwrap();
 
         let mut repairing = ready.clone();
         repairing.repair = true;
         fs::create_dir_all(root.join("repairing")).unwrap();
-        write_json(&root.join("repairing/state.json"), &repairing).unwrap();
+        super::super::state_store::write(&root.join("repairing"), &repairing).unwrap();
 
         assert!(manager.default_ready(&ready.repository, "main").unwrap());
-        fs::remove_file(root.join("ready/state.json")).unwrap();
+        fs::remove_file(root.join("ready/state.bin")).unwrap();
         assert!(!manager.default_ready(&ready.repository, "main").unwrap());
-        fs::remove_file(root.join("repairing/state.json")).unwrap();
+        fs::remove_file(root.join("repairing/state.bin")).unwrap();
 
         let mut stale = ready.clone();
         stale.indexed_revision = Some("older-commit".into());
         fs::create_dir_all(root.join("stale")).unwrap();
-        write_json(&root.join("stale/state.json"), &stale).unwrap();
+        super::super::state_store::write(&root.join("stale"), &stale).unwrap();
 
         assert!(!manager.default_ready(&ready.repository, "main").unwrap());
         assert!(!manager.default_ready(&ready.repository, "develop").unwrap());
@@ -417,10 +416,8 @@ mod refresh_tests {
             .store(0, Ordering::Relaxed);
         manager.trim_unreferenced(|_| false).unwrap();
         assert!(manager.branches.lock().unwrap().is_empty());
-        let restored: State = serde_json::from_slice(
-            &fs::read(cache.path().join("repositories/branch/state.json")).unwrap(),
-        )
-        .unwrap();
+        let restored =
+            super::super::state_store::read(&cache.path().join("repositories/branch")).unwrap();
         assert_eq!(restored.last_use, 2);
         assert!(restored.same_inputs(&saved));
     }
@@ -590,11 +587,10 @@ mod refresh_tests {
         // A branch still being acquired has no persisted inventory.
         assert!(!manager.branch_expired(&branch).unwrap());
         let state = State {
-            schema: 1,
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),
-            target: Some(branch.target.clone()),
+            target: branch.target.clone(),
             last_use: now(),
             refreshed: now(),
             policy: String::new(),
@@ -622,7 +618,7 @@ mod refresh_tests {
         assert!(!manager.branch_expired(&branch).unwrap());
 
         fs::create_dir_all(&branch.root).unwrap();
-        write_json(&branch.root.join("state.json"), &state).unwrap();
+        super::super::state_store::write(&branch.root, &state).unwrap();
         branch.last_use.store(0, Ordering::Relaxed);
         let _publication = branch.state.try_write().unwrap();
         assert!(manager.branch_expired(&branch).unwrap());
@@ -643,19 +639,16 @@ mod refresh_tests {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct State {
-    pub schema: u32,
     pub repository: Identity,
     pub transport: String,
     pub branch: String,
-    #[serde(default)]
-    pub target: Option<Target>,
+    pub target: Target,
     pub last_use: u64,
     pub refreshed: u64,
     pub policy: String,
     pub prepared: Prepared,
     pub indexed_revision: Option<String>,
     pub repair: bool,
-    #[serde(default)]
     pub additional: std::collections::BTreeSet<String>,
 }
 
@@ -755,6 +748,7 @@ pub struct Branch {
     pub state: Arc<AsyncRwLock<Option<State>>>,
     analysis: Arc<AsyncRwLock<()>>,
     pub last_use: AtomicU64,
+    persisted_use: AtomicU64,
     pub generation: AtomicU64,
     running: Mutex<Option<Running>>,
     telemetry_id: Mutex<Option<String>>,
@@ -785,6 +779,7 @@ impl Branch {
             state: Arc::new(AsyncRwLock::new(None)),
             analysis: Arc::new(AsyncRwLock::new(())),
             last_use: AtomicU64::new(0),
+            persisted_use: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             running: Mutex::new(None),
             telemetry_id: Mutex::new(None),
@@ -867,7 +862,37 @@ impl Branch {
         self.root.join("analysis")
     }
     pub fn persist(&self, state: &State) -> Result<()> {
-        write_json(&self.root.join("state.json"), state)
+        super::state_store::write(&self.root, state)?;
+        self.persisted_use
+            .fetch_max(state.last_use, Ordering::Relaxed);
+        Ok(())
+    }
+    pub fn persist_header(&self, state: &State) -> Result<()> {
+        super::state_store::update(&self.root, state)?;
+        self.persisted_use
+            .fetch_max(state.last_use, Ordering::Relaxed);
+        Ok(())
+    }
+    fn publish_inventory(
+        &self,
+        state: &State,
+        inventory: super::state_store::StagedInventory,
+    ) -> Result<()> {
+        super::state_store::publish(&self.root, state, inventory)?;
+        self.persisted_use
+            .fetch_max(state.last_use, Ordering::Relaxed);
+        Ok(())
+    }
+    fn checkpoint_usage(&self, force: bool) -> Result<()> {
+        let used = self.last_use.load(Ordering::Relaxed);
+        let saved = self.persisted_use.load(Ordering::Relaxed);
+        if used > saved
+            && (force || used.saturating_sub(saved) >= super::state_store::USAGE_INTERVAL)
+        {
+            super::state_store::record_use(&self.root, used)?;
+            self.persisted_use.fetch_max(used, Ordering::Relaxed);
+        }
+        Ok(())
     }
     pub fn record_use(&self) {
         self.last_use.fetch_max(now(), Ordering::Relaxed);
@@ -875,12 +900,11 @@ impl Branch {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct DefaultBranch {
-    repository: Identity,
-    branch: String,
-    refreshed: u64,
-    #[serde(default)]
-    previous: Option<String>,
+pub(crate) struct DefaultBranch {
+    pub(crate) repository: Identity,
+    pub(crate) branch: String,
+    pub(crate) refreshed: u64,
+    pub(crate) previous: Option<String>,
 }
 type DefaultOperation = (
     u64,
@@ -897,27 +921,21 @@ pub struct Manager {
     default_running: Mutex<HashMap<String, DefaultOperation>>,
 }
 
-pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("Managed metadata parent is missing")?;
-    fs::create_dir_all(parent)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    let mut writer = BufWriter::new(&mut file);
-    serde_json::to_writer(&mut writer, value)?;
-    writer.flush()?;
-    drop(writer);
-    file.as_file().sync_all()?;
-    file.persist(path)?;
-    Ok(())
-}
-
 impl Manager {
     fn saved_default(&self, identity: &Identity) -> Result<Option<DefaultBranch>> {
-        match fs::read(self.cache.join("defaults").join(identity.storage_key())) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
+        match crate::cache::records::read(
+            &self.cache.join("defaults").join(identity.storage_key()),
+            64 * 1024,
+        ) {
+            Ok(saved) => Ok(Some(saved)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
     }
     fn default_ready(&self, identity: &Identity, branch: &str) -> Result<bool> {
@@ -930,11 +948,16 @@ impl Manager {
         for entry in entries {
             let entry = entry?;
             ensure!(entry.file_type()?.is_dir(), "Invalid selector directory");
-            let path = entry.path().join("state.json");
-            let state = match File::open(path) {
-                Ok(file) => serde_json::from_reader::<_, ReadyState>(BufReader::new(file))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+            let state = match super::state_store::header(&entry.path()) {
+                Ok(state) => state,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             if state.repository == *identity
                 && state.policy == self.options.selection.identity
@@ -988,13 +1011,23 @@ impl Manager {
         }
         // Final retirement checks run with the publication lock held. Only
         // those candidates need the persisted snapshot as a fallback.
-        let bytes = match fs::read(branch.root.join("state.json")) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
+        let state = match super::state_store::header(&branch.root) {
+            Ok(state) => state,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
         };
-        let state: State = serde_json::from_slice(&bytes)?;
-        self.state_expired(&state, last_use)
+        let (pinned, ttl) = super::retention::Policy::from(&self.options).projected_decision(
+            &self.cache,
+            &state,
+            |identity, branch| self.default_ready(identity, branch),
+        )?;
+        Ok(pinned.is_none() && now().saturating_sub(last_use) >= ttl.as_millis() as u64)
     }
 
     pub fn cached(&self) -> Result<Vec<(PathBuf, State)>> {
@@ -1080,7 +1113,7 @@ impl Manager {
         if (identity.dev(), identity.ino()) != (current_identity.dev(), current_identity.ino()) {
             return Ok(false);
         }
-        let mut state: State = serde_json::from_slice(&fs::read(root.join("state.json"))?)?;
+        let mut state = super::state_store::read(root)?;
         if let Some(branch) = &branch {
             state.last_use = branch.last_use.load(Ordering::Relaxed);
         }
@@ -1120,7 +1153,7 @@ impl Manager {
         if !defaults.contains_key(&key) {
             let path = self.cache.join("defaults").join(&key);
             if path.is_file() {
-                let saved: DefaultBranch = serde_json::from_slice(&fs::read(path)?)?;
+                let saved: DefaultBranch = crate::cache::records::read(&path, 64 * 1024)?;
                 ensure!(
                     saved.repository == repository.identity,
                     "Cached repository identity is invalid"
@@ -1202,7 +1235,10 @@ impl Manager {
                             branch: prepared.branch.context("Default branch is missing")?,
                             refreshed: now(),
                         };
-                        write_json(&manager.cache.join("defaults").join(&key), &saved)?;
+                        crate::cache::records::write(
+                            &manager.cache.join("defaults").join(&key),
+                            &saved,
+                        )?;
                         manager.defaults.lock().await.insert(key, saved.clone());
                         Ok::<_, anyhow::Error>(saved)
                     }
@@ -1247,21 +1283,27 @@ impl Manager {
                 expired.push(branch);
                 continue;
             }
-            if let Ok(mut state) = branch.state.try_write()
-                && let Some(state) = state.as_mut()
+            let checkpoint = branch.clone();
+            tokio::task::spawn_blocking(move || checkpoint.checkpoint_usage(false)).await??;
+            if let Ok(state) = branch.state.try_read()
+                && let Some(state) = state.as_ref()
+                && branch.refresh_due(&self.options, state.refreshed, now(), Some(&state.prepared))
             {
-                let last_use = branch.last_use.load(Ordering::Relaxed);
-                if state.last_use != last_use {
-                    state.last_use = last_use;
-                    branch.persist(state)?;
-                }
-                if branch.refresh_due(&self.options, state.refreshed, now(), Some(&state.prepared))
-                {
-                    self.schedule(branch.clone(), false);
-                }
+                self.schedule(branch.clone(), false);
             }
         }
         Ok(expired)
+    }
+
+    pub async fn flush_usage(&self) -> Result<()> {
+        let branches: Vec<_> = self.branches.lock().unwrap().values().cloned().collect();
+        tokio::task::spawn_blocking(move || {
+            for branch in branches {
+                branch.checkpoint_usage(true)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 
     /// Release repository inventories once neither requests nor cached workspaces use them.
@@ -1297,7 +1339,7 @@ impl Manager {
                 if state.last_use != last_use {
                     let previous = state.last_use;
                     state.last_use = last_use;
-                    if let Err(error) = branch.persist(state) {
+                    if let Err(error) = branch.checkpoint_usage(true) {
                         state.last_use = previous;
                         failure = Some(error);
                         return true;
@@ -1458,10 +1500,9 @@ impl Manager {
             Target::DefaultBranch => unreachable!(),
         };
         let identity = if matches!(target, Target::Branch(_)) {
-            // Preserve existing default-branch caches across the selector upgrade.
-            serde_json::to_vec(&(&repository.identity, &name))?
+            postcard::to_allocvec(&(&repository.identity, &name))?
         } else {
-            serde_json::to_vec(&(&repository.identity, &target))?
+            postcard::to_allocvec(&(&repository.identity, &target))?
         };
         let key = blake3::hash(&identity).to_hex().to_string();
         let branch = {
@@ -1470,27 +1511,19 @@ impl Manager {
                 branch.clone()
             } else {
                 let root = self.cache.join("repositories").join(&key);
-                let saved = root.join("state.json");
-                let mut state: Option<State> = if saved.is_file() {
-                    Some(serde_json::from_slice(&fs::read(saved)?)?)
+                let saved = root.join("state.bin");
+                let state = if saved.is_file() {
+                    Some(super::state_store::read(&root)?)
                 } else {
                     None
                 };
-                if let Some(value) = &mut state {
+                if let Some(value) = &state {
                     ensure!(
-                        matches!(value.schema, 2..=5)
-                            && value.repository == repository.identity
+                        value.repository == repository.identity
                             && value.branch == name
-                            && value
-                                .target
-                                .clone()
-                                .unwrap_or_else(|| Target::Branch(value.branch.clone()))
-                                == target,
+                            && value.target == target,
                         "Cached branch identity is invalid"
                     );
-                    if value.schema < 3 {
-                        value.repair = true;
-                    }
                 }
                 fs::create_dir_all(&root)?;
                 let branch = Arc::new(Branch {
@@ -1501,6 +1534,7 @@ impl Manager {
                     last_use: AtomicU64::new(
                         state.as_ref().map_or_else(now, |state| state.last_use),
                     ),
+                    persisted_use: AtomicU64::new(state.as_ref().map_or(0, |state| state.last_use)),
                     generation: AtomicU64::new(0),
                     state: Arc::new(AsyncRwLock::new(state)),
                     analysis: Arc::new(AsyncRwLock::new(())),
@@ -1743,15 +1777,10 @@ impl Manager {
                 .extend(before.prepared.unavailable.iter().cloned());
         }
         telemetry.stage("required_input_publication");
-        let mut state = {
-            let _wait = telemetry.wait("repository_publication");
-            branch.publish().await
-        };
-        let mut next = state.as_ref().unwrap().clone();
-        next.schema = 5;
+        let mut next = before.clone();
         next.additional.extend(paths);
         next.prepared = prepared;
-        if !assets
+        let unchanged = !assets
             && before.same_inputs(&next)
             && fs::read_dir(stage.path())?.next().transpose()?.is_none()
             && branch.source().is_dir()
@@ -1759,18 +1788,35 @@ impl Manager {
                 .prepared
                 .directories
                 .iter()
-                .all(|path| branch.source().join(path).is_dir())
-        {
-            next.indexed_revision = state
-                .as_ref()
-                .and_then(|state| state.indexed_revision.clone());
-            branch.persist(&next)?;
+                .all(|path| branch.source().join(path).is_dir());
+        let staged_inventory = if unchanged {
+            None
+        } else {
+            let root = branch.root.clone();
+            let (returned, inventory) = tokio::task::spawn_blocking(move || {
+                let inventory = super::state_store::stage(&root, &next)?;
+                Ok::<_, anyhow::Error>((next, inventory))
+            })
+            .await??;
+            next = returned;
+            Some(inventory)
+        };
+        let mut state = {
+            let _wait = telemetry.wait("repository_publication");
+            branch.publish().await
+        };
+        next.indexed_revision = state
+            .as_ref()
+            .and_then(|state| state.indexed_revision.clone());
+        if unchanged {
+            branch.persist_header(&next)?;
             *state = Some(next);
             return Ok(());
         }
+        let mut staged_inventory = staged_inventory;
         if !assets {
             next.repair = true;
-            branch.persist(&next)?;
+            branch.publish_inventory(&next, staged_inventory.take().unwrap())?;
             *state = Some(next.clone());
         }
         for path in next.prepared.selected.keys() {
@@ -1789,7 +1835,11 @@ impl Manager {
             }
         }
         next.repair = false;
-        branch.persist(&next)?;
+        if assets {
+            branch.publish_inventory(&next, staged_inventory.unwrap())?;
+        } else {
+            branch.persist_header(&next)?;
+        }
         *state = Some(next);
         if !assets {
             branch.generation.fetch_add(1, Ordering::Release);
@@ -1956,16 +2006,11 @@ impl Manager {
         })
         .await??;
         telemetry.stage("repository_publication");
-        let mut state = {
-            let _wait = telemetry.wait("repository_publication");
-            branch.publish().await
-        };
         let mut next = State {
-            schema: 5,
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),
-            target: Some(branch.target.clone()),
+            target: branch.target.clone(),
             last_use: branch.last_use.load(Ordering::Relaxed),
             refreshed: now(),
             policy: self.options.selection.identity.clone(),
@@ -1978,24 +2023,40 @@ impl Manager {
                 .unwrap_or_default(),
         };
         let source = branch.source();
-        if before.as_ref().is_some_and(|s| s.same_inputs(&next))
+        let unchanged = before.as_ref().is_some_and(|s| s.same_inputs(&next))
             && fs::read_dir(stage.path())?.next().transpose()?.is_none()
             && source.is_dir()
             && next
                 .prepared
                 .directories
                 .iter()
-                .all(|p| source.join(p).is_dir())
-        {
+                .all(|p| source.join(p).is_dir());
+        let staged_inventory = if unchanged {
+            None
+        } else {
+            let root = branch.root.clone();
+            let (returned, inventory) = tokio::task::spawn_blocking(move || {
+                let inventory = super::state_store::stage(&root, &next)?;
+                Ok::<_, anyhow::Error>((next, inventory))
+            })
+            .await??;
+            next = returned;
+            Some(inventory)
+        };
+        let mut state = {
+            let _wait = telemetry.wait("repository_publication");
+            branch.publish().await
+        };
+        if unchanged {
             // Materialization already checked selected files. Keep the latest
             // indexing marker, since indexing can finish during acquisition.
             next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
             next.repair = false;
-            branch.persist(&next)?;
+            branch.persist_header(&next)?;
             *state = Some(next);
             return Ok(());
         }
-        branch.persist(&next)?;
+        branch.publish_inventory(&next, staged_inventory.unwrap())?;
         *state = Some(next.clone());
         fs::create_dir_all(&source)?;
         if let Some(before) = &before {
@@ -2045,26 +2106,10 @@ impl Manager {
         }) {
             next.indexed_revision = Some(next.prepared.revision.clone());
         }
-        branch.persist(&next)?;
+        branch.persist_header(&next)?;
         *state = Some(next);
         branch.generation.fetch_add(1, Ordering::Release);
         branch.inventory.send_replace(None);
         Ok(())
     }
-}
-
-#[derive(Deserialize)]
-struct ReadyState {
-    repository: Identity,
-    policy: String,
-    prepared: ReadyPrepared,
-    indexed_revision: Option<String>,
-    #[serde(default)]
-    repair: bool,
-}
-
-#[derive(Deserialize)]
-struct ReadyPrepared {
-    branch: Option<String>,
-    revision: String,
 }

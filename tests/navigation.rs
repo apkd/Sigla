@@ -8,6 +8,61 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 #[tokio::test]
+async fn cached_path_filters_preserve_globs_boundaries_and_refreshes() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for path in ["src/a.txt", "src/b.txt", "src-other/c.txt"] {
+        write(root.path(), path, "needle");
+    }
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            2,
+        )
+        .unwrap(),
+    );
+    let project = root.path().to_str().unwrap();
+    for _ in 0..2 {
+        let result = app
+            .search(project, "text:needle path:src/{a,b}.txt")
+            .await
+            .unwrap();
+        assert!(
+            result.contains("src/a.txt") && result.contains("src/b.txt"),
+            "{result}"
+        );
+        assert!(!result.contains("src-other"), "{result}");
+        let result = app
+            .search(project, "text:needle path:src/ -path:src/a.txt")
+            .await
+            .unwrap();
+        assert!(
+            result.contains("src/b.txt")
+                && !result.contains("src/a.txt")
+                && !result.contains("src-other"),
+            "{result}"
+        );
+        assert_eq!(
+            app.view(project, "src/a.txt", "raw").await.unwrap(),
+            "needle"
+        );
+    }
+    std::fs::remove_file(root.path().join("src/a.txt")).unwrap();
+    write(root.path(), "src/d.txt", "needle");
+    let result = app.search(project, "text:needle path:src/").await.unwrap();
+    assert!(
+        result.contains("src/d.txt") && !result.contains("src/a.txt"),
+        "{result}"
+    );
+    assert_eq!(
+        app.view(project, "src/d.txt", "raw").await.unwrap(),
+        "needle"
+    );
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn documents_are_searchable_preserved_and_refreshed_without_build_projects() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

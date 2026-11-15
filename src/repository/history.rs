@@ -1918,7 +1918,7 @@ mod tests {
                 fixture.directory.path(),
                 &["commit", "--allow-empty", "-qm", "branch advanced"],
             );
-            let owner = fixture.current().parent().unwrap().join("history.json");
+            let owner = fixture.current().parent().unwrap().join("history.bin");
             for (query, expected) in queries.iter().zip(expected) {
                 assert!(super::super::cache::evict_history(&owner).unwrap());
                 super::super::cache::reclaim(fixture.cache.path()).unwrap();
@@ -1945,24 +1945,13 @@ mod tests {
             text.contains("incomplete:") && !text.ends_with("end\n"),
             "{text}"
         );
-        let coverage: serde_json::Value = serde_json::from_slice(
-            &fs::read(fixture.current().parent().unwrap().join("history.json")).unwrap(),
+        let coverage: super::super::cache::HistoryCoverage = crate::cache::records::read(
+            &fixture.current().parent().unwrap().join("history.bin"),
+            256 * 1024 * 1024,
         )
         .unwrap();
-        assert!(
-            coverage["boundaries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|id| id == &fixture.tip)
-        );
-        assert!(
-            !coverage["complete"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|id| id == &fixture.tip)
-        );
+        assert!(coverage.boundaries.contains(&fixture.tip));
+        assert!(!coverage.complete.contains(&fixture.tip));
         assert!(!fixture.inventory().contains(&fixture.first));
     }
 

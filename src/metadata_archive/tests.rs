@@ -185,11 +185,7 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
             artifact.manifest.origin.name
         ));
         let id = crate::store::source_id("class C {}", Language::CSharp, &[], "").unwrap();
-        assert!(
-            source_analysis(&path, &id, |_| unreachable!())
-                .unwrap()
-                .is_some()
-        );
+        assert!(source_analysis(&path, &id).unwrap().is_some());
     }
     // Concurrent members share the pack download but acquire their extraction
     // permits separately. Seed compressed transport data to keep this offline.
@@ -230,9 +226,9 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
                 let path = client::materialize(cache, artifact, catalog, &leases).unwrap();
                 assert!(path.join("manifest.bin").is_file());
                 let root = path.parent().unwrap();
-                fs::write(
-                    root.join("last-use"),
-                    serde_json::to_vec(&crate::cache::policy::Usage::new(0)).unwrap(),
+                crate::cache::records::write(
+                    &root.join("last-use"),
+                    &crate::cache::policy::Usage::new(0),
                 )
                 .unwrap();
                 assert_eq!(
@@ -295,7 +291,7 @@ fn relocated_archives_retry_without_waiting_for_old_failure_cache() {
 }
 
 #[test]
-fn catalog_migrates_without_rebuilding_analysis() {
+fn catalog_rejects_obsolete_layout() {
     #[derive(Serialize)]
     struct Legacy {
         artifacts: Vec<Artifact>,
@@ -305,10 +301,7 @@ fn catalog_migrates_without_rebuilding_analysis() {
         artifacts: vec![package_artifact("runtime", "1.0.0", 10, &[])],
         unavailable: vec![],
     };
-    let catalog = Catalog::decode(&binary::encode(&legacy).unwrap()).unwrap();
-    assert_eq!(catalog.artifacts[0].manifest, legacy.artifacts[0].manifest);
-    assert_eq!(catalog.artifacts[0].hash, legacy.artifacts[0].hash);
-    assert!(catalog.packs.is_empty());
+    assert!(Catalog::decode(&binary::encode(&legacy).unwrap()).is_err());
 }
 
 #[test]
@@ -379,9 +372,7 @@ fn precomputed_sources_preserve_navigation_and_profile_selection() {
     ] {
         let path = cache.path().join("packages/com.example.fixture").join(file);
         let id = crate::store::source_id(source, language, &defines, "").unwrap();
-        let encoded = source_analysis(&path, &id, |_| unreachable!())
-            .unwrap()
-            .unwrap();
+        let encoded = source_analysis(&path, &id).unwrap().unwrap();
         let facts = crate::extract::extract(source, language, &defines, "").unwrap();
         let expected = records::encode(FileData {
             source: source.into(),
@@ -410,11 +401,7 @@ fn precomputed_sources_preserve_navigation_and_profile_selection() {
     }
     let path = cache.path().join("packages/com.example.fixture/Code.cs");
     let changed = crate::store::source_id("class Changed {}", Language::CSharp, &[], "").unwrap();
-    assert!(
-        source_analysis(&path, &changed, |_| unreachable!())
-            .unwrap()
-            .is_none()
-    );
+    assert!(source_analysis(&path, &changed).unwrap().is_none());
 }
 
 #[test]
@@ -516,24 +503,17 @@ fn verification_rejects_conflicting_file_and_directory_paths() {
 }
 
 #[test]
-fn compatible_source_profiles_keep_preprocessor_selection() {
-    let version = "d70ac251b161d05505fdc5790766a45bdd917c9e97093b7df3751e7479131b09";
-    if !crate::store::compatibility::accepts(version.as_bytes()) {
-        return;
-    }
+fn source_profiles_keep_preprocessor_selection() {
     let source = "#if ENABLED\nclass Enabled {}\n#else\nclass Disabled {}\n#endif\n";
     let defines = vec!["ENABLED".into()];
-    let id =
-        records::source_id_at_version(source, Language::CSharp, &defines, "", version).unwrap();
+    let id = records::source_id(source, Language::CSharp, &defines, "").unwrap();
     let encoded = records::encode(FileData {
         source: source.into(),
         facts: crate::extract::extract(source, Language::CSharp, &defines, "").unwrap(),
         assembly: None,
     })
     .unwrap();
-    let mut bytes =
-        envelope(&binary::encode(&vec![(id, binary::encode(&encoded).unwrap())]).unwrap());
-    bytes[8..72].copy_from_slice(version.as_bytes());
+    let bytes = envelope(&binary::encode(&vec![(id, binary::encode(&encoded).unwrap())]).unwrap());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Code.cs");
     fs::write(dir.path().join("Code.cs.analysis"), bytes).unwrap();
@@ -543,10 +523,7 @@ fn compatible_source_profiles_keep_preprocessor_selection() {
         ("class Changed {}", vec!["ENABLED".into()], false),
     ] {
         let id = records::source_id(text, Language::CSharp, &defines, "").unwrap();
-        let restored = source_analysis(&path, &id, |version| {
-            records::source_id_at_version(text, Language::CSharp, &defines, "", version)
-        })
-        .unwrap();
+        let restored = source_analysis(&path, &id).unwrap();
         assert_eq!(restored.is_some(), matches);
         if let Some(restored) = restored {
             assert_eq!(restored.names, encoded.names);
@@ -635,11 +612,9 @@ fn selecting_a_profile_does_not_decode_other_profiles() {
         .unwrap(),
     )
     .unwrap();
-    let restored = source_analysis(&path, &selected, |_| unreachable!())
-        .unwrap()
-        .unwrap();
+    let restored = source_analysis(&path, &selected).unwrap().unwrap();
     assert_eq!(restored.records, encoded.records);
-    assert!(source_analysis(&path, &other, |_| unreachable!()).is_err());
+    assert!(source_analysis(&path, &other).is_err());
 }
 
 #[test]
@@ -657,11 +632,7 @@ fn editor_only_generated_directives_do_not_block_other_profiles() {
     let path = cache.path().join("Generator.cs");
     assert_eq!(fs::read_to_string(&path).unwrap(), source);
     let id = crate::store::source_id(source, Language::CSharp, &defines, "").unwrap();
-    assert!(
-        source_analysis(&path, &id, |_| unreachable!())
-            .unwrap()
-            .is_some()
-    );
+    assert!(source_analysis(&path, &id).unwrap().is_some());
 }
 
 #[test]

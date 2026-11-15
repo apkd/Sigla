@@ -14,7 +14,6 @@ pub(crate) struct Policy {
     pub rules: Vec<Rule>,
     pub repo_ttl: Duration,
     pub branch_ttl: Duration,
-    #[serde(default)]
     pub selection_identity: String,
 }
 impl From<&crate::config::RemoteOptions> for Policy {
@@ -27,60 +26,15 @@ impl From<&crate::config::RemoteOptions> for Policy {
         }
     }
 }
-#[derive(Deserialize)]
-struct DefaultBranch {
-    branch: String,
-    #[serde(default)]
-    previous: Option<String>,
-}
-
-/// The fields used by maintenance, without the potentially large file inventories.
-#[derive(Deserialize)]
-pub(crate) struct ProjectedState {
-    pub repository: Identity,
-    transport: String,
-    pub branch: String,
-    #[serde(default)]
-    target: Option<Target>,
-    pub last_use: u64,
-    pub policy: String,
-    pub prepared: ProjectedPrepared,
-    pub indexed_revision: Option<String>,
-    pub repair: bool,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ProjectedPrepared {
-    pub branch: Option<String>,
-    pub revision: String,
-}
-
-impl From<&State> for ProjectedState {
-    fn from(state: &State) -> Self {
-        Self {
-            repository: state.repository.clone(),
-            transport: state.transport.clone(),
-            branch: state.branch.clone(),
-            target: state.target.clone(),
-            last_use: state.last_use,
-            policy: state.policy.clone(),
-            prepared: ProjectedPrepared {
-                branch: state.prepared.branch.clone(),
-                revision: state.prepared.revision.clone(),
-            },
-            indexed_revision: state.indexed_revision.clone(),
-            repair: state.repair,
-        }
-    }
-}
+pub(crate) use super::state_store::Header as ProjectedState;
 
 pub(crate) fn projected(cache: &Path) -> Result<BTreeMap<PathBuf, ProjectedState>> {
-    read_states(cache)
+    read_states(cache, super::state_store::header)
 }
 pub(crate) fn cached(cache: &Path) -> Result<BTreeMap<PathBuf, State>> {
-    read_states(cache)
+    read_states(cache, super::state_store::read)
 }
-fn read_states<T: serde::de::DeserializeOwned>(cache: &Path) -> Result<BTreeMap<PathBuf, T>> {
+fn read_states<T>(cache: &Path, read: impl Fn(&Path) -> Result<T>) -> Result<BTreeMap<PathBuf, T>> {
     let mut states = BTreeMap::new();
     let entries = match fs::read_dir(cache.join("repositories")) {
         Ok(entries) => entries,
@@ -90,12 +44,15 @@ fn read_states<T: serde::de::DeserializeOwned>(cache: &Path) -> Result<BTreeMap<
     for entry in entries {
         let entry = entry?;
         anyhow::ensure!(entry.file_type()?.is_dir(), "Invalid selector directory");
-        match fs::read(entry.path().join("state.json")) {
-            Ok(bytes) => {
-                states.insert(entry.path(), serde_json::from_slice(&bytes)?);
+        match read(&entry.path()) {
+            Ok(state) => {
+                states.insert(entry.path(), state);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(states)
@@ -116,15 +73,22 @@ impl Policy {
         state: &ProjectedState,
         default_ready: impl Fn(&Identity, &str) -> Result<bool>,
     ) -> Result<(Option<String>, Duration)> {
-        let default: Option<DefaultBranch> =
-            match fs::read(cache.join("defaults").join(state.repository.storage_key())) {
-                Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
+        let default: Option<super::manager::DefaultBranch> = match crate::cache::records::read(
+            &cache.join("defaults").join(state.repository.storage_key()),
+            64 * 1024,
+        ) {
+            Ok(saved) => Some(saved),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let branch = state.prepared.branch.as_deref().or(match &state.target {
-            Some(Target::Branch(name)) => Some(name.as_str()),
-            None => Some(state.branch.as_str()),
+            Target::Branch(name) => Some(name.as_str()),
             _ => None,
         });
         let is_default = default
@@ -170,6 +134,35 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::materialize::Prepared;
+
+    fn state(repository: &Repository, tracked: BTreeMap<String, String>) -> State {
+        State {
+            repository: repository.identity.clone(),
+            transport: repository.transport.clone(),
+            branch: "main".into(),
+            target: Target::Branch("main".into()),
+            last_use: 12,
+            refreshed: 13,
+            policy: "old".into(),
+            indexed_revision: Some("abc".into()),
+            repair: false,
+            additional: Default::default(),
+            prepared: Prepared {
+                branch: Some("main".into()),
+                revision: "abc".into(),
+                selected: tracked.clone(),
+                tracked,
+                directories: ["src".into()].into(),
+                deferred_assets: Default::default(),
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+            },
+        }
+    }
 
     #[test]
     #[ignore = "manual selector state scan comparison"]
@@ -188,17 +181,11 @@ mod tests {
                 )
             })
             .collect();
-        let json = serde_json::json!({
-            "schema": 4, "repository": repository.identity, "transport": repository.transport,
-            "branch": "main", "last_use": 12, "refreshed": 13, "policy": "current",
-            "indexed_revision": "abc", "repair": false,
-            "prepared": {"branch": "main", "revision": "abc", "selected": tracked,
-                "tracked": tracked, "directories": ["packages"]}
-        });
-        let path = root.join("state.json");
-        serde_json::to_writer(fs::File::create(&path).unwrap(), &json).unwrap();
-        drop(json);
-        let size = fs::metadata(&path).unwrap().len();
+        super::super::state_store::write(&root, &state(&repository, tracked)).unwrap();
+        let size: u64 = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
         for projected_only in [false, true] {
             let started = std::time::Instant::now();
             for _ in 0..3 {
@@ -217,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_states_match_full_retention_decisions_across_legacy_and_current_data() {
+    fn projected_states_match_full_retention_decisions() {
         let cache = tempfile::tempdir().unwrap();
         let repository = Repository::parse("https://github.com/fixture/repo")
             .unwrap()
@@ -227,20 +214,19 @@ mod tests {
         let tracked: BTreeMap<_, _> = (0..2000)
             .map(|index| (format!("src/{index}.cs"), format!("{index:x}")))
             .collect();
-        let mut json = serde_json::json!({
-            "schema": 4, "repository": repository.identity,
-            "transport": repository.transport, "branch": "main", "last_use": 12,
-            "refreshed": 13, "policy": "old", "indexed_revision": "abc", "repair": false,
-            "prepared": {"branch": "main", "revision": "abc", "selected": tracked,
-                "tracked": tracked, "directories": ["src"]}
-        });
+        let mut state = state(&repository, tracked);
         fs::create_dir_all(cache.path().join("defaults")).unwrap();
-        fs::write(
-            cache
+        crate::cache::records::write(
+            &cache
                 .path()
                 .join("defaults")
                 .join(repository.identity.storage_key()),
-            serde_json::to_vec(&serde_json::json!({"branch":"main", "previous":"stable"})).unwrap(),
+            &super::super::manager::DefaultBranch {
+                repository: repository.identity.clone(),
+                branch: "main".into(),
+                refreshed: 0,
+                previous: Some("stable".into()),
+            },
         )
         .unwrap();
         let policy = Policy {
@@ -250,18 +236,14 @@ mod tests {
             selection_identity: "current".into(),
         };
         for (branch, target, ready, protected) in [
-            ("main", None, false, true),
-            ("main", None, true, false),
-            ("stable", Some(Target::Branch("stable".into())), false, true),
-            ("other", Some(Target::Branch("other".into())), true, false),
+            (Some("main"), Target::Branch("main".into()), false, true),
+            (None, Target::Branch("main".into()), true, false),
+            (Some("stable"), Target::Branch("stable".into()), false, true),
+            (Some("other"), Target::Branch("other".into()), true, false),
         ] {
-            json["prepared"]["branch"] = serde_json::json!(branch);
-            if let Some(target) = target {
-                json["target"] = serde_json::to_value(target).unwrap();
-            } else {
-                json.as_object_mut().unwrap().remove("target");
-            }
-            fs::write(root.join("state.json"), serde_json::to_vec(&json).unwrap()).unwrap();
+            state.prepared.branch = branch.map(str::to_owned);
+            state.target = target;
+            super::super::state_store::write(&root, &state).unwrap();
             let full = cached(cache.path()).unwrap().remove(&root).unwrap();
             let projected = projected(cache.path()).unwrap().remove(&root).unwrap();
             assert_eq!(projected.last_use, full.last_use);
@@ -277,7 +259,7 @@ mod tests {
                 decision
             );
         }
-        fs::write(root.join("state.json"), b"{invalid").unwrap();
+        fs::write(root.join("state.bin"), b"invalid").unwrap();
         assert!(projected(cache.path()).is_err());
     }
 }

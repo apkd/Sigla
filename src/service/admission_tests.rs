@@ -14,6 +14,27 @@ fn fixture(workers: usize) -> (tempfile::TempDir, tempfile::TempDir, App) {
 }
 
 #[test]
+fn ownership_lock_rejects_symlinks_and_non_regular_files() {
+    use std::os::unix::ffi::OsStrExt;
+
+    for fifo in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let lock = cache.path().join("ownership.lock");
+        if fifo {
+            let path = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        } else {
+            std::os::unix::fs::symlink(outside.path(), &lock).unwrap();
+        }
+        let policy = Policy::new(vec![root.path().into()]).unwrap();
+        assert!(App::new(policy, cache.path().into(), 1).is_err());
+        assert!(outside.path().is_file());
+    }
+}
+
+#[test]
 fn workspace_registry_trims_after_active_pins_drain() {
     let (root, _cache, app) = fixture(1);
     let pins: Vec<_> = (0..WORKSPACE_CACHE_ENTRIES + 1)
@@ -397,14 +418,19 @@ async fn remote_preparation_fixture() -> (
     Arc<crate::repository::manager::Branch>,
     PathBuf,
 ) {
-    use crate::repository::{Repository, Rule, materialize::Target};
+    use crate::repository::{
+        Repository, Rule,
+        manager::State,
+        materialize::{Prepared, Target},
+    };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     let cache = tempfile::tempdir().unwrap();
+    crate::cache::reset::prepare(cache.path()).unwrap();
     let repository = Repository::parse("https://github.com/fixture/repo#refs/heads/main")
         .unwrap()
         .unwrap();
-    let key = blake3::hash(&serde_json::to_vec(&(&repository.identity, "main")).unwrap())
+    let key = blake3::hash(&postcard::to_allocvec(&(&repository.identity, "main")).unwrap())
         .to_hex()
         .to_string();
     let owner = cache.path().join("repositories").join(key);
@@ -421,20 +447,36 @@ async fn remote_preparation_fixture() -> (
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let state = serde_json::json!({
-        "schema": 4, "repository": repository.identity, "transport": repository.transport,
-        "branch": "main", "target": Target::Branch("main".into()),
-        "last_use": now, "refreshed": now, "store_created": now,
-        "policy": selection.identity, "repair": false, "indexed_revision": null,
-        "prepared": {"branch": "main", "revision": "a".repeat(40),
-            "selected": {"Cargo.toml": "b", "src/lib.rs": "c"},
-            "tracked": {"Cargo.toml": "b", "src/lib.rs": "c"}, "directories": ["src"]}
-    });
-    std::fs::write(
-        owner.join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    let files = std::collections::BTreeMap::from([
+        ("Cargo.toml".into(), "b".into()),
+        ("src/lib.rs".into(), "c".into()),
+    ]);
+    let state = State {
+        repository: repository.identity.clone(),
+        transport: repository.transport.clone(),
+        branch: "main".into(),
+        target: Target::Branch("main".into()),
+        last_use: now,
+        refreshed: now,
+        policy: selection.identity.clone(),
+        repair: false,
+        indexed_revision: None,
+        additional: Default::default(),
+        prepared: Prepared {
+            branch: Some("main".into()),
+            revision: "a".repeat(40),
+            selected: files.clone(),
+            tracked: files,
+            directories: ["src".into()].into(),
+            deferred_assets: Default::default(),
+            omitted: Default::default(),
+            transfer_bytes: 0,
+            unavailable: Default::default(),
+            transport: None,
+            resolved_target: None,
+        },
+    };
+    crate::repository::state_store::write(&owner, &state).unwrap();
     let app = Arc::new(
         App::remote(
             Policy::new(vec![source.clone()]).unwrap(),

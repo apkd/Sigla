@@ -83,9 +83,18 @@ impl Default for Jobs {
     }
 }
 pub fn generation(manifest: &Manifest) -> Result<[u8; 32]> {
-    let mut hash = blake3::Hasher::new();
-    postcard::to_io(&(env!("SIGLA_ASSET_FINGERPRINT"), manifest), &mut hash)?;
-    Ok(*hash.finalize().as_bytes())
+    manifest
+        .derived
+        .asset_generation
+        .get_or_init(|| {
+            let mut hash = blake3::Hasher::new();
+            postcard::to_io(&(env!("SIGLA_ASSET_FINGERPRINT"), manifest), &mut hash)
+                .map_err(|error| error.to_string())?;
+            Ok(*hash.finalize().as_bytes())
+        })
+        .as_ref()
+        .copied()
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 impl Jobs {
     pub fn stats(&self) -> crate::memory::CacheUsage {
@@ -559,11 +568,10 @@ mod tests {
         let dependencies = workspace.leases();
         let branch = Arc::new(Branch::for_test(root.into()));
         *branch.state.write().await = Some(crate::repository::manager::State {
-            schema: 1,
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),
-            target: Some(branch.target.clone()),
+            target: branch.target.clone(),
             last_use: 0,
             refreshed: 0,
             policy: String::new(),

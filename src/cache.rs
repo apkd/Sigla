@@ -6,6 +6,8 @@ pub mod inspect;
 pub mod owners;
 pub mod packages;
 pub mod policy;
+pub mod records;
+pub mod reset;
 pub mod views;
 
 pub(crate) struct Ownership(pub std::fs::File);

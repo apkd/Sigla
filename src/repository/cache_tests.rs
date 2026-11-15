@@ -80,24 +80,43 @@ async fn unchanged_files_need_no_import_or_hydration_job() {
 }
 
 fn publish_selector(cache: &Path, pool: &Pool, root: &Root) {
+    fs::create_dir_all(cache.join("repositories").join(pool.identity.storage_key())).unwrap();
     let selected: std::collections::BTreeMap<_, _> = root
         .selected
         .iter()
         .enumerate()
         .map(|(i, id)| (format!("file-{i}"), id))
         .collect();
-    super::super::manager::write_json(
-        &cache
-            .join("repositories")
-            .join(pool.identity.storage_key())
-            .join("state.json"),
-        &serde_json::json!({
-            "schema": 4, "repository": pool.identity,
-            "transport": "https://github.com/example/sharing-fixture", "branch": "main",
-            "last_use": 0, "refreshed": 0, "policy": "", "indexed_revision": null, "repair": false,
-            "prepared": { "branch": "main", "revision": root.revision, "selected": selected,
-                "tracked": {}, "directories": [] }
-        }),
+    super::super::state_store::write(
+        &cache.join("repositories").join(pool.identity.storage_key()),
+        &super::super::manager::State {
+            repository: pool.identity.clone(),
+            transport: "https://github.com/example/sharing-fixture".into(),
+            branch: "main".into(),
+            target: super::super::materialize::Target::Branch("main".into()),
+            last_use: 0,
+            refreshed: 0,
+            policy: String::new(),
+            indexed_revision: None,
+            repair: false,
+            additional: BTreeSet::new(),
+            prepared: Prepared {
+                branch: Some("main".into()),
+                revision: root.revision.clone(),
+                selected: selected
+                    .into_iter()
+                    .map(|(name, id)| (name, id.clone()))
+                    .collect(),
+                tracked: Default::default(),
+                directories: Default::default(),
+                deferred_assets: Default::default(),
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+            },
+        },
     )
     .unwrap();
 }
@@ -227,7 +246,7 @@ fn ordinary_maintenance_skips_a_pool_with_unchanged_roots() {
     let roots = pool.roots(cache.path()).unwrap();
     state.replaced = 0;
     state.retained = Some(
-        blake3::hash(&serde_json::to_vec(&roots).unwrap())
+        blake3::hash(&postcard::to_allocvec(&roots).unwrap())
             .to_hex()
             .to_string(),
     );
@@ -275,9 +294,9 @@ fn pressure_keeps_inflight_git_objects_and_reclaims_an_idle_pool() {
 fn initial_pool_clock_is_persisted_even_before_successful_acquisition() {
     let cache = tempfile::tempdir().unwrap();
     let pool = Pool::open(cache.path(), &identity()).unwrap();
-    assert!(!pool.root.join("pool.json").exists());
+    assert!(!pool.root.join("pool.bin").exists());
     let state = pool.state().unwrap();
-    assert!(pool.root.join("pool.json").is_file());
+    assert!(pool.root.join("pool.bin").is_file());
     assert_eq!(pool.state().unwrap().replaced, state.replaced);
     assert_eq!(pool.state().unwrap().used, state.used);
 }

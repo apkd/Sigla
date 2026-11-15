@@ -3,7 +3,9 @@ use crate::{
     model::*,
     store::{FileData, MAX_SOURCE_BYTES, Store},
 };
+pub(crate) mod derived;
 use anyhow::{Context, Result, ensure};
+pub use derived::Derived;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -133,6 +135,8 @@ impl FileEntry {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
+    #[serde(skip)]
+    pub derived: Derived,
     pub source_group: Option<crate::native::Group>,
     pub discovery_policy: [u8; 32],
     pub environment: [u8; 32],
@@ -405,6 +409,7 @@ impl Workspace {
         let mut policy_watches = BTreeSet::new();
         let managed = self.policy.managed_root(discovery.metadata.iter());
         let mut manifest = Manifest {
+            derived: Default::default(),
             source_group: None,
             discovery_policy: self.policy.discovery_identity(discovery.metadata.iter())?,
             environment: [0; 32],
@@ -962,17 +967,8 @@ impl InputContents {
         if let Self::Archived(analysis) = self {
             return Ok(analysis.encoded);
         }
-        if let Self::Source {
-            source,
-            language,
-            defines,
-            edition,
-        } = &self
-            && let Some(encoded) = crate::metadata_archive::source_analysis(path, id, |version| {
-                crate::store::payload::source_id_at_version(
-                    source, *language, defines, edition, version,
-                )
-            })?
+        if let Self::Source { .. } = &self
+            && let Some(encoded) = crate::metadata_archive::source_analysis(path, id)?
         {
             return Ok(encoded);
         }
@@ -1032,7 +1028,7 @@ fn index_input(
     let mut extraction = std::time::Duration::ZERO;
     let installed = (|| -> Result<_> {
         verify()?;
-        let (id, _, contents) = prepare_input(store, key, input, project, stamp)?;
+        let (id, _, contents) = prepare_input(store, input, project, stamp)?;
         verify()?;
         store.install_encoded(key, stamp, id, verify, || {
             let start = std::time::Instant::now();
@@ -1068,7 +1064,6 @@ type SourceJob<'a> = (String, (Stamp, &'a SourceInput, &'a Project));
 
 fn prepare_input(
     store: &Store,
-    key: &str,
     input: &SourceInput,
     project: &Project,
     stamp: &Stamp,
@@ -1078,16 +1073,6 @@ fn prepare_input(
     Option<InputContents>,
 )> {
     let identity = input_identity(input, project, stamp)?;
-    {
-        let tx = store.read()?;
-        if let Some(binding) =
-            store
-                .scope
-                .previous_binding(&tx, key, &postcard::to_allocvec(stamp)?)?
-        {
-            return Ok((binding.object, identity, None));
-        }
-    }
     if let Some(identity) = identity
         && let Some(object) = store.scope.input(&identity)?
     {
@@ -1245,8 +1230,7 @@ fn index_source_chunk(
                             Stamp::read(&input.path)? == *stamp,
                             "File changed before extraction; retry query"
                         );
-                        let (id, identity, contents) =
-                            prepare_input(store, key, input, project, stamp)?;
+                        let (id, identity, contents) = prepare_input(store, input, project, stamp)?;
                         ensure!(
                             Stamp::read(&input.path)? == *stamp,
                             "File changed during indexing; retry query"

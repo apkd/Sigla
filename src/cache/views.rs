@@ -24,10 +24,16 @@ pub(crate) fn is_metadata_root(cache: &Path, path: &Path) -> bool {
 }
 
 fn saved_metadata_usage(root: &Path) -> Result<Option<super::policy::Usage>> {
-    match fs::read(root.join(LAST_USE)) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    match super::records::read(&root.join(LAST_USE), 1024 * 1024) {
+        Ok(usage) => Ok(Some(usage)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -157,10 +163,7 @@ impl LeaseSet {
             None => super::policy::Usage::new(now),
         };
         usage.record(now);
-        let mut file = tempfile::NamedTempFile::new_in(root)?;
-        serde_json::to_writer(file.as_file_mut(), &usage)?;
-        file.as_file().sync_all()?;
-        file.persist(root.join(LAST_USE))?;
+        super::records::write(&root.join(LAST_USE), &usage)?;
         Ok(())
     }
 }
@@ -186,8 +189,6 @@ pub fn managed_root(cache: &Path, path: &Path) -> Option<PathBuf> {
         .any(|view| kind.as_os_str() == *view)
     {
         Some(cache.join(kind).join(components.next()?))
-    } else if kind.as_os_str() == "dotnet" && components.next()?.as_os_str() == "packages" {
-        Some(cache.join("dotnet/packages"))
     } else {
         None
     }
@@ -380,6 +381,23 @@ mod tests {
         leases.retain(&legacy).unwrap();
         leases.record_metadata_use(&legacy);
         assert!(metadata_last_use(&legacy).unwrap() > usage[&legacy].last_use);
+    }
+    #[test]
+    fn metadata_usage_is_read_without_a_write_and_updated_on_use() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().join("unity-metadata/editor");
+        fs::create_dir_all(root.join("contents")).unwrap();
+        fs::write(root.join("contents/manifest.bin"), b"cached").unwrap();
+        let marker = root.join(LAST_USE);
+        super::super::records::write(&marker, &super::super::policy::Usage::new(1)).unwrap();
+        let before = fs::read(&marker).unwrap();
+        assert_eq!(metadata_last_use(&root).unwrap(), 1);
+        assert_eq!(fs::read(&marker).unwrap(), before);
+        let leases = LeaseSet::new(cache.path()).unwrap();
+        leases.retain(&root).unwrap();
+        leases.record_metadata_use_at(&root, 120_000).unwrap();
+        assert_eq!(metadata_last_use(&root).unwrap(), 120_000);
+        assert_ne!(fs::read(&marker).unwrap(), before);
     }
     #[test]
     fn leases_cover_clones_aliases_and_reacquisition() {

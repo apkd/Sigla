@@ -163,26 +163,28 @@ impl Sources<'_> {
         }
         None
     }
-    fn source_paths(&self, root: &std::path::Path) -> BTreeMap<String, String> {
-        let mut paths: BTreeMap<String, String> = self
-            .manifest
-            .files
-            .iter()
-            .chain(self.manifest.deferred.iter())
-            .filter(|(_, file)| !file.metadata)
-            .flat_map(|(key, file)| {
-                file.memberships.iter().filter_map(move |m| {
-                    if let Ok(path) = file.path.strip_prefix(root) {
-                        Some((path.to_string_lossy().into_owned(), key.clone()))
-                    } else {
-                        let display = self.manifest.display(file, m);
-                        (!std::path::Path::new(display.as_ref()).is_absolute())
-                            .then(|| (display.into_owned(), key.clone()))
-                    }
+    fn source_paths(&self, root: &std::path::Path) -> std::sync::Arc<BTreeMap<String, String>> {
+        let mut paths = self.manifest.derived.navigation(root, || {
+            self.manifest
+                .files
+                .iter()
+                .chain(self.manifest.deferred.iter())
+                .filter(|(_, file)| !file.metadata)
+                .flat_map(|(key, file)| {
+                    file.memberships.iter().filter_map(move |m| {
+                        if let Ok(path) = file.path.strip_prefix(root) {
+                            Some((path.to_string_lossy().into_owned(), key.clone()))
+                        } else {
+                            let display = self.manifest.display(file, m);
+                            (!std::path::Path::new(display.as_ref()).is_absolute())
+                                .then(|| (display.into_owned(), key.clone()))
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        });
         if let Some(assets) = self.assets {
+            let paths = std::sync::Arc::make_mut(&mut paths);
             for asset in assets.assets.values() {
                 paths.entry(asset.path.clone()).or_default();
             }
@@ -208,7 +210,8 @@ impl Sources<'_> {
             .collect::<Result<Vec<_>>>()?;
         let mut found = Vec::new();
         let mut total = 0;
-        for (path, key) in self.source_paths(root) {
+        let source_paths = self.source_paths(root);
+        for (path, key) in source_paths.iter() {
             self.check()?;
             let target = if q.target.name.contains('/') {
                 path.as_str()
@@ -217,7 +220,7 @@ impl Sources<'_> {
             };
             if !pattern.is_match(target)
                 || !paths.iter().all(|(f, p)| {
-                    (p.is_match(&path)
+                    (p.is_match(path)
                         || path
                             .strip_prefix(f.value.trim_end_matches('/'))
                             .is_some_and(|suffix| suffix.starts_with('/')))
@@ -229,8 +232,8 @@ impl Sources<'_> {
             let file = self
                 .manifest
                 .files
-                .get(&key)
-                .or_else(|| self.manifest.deferred.get(&key));
+                .get(key)
+                .or_else(|| self.manifest.deferred.get(key));
             if q.filters.iter().any(|f| f.key == "lang")
                 && file.is_none_or(|file| !q.file_language_filters(file.language))
             {
@@ -251,7 +254,7 @@ impl Sources<'_> {
             }
             total += 1;
             if found.len() < q.limit {
-                found.push(crate::navigation::quote(&path));
+                found.push(crate::navigation::quote(path));
             }
         }
         if total == 0 {

@@ -79,28 +79,28 @@ fn source_indexing_benchmark() {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let cache = tempfile::tempdir_in(parent).unwrap();
-    let manifest =
-        if let Some(index) = std::env::var_os("SIGLA_BENCH_INDEX") {
-            let bytes =
-                crate::store::shared::snapshot_manifest(&PathBuf::from(index), &root, |bytes| {
-                    Ok(crate::store::inspect_manifest(bytes)?
-                        .is_some_and(|m| m.source_group.is_none()))
-                })
-                .unwrap();
-            crate::store::inspect_manifest(&bytes).unwrap().unwrap()
-        } else {
-            let mut workspace = Workspace::open(
-                root.clone(),
-                cache.path(),
-                Policy::new(vec![root.clone()]).unwrap(),
-                &cache.path().join("discovery"),
-                None,
-                Default::default(),
-            )
+    let manifest = if let Some(index) = std::env::var_os("SIGLA_BENCH_INDEX") {
+        let bytes =
+            crate::store::shared::snapshot_manifest(&PathBuf::from(index), &root, |bytes| {
+                Ok(crate::store::inspect_manifest(bytes)?
+                    .source_group
+                    .is_none())
+            })
             .unwrap();
-            let prepared = workspace.prepare().unwrap().unwrap();
-            Arc::unwrap_or_clone(workspace.plan(prepared).unwrap().manifest)
-        };
+        crate::store::inspect_manifest(&bytes).unwrap()
+    } else {
+        let mut workspace = Workspace::open(
+            root.clone(),
+            cache.path(),
+            Policy::new(vec![root.clone()]).unwrap(),
+            &cache.path().join("discovery"),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let prepared = workspace.prepare().unwrap().unwrap();
+        Arc::unwrap_or_clone(workspace.plan(prepared).unwrap().manifest)
+    };
     let inputs: VecDeque<_> = manifest
         .files
         .values()
