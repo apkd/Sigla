@@ -183,10 +183,15 @@ impl View {
                 "/tmp",
                 "--proc",
                 "/proc",
+                "--chdir",
+                "/",
             ])
             .arg("--bind")
             .arg(&self.root)
             .arg(&self.root)
+            .arg("--ro-bind")
+            .arg(integration)
+            .arg(integration)
             .arg("--overlay-src")
             .arg(self.path())
             .arg("--overlay-src")
@@ -197,7 +202,8 @@ impl View {
             .arg("--seal-packages")
             .arg(self.path())
             .arg(self.upper())
-            .arg(&contents);
+            .arg(&contents)
+            .env("XDG_RUNTIME_DIR", stage.path());
         crate::process::run(&mut command, deadline.remaining(Duration::from_secs(300))?)?;
         self.store.import_tree(&contents)?;
         let generation = stage

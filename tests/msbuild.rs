@@ -189,6 +189,41 @@ fn check_project_failure(solution: bool) {
 }
 
 #[test]
+fn local_package_writes_remain_readable_after_discovery() {
+    let source = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        source.path(),
+        "App.csproj",
+        r#"<Project>
+          <ItemGroup><Compile Include="$(NUGET_PACKAGES)/fixture/Generated.cs" /></ItemGroup>
+          <Target Name="PrepareForBuild">
+            <MakeDir Directories="$(NUGET_PACKAGES)/fixture" />
+            <WriteLinesToFile File="$(NUGET_PACKAGES)/fixture/Generated.cs" Lines="public class Generated {}" Overwrite="true" />
+          </Target>
+        </Project>"#,
+    );
+    let policy = Policy::new(vec![source.path().into(), cache.path().into()]).unwrap();
+    let discovery =
+        discover_cached(&source.path().join("App.csproj"), &policy, cache.path()).unwrap();
+    assert!(
+        discovery.diagnostics.is_empty(),
+        "{:?}",
+        discovery.diagnostics
+    );
+    let generated = discovery
+        .sources
+        .iter()
+        .find(|source| source.path.ends_with("Generated.cs"))
+        .expect("The project's generated package source must remain available");
+    assert!(
+        std::fs::read_to_string(&generated.path)
+            .unwrap()
+            .contains("class Generated")
+    );
+}
+
+#[test]
 fn package_views_share_storage_and_isolate_project_writes() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let cache = tempfile::tempdir().unwrap();

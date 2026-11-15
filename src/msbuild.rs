@@ -83,20 +83,19 @@ fn command(directory: &Path) -> Command {
     command
 }
 
-fn payload(cache: &Path, major: &str) -> Result<PathBuf> {
+fn payload(cache: &Path, sdk: &Path) -> Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::DirBuilderExt;
     static EXTRACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _extraction = EXTRACTION.lock().unwrap();
-    let runtime = format!(
-        r#"{{"runtimeOptions":{{"tfm":"net{major}.0","framework":{{"name":"Microsoft.NETCore.App","version":"{major}.0.0"}},"rollForward":"LatestMinor"}}}}"#
-    );
+    // Follow the selected SDK's runtime policy, including prerelease versions.
+    let runtime = fs::read(sdk.join("dotnet.runtimeconfig.json"))?;
     let mut digest = blake3::Hasher::new();
     for (name, bytes) in PAYLOAD {
         digest.update(name.as_bytes());
         digest.update(bytes);
     }
-    digest.update(runtime.as_bytes());
+    digest.update(&runtime);
     let root = cache
         .join("integration")
         .join(digest.finalize().to_hex().as_str());
@@ -106,7 +105,7 @@ fn payload(cache: &Path, major: &str) -> Result<PathBuf> {
         .create(&root)?;
     for (name, bytes) in PAYLOAD.iter().copied().chain(std::iter::once((
         "Sigla.Discovery.runtimeconfig.json",
-        runtime.as_bytes(),
+        runtime.as_slice(),
     ))) {
         let path = root.join(name);
         if path.exists() {
@@ -150,11 +149,11 @@ impl Budget {
 }
 
 struct Bootstrap {
-    version: String,
+    sdk: PathBuf,
     root: PathBuf,
     fxr: PathBuf,
     roots: Vec<PathBuf>,
-    approved: BTreeMap<PathBuf, String>,
+    approved: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -359,22 +358,19 @@ pub(crate) fn discover_in(
                 .lines()
                 .filter_map(|line| {
                     let (version, location) = line.split_once(" [")?;
-                    let major = version.split('.').next()?;
+                    let major = semver::Version::parse(version).ok()?.major;
                     let location = PathBuf::from(location.trim_end_matches(']'));
                     metadata.insert(location.clone());
-                    matches!(major, "8" | "10")
-                        .then(|| (version.to_owned(), location.join(version)))
+                    (major >= 8).then(|| (version.to_owned(), location.join(version)))
                 })
                 .collect();
             #[cfg(test)]
             BOOTSTRAP_CALLS.with(|calls| calls.set(calls.get() + 1));
-            let (bootstrap_version, bootstrap_sdk) = installed
+            let (_, bootstrap_sdk) = installed
                 .iter()
                 .max_by_key(|(v, _)| semver::Version::parse(v).ok())
                 .ok_or_else(|| {
-                    SdkFailure(
-                        "MSBuild discovery requires an installed .NET 8 or .NET 10 SDK".into(),
-                    )
+                    SdkFailure("MSBuild discovery requires an installed .NET 8 or newer SDK".into())
                 })?;
             let host_root = bootstrap_sdk.parent().unwrap().parent().unwrap();
             let host = host_root.join("dotnet");
@@ -392,14 +388,14 @@ pub(crate) fn discover_in(
                 .iter()
                 .map(|(_, p)| p.parent().unwrap().parent().unwrap().to_owned())
                 .collect::<Vec<_>>();
-            let mut approved = BTreeMap::new();
-            for (version, path) in &installed {
+            let mut approved = BTreeSet::new();
+            for (_, path) in &installed {
                 if let Ok(path) = path.canonicalize() {
-                    approved.entry(path).or_insert_with(|| version.clone());
+                    approved.insert(path);
                 }
             }
             Ok(Bootstrap {
-                version: bootstrap_version.clone(),
+                sdk: bootstrap_sdk.clone(),
                 root: host_root.to_owned(),
                 fxr,
                 roots,
@@ -414,7 +410,6 @@ pub(crate) fn discover_in(
         .unwrap()
         .as_ref()
         .map_err(|error| SetupFailure(error.clone()))?;
-    let bootstrap_version = &bootstrap.version;
     let host_root = &bootstrap.root;
     let host = host_root.join("dotnet");
     let fxr = &bootstrap.fxr;
@@ -433,7 +428,8 @@ pub(crate) fn discover_in(
         sdk.clone()
     } else {
         let sdk = (|| -> Result<PathBuf> {
-            let integration = payload(cache, bootstrap_version.split('.').next().unwrap())?;
+            metadata.insert(bootstrap.sdk.join("dotnet.runtimeconfig.json"));
+            let integration = payload(cache, &bootstrap.sdk)?;
             let mut resolve = match &sandbox {
                 Some(sandbox) => {
                     let mut command =
@@ -506,10 +502,11 @@ pub(crate) fn discover_in(
                     ))
                 })?
                 .canonicalize()?;
-            if !bootstrap.approved.contains_key(&sdk) {
-                return Err(SdkFailure(
-                    "global.json selected a toolchain outside approved installed SDKs".into(),
-                )
+            if !bootstrap.approved.contains(&sdk) {
+                return Err(SdkFailure(format!(
+                    "SDK policy selected a toolchain outside approved installed SDKs: {}",
+                    sdk.display()
+                ))
                 .into());
             }
             Ok(sdk)
@@ -518,11 +515,8 @@ pub(crate) fn discover_in(
         session.resolved.insert(scope.clone(), sdk.clone());
         sdk
     };
-    let version = bootstrap
-        .approved
-        .get(&sdk)
-        .context("global.json selected a toolchain outside approved installed SDKs")?;
-    let root = payload(cache, version.split('.').next().unwrap())?;
+    metadata.insert(sdk.join("dotnet.runtimeconfig.json"));
+    let root = payload(cache, &sdk)?;
     let mapped_entries = entries
         .iter()
         .map(|entry| match &sandbox {
