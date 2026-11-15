@@ -1187,6 +1187,26 @@ impl App {
                 return Ok(indexes::pending("Workspace preparation"));
             }
         };
+        if let Request::View(path, mode) = &request
+            && crate::unity::assets::view::requested(path)
+        {
+            let Some(result) = wait
+                .until(self.view_asset_file(
+                    inventory.clone(),
+                    path.clone(),
+                    *mode,
+                    (usage_entry.clone(), usage_branch.clone()),
+                    activity.clone(),
+                    operation.clone(),
+                ))
+                .await?
+            else {
+                return Ok(indexes::pending("Asset file preparation"));
+            };
+            if let Some(result) = result {
+                return Ok(result);
+            }
+        }
         if indexes::navigation(&request, query.as_ref())
             && (!matches!(request, Request::Search(_))
                 || indexes::source_only(&request, query.as_ref())
@@ -1427,7 +1447,7 @@ impl App {
                 let workspace = state.as_mut().unwrap();
                 let store = workspace.store.clone();
                 let base_manifest = workspace.manifest.clone();
-                let mut manifest = workspace.manifest.clone();
+                let mut source_manifests = Vec::new();
                 let asset_only = query.as_ref().is_some_and(|q| {
                     matches!(
                         q.selector.as_str(),
@@ -1444,9 +1464,7 @@ impl App {
                             if !snapshot.manifest.files.is_empty()
                                 && (!asset_only || context.is_some())
                             {
-                                Arc::make_mut(&mut manifest)
-                                    .files
-                                    .extend(snapshot.manifest.files.clone());
+                                source_manifests.push(snapshot.manifest.clone());
                             }
                             if !asset_only {
                                 ready.push((*group, snapshot));
@@ -1454,14 +1472,14 @@ impl App {
                         }
                         Some(Err(_)) if needed.contains_key(group) => {
                             pending.extend(
-                                manifest.deferred.values()
+                                base_manifest.deferred.values()
                                     .filter(|f| crate::native::Group::of(f.language) == Some(*group))
                                     .map(|f| format!("{} (indexing failed)", f.language.tag())),
                             );
                         }
                         None if needed.contains_key(group) => {
                             pending.extend(
-                                manifest
+                                base_manifest
                                     .deferred
                                     .values()
                                     .filter(|f| {
@@ -1476,6 +1494,7 @@ impl App {
                         _ => (),
                     }
                 }
+                let manifest = crate::workspace::Derived::query(&base_manifest, &source_manifests);
                 let assets = ticket.as_ref().and_then(|ticket| ticket.ready_index());
                 let summary_sources: Vec<_> = ready.iter().map(|(_, snapshot)| Arc::downgrade(snapshot)).collect();
                 if asset_request && assets.is_none() {
@@ -2586,6 +2605,68 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("Available"), "{result}");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn asset_file_views_do_not_wait_for_code_or_asset_indexing() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = root.path().join("code.rs");
+        std::fs::write(&source, "pub struct Available;").unwrap();
+        std::fs::create_dir(root.path().join("Assets")).unwrap();
+        std::fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+        std::fs::write(
+            root.path().join("ProjectSettings/ProjectVersion.txt"),
+            "version",
+        )
+        .unwrap();
+        let asset = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Selected\n  m_Component: []\n";
+        std::fs::write(root.path().join("Assets/Selected.prefab"), asset).unwrap();
+        std::fs::write(
+            root.path().join("Assets/Unrelated.asset"),
+            "malformed asset",
+        )
+        .unwrap();
+        let app = Arc::new(
+            App::new(
+                Policy::new(vec![root.path().into()]).unwrap(),
+                cache.path().into(),
+                2,
+            )
+            .unwrap(),
+        );
+        let pause_code = app.indexing_pause.clone().acquire_owned().await.unwrap();
+        let pause_assets = app.assets.pause().await;
+        let project = source.to_str().unwrap();
+        for mode in ["raw", "exact", "minified"] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                app.view(project, "Selected.prefab", mode),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, asset);
+        }
+        let result = app
+            .view(project, "Assets/Selected.prefab:4-4", "raw")
+            .await
+            .unwrap();
+        assert_eq!(result, "  m_Name: Selected\n");
+        assert_eq!(
+            app.assets.stats().entries,
+            0,
+            "A file view must not queue whole-workspace asset indexing"
+        );
+        drop((pause_code, pause_assets));
+        let result = app
+            .search(project, "text:Selected wait:complete")
+            .await
+            .unwrap();
+        assert!(result.contains("Selected"), "{result}");
+        assert!(app.assets.stats().entries > 0);
         app.shutdown().await;
     }
 

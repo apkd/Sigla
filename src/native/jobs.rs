@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 pub struct Snapshot {
     pub store: Arc<Store>,
-    pub manifest: Manifest,
+    pub manifest: Arc<Manifest>,
 }
 type Outcome = std::result::Result<Arc<Snapshot>, Arc<anyhow::Error>>;
 #[derive(Clone)]
@@ -330,7 +330,7 @@ impl Jobs {
                         }
                         Ok(())
                     }).await??;
-                    let snapshot = Arc::new(Snapshot { store: code.store.clone(), manifest: snapshot });
+                    let snapshot = Arc::new(Snapshot { store: code.store.clone(), manifest: Arc::new(snapshot) });
                     progress.retained.store(crate::memory::encoded_size(&snapshot.manifest) as u64 * 3 + 256, Ordering::Relaxed);
                     send.send_replace(Some(Ok(snapshot.clone())));
                     return Ok(snapshot);
@@ -415,7 +415,7 @@ impl Jobs {
                 let snapshot = tokio::task::spawn_blocking(move || -> Result<_> {
                     ensure!(snapshot.sources_current(), crate::diagnostics::RefreshRequired("Source changed during indexing; retry query"));
                     if !reused { store.save_manifest(&snapshot)?; }
-                    Ok(Arc::new(Snapshot { store, manifest: snapshot }))
+                    Ok(Arc::new(Snapshot { store, manifest: Arc::new(snapshot) }))
                 }).await??;
                 for diagnostic in &snapshot.manifest.diagnostics {
                     tracing::warn!("{diagnostic}");
@@ -479,7 +479,7 @@ mod tests {
         let snapshot = Arc::new(Snapshot {
             store: Store::open_workspace(&root.path().join("analysis"), [1; 32], root.path(), None)
                 .unwrap(),
-            manifest: Manifest::default(),
+            manifest: Arc::new(Manifest::default()),
         });
         let ticket = Ticket {
             outcome: Arc::new(watch::channel(Some(Ok(snapshot))).1),

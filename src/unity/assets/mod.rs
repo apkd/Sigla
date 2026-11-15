@@ -6,6 +6,7 @@ mod parse;
 mod query;
 mod records;
 mod snapshot;
+pub(crate) mod view;
 mod yaml;
 
 use crate::{
@@ -166,7 +167,9 @@ fn roots(
     found: &mut Vec<PathBuf>,
     observed: &mut BTreeMap<PathBuf, Stamp>,
     depth: usize,
+    cancel: &dyn crate::cancellation::Cancellation,
 ) -> Result<()> {
+    cancel.check()?;
     ensure!(
         depth < 128,
         "Directory nesting exceeds asset discovery limit"
@@ -177,12 +180,13 @@ fn roots(
         return Ok(());
     }
     for entry in std::fs::read_dir(path)? {
+        cancel.check()?;
         let entry = entry?;
         if entry.file_type()?.is_dir()
             && !ignored(&entry.path())
             && !crate::discovery::linked_worktree(&entry.path())
         {
-            roots(&entry.path(), found, observed, depth + 1)?;
+            roots(&entry.path(), found, observed, depth + 1, cancel)?;
         }
     }
     Ok(())
@@ -193,13 +197,16 @@ fn inventory(
     directories: &mut BTreeMap<PathBuf, Stamp>,
     depth: usize,
     visual_graphs: bool,
+    cancel: &dyn crate::cancellation::Cancellation,
 ) -> Result<()> {
+    cancel.check()?;
     ensure!(
         depth < 128 && files.len() < 1_000_000,
         "Unity asset inventory limit exceeded"
     );
     directories.insert(path.into(), Stamp::read(path)?);
     for entry in std::fs::read_dir(path)? {
+        cancel.check()?;
         let entry = entry?;
         let path = entry.path();
         if ignored(&path) {
@@ -208,7 +215,7 @@ fn inventory(
         let kind = entry.file_type()?;
         if kind.is_dir() {
             if !is_root(&path) && !crate::discovery::linked_worktree(&path) {
-                inventory(&path, files, directories, depth + 1, visual_graphs)?;
+                inventory(&path, files, directories, depth + 1, visual_graphs, cancel)?;
             }
         } else if kind.is_file()
             && (crate::repository::selection::asset(&path)
@@ -219,6 +226,72 @@ fn inventory(
         }
     }
     Ok(())
+}
+
+fn scopes(root: &Path, project: &Path, manifest: &Manifest) -> BTreeSet<PathBuf> {
+    let mut scopes: BTreeSet<_> = [project.join("Assets"), project.join("ProjectSettings")]
+        .into_iter()
+        .filter(|p| !crate::discovery::linked_worktree(p))
+        .collect();
+    let mut mapped = false;
+    let relative = project.strip_prefix(root).unwrap();
+    let prefix = if relative.as_os_str().is_empty() {
+        "Packages/".into()
+    } else {
+        format!("{}/Packages/", relative.display())
+    };
+    for p in &manifest.projects {
+        if p.source_roots
+            .iter()
+            .any(|s| s.physical == project.join("Assets"))
+        {
+            mapped = true;
+            scopes.extend(
+                p.source_roots
+                    .iter()
+                    .filter(|s| s.logical.starts_with(&prefix))
+                    .map(|s| s.physical.clone()),
+            );
+        }
+    }
+    if !mapped
+        && let Ok(bytes) = std::fs::read(project.join("Packages/manifest.json"))
+        && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(dependencies) = manifest["dependencies"].as_object()
+    {
+        scopes.extend(
+            dependencies
+                .keys()
+                .filter(|n| !n.contains('/') && !n.contains('\\') && !n.starts_with('.'))
+                .map(|n| project.join("Packages").join(n))
+                .filter(|p| !crate::discovery::crosses_worktree(project, p)),
+        );
+    }
+    scopes
+}
+
+fn logical_path(root: &Path, project: &Path, physical: &Path, manifest: &Manifest) -> String {
+    physical
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| {
+            manifest
+                .projects
+                .iter()
+                .filter(|p| {
+                    p.source_roots
+                        .iter()
+                        .any(|s| s.physical == project.join("Assets"))
+                })
+                .flat_map(|p| &p.source_roots)
+                .find_map(|s| {
+                    physical
+                        .strip_prefix(&s.physical)
+                        .ok()
+                        .map(|p| format!("{}/{}", s.logical, p.display()))
+                })
+                .unwrap_or_else(|| physical.to_string_lossy().into())
+        })
 }
 fn metadata(path: &Path) -> Option<(Option<String>, bool)> {
     if std::fs::metadata(path).ok()?.len() > 1024 * 1024 {
@@ -397,7 +470,7 @@ pub fn build(
     std::fs::create_dir_all(cache)?;
     let mut projects = Vec::new();
     let mut observed = BTreeMap::new();
-    roots(root, &mut projects, &mut observed, 0)?;
+    roots(root, &mut projects, &mut observed, 0, cancel)?;
     let mut index = Index::default();
     let type_files = script_types(root, cache, &projects, manifest, store, cancel)?;
     let assets_started = std::time::Instant::now();
@@ -411,49 +484,13 @@ pub fn build(
         // Rewriting this file need not change its parent directory's stamp.
         let version_file = project.join("ProjectSettings/ProjectVersion.txt");
         observed.insert(version_file.clone(), Stamp::read(&version_file)?);
-        let mut scopes: BTreeSet<_> = [project.join("Assets"), project.join("ProjectSettings")]
-            .into_iter()
-            .filter(|p| !crate::discovery::linked_worktree(p))
-            .collect();
-        let mut mapped = false;
-        for p in &manifest.projects {
-            if p.source_roots
-                .iter()
-                .any(|s| s.physical == project.join("Assets"))
-            {
-                mapped = true;
-                let prefix = if project_name == "." {
-                    "Packages/".into()
-                } else {
-                    format!("{project_name}/Packages/")
-                };
-                scopes.extend(
-                    p.source_roots
-                        .iter()
-                        .filter(|s| s.logical.starts_with(&prefix))
-                        .map(|s| s.physical.clone()),
-                );
-            }
-        }
-        if !mapped
-            && let Ok(bytes) = std::fs::read(project.join("Packages/manifest.json"))
-            && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            && let Some(dependencies) = manifest["dependencies"].as_object()
-        {
-            scopes.extend(
-                dependencies
-                    .keys()
-                    .filter(|n| !n.contains('/') && !n.contains('\\') && !n.starts_with('.'))
-                    .map(|n| project.join("Packages").join(n))
-                    .filter(|p| !crate::discovery::crosses_worktree(project, p)),
-            );
-        }
+        let scopes = scopes(root, project, manifest);
         let inventory_started = std::time::Instant::now();
         let scope_count = scopes.len();
         let mut files = BTreeSet::new();
         for scope in scopes {
             if scope.is_dir() {
-                inventory(&scope, &mut files, &mut observed, 0, remote)?;
+                inventory(&scope, &mut files, &mut observed, 0, remote, cancel)?;
             }
         }
         for file in &files {
@@ -487,27 +524,7 @@ pub fn build(
             if physical.is_dir() || meta.as_ref().is_some_and(|(_, folder)| *folder) {
                 continue;
             }
-            let logical = physical
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| {
-                    manifest
-                        .projects
-                        .iter()
-                        .filter(|p| {
-                            p.source_roots
-                                .iter()
-                                .any(|s| s.physical == project.join("Assets"))
-                        })
-                        .flat_map(|p| &p.source_roots)
-                        .find_map(|s| {
-                            physical
-                                .strip_prefix(&s.physical)
-                                .ok()
-                                .map(|p| format!("{}/{}", s.logical, p.display()))
-                        })
-                        .unwrap_or_else(|| physical.to_string_lossy().into())
-                });
+            let logical = logical_path(root, project, &physical, manifest);
             let asset_key = key(&project_name, &logical);
             let asset = index
                 .assets

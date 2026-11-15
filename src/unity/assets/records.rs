@@ -25,7 +25,7 @@ pub(super) struct Record {
     pub unavailable: Option<String>,
 }
 
-fn load(
+pub(super) fn load(
     cache: &Path,
     shared: Option<&crate::cache::artifacts::Store>,
     file: &Path,

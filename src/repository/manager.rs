@@ -63,6 +63,7 @@ mod refresh_tests {
             acquiring: AsyncMutex::new(()),
             sources: Mutex::new(None),
             inventory: watch::channel(None).0,
+            initialized: Arc::new(AsyncMutex::new(true)),
         }
     }
 
@@ -422,6 +423,114 @@ mod refresh_tests {
         assert!(restored.same_inputs(&saved));
     }
 
+    #[tokio::test]
+    async fn cancelled_branch_load_stays_shared_without_blocking_other_branches() {
+        use std::os::fd::AsRawFd;
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let mut pending = Branch::for_test(cache.path().join("repositories/pending"));
+        pending.initialized = Arc::new(AsyncMutex::new(false));
+        fs::create_dir_all(&pending.root).unwrap();
+        super::super::state_store::write(&pending.root, &state()).unwrap();
+        let locked = fs::File::open(&pending.root).unwrap();
+        assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let pending = Arc::new(pending);
+        manager
+            .branches
+            .lock()
+            .unwrap()
+            .insert("pending".into(), pending.clone());
+        let loader = {
+            let manager = manager.clone();
+            let pending = pending.clone();
+            tokio::spawn(async move {
+                manager
+                    .initialize_branch(&pending, &crate::telemetry::Operation::default())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pending.initialized.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        loader.abort();
+        assert!(loader.await.unwrap_err().is_cancelled());
+
+        let mut other = Branch::for_test(cache.path().join("repositories/other"));
+        other.initialized = Arc::new(AsyncMutex::new(false));
+        let other = Arc::new(other);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.initialize_branch(&other, &crate::telemetry::Operation::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(other.root.is_dir());
+        manager.trim_unreferenced(|_| false).unwrap();
+        assert!(manager.branches.lock().unwrap().contains_key("pending"));
+        assert!(pending.initialized.try_lock().is_err());
+        let flush = manager.flush_usage();
+        tokio::pin!(flush);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(flush.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_UN) }, 0);
+        tokio::time::timeout(Duration::from_secs(5), flush)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .initialize_branch(&pending, &crate::telemetry::Operation::default())
+            .await
+            .unwrap();
+        assert!(
+            pending
+                .state
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .same_inputs(&state())
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_load_failure_can_retry_and_pending_loads_allow_maintenance() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let mut pending = Branch::for_test(cache.path().join("repositories/pending"));
+        pending.initialized = Arc::new(AsyncMutex::new(false));
+        let pending = Arc::new(pending);
+        manager
+            .branches
+            .lock()
+            .unwrap()
+            .insert("pending".into(), pending.clone());
+        manager.maintain(false).await.unwrap();
+        assert!(!pending.root.exists());
+        fs::create_dir_all(&pending.root).unwrap();
+        fs::write(pending.root.join("state.bin"), b"broken").unwrap();
+        assert!(
+            manager
+                .initialize_branch(&pending, &crate::telemetry::Operation::default())
+                .await
+                .is_err()
+        );
+        assert!(!*pending.initialized.lock().await);
+        fs::remove_file(pending.root.join("state.bin")).unwrap();
+        super::super::state_store::write(&pending.root, &state()).unwrap();
+        manager
+            .initialize_branch(&pending, &crate::telemetry::Operation::default())
+            .await
+            .unwrap();
+        assert!(pending.state.read().await.is_some());
+    }
+
     #[test]
     fn unchanged_omissions_survive_refresh_but_changed_inputs_retry() {
         let mut before = state();
@@ -756,6 +865,7 @@ pub struct Branch {
     acquiring: AsyncMutex<()>,
     sources: Mutex<Option<super::source_validation::Sources>>,
     pub(crate) inventory: watch::Sender<Option<Arc<Inventory>>>,
+    initialized: Arc<AsyncMutex<bool>>,
 }
 
 impl Branch {
@@ -787,6 +897,7 @@ impl Branch {
             acquiring: AsyncMutex::new(()),
             sources: Mutex::new(None),
             inventory: watch::channel(None).0,
+            initialized: Arc::new(AsyncMutex::new(true)),
         }
     }
 
@@ -922,6 +1033,49 @@ pub struct Manager {
 }
 
 impl Manager {
+    async fn initialize_branch(
+        &self,
+        branch: &Arc<Branch>,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<()> {
+        let mut initialized = branch.initialized.clone().lock_owned().await;
+        if *initialized {
+            return Ok(());
+        }
+        let permit = self.capacity.import(telemetry).await?;
+        let branch = branch.clone();
+        // The worker owns the gate and branch even if its original waiter leaves.
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let state = if branch.root.join("state.bin").is_file() {
+                Some(super::state_store::read(&branch.root)?)
+            } else {
+                None
+            };
+            if let Some(value) = &state {
+                ensure!(
+                    value.repository == branch.repository.identity
+                        && value.branch == branch.name
+                        && value.target == branch.target,
+                    "Cached branch identity is invalid"
+                );
+            }
+            fs::create_dir_all(&branch.root)?;
+            branch.last_use.store(
+                state.as_ref().map_or_else(now, |state| state.last_use),
+                Ordering::Relaxed,
+            );
+            branch.persisted_use.store(
+                state.as_ref().map_or(0, |state| state.last_use),
+                Ordering::Relaxed,
+            );
+            *branch.state.blocking_write() = state;
+            *initialized = true;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
     fn saved_default(&self, identity: &Identity) -> Result<Option<DefaultBranch>> {
         match crate::cache::records::read(
             &self.cache.join("defaults").join(identity.storage_key()),
@@ -1297,6 +1451,10 @@ impl Manager {
 
     pub async fn flush_usage(&self) -> Result<()> {
         let branches: Vec<_> = self.branches.lock().unwrap().values().cloned().collect();
+        // Shutdown must also join loads whose request was cancelled.
+        for branch in &branches {
+            drop(branch.initialized.lock().await);
+        }
         tokio::task::spawn_blocking(move || {
             for branch in branches {
                 branch.checkpoint_usage(true)?;
@@ -1511,32 +1669,15 @@ impl Manager {
                 branch.clone()
             } else {
                 let root = self.cache.join("repositories").join(&key);
-                let saved = root.join("state.bin");
-                let state = if saved.is_file() {
-                    Some(super::state_store::read(&root)?)
-                } else {
-                    None
-                };
-                if let Some(value) = &state {
-                    ensure!(
-                        value.repository == repository.identity
-                            && value.branch == name
-                            && value.target == target,
-                        "Cached branch identity is invalid"
-                    );
-                }
-                fs::create_dir_all(&root)?;
                 let branch = Arc::new(Branch {
                     root,
                     repository: repository.clone(),
                     name,
                     target,
-                    last_use: AtomicU64::new(
-                        state.as_ref().map_or_else(now, |state| state.last_use),
-                    ),
-                    persisted_use: AtomicU64::new(state.as_ref().map_or(0, |state| state.last_use)),
+                    last_use: AtomicU64::new(0),
+                    persisted_use: AtomicU64::new(0),
                     generation: AtomicU64::new(0),
-                    state: Arc::new(AsyncRwLock::new(state)),
+                    state: Arc::new(AsyncRwLock::new(None)),
                     analysis: Arc::new(AsyncRwLock::new(())),
                     running: Mutex::new(None),
                     telemetry_id: Mutex::new(None),
@@ -1544,11 +1685,17 @@ impl Manager {
                     acquiring: AsyncMutex::new(()),
                     sources: Mutex::new(None),
                     inventory: watch::channel(None).0,
+                    initialized: Arc::new(AsyncMutex::new(false)),
                 });
                 branches.insert(key, branch.clone());
                 branch
             }
         };
+        self.initialize_branch(
+            &branch,
+            operation.unwrap_or(&crate::telemetry::Operation::default()),
+        )
+        .await?;
         let state = branch.state.read().await;
         let usable = state.as_ref().is_some_and(|s| {
             !s.repair
@@ -1663,6 +1810,55 @@ impl Manager {
         .await
     }
 
+    /// Materialize only the repository asset selected by a file-content view.
+    pub(crate) async fn asset_file(
+        &self,
+        branch: &Branch,
+        path: &str,
+        telemetry: &crate::telemetry::Operation,
+    ) -> Result<()> {
+        self.sources_ready(branch).await?;
+        let (path, _) = crate::navigation::location(path)?;
+        let guard = branch.state.read().await;
+        let state = guard
+            .as_ref()
+            .context("Repository inputs are unavailable")?;
+        let paths: BTreeMap<_, _> = state
+            .prepared
+            .selected
+            .keys()
+            .chain(state.prepared.deferred_assets.iter())
+            .filter(|path| crate::unity::assets::is_asset(Path::new(path)))
+            .map(|path| (path.as_str(), ()))
+            .collect();
+        let selected = crate::navigation::matches(paths.keys().copied(), path);
+        ensure!(
+            selected.len() <= 1,
+            "Asset path is ambiguous across Unity projects"
+        );
+        if selected.is_empty() || !state.prepared.deferred_assets.contains(selected[0]) {
+            return Ok(());
+        }
+        let mut only = std::collections::BTreeSet::from([selected[0].to_owned()]);
+        let meta = format!("{}.meta", selected[0]);
+        if state.prepared.selected.contains_key(&meta)
+            || state.prepared.deferred_assets.contains(&meta)
+        {
+            only.insert(meta);
+        }
+        let revision = state.prepared.revision.clone();
+        drop(guard);
+        // Release the state reader before acquiring the publication gate.
+        self.extend_inputs(
+            branch,
+            &revision,
+            Vec::new(),
+            super::materialize::Contents::Only(only),
+            telemetry,
+        )
+        .await
+    }
+
     async fn extend_inputs(
         &self,
         branch: &Branch,
@@ -1671,7 +1867,14 @@ impl Manager {
         contents: super::materialize::Contents,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
-        let assets = matches!(contents, super::materialize::Contents::All);
+        let assets = matches!(
+            contents,
+            super::materialize::Contents::All | super::materialize::Contents::Only(_)
+        );
+        let only = match &contents {
+            super::materialize::Contents::Only(paths) => Some(paths.clone()),
+            _ => None,
+        };
         authorize(&self.options.rules, &branch.repository)?;
         for path in &paths {
             self.options.selection.require(path)?;
@@ -1692,7 +1895,11 @@ impl Manager {
                     "Repository changed before asset acquisition; retry query"
                 )
             );
-            if before.prepared.deferred_assets.is_empty() {
+            if before.prepared.deferred_assets.is_empty()
+                || only
+                    .as_ref()
+                    .is_some_and(|paths| paths.is_disjoint(&before.prepared.deferred_assets))
+            {
                 return Ok(());
             }
         }
@@ -1771,6 +1978,20 @@ impl Manager {
         prepared.branch = before.prepared.branch.clone();
         prepared.resolved_target = before.prepared.resolved_target.clone();
         before.reuse_omissions(&mut prepared, &self.options.selection.identity);
+        if let Some(only) = &only {
+            let mut selected = before.prepared.selected.clone();
+            selected.extend(std::mem::take(&mut prepared.selected));
+            prepared.selected = selected;
+            prepared.deferred_assets = before
+                .prepared
+                .deferred_assets
+                .difference(only)
+                .cloned()
+                .collect();
+            let mut omitted = before.prepared.omitted.clone();
+            omitted.extend(std::mem::take(&mut prepared.omitted));
+            prepared.omitted = omitted;
+        }
         if assets {
             prepared
                 .unavailable

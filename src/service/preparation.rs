@@ -209,6 +209,100 @@ fn context(
 }
 
 impl App {
+    pub(super) async fn view_asset_file(
+        self: &Arc<Self>,
+        inventory: Arc<Inventory>,
+        path: String,
+        mode: crate::navigation::Mode,
+        usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
+        activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+        operation: crate::telemetry::Operation,
+    ) -> Result<Option<CallToolResult>> {
+        if let Some(branch) = &usage.1 {
+            let branch = branch.clone();
+            let remote = self.remote.as_ref().unwrap().clone();
+            let activity = activity.clone();
+            let path = path.clone();
+            let operation = operation.clone();
+            tokio::spawn(async move {
+                let _activity = activity;
+                remote.asset_file(&branch, &path, &operation).await
+            })
+            .await??;
+        }
+        let permit = {
+            let _wait = operation.wait("query_admission");
+            self.navigation_workers.clone().acquire_owned().await?
+        };
+        let branch_state = match &usage.1 {
+            Some(branch) => Some(branch.state.clone().read_owned().await),
+            None => None,
+        };
+        if let Some(state) = &branch_state {
+            let state = state
+                .as_ref()
+                .context("Repository inputs are unavailable")?;
+            ensure!(
+                !state.repair
+                    && inventory
+                        .context
+                        .as_ref()
+                        .is_some_and(|context| context.2 == state.prepared.revision),
+                crate::diagnostics::RefreshRequired(
+                    "Repository changed before asset view; retry query"
+                )
+            );
+        }
+        let cache = self.asset_cache(&inventory.manifest, usage.1.as_deref());
+        let leases = crate::cache::views::LeaseSet::new(&self.cache)?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
+        let app = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _activity = activity;
+            let _permit = permit;
+            let prepared = branch_state
+                .as_ref()
+                .and_then(|state| state.as_ref())
+                .map(|state| &state.prepared);
+            let omitted = std::collections::BTreeMap::new();
+            let unavailable = std::collections::BTreeSet::new();
+            let manifest = &inventory.manifest;
+            let reader = crate::unity::assets::view::Reader {
+                root: &manifest.root,
+                cache: &cache,
+                manifest,
+                records: &app.asset_records,
+                leases: &leases,
+                remote: app.remote.is_some(),
+                omitted: prepared.map_or(&omitted, |prepared| &prepared.omitted),
+                unavailable: prepared.map_or(&unavailable, |prepared| &prepared.unavailable),
+                cancel: &cancel,
+            };
+            let Some(text) = reader.view(&path, mode)? else {
+                return Ok(None);
+            };
+            app.record_usage(&usage.0, usage.1.as_deref(), manifest);
+            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            if mode != crate::navigation::Mode::Raw
+                && let Some(context) = &inventory.context
+            {
+                let root = usage
+                    .1
+                    .as_ref()
+                    .map(|branch| branch.source())
+                    .unwrap_or_else(|| manifest.root.clone());
+                inventory
+                    .summary(context, &root, manifest, manifest, &[])
+                    .attach(&mut result);
+            }
+            Ok(Some(result))
+        })
+        .await?;
+        guard.disarm();
+        result
+    }
+
     /// Repository paths and bytes are usable before build discovery acquires dependencies.
     pub(super) async fn navigate_repository(
         self: &Arc<Self>,

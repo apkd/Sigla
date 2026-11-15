@@ -25,13 +25,12 @@ pub fn lines(source: &str, span: std::ops::Range<usize>) -> (usize, usize) {
     (first, last)
 }
 
-/// Response-local abbreviations, checked against the complete source inventory.
-pub struct Paths {
+/// Immutable abbreviation counts for one published source inventory.
+pub(crate) struct Inventory {
     suffixes: BTreeMap<String, usize>,
-    known: BTreeSet<String>,
 }
 
-impl Paths {
+impl Inventory {
     pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
         let mut suffixes = BTreeMap::new();
         for path in paths.into_iter().collect::<BTreeSet<_>>() {
@@ -40,8 +39,27 @@ impl Paths {
             }
             *suffixes.entry(path).or_default() += 1;
         }
+        Self { suffixes }
+    }
+
+    pub fn heap_bytes(&self) -> u64 {
+        self.suffixes
+            .keys()
+            .map(|key| key.capacity() as u64 + 80)
+            .sum()
+    }
+}
+
+/// Response-local abbreviations, checked against the complete source inventory.
+pub struct Paths<'a> {
+    inventory: &'a Inventory,
+    known: BTreeSet<String>,
+}
+
+impl<'a> Paths<'a> {
+    pub(crate) fn new(inventory: &'a Inventory) -> Self {
         Self {
-            suffixes,
+            inventory,
             known: BTreeSet::new(),
         }
     }
@@ -53,7 +71,7 @@ impl Paths {
             .contains(path)
             .then(|| {
                 let (_, filename) = path.rsplit_once('/')?;
-                (self.suffixes.get(filename) == Some(&1)).then(|| format!("…/{filename}"))
+                (self.inventory.suffixes.get(filename) == Some(&1)).then(|| format!("…/{filename}"))
             })
             .flatten();
         let shortened = repeated.or_else(|| {
@@ -63,7 +81,7 @@ impl Paths {
                 }
                 let start = path[..end].rfind('/')? + 1;
                 let suffix = &path[start..];
-                (self.suffixes.get(suffix) == Some(&1)).then(|| format!("…/{suffix}"))
+                (self.inventory.suffixes.get(suffix) == Some(&1)).then(|| format!("…/{suffix}"))
             })
         });
         self.known
@@ -339,14 +357,15 @@ mod tests {
             "Other/GameCore/World.cs",
             "Assets/Scripts/GameCore/Unique.cs",
         ];
-        let mut paths = Paths::new(inventory.map(str::to_owned));
+        let counts = Inventory::new(inventory.map(str::to_owned));
+        let mut paths = Paths::new(&counts);
         assert_eq!(paths.display(inventory[0]), inventory[0]);
         // The collision is indexed but has never appeared in this response.
         assert_eq!(paths.display(inventory[0]), "…/Scripts/GameCore/World.cs");
         assert_eq!(paths.display(inventory[3]), "…/GameCore/Unique.cs");
         assert_eq!(paths.display(inventory[3]), "…/Unique.cs");
         assert_eq!(paths.display(inventory[1]), "…/Scripts/Inputs/Input.cs");
-        let mut fresh = Paths::new(inventory.map(str::to_owned));
+        let mut fresh = Paths::new(&counts);
         assert_eq!(fresh.display(inventory[1]), inventory[1]);
         assert_eq!(fresh.display(inventory[1]), "…/Input.cs");
     }

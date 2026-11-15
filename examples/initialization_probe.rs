@@ -22,6 +22,9 @@ struct Options {
     files: usize,
     #[arg(long, default_value_t = 4)]
     workspaces: usize,
+    /// Add cold and warm views over a Unity asset tree.
+    #[arg(long, default_value_t = 0)]
+    assets: usize,
     /// Compete with a continuous data writer on the same filesystem.
     #[arg(long)]
     io_load: bool,
@@ -146,6 +149,23 @@ async fn run(options: Options) -> Result<()> {
     let roots: Vec<_> = (0..options.workspaces)
         .map(|index| cache.join(format!("view{index}")))
         .collect();
+    let asset_root = cache.join("asset-view");
+    let asset_source = "--- !u!1 &1\nGameObject:\n  m_Name: Item0\n  m_Component: []\n";
+    if options.assets > 0 {
+        fs::create_dir_all(asset_root.join("Assets"))?;
+        fs::create_dir(asset_root.join("ProjectSettings"))?;
+        fs::write(
+            asset_root.join("ProjectSettings/ProjectVersion.txt"),
+            "version",
+        )?;
+        fs::write(asset_root.join("code.rs"), "pub struct Available;")?;
+        for file in 0..options.assets {
+            fs::write(
+                asset_root.join(format!("Assets/Item{file}.prefab")),
+                asset_source.replace("Item0", &format!("Item{file}")),
+            )?;
+        }
+    }
     let setup = Instant::now();
     fixture(&roots[0], options.files)?;
     let blobs = blobs::Store::open(&cache)?;
@@ -159,7 +179,11 @@ async fn run(options: Options) -> Result<()> {
         setup.elapsed().as_secs_f64()
     );
     let load = IoLoad::start(&cache, options.io_load)?;
-    let service = app(&cache, &roots)?;
+    let mut allowed = roots.clone();
+    if options.assets > 0 {
+        allowed.push(asset_root.clone());
+    }
+    let service = app(&cache, &allowed)?;
     let cold = query(&service, &roots[0]).await?;
     let mut pending = tokio::task::JoinSet::new();
     let attach = Instant::now();
@@ -183,19 +207,21 @@ async fn run(options: Options) -> Result<()> {
     }
     let attach = attach.elapsed().as_secs_f64();
     let warm = query(&service, &roots[0]).await?;
+    let mut queries = std::collections::BTreeMap::new();
     for (name, text) in [
         ("exact path", "text:value path:src/item0.rs"),
         ("directory path", "text:value path:src/"),
+        ("all sources", "text:value wait:complete"),
     ] {
-        service.search(roots[0].to_str().unwrap(), text).await?;
+        let expected = service.search(roots[0].to_str().unwrap(), text).await?;
         let start = Instant::now();
         for _ in 0..10 {
-            service.search(roots[0].to_str().unwrap(), text).await?;
+            let result = service.search(roots[0].to_str().unwrap(), text).await?;
+            ensure!(result == expected, "Repeated query output changed: {name}");
         }
-        eprintln!(
-            "warm {name}: {:.3} ms/query",
-            start.elapsed().as_secs_f64() * 100.0
-        );
+        let seconds = start.elapsed().as_secs_f64() / 10.0;
+        queries.insert(name, serde_json::json!({"seconds":seconds,"output_hash":blake3::hash(expected.as_bytes()).to_hex().to_string()}));
+        eprintln!("warm {name}: {:.3} ms/query", seconds * 1000.0);
     }
     service
         .view(roots[0].to_str().unwrap(), "src/item0.rs", "raw")
@@ -206,10 +232,30 @@ async fn run(options: Options) -> Result<()> {
             .view(roots[0].to_str().unwrap(), "src/item0.rs", "raw")
             .await?;
     }
-    eprintln!(
-        "warm raw view: {:.3} ms/query",
-        start.elapsed().as_secs_f64() * 100.0
-    );
+    let raw_view = start.elapsed().as_secs_f64() / 10.0;
+    eprintln!("warm raw view: {:.3} ms/query", raw_view * 1000.0);
+    let asset_views = if options.assets > 0 {
+        let entry = asset_root.join("code.rs");
+        let entry = entry.to_str().context("Non-UTF8 asset fixture path")?;
+        let start = Instant::now();
+        let result = service.view(entry, "Assets/Item0.prefab", "raw").await?;
+        let cold = start.elapsed().as_secs_f64();
+        ensure!(result == asset_source, "Cold asset source changed");
+        // Let the independent code job finish before measuring steady-state views.
+        service
+            .search(entry, "type:Available lang:rust wait:complete")
+            .await?;
+        let start = Instant::now();
+        for _ in 0..10 {
+            let result = service.view(entry, "Assets/Item0.prefab", "raw").await?;
+            ensure!(result == asset_source, "Warm asset source changed");
+        }
+        Some(
+            serde_json::json!({"cold_seconds":cold,"warm_seconds":start.elapsed().as_secs_f64()/10.0,"output_hash":blake3::hash(asset_source.as_bytes()).to_hex().to_string()}),
+        )
+    } else {
+        None
+    };
     service.shutdown().await;
     drop(service);
     let restarting = Instant::now();
@@ -229,7 +275,7 @@ async fn run(options: Options) -> Result<()> {
         .collect();
     println!(
         "{}",
-        serde_json::json!({"files":options.files,"workspaces":options.workspaces,"cold_seconds":cold,"reused_seconds":reused,"concurrent_attach_seconds":attach,"foreground_queries":foreground_queries,"foreground_max_seconds":foreground_peak,"warm_seconds":warm,"restart_all_seconds":restart,"competing_write_bytes":competing_writes,"memory":memory})
+        serde_json::json!({"files":options.files,"workspaces":options.workspaces,"assets":options.assets,"cold_seconds":cold,"reused_seconds":reused,"concurrent_attach_seconds":attach,"foreground_queries":foreground_queries,"foreground_max_seconds":foreground_peak,"warm_seconds":warm,"queries":queries,"raw_view_seconds":raw_view,"asset_views":asset_views,"restart_all_seconds":restart,"competing_write_bytes":competing_writes,"memory":memory})
     );
     Ok(())
 }

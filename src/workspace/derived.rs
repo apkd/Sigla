@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 type Navigation = BTreeMap<String, String>;
@@ -15,10 +15,18 @@ struct CachedNavigation {
     heap_bytes: u64,
 }
 
+struct QueryManifest {
+    sources: Vec<Weak<Manifest>>,
+    manifest: Arc<Manifest>,
+    heap_bytes: u64,
+}
+
 #[derive(Default)]
 pub struct Derived {
     navigation: Mutex<Vec<CachedNavigation>>,
     search: OnceLock<Paths>,
+    rendering: OnceLock<crate::render::Inventory>,
+    query: Mutex<Option<QueryManifest>>,
     pub(crate) asset_generation: OnceLock<Result<[u8; 32], String>>,
 }
 
@@ -29,6 +37,36 @@ impl Clone for Derived {
 }
 
 impl Derived {
+    /// Retain only the latest ready-source combination within the workspace heap budget.
+    pub(crate) fn query(base: &Arc<Manifest>, sources: &[Arc<Manifest>]) -> Arc<Manifest> {
+        if sources.is_empty() {
+            return base.clone();
+        }
+        let mut cached = base.derived.query.lock().unwrap();
+        if let Some(saved) = cached.as_ref()
+            && saved.sources.len() == sources.len()
+            && saved
+                .sources
+                .iter()
+                .zip(sources)
+                .all(|(left, right)| left.ptr_eq(&Arc::downgrade(right)))
+        {
+            return saved.manifest.clone();
+        }
+        let mut manifest = (**base).clone();
+        for source in sources {
+            manifest.files.extend(source.files.clone());
+        }
+        let heap_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3) as u64;
+        let manifest = Arc::new(manifest);
+        *cached = Some(QueryManifest {
+            sources: sources.iter().map(Arc::downgrade).collect(),
+            manifest: manifest.clone(),
+            heap_bytes,
+        });
+        manifest
+    }
+
     pub(crate) fn navigation(
         &self,
         root: &Path,
@@ -60,6 +98,22 @@ impl Derived {
         self.search.get_or_init(|| Paths::new(manifest))
     }
 
+    pub(crate) fn rendering(&self, manifest: &Manifest) -> &crate::render::Inventory {
+        self.rendering.get_or_init(|| {
+            crate::render::Inventory::new(
+                manifest
+                    .files
+                    .values()
+                    .filter(|file| !file.metadata)
+                    .flat_map(|file| {
+                        file.memberships
+                            .iter()
+                            .map(|membership| manifest.display(file, membership).into_owned())
+                    }),
+            )
+        })
+    }
+
     pub(crate) fn heap_bytes(&self) -> u64 {
         let navigation: u64 = self
             .navigation
@@ -68,7 +122,16 @@ impl Derived {
             .iter()
             .map(|cached| cached.heap_bytes)
             .sum();
-        navigation + self.search.get().map_or(0, |paths| paths.heap_bytes)
+        let query = self.query.lock().unwrap().as_ref().map_or(0, |query| {
+            query.heap_bytes + query.manifest.derived.heap_bytes()
+        });
+        navigation
+            + query
+            + self.search.get().map_or(0, |paths| paths.heap_bytes)
+            + self
+                .rendering
+                .get()
+                .map_or(0, |inventory| inventory.heap_bytes())
     }
 }
 
@@ -184,4 +247,26 @@ pub(crate) fn candidate_files<'a>(
         .into_iter()
         .flat_map(|keys| keys.iter().filter_map(|key| files.get_key_value(key)));
     all.chain(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_manifest_reuses_only_the_same_immutable_sources() {
+        let base = Arc::new(Manifest::default());
+        let source = Arc::new(Manifest::default());
+        let first = Derived::query(&base, std::slice::from_ref(&source));
+        let repeated = Derived::query(&base, std::slice::from_ref(&source));
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert!(base.derived.heap_bytes() > 0);
+        assert!(Arc::ptr_eq(&base, &Derived::query(&base, &[])));
+        let replacement = Arc::new((*source).clone());
+        let changed = Derived::query(&base, &[replacement]);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        let cloned = Arc::new((*base).clone());
+        assert_eq!(cloned.derived.heap_bytes(), 0);
+        assert!(!Arc::ptr_eq(&changed, &Derived::query(&cloned, &[source])));
+    }
 }

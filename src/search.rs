@@ -2117,21 +2117,7 @@ impl<'a> Search<'a> {
         if entries.is_empty() {
             return "No matches.".into();
         }
-        let mut paths = crate::render::Paths::new(
-            self.source_manifest
-                .derived
-                .paths(self.source_manifest)
-                .ordered(None)
-                .filter(|(_, keys)| {
-                    keys.iter().any(|key| {
-                        self.manifest
-                            .files
-                            .get(key.as_ref())
-                            .is_some_and(|file| !file.metadata)
-                    })
-                })
-                .map(|(path, _)| path.to_owned()),
-        );
+        let mut paths = crate::render::Paths::new(self.manifest.derived.rendering(self.manifest));
         let rendered: Vec<_> = entries
             .into_iter()
             .map(|unit| unit.render(&mut paths))
@@ -2175,17 +2161,7 @@ impl<'a> Search<'a> {
             }
             results.push(unit);
         }
-        let mut paths = crate::render::Paths::new(
-            self.manifest
-                .files
-                .values()
-                .filter(|f| !f.metadata)
-                .flat_map(|f| {
-                    f.memberships
-                        .iter()
-                        .map(|m| self.manifest.display(f, m).into_owned())
-                }),
-        );
+        let mut paths = crate::render::Paths::new(self.manifest.derived.rendering(self.manifest));
         let mut text = results
             .into_iter()
             .map(|u| u.render(&mut paths))
@@ -2581,6 +2557,23 @@ mod tests {
             ("c/Shared.txt", "x\nneedle early offset\n"),
         ]);
         let mut manifest = (*workspace.manifest).clone();
+        // File keys contain content identities, so their order need not match paths.
+        let tied: Vec<_> = manifest
+            .files
+            .values()
+            .filter(|file| matches!(file.display.as_str(), "a/Shared.txt" | "b/Shared.txt"))
+            .map(|file| file.display.clone())
+            .collect();
+        let winner = if tied[0].starts_with('a') {
+            "needle from A"
+        } else {
+            "needle from B"
+        };
+        let loser = if tied[1].starts_with('a') {
+            "needle from A"
+        } else {
+            "needle from B"
+        };
         manifest.projects[0].source_roots = ["a", "b", "c"]
             .into_iter()
             .map(|part| SourceRoot {
@@ -2590,7 +2583,9 @@ mod tests {
             .collect();
         let mut alias = manifest.projects[0].clone();
         alias.source_roots = vec![SourceRoot {
-            physical: root.path().join("b"),
+            physical: root
+                .path()
+                .join(std::path::Path::new(&tied[1]).parent().unwrap()),
             logical: "a".into(),
         }];
         let alias_project = manifest.projects.len();
@@ -2598,7 +2593,7 @@ mod tests {
         manifest
             .files
             .values_mut()
-            .find(|file| file.display == "b/Shared.txt")
+            .find(|file| file.display == tied[1])
             .unwrap()
             .memberships
             .push(Membership {
@@ -2614,11 +2609,11 @@ mod tests {
             .run(&Query::parse("text:needle limit:2").unwrap())
             .unwrap();
         assert!(
-            limited.contains("needle from A") && limited.contains("needle early offset"),
+            limited.contains(winner) && limited.contains("needle early offset"),
             "{limited}"
         );
         assert!(
-            !limited.contains("needle from B") && !limited.contains("needle later"),
+            !limited.contains(loser) && !limited.contains("needle later"),
             "{limited}"
         );
         let prefix = limited

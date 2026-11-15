@@ -23,9 +23,23 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
     fs::write(upstream.join("Module.asset"), "pub struct RequiredCode;\n")?;
     fs::File::create(upstream.join("TooLarge.asset"))?
         .set_len(sigla::repository::selection::ASSET_LIMIT + 1)?;
-    fs::write(upstream.join("Ready.asset"), "ready asset contents\n")?;
+    fs::create_dir(upstream.join("Assets"))?;
+    fs::create_dir(upstream.join("ProjectSettings"))?;
+    // An unavailable editor keeps this fixture independent of metadata downloads.
     fs::write(
-        upstream.join("Object.asset"),
+        upstream.join("ProjectSettings/ProjectVersion.txt"),
+        "version",
+    )?;
+    let ready = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Ready\n  m_Component: []\n";
+    fs::write(upstream.join("Assets/Ready.asset"), ready)?;
+    fs::create_dir(upstream.join("Assets/Other"))?;
+    fs::write(upstream.join("Assets/Other/Ready.asset"), ready)?;
+    fs::write(
+        upstream.join("Assets/Later.asset"),
+        "later asset contents\n",
+    )?;
+    fs::write(
+        upstream.join("Assets/Object.asset"),
         format!(
             "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 10\n",
             "0".repeat(64)
@@ -57,7 +71,40 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
             !root.path().join("lfs-started").exists(),
             "Code search started an unrelated asset download"
         );
-        scope.spawn(move || server.call("view", json!({"codebase":project,"path":"Object.asset"})));
+        let (error, result) = server.call(
+            "view",
+            json!({"codebase":project,"path":"Assets/Ready.asset","mode":"raw"}),
+        )?;
+        ensure!(
+            !error && result == ready,
+            "Single asset view failed: {result}"
+        );
+        ensure!(
+            !root.path().join("lfs-started").exists(),
+            "A single asset view started an unrelated LFS download"
+        );
+        let sources = fs::read_dir(root.path().join("cache/repositories"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let source = sources
+            .iter()
+            .map(|entry| entry.path().join("source"))
+            .find(|path| path.join("lib.rs").is_file())
+            .context("Prepared source missing")?;
+        ensure!(
+            !source.join("Assets/Later.asset").exists(),
+            "A single asset view fetched unrelated assets"
+        );
+        let (error, _) = server.call(
+            "view",
+            json!({"codebase":project,"path":"Ready.asset","mode":"raw"}),
+        )?;
+        ensure!(error, "A materialized file hid an ambiguous deferred file");
+        scope.spawn(move || {
+            server.call(
+                "view",
+                json!({"codebase":project,"path":"Assets/Object.asset"}),
+            )
+        });
         let started = Instant::now();
         while !root.path().join("lfs-started").exists() {
             ensure!(
@@ -74,7 +121,14 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
         fs::remove_file(root.path().join("pause-lfs"))?;
         Ok(())
     })?;
-    let (_, result) = server.call("view", json!({"codebase":project,"path":"Object.asset"}))?;
+    let (error, result) = server.call(
+        "view",
+        json!({"codebase":project,"path":"Assets/Object.asset","mode":"raw"}),
+    )?;
+    ensure!(
+        error,
+        "Unavailable asset source was returned as complete text"
+    );
     ensure!(
         !result.contains("oid sha256:"),
         "An LFS pointer was returned as asset contents"
@@ -87,11 +141,24 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
         .find(|path| path.join("lib.rs").is_file())
         .context("Prepared source missing")?;
     ensure!(
-        fs::read_to_string(source.join("Ready.asset"))? == "ready asset contents\n",
+        !source.join("Assets/Later.asset").exists(),
+        "A failed single-file download fetched unrelated assets"
+    );
+    let (error, result) = server.query(project, "text:later wait:complete")?;
+    ensure!(
+        !error && result.contains("later asset contents"),
+        "Full asset completion failed: {result}"
+    );
+    ensure!(
+        fs::read_to_string(source.join("Assets/Ready.asset"))? == ready,
         "Readable assets were lost after another asset failed"
     );
     ensure!(
-        !source.join("Object.asset").exists(),
+        fs::read_to_string(source.join("Assets/Later.asset"))? == "later asset contents\n",
+        "Full acquisition lost assets deferred by an earlier file view"
+    );
+    ensure!(
+        !source.join("Assets/Object.asset").exists(),
         "Failed asset was published"
     );
     ensure!(

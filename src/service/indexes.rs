@@ -318,6 +318,22 @@ pub(super) struct AssetRequest<'a> {
 }
 
 impl super::App {
+    pub(super) fn asset_cache(
+        &self,
+        manifest: &Manifest,
+        branch: Option<&crate::repository::manager::Branch>,
+    ) -> std::path::PathBuf {
+        branch
+            .map(|branch| branch.root.join("unity-assets"))
+            .unwrap_or_else(|| {
+                self.cache.join("unity-assets").join(
+                    blake3::hash(manifest.root.as_os_str().as_encoded_bytes())
+                        .to_hex()
+                        .as_str(),
+                )
+            })
+    }
+
     pub(super) fn start_assets(
         &self,
         request: AssetRequest<'_>,
@@ -334,16 +350,7 @@ impl super::App {
         if !has_unity(manifest) && !assets_pending {
             return Ok(crate::unity::assets::jobs::empty());
         }
-        let cache = branch
-            .as_ref()
-            .map(|b| b.root.join("unity-assets"))
-            .unwrap_or_else(|| {
-                self.cache.join("unity-assets").join(
-                    blake3::hash(manifest.root.as_os_str().as_encoded_bytes())
-                        .to_hex()
-                        .as_str(),
-                )
-            });
+        let cache = self.asset_cache(manifest, branch.as_deref());
         let leases = crate::cache::views::LeaseSet::new(&self.cache)?;
         leases.retain(&cache)?;
         Ok(self.assets.start(crate::unity::assets::jobs::Request {
