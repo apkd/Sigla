@@ -102,14 +102,24 @@ impl Index {
             .case_insensitive(q.loose)
             .build()?;
         let selected = selection(q);
-        for (key, asset) in &self.assets {
+        let mut files: Vec<_> = self
+            .assets
+            .iter()
+            .filter(|(_, asset)| selected(asset) && asset.content.is_some())
+            .collect();
+        files.sort_unstable_by(|(a, left), (b, right)| (&left.path, a).cmp(&(&right.path, b)));
+        let mut matches = crate::selection::Top::new(q.limit + 1);
+        for (key, asset) in files {
             cancel.check()?;
-            if !selected(asset) || asset.content.is_none() {
-                continue;
+            if matches
+                .boundary()
+                .is_some_and(|(path, _): &(String, usize)| path < &asset.path)
+            {
+                break;
             }
             let parsed = content(asset, cancel)?;
             let mut previous = None;
-            for fragment in &parsed.fragments {
+            'fragments: for fragment in &parsed.fragments {
                 cancel.check()?;
                 let mut offset = 0;
                 let mut line = fragment.line;
@@ -117,6 +127,10 @@ impl Index {
                     cancel.check()?;
                     let start = fragment.start + matched.start();
                     let end = fragment.start + matched.end();
+                    let rank = (asset.path.clone(), start);
+                    if matches.boundary().is_some_and(|last| &rank > last) {
+                        break 'fragments;
+                    }
                     // Advance between starts so multiline matches retain their newlines.
                     line += fragment.text[offset..matched.start()]
                         .bytes()
@@ -127,6 +141,9 @@ impl Index {
                         continue;
                     }
                     previous = Some(line);
+                    if matches.get_mut(&rank).is_some() {
+                        continue;
+                    }
                     // Parsed object spans are ordered and do not overlap.
                     let owner = asset
                         .objects
@@ -146,8 +163,8 @@ impl Index {
                         .chars()
                         .take(512)
                         .collect();
-                    visit(
-                        start,
+                    matches.insert(
+                        rank,
                         crate::render::SearchResult {
                             symbol: owner.map(|o| ("Unity object".into(), o.name.clone())),
                             path: asset.path.clone(),
@@ -160,9 +177,13 @@ impl Index {
                             candidates: Vec::new(),
                             possible_write: false,
                         },
-                    )?;
+                    );
                 }
             }
+        }
+        for ((_, start), result) in matches.into_entries() {
+            cancel.check()?;
+            visit(start, result)?;
         }
         Ok(())
     }
@@ -744,6 +765,56 @@ mod tests {
             })
             .unwrap();
         results
+    }
+
+    #[test]
+    fn bounded_text_orders_assets_and_skips_unneeded_contents() {
+        let (_first_root, mut first) =
+            index("--- !u!1 &1\nGameObject:\n  m_Name: needle first\n  m_Tag: needle next\n");
+        let (_second_root, mut second) =
+            index("--- !u!1 &1\nGameObject:\n  m_Name: needle other\n  m_Tag: needle next\n");
+        let (_last_root, mut last) = index("--- !u!1 &1\nGameObject:\n  m_Name: needle tail\n");
+        let mut a = first.assets.remove("fixture").unwrap();
+        let mut b = second.assets.remove("fixture").unwrap();
+        let mut tail = last.assets.remove("fixture").unwrap();
+        a.path = "A/Object.prefab".into();
+        b.path = a.path.clone();
+        tail.path = "Z/Object.prefab".into();
+        tail.content = Some(_last_root.path().join("unavailable"));
+        let index = Index {
+            assets: BTreeMap::from([
+                ("first".into(), a),
+                ("second".into(), b),
+                ("earlier-key".into(), tail),
+            ]),
+            ..Default::default()
+        };
+        let mut results = Vec::new();
+        index
+            .visit_text(
+                &Query::parse("text:needle limit:1").unwrap(),
+                &(),
+                |_, result| {
+                    results.push(result);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "Keep one extra distinct match to prove truncation"
+        );
+        assert!(results[0].source.contains("needle first"));
+        assert!(
+            index
+                .visit_text(
+                    &Query::parse("text:needle limit:10").unwrap(),
+                    &(),
+                    |_, _| Ok(())
+                )
+                .is_err()
+        );
     }
 
     fn positions(source: &str, needle: &str) -> Vec<(usize, Option<(usize, usize)>)> {

@@ -1369,7 +1369,8 @@ impl<'a> Search<'a> {
         self.navigation().view(root, path, mode, absolute)
     }
     fn text(&mut self, q: &Query, inside: &[(bool, Vec<Hit>)]) -> Result<String> {
-        let mut units = crate::selection::Selection::new(q.limit);
+        // One extra distinct result proves truncation without counting the full corpus.
+        let mut units = crate::selection::Top::new(q.limit + 1);
         if inside.is_empty()
             && !q
                 .filters
@@ -1379,118 +1380,165 @@ impl<'a> Search<'a> {
         {
             assets.visit_text(q, self.cancel, |position, result| {
                 self.check()?;
-                units.insert((result.path.clone(), position), result);
+                units.insert((result.path.clone(), position), (None, result));
                 Ok(())
             })?;
         }
         let files = self.containment_files(inside)?;
-        let files = self.filtered_files(q, files);
         let literal = regex::RegexBuilder::new(&regex::escape(&q.target.name))
             .case_insensitive(q.loose)
             .build()?;
-        for (key, file) in candidate_files(&self.manifest.files, files.as_ref()) {
+        let paths = self.source_manifest.derived.paths(self.source_manifest);
+        let mut visited = BTreeSet::new();
+        for (minimum_path, keys) in paths.ordered(crate::workspace::derived::literal_filter(q)) {
             self.check()?;
-            if file.metadata {
-                continue;
-            }
-            if !file
-                .memberships
-                .iter()
-                .any(|m| self.filters(q, file, m, None, 0, &[]))
+            if units
+                .boundary()
+                .is_some_and(|(path, _)| path.as_str() < minimum_path)
             {
-                continue;
+                break;
             }
-            let source = self
-                .source_store(key)
-                .source(&self.tx, key)?
-                .context("Missing cache record; retry query")?;
-            if !literal.is_match(source) {
-                continue;
-            }
-            let data = self.data(key)?;
-            let mut previous_line = None;
-            let mut first_lookup = true;
-            let mut containing_declarations = None;
-            let mut scanned = 0;
-            let mut line_no = 1;
-            let mut line_start = 0;
-            for matched in literal.find_iter(&data.source) {
-                self.check()?;
-                for (offset, _) in data.source[scanned..matched.start()].match_indices('\n') {
-                    line_no += 1;
-                    line_start = scanned + offset + 1;
-                }
-                scanned = matched.start();
-                if previous_line == Some(line_no) {
+            for key in keys {
+                let Some((key, file)) = self.manifest.files.get_key_value(key.as_ref()) else {
+                    continue;
+                };
+                if files.as_ref().is_some_and(|files| !files.contains(key))
+                    || !visited.insert(key.as_str())
+                {
                     continue;
                 }
-                if let Some(native) = &data.facts.native {
-                    let dialect = native
-                        .regions
-                        .iter()
-                        .find(|r| r.span.contains(&matched.start()))
-                        .map_or(file.language, |r| r.language);
-                    if !Self::language_filters(q, dialect, file.language) {
+                self.check()?;
+                if file.metadata || !Self::file_language_filters(q, file.language) {
+                    continue;
+                }
+                if !file.memberships.iter().enumerate().any(|(index, m)| {
+                    self.project_membership(q, file, m)
+                        && q.filters.iter().all(|filter| match filter.key.as_str() {
+                            "project" => {
+                                wildcard(&filter.value, &self.manifest.projects[m.project].name)
+                                    != filter.negate
+                            }
+                            "path" => {
+                                self.path_matches(&filter.value, paths.display(key, index))
+                                    != filter.negate
+                            }
+                            _ => true,
+                        })
+                }) {
+                    continue;
+                }
+                let source = self
+                    .source_store(key)
+                    .source(&self.tx, key)?
+                    .context("Missing cache record; retry query")?;
+                if !literal.is_match(source) {
+                    continue;
+                }
+                let data = self.data(key)?;
+                let mut previous_line = None;
+                let mut first_lookup = true;
+                let mut containing_declarations = None;
+                let mut scanned = 0;
+                let mut line_no = 1;
+                let mut line_start = 0;
+                for matched in literal.find_iter(&data.source) {
+                    self.check()?;
+                    if units.boundary().is_some_and(|(path, offset)| {
+                        (path.as_str(), *offset) < (minimum_path, matched.start())
+                    }) {
+                        break;
+                    }
+                    for (offset, _) in data.source[scanned..matched.start()].match_indices('\n') {
+                        line_no += 1;
+                        line_start = scanned + offset + 1;
+                    }
+                    scanned = matched.start();
+                    if previous_line == Some(line_no) {
                         continue;
                     }
-                }
-                // Single-match files avoid index construction; repeated lookups share a sweep.
-                let containing = if first_lookup {
-                    first_lookup = false;
-                    data.facts
-                        .declarations
-                        .iter()
-                        .filter(|d| !d.local() && d.span.contains(&matched.start()))
-                        .min_by_key(|d| d.span.end - d.span.start)
-                } else {
-                    containing_declarations
-                        .get_or_insert_with(|| {
-                            ContainingDeclarations::new(&data.facts.declarations)
+                    if let Some(native) = &data.facts.native {
+                        let dialect = native
+                            .regions
+                            .iter()
+                            .find(|r| r.span.contains(&matched.start()))
+                            .map_or(file.language, |r| r.language);
+                        if !Self::language_filters(q, dialect, file.language) {
+                            continue;
+                        }
+                    }
+                    // Single-match files avoid index construction; repeated lookups share a sweep.
+                    let containing = if first_lookup {
+                        first_lookup = false;
+                        data.facts
+                            .declarations
+                            .iter()
+                            .filter(|d| !d.local() && d.span.contains(&matched.start()))
+                            .min_by_key(|d| d.span.end - d.span.start)
+                    } else {
+                        containing_declarations
+                            .get_or_insert_with(|| {
+                                ContainingDeclarations::new(&data.facts.declarations)
+                            })
+                            .at(matched.start())
+                    };
+                    let Some(membership) = file.memberships.iter().find(|m| {
+                        let containing = containing.map(|d| contextual(d, m));
+                        self.filters(q, file, m, containing.as_ref(), matched.start(), inside)
+                    }) else {
+                        continue;
+                    };
+                    let display = self.manifest.display(file, membership);
+                    previous_line = Some(line_no);
+                    let rank = (display.to_string(), matched.start());
+                    if units.boundary().is_some_and(|last| &rank > last)
+                        || units.get_mut(&rank).is_some_and(|(previous, _)| {
+                            previous.is_none_or(|previous| previous <= key.as_str())
                         })
-                        .at(matched.start())
-                };
-                let Some(membership) = file.memberships.iter().find(|m| {
-                    let containing = containing.map(|d| contextual(d, m));
-                    self.filters(q, file, m, containing.as_ref(), matched.start(), inside)
-                }) else {
-                    continue;
-                };
-                let display = self.manifest.display(file, membership);
-                previous_line = Some(line_no);
-                let rank = (display.to_string(), matched.start());
-                if !units.accepts(&rank) {
-                    continue;
+                    {
+                        continue;
+                    }
+                    let end = data.source[matched.end()..]
+                        .find('\n')
+                        .map_or(data.source.len(), |n| matched.end() + n);
+                    let last = line_no
+                        + data.source.as_bytes()
+                            [matched.start()..matched.end().saturating_sub(1).max(matched.start())]
+                            .iter()
+                            .filter(|&&b| b == b'\n')
+                            .count();
+                    units.insert(
+                        rank,
+                        (
+                            Some(key.as_str()),
+                            crate::render::SearchResult {
+                                symbol: containing.map(|d| {
+                                    let d = contextual(d, membership);
+                                    (d.kind, d.qualified)
+                                }),
+                                path: display.to_string(),
+                                lines: Some((line_no, last)),
+                                source: data.source[line_start..end].to_owned(),
+                                language: file.language,
+                                uncertain: false,
+                                target: None,
+                                occurrences: BTreeSet::new(),
+                                candidates: Vec::new(),
+                                possible_write: false,
+                            },
+                        ),
+                    );
                 }
-                let end = data.source[matched.end()..]
-                    .find('\n')
-                    .map_or(data.source.len(), |n| matched.end() + n);
-                let last = line_no
-                    + data.source.as_bytes()
-                        [matched.start()..matched.end().saturating_sub(1).max(matched.start())]
-                        .iter()
-                        .filter(|&&b| b == b'\n')
-                        .count();
-                units.insert(
-                    rank,
-                    crate::render::SearchResult {
-                        symbol: containing.map(|d| {
-                            let d = contextual(d, membership);
-                            (d.kind, d.qualified)
-                        }),
-                        path: display.to_string(),
-                        lines: Some((line_no, last)),
-                        source: data.source[line_start..end].to_owned(),
-                        language: file.language,
-                        uncertain: false,
-                        target: None,
-                        occurrences: BTreeSet::new(),
-                        candidates: Vec::new(),
-                        possible_write: false,
-                    },
-                );
             }
         }
-        Ok(self.finish_results(units))
+        let entries = units.into_entries();
+        let total = (entries.len() <= q.limit).then_some(entries.len());
+        Ok(self.render_results(
+            entries
+                .into_values()
+                .take(q.limit)
+                .map(|(_, result)| result),
+            total,
+        ))
     }
     fn relationship(
         &mut self,
@@ -2058,27 +2106,44 @@ impl<'a> Search<'a> {
         units: crate::selection::Selection<K, crate::render::SearchResult>,
     ) -> String {
         let (entries, total) = units.into_parts();
+        self.render_results(entries.into_values(), Some(total))
+    }
+    fn render_results(
+        &self,
+        entries: impl IntoIterator<Item = crate::render::SearchResult>,
+        total: Option<usize>,
+    ) -> String {
+        let entries: Vec<_> = entries.into_iter().collect();
         if entries.is_empty() {
             return "No matches.".into();
         }
         let mut paths = crate::render::Paths::new(
-            self.manifest
-                .files
-                .values()
-                .filter(|f| !f.metadata)
-                .flat_map(|f| {
-                    f.memberships
-                        .iter()
-                        .map(|m| self.manifest.display(f, m).into_owned())
-                }),
+            self.source_manifest
+                .derived
+                .paths(self.source_manifest)
+                .ordered(None)
+                .filter(|(_, keys)| {
+                    keys.iter().any(|key| {
+                        self.manifest
+                            .files
+                            .get(key.as_ref())
+                            .is_some_and(|file| !file.metadata)
+                    })
+                })
+                .map(|(path, _)| path.to_owned()),
         );
-        render_selected(
-            entries
-                .into_values()
-                .map(|unit| unit.render(&mut paths))
-                .collect(),
-            total,
-        )
+        let rendered: Vec<_> = entries
+            .into_iter()
+            .map(|unit| unit.render(&mut paths))
+            .collect();
+        match total {
+            Some(total) => render_selected(rendered, total),
+            None => format!(
+                "{}\n\n{}",
+                rendered.join("\n\n").trim_end(),
+                crate::render::omission(None)
+            ),
+        }
     }
     fn finish_relationship<K: Ord + Clone>(
         &self,
@@ -2446,6 +2511,122 @@ pub(crate) fn render_selected(units: Vec<String>, total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_workspace(
+        files: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::workspace::Workspace,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        for (name, source) in files {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let mut workspace = crate::workspace::Workspace::open(
+            root.path().into(),
+            cache.path(),
+            crate::discovery::Policy::new(vec![root.path().into()]).unwrap(),
+            &cache.path().join("analysis"),
+            None,
+            Arc::new(crate::watch::Monitor::default()),
+        )
+        .unwrap();
+        let plan = workspace.prepare().unwrap().unwrap();
+        workspace.apply(plan).unwrap();
+        (root, cache, workspace)
+    }
+
+    #[test]
+    fn bounded_text_skips_records_after_the_result_boundary() {
+        let (_root, _cache, workspace) = text_workspace(&[
+            ("a.txt", "needle first\nneedle second\n"),
+            ("z.txt", "needle tail\n"),
+        ]);
+        let mut manifest = (*workspace.manifest).clone();
+        let tail = manifest
+            .files
+            .iter()
+            .find(|(_, file)| file.display == "z.txt")
+            .unwrap()
+            .0
+            .clone();
+        let file = manifest.files.remove(&tail).unwrap();
+        manifest.files.insert("unavailable".into(), file);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut search = Search::new(&workspace.store, &manifest, &cancel).unwrap();
+        let result = search
+            .run(&Query::parse("text:needle limit:1").unwrap())
+            .unwrap();
+        assert!(
+            result.contains("needle first") && !result.contains("needle second"),
+            "{result}"
+        );
+        assert!(result.ends_with(&crate::render::omission(None)), "{result}");
+        assert!(
+            search
+                .run(&Query::parse("text:needle limit:10").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_text_keeps_logical_order_offsets_and_original_tie_precedence() {
+        let (root, _cache, workspace) = text_workspace(&[
+            ("a/Shared.txt", "needle from A\nneedle later\n"),
+            ("b/Shared.txt", "needle from B\nneedle later\n"),
+            ("c/Shared.txt", "x\nneedle early offset\n"),
+        ]);
+        let mut manifest = (*workspace.manifest).clone();
+        manifest.projects[0].source_roots = ["a", "b", "c"]
+            .into_iter()
+            .map(|part| SourceRoot {
+                physical: root.path().join(part),
+                logical: "z".into(),
+            })
+            .collect();
+        let mut alias = manifest.projects[0].clone();
+        alias.source_roots = vec![SourceRoot {
+            physical: root.path().join("b"),
+            logical: "a".into(),
+        }];
+        let alias_project = manifest.projects.len();
+        manifest.projects.push(alias);
+        manifest
+            .files
+            .values_mut()
+            .find(|file| file.display == "b/Shared.txt")
+            .unwrap()
+            .memberships
+            .push(Membership {
+                project: alias_project,
+                module: String::new(),
+            });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut search = Search::new(&workspace.store, &manifest, &cancel).unwrap();
+        let full = search
+            .run(&Query::parse("text:needle limit:10").unwrap())
+            .unwrap();
+        let limited = search
+            .run(&Query::parse("text:needle limit:2").unwrap())
+            .unwrap();
+        assert!(
+            limited.contains("needle from A") && limited.contains("needle early offset"),
+            "{limited}"
+        );
+        assert!(
+            !limited.contains("needle from B") && !limited.contains("needle later"),
+            "{limited}"
+        );
+        let prefix = limited
+            .strip_suffix(&crate::render::omission(None))
+            .unwrap()
+            .trim_end();
+        assert!(full.starts_with(prefix), "{full}\n{limited}");
+    }
 
     #[test]
     fn containing_declaration_sweep_matches_linear_lookup() {

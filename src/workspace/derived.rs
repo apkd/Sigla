@@ -135,25 +135,27 @@ impl Paths {
     }
 
     pub fn visit(&self, literal: Option<&str>, mut visit: impl FnMut(&str, &[Arc<str>])) {
-        if let Some(literal) = literal {
-            if let Some(rows) = self.by_path.get(literal) {
-                visit(literal, rows);
-            }
-            let prefix = format!("{}/", literal.trim_end_matches('/'));
-            for (path, rows) in self
-                .by_path
-                .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
-            {
-                if !path.starts_with(&prefix) {
-                    break;
-                }
-                visit(path, rows);
-            }
-        } else {
-            for (path, rows) in &self.by_path {
-                visit(path, rows);
-            }
+        for (path, rows) in self.ordered(literal) {
+            visit(path, rows);
         }
+    }
+
+    pub fn ordered(&self, literal: Option<&str>) -> impl Iterator<Item = (&str, &[Arc<str>])> {
+        let exact = literal.and_then(|path| self.by_path.get_key_value(path));
+        let prefix = literal.map(|path| format!("{}/", path.trim_end_matches('/')));
+        let start = prefix.as_deref().map_or(Bound::Unbounded, Bound::Included);
+        let range = self
+            .by_path
+            .range::<str, _>((start, Bound::Unbounded))
+            .take_while(move |(path, _)| {
+                prefix
+                    .as_ref()
+                    .is_none_or(|prefix| path.starts_with(prefix))
+            });
+        exact
+            .into_iter()
+            .chain(range)
+            .map(|(path, rows)| (path.as_ref(), rows.as_slice()))
     }
 }
 

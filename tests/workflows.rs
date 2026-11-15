@@ -719,6 +719,41 @@ async fn text_search_deduplicates_only_after_containment_accepts_a_match() {
 }
 
 #[tokio::test]
+async fn text_limits_report_only_proven_overflow_after_containment() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "Text.csproj",
+        r#"<Project><ItemGroup><Compile Include="Text.cs" /></ItemGroup></Project>"#,
+    );
+    write(
+        root.path(),
+        "Text.cs",
+        "namespace Selected { public class First {\npublic void Keep() { /* needle */ }\nprivate void Skip() { /* needle */ }\n} }\nnamespace Other { class Second { void Skip() { /* needle */ } } }\n",
+    );
+    let app = app(root.path(), cache.path());
+    let root = root.path().to_str().unwrap();
+    let filtered = app
+        .search(root, "text:needle in:Selected.First.Keep limit:1")
+        .await
+        .unwrap();
+    assert!(
+        filtered.contains("Keep") && !filtered.contains("Skip"),
+        "{filtered}"
+    );
+    assert!(!filtered.contains("omitted"), "{filtered}");
+    let exact = app.search(root, "text:needle limit:3").await.unwrap();
+    let full = app.search(root, "text:needle limit:10").await.unwrap();
+    assert_eq!(exact, full);
+    let limited = app.search(root, "text:needle limit:2").await.unwrap();
+    let (prefix, footer) = limited.rsplit_once("\n\n").unwrap();
+    assert!(footer.contains("omitted"), "{limited}");
+    assert!(full.starts_with(prefix), "{full}\n{limited}");
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn text_search_preserves_multiline_unicode_and_crlf_locations() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

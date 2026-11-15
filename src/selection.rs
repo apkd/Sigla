@@ -2,32 +2,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Selection<K, V = String> {
-    entries: BTreeMap<K, V>,
+    entries: Top<K, V>,
     seen: BTreeSet<K>,
-    limit: usize,
 }
 impl<K: Ord + Clone, V> Selection<K, V> {
     pub fn new(limit: usize) -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: Top::new(limit),
             seen: BTreeSet::new(),
-            limit,
         }
     }
     pub fn accepts(&mut self, key: &K) -> bool {
         self.seen.insert(key.clone());
-        if self.entries.contains_key(key) {
+        if self.entries.get_mut(key).is_some() {
             return false;
         }
-        if self.entries.len() >= self.limit
-            && self
-                .entries
-                .last_key_value()
-                .is_some_and(|(last, _)| key > last)
-        {
-            return false;
-        }
-        true
+        self.entries.boundary().is_none_or(|last| key <= last)
     }
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         self.entries.get_mut(key)
@@ -37,12 +27,48 @@ impl<K: Ord + Clone, V> Selection<K, V> {
             return;
         }
         self.entries.insert(key, unit);
+    }
+    pub fn into_parts(self) -> (BTreeMap<K, V>, usize) {
+        (self.entries.into_entries(), self.seen.len())
+    }
+}
+
+/// Keep the best results without retaining every discarded rank.
+pub(crate) struct Top<K, V> {
+    entries: BTreeMap<K, V>,
+    limit: usize,
+}
+
+impl<K: Ord, V> Top<K, V> {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            limit,
+        }
+    }
+
+    pub fn boundary(&self) -> Option<&K> {
+        (self.entries.len() >= self.limit)
+            .then(|| self.entries.last_key_value().map(|(key, _)| key))
+            .flatten()
+    }
+
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.boundary().is_some_and(|last| &key > last) {
+            return;
+        }
+        self.entries.insert(key, value);
         if self.entries.len() > self.limit {
             self.entries.pop_last();
         }
     }
-    pub fn into_parts(self) -> (BTreeMap<K, V>, usize) {
-        (self.entries, self.seen.len())
+
+    pub fn into_entries(self) -> BTreeMap<K, V> {
+        self.entries
     }
 }
 
@@ -71,7 +97,7 @@ mod tests {
                     selected.insert(i, units[i].clone());
                     selected.insert(i, units[i].clone());
                 }
-                assert!(selected.entries.len() <= limit);
+                assert!(selected.entries.entries.len() <= limit);
                 assert_eq!(selected.finish(), expected);
             }
         }
