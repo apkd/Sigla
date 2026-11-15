@@ -229,6 +229,24 @@ fn packs_preserve_compressed_bytes_and_individual_analysis() {
                 let leases = crate::cache::views::LeaseSet::new(cache).unwrap();
                 let path = client::materialize(cache, artifact, catalog, &leases).unwrap();
                 assert!(path.join("manifest.bin").is_file());
+                let root = path.parent().unwrap();
+                fs::write(
+                    root.join("last-use"),
+                    serde_json::to_vec(&crate::cache::policy::Usage::new(0)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    client::materialize(cache, artifact, catalog, &leases).unwrap(),
+                    path
+                );
+                assert!(crate::cache::views::metadata_last_use(root).unwrap() > 0);
+                // Usage bookkeeping failures must not make cached inputs unavailable.
+                fs::remove_file(root.join("last-use")).unwrap();
+                fs::create_dir(root.join("last-use")).unwrap();
+                assert_eq!(
+                    client::materialize(cache, artifact, catalog, &leases).unwrap(),
+                    path
+                );
             });
         }
     });

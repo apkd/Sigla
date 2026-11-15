@@ -154,6 +154,47 @@ impl Catalog {
         self.entries.get_mut(entry).unwrap().usage.record(now);
         self.dirty = true;
     }
+    pub(crate) fn seed_metadata(&mut self, usage: &BTreeMap<PathBuf, Usage>) {
+        let missing: Vec<_> = self
+            .entries
+            .keys()
+            .filter(|root| {
+                super::views::is_metadata_root(self.path.parent().unwrap(), root)
+                    && !usage.contains_key(*root)
+            })
+            .cloned()
+            .collect();
+        for root in missing {
+            self.remove(&root);
+        }
+        for (root, &usage) in usage {
+            if let Some(owner) = self.entries.get_mut(root) {
+                if usage.last_use > owner.usage.last_use {
+                    owner.usage = usage;
+                    self.revision += 1;
+                    self.dirty = true;
+                }
+            } else {
+                self.entries.insert(
+                    root.clone(),
+                    Owner {
+                        entry: root.clone(),
+                        repository: None,
+                        usage,
+                        dependencies: BTreeSet::from([root.clone()]),
+                    },
+                );
+                self.revision += 1;
+                self.dependency_revision += 1;
+                self.dirty = true;
+            }
+        }
+    }
+    pub(crate) fn referenced_metadata(&self, root: &Path) -> bool {
+        self.entries.values().any(|owner| {
+            owner.entry != root && owner.dependencies.iter().any(|path| path.starts_with(root))
+        })
+    }
     pub fn flush(&mut self) -> Result<()> {
         if let Some(publication) = self.stage()? {
             self.publish(publication)?;

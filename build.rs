@@ -577,6 +577,11 @@ fn main() {
     // inputs. Release placement and acquisition retries do not change the graph.
     // Removing an unused search-result renderer does not change discovery.
     let workspace_aliases: &[(&str, &str)] = &[
+        // Metadata usage tracking leaves archive contents and discovery unchanged.
+        (
+            "363af54187bdf4dd5213292b5c4545f3305b44fb12a23aaa065f8d604ffbb898",
+            "2ef6ad75638363b5d517f6fcdaa4b77e739eb288f07817abc41a32b8e081babf",
+        ),
         // Streaming trusted metadata and owned imports preserve discovery inputs.
         (
             "938fce78445444dec3c2590f301570b2a4b8d53e0dc1c17335dda1debe24e97e",

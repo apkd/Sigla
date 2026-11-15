@@ -84,6 +84,8 @@ pub struct Report {
     pub footprint: Footprint,
     pub analysis: Option<super::compaction::Stats>,
     pub workspaces: Vec<Workspace>,
+    #[serde(default)]
+    pub metadata: Vec<Workspace>,
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub active_view_leases: Vec<PathBuf>,
@@ -101,6 +103,7 @@ pub(crate) struct Analysis {
 }
 
 pub(crate) fn seed_repositories(cache: &Path, owners: &mut Catalog) -> Result<()> {
+    owners.seed_metadata(&super::views::metadata_usage(cache)?);
     for (owner, _, used) in crate::repository::cache::history_owners(cache)? {
         owners.seed(&owner, None, used);
     }
@@ -226,6 +229,7 @@ pub(crate) fn build(
     let now = super::now();
     let limits = overrides.apply(config.limits)?;
     let states = crate::repository::retention::projected(cache)?;
+    owners.seed_metadata(&super::views::metadata_usage(cache)?);
     let history = crate::repository::cache::history_owners(cache)?;
     for (owner, _, used) in &history {
         owners.seed(owner, None, *used);
@@ -233,7 +237,10 @@ pub(crate) fn build(
     for (root, state) in &states {
         owners.seed(&root.join("source"), Some(root), state.last_use);
     }
-    let mut notes = vec!["Eviction uses age limits, then favors workspaces used in the last 15 minutes and those used more often. Size breaks ties. Priority reports decayed use frequency; recent use is ranked separately. Byte estimates are approximate: shared data can remain after a workspace is removed. Cleanup chooses evictions before rewriting retained data, so it can remove more idle workspaces to finish faster.".into()];
+    let mut notes = vec!["Eviction uses age limits, then favors entries used in the last 15 minutes and those used more often. Metadata has its own usage record and can survive workspace eviction. Size breaks ties. Priority reports decayed use frequency; recent use is ranked separately. Byte estimates are approximate: shared data can remain after a workspace is removed. Cleanup chooses evictions before rewriting retained data, so it can remove more idle entries to finish faster.".into()];
+    let dependencies_unknown = analysis
+        .as_ref()
+        .is_some_and(|analysis| !analysis.unknown.is_empty());
     if let Some(analysis) = &analysis {
         for entry in &analysis.unknown {
             notes.push(format!(
@@ -255,10 +262,23 @@ pub(crate) fn build(
         + analysis
             .filter(|s| s.eligible() && disk.available >= s.temporary_bytes())
             .map_or(0, |s| s.reclaimable());
+    let active_view_leases = if live_service {
+        super::views::Registry::open(cache)?.roots()
+    } else {
+        Vec::new()
+    };
+    let editor_branches: Vec<_> = config
+        .editors
+        .iter()
+        .filter_map(|editor| editor.parse().ok())
+        .collect();
     let mut workspaces: Vec<_> = candidates
         .iter()
         .map(|candidate| {
-            let protection = if active.contains(&candidate.owner.entry) {
+            let metadata = super::views::is_metadata_root(cache, &candidate.owner.entry);
+            let protection = if active.contains(&candidate.owner.entry)
+                || metadata && active_view_leases.contains(&candidate.owner.entry)
+            {
                 Some(
                     candidate
                         .protection
@@ -267,6 +287,19 @@ pub(crate) fn build(
                             format!("{reason}; active job or request")
                         }),
                 )
+            } else if metadata && dependencies_unknown {
+                Some("workspace dependencies are not fully known".into())
+            } else if metadata && owners.referenced_metadata(&candidate.owner.entry) {
+                Some("retained workspace dependency".into())
+            } else if metadata
+                && candidate
+                    .owner
+                    .entry
+                    .parent()
+                    .is_some_and(|p| p.ends_with("unity-metadata"))
+                && crate::metadata_archive::configured(&candidate.owner.entry, &editor_branches)
+            {
+                Some("configured editor policy".into())
             } else {
                 candidate.protection.clone()
             };
@@ -340,9 +373,13 @@ pub(crate) fn build(
                     pinned_by: Vec::new(),
                     configured: false,
                 });
-            dependency.retained_by.push(workspace.entry.clone());
-            if workspace.protection.is_some() {
-                dependency.pinned_by.push(workspace.entry.clone());
+            if workspace.entry != *path {
+                dependency.retained_by.push(workspace.entry.clone());
+                if workspace.protection.is_some() {
+                    dependency.pinned_by.push(workspace.entry.clone());
+                }
+            } else if path.parent().is_some_and(|p| p.ends_with("unity-metadata")) {
+                dependency.configured = crate::metadata_archive::configured(path, &editor_branches);
             }
         }
     }
@@ -363,6 +400,9 @@ pub(crate) fn build(
     if live_service {
         notes.push("Live usage can change while filesystem sizes are measured. Active work is protected in this snapshot.".into());
     }
+    let (metadata, workspaces) = workspaces
+        .into_iter()
+        .partition(|entry| super::views::is_metadata_root(cache, &entry.entry));
     Ok(Report {
         cache: cache.into(),
         live_service,
@@ -372,12 +412,9 @@ pub(crate) fn build(
         footprint,
         analysis,
         workspaces,
+        metadata,
         dependencies: dependencies.into_values().collect(),
-        active_view_leases: if live_service {
-            super::views::Registry::open(cache)?.roots()
-        } else {
-            Vec::new()
-        },
+        active_view_leases,
         pending_retirement_bytes: super::blobs::allocated(&cache.join("retired-views"))?,
         resources: live_service.then(crate::memory::resources),
         preview: Preview {
@@ -523,19 +560,25 @@ impl Report {
                 }
             ));
         }
-        text.push_str("\nWorkspaces (least retention priority first):\n");
-        for workspace in &self.workspaces {
-            let label = workspace
-                .repository
-                .as_deref()
-                .map(str::to_owned)
-                .unwrap_or_else(|| workspace.entry.display().to_string());
-            let status = workspace.protection.as_deref().unwrap_or(&workspace.action);
-            text.push_str(&format!(
-                "  {:>12}  last used {:.1} days ago  {label}\n                {status}\n",
-                size(workspace.attributed_bytes),
-                self.measured_at_ms.saturating_sub(workspace.last_used_ms) as f64 / 86_400_000.0
-            ));
+        for (heading, entries) in [
+            ("Workspaces", &self.workspaces),
+            ("Metadata", &self.metadata),
+        ] {
+            text.push_str(&format!("\n{heading} (least retention priority first):\n"));
+            for workspace in entries {
+                let label = workspace
+                    .repository
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| workspace.entry.display().to_string());
+                let status = workspace.protection.as_deref().unwrap_or(&workspace.action);
+                text.push_str(&format!(
+                    "  {:>12}  last used {:.1} days ago  {label}\n                {status}\n",
+                    size(workspace.attributed_bytes),
+                    self.measured_at_ms.saturating_sub(workspace.last_used_ms) as f64
+                        / 86_400_000.0
+                ));
+            }
         }
         text.push_str("\nShared dependencies:\n");
         for dependency in &self.dependencies {

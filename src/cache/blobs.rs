@@ -86,6 +86,18 @@ fn regular(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn replace_with_link(source: &Path, destination: &Path) -> Result<()> {
+    tempfile::Builder::new()
+        .prefix(".sigla-link-")
+        .make_in(
+            destination.parent().context("Cache input has no parent")?,
+            |path| fs::hard_link(source, path),
+        )?
+        .into_temp_path()
+        .persist(destination)?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(cache: &Path) -> Result<Arc<Self>> {
         fs::create_dir_all(cache.join("blobs"))?;
@@ -219,10 +231,7 @@ impl Store {
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let parent = path.parent().context("Cache input has no parent")?;
-        let temporary = tempfile::tempdir_in(parent)?;
-        fs::hard_link(&destination, temporary.path().join("file"))?;
-        fs::rename(temporary.path().join("file"), path)?;
+        replace_with_link(&destination, path)?;
         Ok(id)
     }
 
@@ -416,10 +425,7 @@ impl Store {
         if adopted {
             stats.adopted += 1;
         } else {
-            let parent = path.parent().context("Cache input has no parent")?;
-            let temporary = tempfile::tempdir_in(parent)?;
-            fs::hard_link(&destination, temporary.path().join("file"))?;
-            fs::rename(temporary.path().join("file"), path)?;
+            replace_with_link(&destination, path)?;
             stats.reused += 1;
         }
         stats.sync += sync;
@@ -1374,6 +1380,58 @@ mod tests {
             cold_stats.sync,
             stats.reused
         );
+    }
+
+    #[test]
+    #[ignore = "measures owned imports using SIGLA_IMPORT_PROBE_SOURCE"]
+    fn owned_import_real_tree_probe() {
+        fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+            fs::create_dir(target)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let path = entry.path();
+                let target = target.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_tree(&path, &target)?;
+                } else {
+                    assert!(entry.file_type()?.is_file());
+                    fs::copy(path, target)?;
+                }
+            }
+            Ok(())
+        }
+
+        let source = std::env::var_os("SIGLA_IMPORT_PROBE_SOURCE").unwrap();
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let cache = tempfile::Builder::new()
+            .prefix("blob-real-import-probe-")
+            .tempdir_in(target)
+            .unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let first = cache.path().join("first");
+        let second = cache.path().join("second");
+        copy_tree(Path::new(&source), &first).unwrap();
+        copy_tree(Path::new(&source), &second).unwrap();
+        eprintln!(
+            "phase,files,hashed_bytes,adopted,reused,fallback,wall_ms,read_hash_worker_ms,publication_worker_ms,sync_work_ms"
+        );
+        for (phase, stage) in [("cold", first), ("reuse", second)] {
+            let started = Instant::now();
+            let stats = store.import_owned_tree(&stage).unwrap();
+            eprintln!(
+                "{phase},{},{},{},{},{},{},{},{},{}",
+                stats.files,
+                stats.hashed_bytes,
+                stats.adopted,
+                stats.reused,
+                stats.fallback,
+                started.elapsed().as_millis(),
+                stats.read_hash.as_millis(),
+                stats.publication.as_millis(),
+                stats.sync.as_millis()
+            );
+            assert_eq!(stats.adopted + stats.reused + stats.fallback, stats.files);
+        }
     }
 
     #[test]

@@ -141,7 +141,7 @@ pub(super) fn packed_source(
     };
     let root = cache.join("unity-metadata-packs").join(hex(&pack.hash));
     leases.retain(&root)?;
-    acquisition::shared_versioned(&root.to_string_lossy(), &pack.release, || {
+    let source = acquisition::shared_versioned(&root.to_string_lossy(), &pack.release, || {
         let contents = root.join("contents");
         if !contents.is_dir() {
             fs::create_dir_all(&root)?;
@@ -157,7 +157,9 @@ pub(super) fn packed_source(
             fs::rename(output, &contents)?;
         }
         Ok(Some(contents.join(&artifact.name)))
-    })
+    })?;
+    leases.record_metadata_use(&root);
+    Ok(source)
 }
 
 pub(super) fn materialize(
@@ -169,6 +171,7 @@ pub(super) fn materialize(
     let root = cache.join("unity-metadata").join(hex(&artifact.hash));
     leases.retain(&root)?;
     if root.join("contents/manifest.bin").is_file() {
+        leases.record_metadata_use(&root);
         return Ok(root.join("contents"));
     }
     // Complete transport acquisition before taking a materialization permit.
@@ -179,7 +182,7 @@ pub(super) fn materialize(
         .iter()
         .find(|p| p.members.contains(&artifact.name))
         .map_or(artifact.release.as_str(), |p| p.name.as_str());
-    acquisition::shared_versioned(&root.to_string_lossy(), source_version, || {
+    let contents = acquisition::shared_versioned(&root.to_string_lossy(), source_version, || {
         let contents = root.join("contents");
         if contents.join("manifest.bin").is_file() {
             return Ok(contents);
@@ -218,7 +221,9 @@ pub(super) fn materialize(
             fs::rename(output, &contents)?;
             Ok(contents)
         })
-    })
+    })?;
+    leases.record_metadata_use(&root);
+    Ok(contents)
 }
 fn select_editor(catalog: &Catalog, declared: UnityVersion) -> Result<&Artifact> {
     catalog
@@ -270,6 +275,9 @@ pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
     Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?, &leases)?.0)
 }
 pub(crate) fn configured(path: &Path, branches: &[ReleaseBranch]) -> bool {
+    if branches.is_empty() {
+        return false;
+    }
     let Ok(cached) = CATALOG.lock() else {
         return false;
     };

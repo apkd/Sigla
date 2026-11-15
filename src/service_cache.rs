@@ -892,6 +892,8 @@ impl App {
         let mut known = true;
         let mut missing_manifests = 0u64;
         let mut changed_dependencies = 0u64;
+        let metadata_usage = crate::cache::views::metadata_usage(&self.cache)?;
+        self.owners.lock().unwrap().seed_metadata(&metadata_usage);
         for (owner, _, used) in crate::repository::cache::history_owners(&self.cache)? {
             self.owners.lock().unwrap().seed(&owner, None, used);
         }
@@ -1008,6 +1010,33 @@ impl App {
     fn evict_candidate(&self, candidate: &Candidate, pressure: bool) -> Result<bool> {
         if candidate.pinned {
             return Ok(false);
+        }
+        if crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry) {
+            let root = &candidate.owner.entry;
+            if root
+                .parent()
+                .is_some_and(|parent| parent.ends_with("unity-metadata"))
+                && self.remote.as_ref().is_some_and(|remote| {
+                    crate::metadata_archive::configured(root, &remote.options.unity_versions)
+                })
+            {
+                return Ok(false);
+            }
+            let retired = crate::cache::views::Registry::open(&self.cache)?.try_retire_checked(
+                root,
+                || {
+                    Ok(crate::cache::views::metadata_last_use(root)?
+                        > candidate.owner.usage.last_use
+                        || self.owners.lock().unwrap().referenced_metadata(root))
+                },
+            )?;
+            let Some(retired) = retired else {
+                return Ok(false);
+            };
+            self.owners.lock().unwrap().remove(root);
+            retired.dispose()?;
+            tracing::info!(entry = %root.display(), pressure, "Evicted cached metadata");
+            return Ok(true);
         }
         if crate::repository::cache::history_owner(&self.cache, &candidate.owner.entry) {
             if !crate::repository::cache::evict_history(&candidate.owner.entry)? {
@@ -1237,11 +1266,11 @@ impl App {
                 if retained.contains(&path) {
                     continue;
                 }
-                let configured = kind == "unity-metadata"
-                    && self.remote.as_ref().is_some_and(|remote| {
-                        crate::metadata_archive::configured(&path, &remote.options.unity_versions)
-                    });
-                if configured {
+                // Completed metadata has its own retention candidates. This also
+                // covers views published after the ownership scan began.
+                if crate::cache::views::is_metadata_root(&self.cache, &path)
+                    && crate::cache::views::metadata_complete(&path)
+                {
                     continue;
                 }
                 if let Some(retired) =
@@ -1309,11 +1338,23 @@ impl App {
         let mut candidates = maintenance_stage(operation, "eviction planning", || {
             self.candidates_from(&states)
         })?;
-        for candidate in candidates.iter().filter(|candidate| candidate.expired) {
-            if self.inspection_shutdown.is_cancelled() {
-                return Ok(outcome);
+        if !known {
+            candidates.retain(|candidate| {
+                !crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry)
+            });
+        }
+        // Expiring workspaces release their dependencies before metadata ages out.
+        for metadata in [false, true] {
+            for candidate in candidates.iter().filter(|candidate| {
+                candidate.expired
+                    && crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry)
+                        == metadata
+            }) {
+                if self.inspection_shutdown.is_cancelled() {
+                    return Ok(outcome);
+                }
+                outcome.progress |= self.evict_candidate(candidate, false)?;
             }
-            outcome.progress |= self.evict_candidate(candidate, false)?;
         }
         outcome.progress |= self.collect_analysis(pressure, operation)?;
         outcome.progress |=
@@ -1324,7 +1365,11 @@ impl App {
         maintenance_stage(operation, "asset record collection", || {
             self.asset_records.collect(pressure)
         })?;
-        candidates.retain(|candidate| !candidate.expired);
+        candidates.retain(|candidate| {
+            !candidate.expired
+                || crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry)
+                    && candidate.owner.entry.exists()
+        });
         let allocation_roots = pressure.then(|| {
             crate::cache::policy::allocation_roots(&self.owners.lock().unwrap(), &candidates)
         });
@@ -1374,7 +1419,7 @@ impl App {
             })?;
         }
         candidates.retain(|candidate| !candidate.pinned);
-        let mut candidates = candidates.into_iter();
+        let mut candidates = std::collections::VecDeque::from(candidates);
         while remaining > savings {
             if self.inspection_shutdown.is_cancelled() {
                 return Ok(outcome);
@@ -1385,16 +1430,23 @@ impl App {
             let allocated = after;
             let mut estimated = 0;
             let mut evicted = false;
-            for candidate in candidates.by_ref() {
+            let mut retry = Vec::new();
+            while let Some(candidate) = candidates.pop_front() {
                 if self.evict_candidate(&candidate, true)? {
                     evicted = true;
                     outcome.progress = true;
                     estimated += candidate.bytes;
+                } else if crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry)
+                {
+                    // An earlier candidate may lose its workspace owner later in
+                    // this batch. Retry after those workspace retirements finish.
+                    retry.push(candidate);
                 }
                 if estimated >= needed {
                     break;
                 }
             }
+            candidates.extend(retry);
             if !evicted {
                 break;
             }
@@ -1766,6 +1818,193 @@ mod tests {
         app.collect_views(true).unwrap();
         assert!(managed.is_file());
         assert!(native.is_file());
+    }
+
+    fn metadata_fixture(
+        cache: &Path,
+        name: &str,
+        used: std::time::SystemTime,
+    ) -> std::path::PathBuf {
+        let root = cache.join("unity-metadata").join(name);
+        fs::create_dir_all(root.join("contents")).unwrap();
+        fs::write(root.join("contents/manifest.bin"), vec![1; 512 * 1024]).unwrap();
+        fs::write(
+            root.join("last-use"),
+            serde_json::to_vec(&crate::cache::policy::Usage::new(
+                used.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn metadata_outlives_its_workspace_and_restores_independent_usage() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let root = metadata_fixture(cache.path(), "editor", std::time::SystemTime::now());
+        let manifest = crate::workspace::Manifest {
+            dependencies: std::collections::BTreeSet::from([root.clone()]),
+            ..Default::default()
+        };
+        app.owners.lock().unwrap().observe(
+            workspace.path(),
+            None,
+            &manifest,
+            Some(crate::cache::now()),
+        );
+        assert!(app.seed_owners().unwrap());
+        let candidate = app
+            .candidates()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.owner.entry == workspace.path())
+            .unwrap();
+        assert!(app.evict_candidate(&candidate, true).unwrap());
+        app.collect_views(true).unwrap();
+        assert!(root.join("contents/manifest.bin").is_file());
+        app.flush_owners().unwrap();
+        let restored = crate::cache::owners::Catalog::open(cache.path()).unwrap();
+        assert_eq!(
+            restored.entries[&root].usage.last_use,
+            crate::cache::views::metadata_last_use(&root).unwrap()
+        );
+        assert!(!restored.referenced_metadata(&root));
+    }
+
+    #[test]
+    fn metadata_published_after_the_owner_scan_survives_collection() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        assert!(app.seed_owners().unwrap());
+        app.collect_views_observed(true, || {
+            metadata_fixture(cache.path(), "new", std::time::SystemTime::now());
+        })
+        .unwrap();
+        let root = cache.path().join("unity-metadata/new");
+        assert!(root.join("contents/manifest.bin").is_file());
+        assert!(app.seed_owners().unwrap());
+        assert!(app.owners.lock().unwrap().entries.contains_key(&root));
+        fs::remove_file(root.join("contents/manifest.bin")).unwrap();
+        assert!(app.seed_owners().unwrap());
+        assert!(!app.owners.lock().unwrap().entries.contains_key(&root));
+        app.collect_views(true).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn metadata_retirement_rechecks_reuse_leases_and_workspace_references() {
+        let cache = tempfile::tempdir().unwrap();
+        let app = app(cache.path(), vec![]);
+        let root = metadata_fixture(cache.path(), "editor", std::time::SystemTime::UNIX_EPOCH);
+        assert!(app.seed_owners().unwrap());
+        let candidate = app
+            .candidates()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.owner.entry == root)
+            .unwrap();
+        {
+            let leases = crate::cache::views::LeaseSet::new(cache.path()).unwrap();
+            leases.retain(&root).unwrap();
+            leases.record_metadata_use(&root);
+        }
+        assert!(!app.evict_candidate(&candidate, true).unwrap());
+        assert!(app.seed_owners().unwrap());
+        let candidate = app
+            .candidates()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.owner.entry == root)
+            .unwrap();
+        let leases = crate::cache::views::LeaseSet::new(cache.path()).unwrap();
+        leases.retain(&root).unwrap();
+        assert!(!app.evict_candidate(&candidate, true).unwrap());
+        drop(leases);
+        let workspace = tempfile::tempdir().unwrap();
+        let manifest = crate::workspace::Manifest {
+            dependencies: std::collections::BTreeSet::from([root.clone()]),
+            ..Default::default()
+        };
+        app.owners
+            .lock()
+            .unwrap()
+            .observe(workspace.path(), None, &manifest, None);
+        assert!(!app.evict_candidate(&candidate, true).unwrap());
+        app.owners.lock().unwrap().remove(workspace.path());
+        assert!(app.evict_candidate(&candidate, true).unwrap());
+        assert!(!root.exists());
+        assert!(!app.owners.lock().unwrap().entries.contains_key(&root));
+    }
+
+    #[test]
+    fn pressure_reclaims_older_metadata_before_recent_metadata() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut app = app(cache.path(), vec![]);
+        let now = std::time::SystemTime::now();
+        let old = metadata_fixture(
+            cache.path(),
+            "old",
+            now - crate::config::DEFAULT_REPO_TTL / 2,
+        );
+        let recent = metadata_fixture(cache.path(), "recent", now);
+        app.cache_limits.max_bytes = blobs::allocated(cache.path()).unwrap() - 256 * 1024;
+        app.cache_limits.headroom_percent = 0;
+        let outcome = app.maintain_disk_shared().unwrap();
+        assert!(outcome.progress && !outcome.pressure);
+        assert!(!old.exists());
+        assert!(recent.join("contents/manifest.bin").is_file());
+    }
+
+    #[test]
+    fn expired_archives_and_packs_retire_after_their_workspace_in_one_pass() {
+        for kind in ["unity-metadata", "unity-metadata-packs"] {
+            let cache = tempfile::tempdir().unwrap();
+            let app = app(cache.path(), vec![]);
+            let archive = metadata_fixture(cache.path(), "old", std::time::SystemTime::UNIX_EPOCH);
+            let root = cache.path().join(kind).join("old");
+            if root != archive {
+                fs::create_dir_all(root.parent().unwrap()).unwrap();
+                fs::rename(archive, &root).unwrap();
+            }
+            let workspace = cache.path().join("z-workspace");
+            fs::create_dir(&workspace).unwrap();
+            let manifest = crate::workspace::Manifest {
+                dependencies: std::collections::BTreeSet::from([root.clone()]),
+                ..Default::default()
+            };
+            app.owners
+                .lock()
+                .unwrap()
+                .observe(&workspace, None, &manifest, Some(0));
+            let outcome = app.maintain_disk_shared().unwrap();
+            assert!(outcome.progress && !outcome.pressure);
+            assert!(!root.exists());
+            assert!(!app.owners.lock().unwrap().entries.contains_key(&workspace));
+        }
+    }
+
+    #[test]
+    fn unknown_workspace_dependencies_block_metadata_eviction() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = app(cache.path(), vec![]);
+        let root = metadata_fixture(cache.path(), "editor", std::time::SystemTime::UNIX_EPOCH);
+        let _scope = crate::store::Store::open_workspace(
+            &cache.path().join("analysis"),
+            [0; 32],
+            workspace.path(),
+            None,
+        )
+        .unwrap();
+        app.cache_limits.max_bytes = 1;
+        app.cache_limits.headroom_percent = 0;
+        app.maintain_disk_shared().unwrap();
+        assert!(root.join("contents/manifest.bin").is_file());
     }
 
     #[test]

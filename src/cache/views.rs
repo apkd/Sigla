@@ -5,13 +5,91 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
+    time::SystemTime,
 };
+
+const METADATA_KINDS: [&str; 2] = ["unity-metadata", "unity-metadata-packs"];
+const LAST_USE: &str = "last-use";
+
+pub(crate) fn is_metadata_root(cache: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(cache) else {
+        return false;
+    };
+    let mut parts = relative.components();
+    parts
+        .next()
+        .is_some_and(|kind| METADATA_KINDS.iter().any(|name| kind.as_os_str() == *name))
+        && parts.next().is_some()
+        && parts.next().is_none()
+}
+
+fn saved_metadata_usage(root: &Path) -> Result<Option<super::policy::Usage>> {
+    match fs::read(root.join(LAST_USE)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn metadata_last_use(root: &Path) -> Result<u64> {
+    Ok(metadata_usage_at(root)?.last_use)
+}
+
+fn metadata_usage_at(root: &Path) -> Result<super::policy::Usage> {
+    if let Some(usage) = saved_metadata_usage(root)? {
+        return Ok(usage);
+    }
+    let used = fs::metadata(root)?
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_millis() as u64;
+    Ok(super::policy::Usage::new(used))
+}
+
+pub(crate) fn metadata_complete(root: &Path) -> bool {
+    if root
+        .parent()
+        .is_some_and(|parent| parent.ends_with("unity-metadata"))
+    {
+        root.join("contents/manifest.bin").is_file()
+    } else {
+        root.join("contents").is_dir()
+    }
+}
+
+pub(crate) fn metadata_usage(cache: &Path) -> Result<BTreeMap<PathBuf, super::policy::Usage>> {
+    let mut usage = BTreeMap::new();
+    for kind in METADATA_KINDS {
+        let entries = match fs::read_dir(cache.join(kind)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let root = entry?.path();
+            if metadata_complete(&root) {
+                match metadata_usage_at(&root) {
+                    Ok(used) => {
+                        usage.insert(root, used);
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(usage)
+}
 
 #[derive(Debug)]
 pub struct Registry {
     cache: PathBuf,
     roots: Mutex<BTreeMap<PathBuf, usize>>,
     retirement: Mutex<()>,
+    usage: Mutex<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +138,29 @@ impl LeaseSet {
                 .entry(root)
                 .or_default() += 1;
         }
+        Ok(())
+    }
+
+    /// Record successful reuse while retaining the view. Preserve frequency
+    /// between maintenance passes without writing on every acquisition.
+    pub(crate) fn record_metadata_use(&self, root: &Path) {
+        if let Err(error) = self.record_metadata_use_at(root, super::now()) {
+            tracing::warn!(root = %root.display(), %error, "Cannot record cached metadata use");
+        }
+    }
+
+    fn record_metadata_use_at(&self, root: &Path, now: u64) -> Result<()> {
+        let _usage = self.0.registry.usage.lock().unwrap();
+        let mut usage = match saved_metadata_usage(root)? {
+            Some(usage) if now.saturating_sub(usage.last_use) < 60_000 => return Ok(()),
+            Some(usage) => usage,
+            None => super::policy::Usage::new(now),
+        };
+        usage.record(now);
+        let mut file = tempfile::NamedTempFile::new_in(root)?;
+        serde_json::to_writer(file.as_file_mut(), &usage)?;
+        file.as_file().sync_all()?;
+        file.persist(root.join(LAST_USE))?;
         Ok(())
     }
 }
@@ -127,6 +228,7 @@ impl Registry {
             cache: cache.clone(),
             roots: Mutex::new(BTreeMap::new()),
             retirement: Mutex::new(()),
+            usage: Mutex::new(()),
         });
         registries.insert(cache, Arc::downgrade(&registry));
         Ok(registry)
@@ -142,12 +244,20 @@ impl Registry {
         root: &Path,
         protected: impl FnOnce() -> bool,
     ) -> Result<Option<Retired>> {
+        self.try_retire_checked(root, || Ok(protected()))
+    }
+
+    pub(crate) fn try_retire_checked(
+        &self,
+        root: &Path,
+        protected: impl FnOnce() -> Result<bool>,
+    ) -> Result<Option<Retired>> {
         let root = normalized(root.parent().unwrap())?.join(root.file_name().unwrap());
         let roots = self.roots.lock().unwrap();
         if roots
             .keys()
             .any(|p| p.starts_with(&root) || root.starts_with(p))
-            || protected()
+            || protected()?
         {
             return Ok(None);
         }
@@ -211,12 +321,66 @@ pub fn retire(cache: &Path, root: &Path) -> Result<Retired> {
     fs::File::open(root.parent().unwrap())?.sync_all()?;
     fs::File::open(&slot)?.sync_all()?;
     fs::File::open(&directory)?.sync_all()?;
+    tracing::info!(root = %root.display(), "Retired managed cache view");
     Ok(Retired(slot))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_reuse_frequency_survives_between_ownership_scans() {
+        let cache = tempfile::tempdir().unwrap();
+        let leases = LeaseSet::new(cache.path()).unwrap();
+        let repeated = cache.path().join("unity-metadata/repeated");
+        let once = cache.path().join("unity-metadata/once");
+        for root in [&repeated, &once] {
+            leases.retain(root).unwrap();
+            fs::create_dir_all(root.join("contents")).unwrap();
+            fs::write(root.join("contents/manifest.bin"), b"cached").unwrap();
+        }
+        let hour = 60 * 60 * 1000;
+        for at in [hour, 2 * hour, 3 * hour] {
+            leases.record_metadata_use_at(&repeated, at).unwrap();
+        }
+        leases.record_metadata_use_at(&once, 3 * hour).unwrap();
+        let usage = metadata_usage(cache.path()).unwrap();
+        let mut owners = super::super::owners::Catalog::open(cache.path()).unwrap();
+        owners.seed_metadata(&usage);
+        owners.flush().unwrap();
+        let owners = super::super::owners::Catalog::open(cache.path()).unwrap();
+        assert_eq!(
+            owners.entries[&repeated].usage.last_use,
+            owners.entries[&once].usage.last_use
+        );
+        assert!(
+            owners.entries[&repeated].usage.priority(3 * hour)
+                > owners.entries[&once].usage.priority(3 * hour)
+        );
+    }
+    #[test]
+    fn metadata_usage_recovers_legacy_views_and_excludes_unfinished_downloads() {
+        let cache = tempfile::tempdir().unwrap();
+        let legacy = cache.path().join("unity-metadata/legacy");
+        let pack = cache.path().join("unity-metadata-packs/pack");
+        let partial = cache.path().join("unity-metadata/partial");
+        fs::create_dir_all(legacy.join("contents")).unwrap();
+        fs::write(legacy.join("contents/manifest.bin"), b"cached").unwrap();
+        fs::create_dir_all(pack.join("contents")).unwrap();
+        fs::create_dir_all(&partial).unwrap();
+        fs::File::open(&legacy)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let usage = metadata_usage(cache.path()).unwrap();
+        assert!(usage.contains_key(&legacy));
+        assert!(usage.contains_key(&pack));
+        assert!(!usage.contains_key(&partial));
+        let leases = LeaseSet::new(cache.path()).unwrap();
+        leases.retain(&legacy).unwrap();
+        leases.record_metadata_use(&legacy);
+        assert!(metadata_last_use(&legacy).unwrap() > usage[&legacy].last_use);
+    }
     #[test]
     fn leases_cover_clones_aliases_and_reacquisition() {
         let cache = tempfile::tempdir().unwrap();

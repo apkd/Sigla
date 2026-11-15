@@ -10,6 +10,9 @@ async fn live_and_idle_inspection_preserve_analysis_and_report_its_live_pages() 
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     fs::write(root.path().join("source.rs"), "pub struct Indexed;").unwrap();
+    let metadata = cache.path().join("unity-metadata/cached");
+    fs::create_dir_all(metadata.join("contents")).unwrap();
+    fs::write(metadata.join("contents/manifest.bin"), b"cached metadata").unwrap();
     let app = Arc::new(
         App::new(
             Policy::new(vec![root.path().into()]).unwrap(),
@@ -29,6 +32,13 @@ async fn live_and_idle_inspection_preserve_analysis_and_report_its_live_pages() 
     let analysis = report.analysis.unwrap();
     assert!(analysis.live > 0 && analysis.live <= analysis.allocated);
     assert!(report.workspaces.iter().any(|w| w.entry == root.path()));
+    assert!(report.metadata.iter().any(|entry| entry.entry == metadata));
+    assert!(
+        report
+            .workspaces
+            .iter()
+            .all(|entry| entry.entry != metadata)
+    );
     app.shutdown().await;
     server.await.unwrap();
     drop(app);
@@ -41,4 +51,5 @@ async fn live_and_idle_inspection_preserve_analysis_and_report_its_live_pages() 
     assert_eq!(fs::read(cache.path().join("owners.json")).unwrap(), owners);
     assert_eq!(offline.analysis.unwrap().live, analysis.live);
     assert!(offline.workspaces.iter().any(|w| w.entry == root.path()));
+    assert!(offline.metadata.iter().any(|entry| entry.entry == metadata));
 }
