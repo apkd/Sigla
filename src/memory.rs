@@ -143,6 +143,7 @@ pub fn encoded_size(value: &impl serde::Serialize) -> usize {
 }
 
 // leave room for two active jobs and temporary parser allocations.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub const IDLE_CACHE_HIGH_WATER: u64 = 640 * 1024 * 1024;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const INDEXING_FREE_HIGH_WATER: usize = 64 * 1024 * 1024;

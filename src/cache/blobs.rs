@@ -624,7 +624,7 @@ thread_local! {
 /// Physical allocation, rather than the sum of each hardlinked view's apparent size.
 pub fn allocated(root: &Path) -> Result<u64> {
     #[cfg(test)]
-    ALLOCATION_WALKS.update(|count| count + 1);
+    ALLOCATION_WALKS.with(|count| count.set(count.get() + 1));
     fn visit(
         root: &Path,
         metadata: std::io::Result<fs::Metadata>,
@@ -687,7 +687,7 @@ pub(crate) fn allocated_with_owners(
     owners: &[(PathBuf, Vec<PathBuf>)],
 ) -> Result<(AttributedAllocation, BTreeMap<PathBuf, u64>)> {
     #[cfg(test)]
-    ALLOCATION_WALKS.update(|count| count + 1);
+    ALLOCATION_WALKS.with(|count| count.set(count.get() + 1));
     const NONE: u32 = u32::MAX;
 
     struct Tags {
