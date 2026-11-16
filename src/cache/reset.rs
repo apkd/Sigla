@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
@@ -13,7 +13,7 @@ const FINGERPRINT: &[u8] = env!("SIGLA_CACHE_FINGERPRINT").as_bytes();
 /// Returns true after clearing an incompatible or unmarked cache.
 /// The caller must hold exclusive cache ownership, or own a private cache.
 pub fn prepare(cache: &Path) -> Result<bool> {
-    prepare_with(cache, remove)
+    prepare_with(cache, super::cleanup::remove)
 }
 
 /// Checks the cache marker without changing cache contents.
@@ -39,36 +39,6 @@ pub fn current(cache: &Path) -> Result<bool> {
     file.take(FINGERPRINT.len() as u64 + 1)
         .read_to_end(&mut bytes)?;
     Ok(bytes == FINGERPRINT)
-}
-
-fn remove(path: &Path) -> std::io::Result<()> {
-    if fs::symlink_metadata(path)?.file_type().is_dir() {
-        match fs::remove_dir_all(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                remove_restricted_directory(path)
-            }
-            result => result,
-        }
-    } else {
-        fs::remove_file(path)
-    }
-}
-
-// OverlayFS leaves mode-000 work directories behind. Reset owns this tree
-// exclusively; change only directory permissions, never shared files or links.
-fn remove_restricted_directory(path: &Path) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() {
-        return fs::remove_file(path);
-    }
-    let mode = metadata.permissions().mode();
-    if mode & 0o700 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
-    }
-    for entry in fs::read_dir(path)? {
-        remove_restricted_directory(&entry?.path())?;
-    }
-    fs::remove_dir(path)
 }
 
 fn prepare_with(
@@ -104,7 +74,7 @@ fn prepare_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn missing_or_changed_fingerprint_clears_cache_but_preserves_ownership() {
@@ -141,7 +111,7 @@ mod tests {
             if path.file_name().is_some_and(|name| name == "fail") {
                 Err(std::io::Error::other("injected deletion failure"))
             } else {
-                remove(path)
+                super::super::cleanup::remove(path)
             }
         });
         assert!(result.is_err());
@@ -173,7 +143,7 @@ mod tests {
         fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).unwrap();
         fs::set_permissions(work.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
         if explicit_fallback {
-            remove_restricted_directory(&root.path().join("repositories")).unwrap();
+            super::super::cleanup::restricted(&root.path().join("repositories")).unwrap();
         }
         assert!(prepare(root.path()).unwrap());
         assert!(!root.path().join("repositories").exists());

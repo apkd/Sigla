@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt},
     },
     path::{Path, PathBuf},
     process::Command,
@@ -86,13 +86,7 @@ impl View {
 
     fn clear_writes(&self) -> Result<()> {
         for path in [self.upper(), self.work()] {
-            let work = path.join("work");
-            if work.is_dir() {
-                fs::set_permissions(work, fs::Permissions::from_mode(0o700))?;
-            }
-            if path.exists() {
-                fs::remove_dir_all(&path)?;
-            }
+            super::cleanup::remove(&path)?;
             fs::create_dir_all(path)?;
         }
         Ok(())
@@ -121,9 +115,7 @@ impl View {
             self.clear_writes()?;
         }
         let stage = self.root.join(publication.stage);
-        if stage.exists() {
-            fs::remove_dir_all(stage)?;
-        }
+        super::cleanup::remove(&stage)?;
         fs::remove_file(journal)?;
         self.discard_stages()?;
         File::open(&self.root)?.sync_all()?;
@@ -139,7 +131,7 @@ impl View {
                     .to_string_lossy()
                     .starts_with("package-snapshot-")
             {
-                fs::remove_dir_all(entry.path())?;
+                super::cleanup::remove(&entry.path())?;
             }
         }
         Ok(())
@@ -152,10 +144,14 @@ impl View {
         integration: &Path,
         deadline: crate::process::Deadline,
     ) -> Result<()> {
-        if fs::read_dir(self.upper())?.next().is_none() {
-            return Ok(());
+        match validate_upper(&self.upper()) {
+            Ok(false) => return Ok(()),
+            Ok(true) => (),
+            Err(error) => {
+                self.clear_writes()?;
+                return Err(error);
+            }
         }
-        validate_upper(&self.upper())?;
         let stage = tempfile::Builder::new()
             .prefix("package-snapshot-")
             .tempdir_in(&self.root)?;
@@ -224,8 +220,10 @@ impl View {
     }
 }
 
-fn validate_upper(path: &Path) -> Result<()> {
+fn validate_upper(path: &Path) -> Result<bool> {
+    let mut changed = false;
     for entry in fs::read_dir(path)? {
+        changed = true;
         let path = entry?.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_dir() {
@@ -239,7 +237,7 @@ fn validate_upper(path: &Path) -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn exchange(a: &Path, b: &Path) -> Result<()> {

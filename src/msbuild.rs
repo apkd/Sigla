@@ -466,7 +466,11 @@ pub(crate) fn discover_in(
                 session.budget.remaining(Duration::from_secs(30))?,
                 None,
                 None,
-            )?;
+            );
+            if let Some(sandbox) = &sandbox {
+                sandbox.validate_writes()?;
+            }
+            let resolution = resolution?;
             ensure!(
                 resolution.status.success(),
                 "SDK resolver helper failed ({}): {}",
@@ -573,19 +577,20 @@ pub(crate) fn discover_in(
                 command
             }
         };
-        process::run(
+        let discovery_result = process::run(
             &mut discovery,
             session.budget.remaining(Duration::from_secs(120))?,
-        )?;
+        );
+        if let Some(sandbox) = &sandbox {
+            sandbox.validate_writes()?;
+        }
+        discovery_result?;
         match &sandbox {
             Some(s) => s.packages.seal(&host, &root, session.budget.0)?,
             None => local_packages
                 .as_ref()
                 .unwrap()
                 .seal(&host, &root, session.budget.0)?,
-        }
-        if let Some(sandbox) = &sandbox {
-            sandbox.validate_writes()?;
         }
         let mut snapshot: Snapshot =
             serde_json::from_slice(&crate::sandbox::read_job_file(&output, 64 * 1024 * 1024)?)?;
@@ -615,7 +620,6 @@ pub(crate) fn discover_in(
             snapshot.diagnostics.extend(diagnostics);
             crate::cache::records::write(&state_file, &snapshot.dependency_state)?;
             if let Some(sandbox) = &sandbox {
-                sandbox.validate_writes()?;
                 map_snapshot(&mut snapshot, sandbox)?;
             }
             return Ok(snapshot);

@@ -1,6 +1,7 @@
 //! Managed disk storage. Owners retain views; jobs lease them until publication ends.
 pub mod artifacts;
 pub mod blobs;
+pub(crate) mod cleanup;
 pub mod compaction;
 pub mod inspect;
 pub mod owners;

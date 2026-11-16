@@ -133,29 +133,7 @@ pub struct Sandbox {
 
 /// Remove generated outputs after all sandbox processes have stopped.
 pub fn remove_outputs(writable: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    // Overlayfs leaves its private work directory at mode 000 after unmounting.
-    // It is outside the mounted workspace and is never exposed to project code.
-    for child in ["overlay-work/work", "package-work/work"] {
-        let work = writable.join(child);
-        match fs::symlink_metadata(&work) {
-            Ok(metadata) => {
-                ensure!(metadata.is_dir(), "Invalid overlay work directory");
-                match fs::set_permissions(&work, fs::Permissions::from_mode(0o700)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    match fs::remove_dir_all(writable) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    Ok(crate::cache::cleanup::remove(writable)?)
 }
 
 impl Sandbox {
@@ -469,7 +447,12 @@ impl Sandbox {
             }
             Ok(())
         }
-        visit(&self.source, &self.source, &self.writable.join("upper"))
+        let upper = self.writable.join("upper");
+        if let Err(error) = visit(&self.source, &self.source, &upper) {
+            remove_outputs(&upper).context("Cannot discard invalid build outputs")?;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -702,6 +685,41 @@ mod tests {
         remove_outputs(&outputs).unwrap();
         assert!(!outputs.exists());
         remove_outputs(&outputs).unwrap();
+    }
+
+    #[test]
+    fn invalid_writes_discard_restricted_outputs_and_preserve_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let writable = root.path().join("generated");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("input"), b"original").unwrap();
+        fs::set_permissions(source.join("input"), fs::Permissions::from_mode(0o444)).unwrap();
+        let private = writable.join("upper/custom/private");
+        fs::create_dir_all(&private).unwrap();
+        fs::hard_link(source.join("input"), private.join("shared")).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(writable.join("upper/input"), b"changed").unwrap();
+        let leases = crate::cache::views::LeaseSet::new(root.path()).unwrap();
+        let sandbox = Sandbox {
+            packages: crate::cache::packages::View::open(root.path(), &writable, &leases).unwrap(),
+            source: source.clone(),
+            writable: writable.clone(),
+            toolchains: BTreeSet::new(),
+            hidden: Vec::new(),
+        };
+        assert!(sandbox.validate_writes().is_err());
+        assert!(!writable.join("upper").exists());
+        assert_eq!(fs::read(source.join("input")).unwrap(), b"original");
+        assert_eq!(
+            fs::metadata(source.join("input"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
     }
 
     #[test]

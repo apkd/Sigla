@@ -294,12 +294,7 @@ impl Retired {
         &self.0
     }
     pub fn dispose(self) -> Result<()> {
-        let generated = self.0.join("contents/generated");
-        if fs::symlink_metadata(&generated).is_ok_and(|metadata| metadata.is_dir()) {
-            crate::sandbox::remove_outputs(&generated)?;
-        }
-        crate::sandbox::remove_outputs(&self.0.join("contents"))?;
-        crate::sandbox::remove_outputs(&self.0)
+        Ok(super::cleanup::remove(&self.0)?)
     }
 }
 
@@ -432,8 +427,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let cache = tempfile::tempdir().unwrap();
         let path = cache.path().join("unity-metadata/old");
-        let work = path.join("generated/package-work/work");
+        let work = path.join("generated/upper/custom/private");
         fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("leftover"), b"scratch").unwrap();
         fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).unwrap();
         drop(retire(cache.path(), &path).unwrap());
         let registry = Registry::open(cache.path()).unwrap();
