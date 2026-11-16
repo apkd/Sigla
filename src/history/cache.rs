@@ -359,31 +359,56 @@ mod tests {
     }
 
     #[test]
-    fn whole_file_validation_preserves_recovery_and_symbol_cache() {
+    fn whole_file_text_is_independent_of_syntax_and_symbol_cache() {
         use super::super::regions::{Region, Sources};
         let root = repository();
-        for text in [
-            "pub fn selected() { let closure = || called(); closure(); }",
-            "pub fn selected( {",
+        for (path, valid, malformed) in [
+            (
+                "code.rs",
+                "pub fn selected() { called(); }",
+                "pub fn selected( {",
+            ),
+            (
+                "code.cs",
+                "class C { void Selected() {} }",
+                "class C { void Selected( {",
+            ),
+            (
+                "code.java",
+                "class C { void selected() {} }",
+                "class C { void selected( {",
+            ),
+            (
+                "code.hlsl",
+                "float selected() { return 1; }",
+                "float selected( {",
+            ),
         ] {
-            let blob = git(
-                root.path(),
-                &["hash-object", "-w", "--stdin"],
-                text.as_bytes(),
-            );
-            let region = Region::whole("code.rs", &blob, 0o100644);
-            for file_first in [true, false] {
-                let sources = Sources::default();
-                let files = sources.for_region(&region);
-                let mut store =
-                    Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
-                let first = if file_first { &files } else { &sources };
-                first.get(&mut store, "code.rs", &blob).unwrap();
-                let file = files.get(&mut store, "code.rs", &blob).unwrap();
-                let symbols = sources.get(&mut store, "code.rs", &blob).unwrap();
-                assert_eq!(file.text, symbols.text);
-                assert_eq!(file.incomplete, symbols.incomplete);
-                assert!(symbols.declarations.iter().any(|d| d.name == "selected"));
+            for (text, broken) in [(valid, false), (malformed, true)] {
+                let blob = git(
+                    root.path(),
+                    &["hash-object", "-w", "--stdin"],
+                    text.as_bytes(),
+                );
+                let region = Region::whole(path, &blob, 0o100644);
+                for file_first in [true, false] {
+                    let sources = Sources::default();
+                    let files = sources.for_region(&region);
+                    let mut store =
+                        Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
+                    let first = if file_first { &files } else { &sources };
+                    first.get(&mut store, path, &blob).unwrap();
+                    let file = files.get(&mut store, path, &blob).unwrap();
+                    let symbols = sources.get(&mut store, path, &blob).unwrap();
+                    assert_eq!(file.text, symbols.text);
+                    assert!(file.incomplete.is_none(), "{path}: {:?}", file.incomplete);
+                    assert!(file.declarations.is_empty() && file.calls.is_empty());
+                    if broken {
+                        assert!(symbols.incomplete.is_some(), "{path}");
+                    } else {
+                        assert!(!symbols.declarations.is_empty(), "{path}");
+                    }
+                }
             }
         }
     }

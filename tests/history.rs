@@ -1292,6 +1292,24 @@ async fn nested_attributes_use_each_committed_tree() {
         &[&hidden],
         "remove exclusion",
     );
+    assert!(
+        f.app
+            .history(
+                &format!("{}#{hidden}", f.root.path().display()),
+                "log file:src/Target.cs",
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        f.app
+            .history(
+                &format!("{}#{visible}", f.root.path().display()),
+                "log file:src/Target.cs",
+            )
+            .await
+            .is_ok()
+    );
     for commit in [&hidden, &visible] {
         let shown = f.history(&visible, &format!("show {commit}")).await;
         let patch = body(&shown);
@@ -2989,6 +3007,80 @@ async fn renamed_directory_includes_members_deleted_before_anchor() {
 }
 
 #[tokio::test]
+async fn directory_history_ignores_unrelated_changes_and_keeps_member_additions_and_deletions() {
+    let f = Fixture::new();
+    let base = [
+        ("src/keep.rs", "const KEEP: u8 = 1;\n"),
+        ("src/removed.rs", "const REMOVED: u8 = 2;\n"),
+        ("src/private.rs", "const PRIVATE: u8 = 1;\n"),
+        ("other.rs", "const NOISE: u8 = 1;\n"),
+    ];
+    let root = f.commit(&base, &[], "initial members");
+    let noise = f.commit(
+        &[
+            base[0],
+            base[1],
+            ("src/private.rs", "const PRIVATE: u8 = 2;\n"),
+            ("other.rs", "const NOISE: u8 = 2;\n"),
+        ],
+        &[&root],
+        "unrelated changes",
+    );
+    let added = f.commit(
+        &[
+            base[0],
+            base[1],
+            ("src/private.rs", "const PRIVATE: u8 = 2;\n"),
+            ("other.rs", "const NOISE: u8 = 2;\n"),
+            ("src/added.rs", "const ADDED: u8 = 3;\n"),
+        ],
+        &[&noise],
+        "add member",
+    );
+    let deleted = f.commit(
+        &[
+            base[0],
+            ("src/private.rs", "const PRIVATE: u8 = 2;\n"),
+            ("other.rs", "const NOISE: u8 = 2;\n"),
+            ("src/added.rs", "const ADDED: u8 = 3;\n"),
+        ],
+        &[&added],
+        "delete member",
+    );
+    let tip = f.commit(
+        &[
+            base[0],
+            ("src/private.rs", "const PRIVATE: u8 = 3;\n"),
+            ("other.rs", "const NOISE: u8 = 3;\n"),
+            ("src/added.rs", "const ADDED: u8 = 3;\n"),
+        ],
+        &[&deleted],
+        "more unrelated changes",
+    );
+    for selector in [
+        "path:src -path:src/private.rs",
+        "path:src/** -path:src/private.rs",
+    ] {
+        let history = f.history(&tip, &format!("log {selector} limit:20")).await;
+        assert_eq!(
+            ids(&history),
+            [deleted.as_str(), added.as_str(), root.as_str()],
+            "{selector}: {history}"
+        );
+        let addition = f.history(&tip, &format!("show {added} {selector}")).await;
+        assert!(body(&addition).contains("src/added.rs"), "{addition}");
+        let deletion = f.history(&tip, &format!("show {deleted} {selector}")).await;
+        assert!(body(&deletion).contains("src/removed.rs"), "{deletion}");
+        for shown in [&addition, &deletion] {
+            assert!(
+                !body(shown).contains("private.rs") && !body(shown).contains("other.rs"),
+                "{shown}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn same_name_after_deletion_does_not_claim_a_trivial_neighbour() {
     let f = Fixture::new();
     let root = f.commit(
@@ -4283,7 +4375,7 @@ async fn file_based_app_directives_do_not_poison_unrelated_histories() {
 }
 
 #[tokio::test]
-async fn invalid_csharp_conditionals_in_candidates_do_not_prove_absence() {
+async fn invalid_csharp_conditionals_affect_symbols_but_not_whole_file_history() {
     for (directive, reason) in [
         (
             "#if FEATURE & OTHER\n#endif",
@@ -4311,15 +4403,17 @@ async fn invalid_csharp_conditionals_in_candidates_do_not_prove_absence() {
         // A repeated query must not turn incomplete candidate analysis into a
         // cached absence and falsely claim that the selected source was added.
         for _ in 0..2 {
-            for query in ["log method:Worker.Target()", "log file:Worker.cs"] {
-                let history = f.history(&tip, query).await;
-                assert!(ids(&history).is_empty(), "{query}: {history}");
-                assert!(
-                    history.contains("incomplete:") && history.contains(reason),
-                    "{query}: {history}"
-                );
-                assert!(!history.ends_with("end\n"), "{query}: {history}");
-            }
+            let symbols = f.history(&tip, "log method:Worker.Target()").await;
+            assert!(ids(&symbols).is_empty(), "{symbols}");
+            assert!(
+                symbols.contains("incomplete:") && symbols.contains(reason),
+                "{symbols}"
+            );
+            assert!(!symbols.ends_with("end\n"), "{symbols}");
+            let file = f.history(&tip, "log file:Worker.cs").await;
+            assert_eq!(ids(&file), [tip.as_str()], "{file}");
+            assert!(!file.contains("incomplete:"), "{file}");
+            assert!(file.ends_with("end\n"), "{file}");
         }
     }
 }

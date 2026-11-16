@@ -1018,6 +1018,21 @@ impl Store {
         }
         Ok(result)
     }
+    /// Resolve one regular file under its committed source attributes.
+    pub fn source_file(&mut self, commit: &Commit, path: &str) -> Result<Option<Entry>> {
+        let source = self.source_path(commit, path)?;
+        if !source
+            .entry
+            .as_ref()
+            .is_some_and(|entry| matches!(entry.mode, 0o100644 | 0o100755))
+            || self
+                .source_exclusions(&commit.tree, &source.attributes, &[path])?
+                .contains(path)
+        {
+            return Ok(None);
+        }
+        Ok(source.entry)
+    }
     pub fn prepare_tree(&mut self, commit: &Commit) -> Result<()> {
         // Fetch a bounded ancestry window even when commit metadata is already cached.
         self.object_from(&commit.tree, "tree", Some(&commit.id))?;

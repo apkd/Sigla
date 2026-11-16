@@ -401,6 +401,23 @@ async fn weak_file_alternatives_require_a_complete_wider_search() {
         // The changed file is weak evidence, but the unchanged origin can
         // still outrank it. A failed wider search cannot commit either choice.
         let history = f.history(&tip, "log file:src/Selected.cs").await;
+        if failure == "malformed source" {
+            assert!(!history.contains("incomplete:"), "{history}");
+            assert!(
+                history.contains("ancestry: unresolved file identity"),
+                "{history}"
+            );
+            assert!(
+                f.app
+                    .history(
+                        &format!("{}#{tip}", f.root.path().display()),
+                        &format!("show {tip} file:src/Selected.cs"),
+                    )
+                    .await
+                    .is_ok()
+            );
+            continue;
+        }
         assert!(ids(&history).is_empty(), "{failure}: {history}");
         assert!(history.contains("incomplete:"), "{failure}: {history}");
         assert!(!history.ends_with("end\n"), "{history}");

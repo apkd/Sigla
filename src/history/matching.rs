@@ -333,16 +333,16 @@ impl Tracker {
         if matches!(selector, Selector::Repository) {
             return Ok(state);
         }
-        let tree = self.tree(commit)?;
         match selector {
             Selector::Repository => return Ok(state),
             Selector::Paths(patterns) => {
+                let tree = self.tree(commit)?;
                 state.paths = patterns.clone();
                 state.regions = members(&tree, state.selection().compile(&self.store.cancel)?);
                 // Deleted-before-anchor members remain discoverable through the path scope.
             }
             Selector::File(path) | Selector::Text { path, .. } => {
-                let entry = tree.get(path).filter(|e| matches!(e.mode, 0o100644 | 0o100755))
+                let entry = self.store.source_file(commit, path)?
                     .with_context(|| {
                         let mut message = format!("Target file is absent or excluded by committed source attributes at {}: {path}", commit.id);
                         if matches!(selector, Selector::File(_)) && path.contains(['*', '?', '[', '{']) {
@@ -368,6 +368,7 @@ impl Tracker {
                 state.regions.push(region);
             }
             Selector::Declaration(query) => {
+                let tree = self.tree(commit)?;
                 let mut incomplete = None;
                 let filters = query
                     .filters
@@ -642,7 +643,33 @@ impl Tracker {
     }
     fn unchanged(&mut self, from: &Commit, to: &Commit, state: &State) -> Result<Option<Mapping>> {
         if !state.paths.is_empty() {
-            return Ok(None);
+            if state.uncertain
+                || state.scope_unresolved
+                || state.file_ancestry_unresolved
+                || state.absent
+                || !state.scope_exclusions.is_empty()
+            {
+                return Ok(None);
+            }
+            if from.tree != to.tree {
+                for pattern in &state.paths {
+                    let Some(pattern) = pattern
+                        .strip_prefix("path:")
+                        .or_else(|| pattern.strip_prefix("-path:"))
+                    else {
+                        return Ok(None);
+                    };
+                    let root = pattern.trim_end_matches('/');
+                    let root = root.strip_suffix("/**").unwrap_or(root);
+                    if root.contains(['*', '?', '[', '{', '\\'])
+                        || crate::repository::selection::validate_path(root).is_err()
+                        || self.store.source_path(from, root)?
+                            != self.store.source_path(to, root)?
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
         }
         if from.tree != to.tree {
             for region in &state.regions {

@@ -387,7 +387,7 @@ impl Sources {
         } else {
             format!("{language:?}/2024")
         };
-        let file_only = self.file_only && language == Language::Rust;
+        let file_only = self.file_only;
         let key = cache::key(store.cache_scope(), &(blob, policy, file_only));
         if let Some(source) = self.cache.source(&key) {
             return Ok(Input::Cached(source));
@@ -431,10 +431,10 @@ impl Sources {
             .map_err(|error| UnreadableSource(format!("non-UTF-8 source at {path}: {error}")))?
             .into();
         let started = std::time::Instant::now();
-        let facts = if java {
+        let facts = if file_only {
+            Ok(crate::extract::HistoricalFacts::default())
+        } else if java {
             java::extract(&text, cancel)
-        } else if file_only {
-            crate::extract::historical_file_cancellable(&text, language, cancel)
         } else {
             crate::extract::historical_cancellable(&text, language, cancel)
         };
