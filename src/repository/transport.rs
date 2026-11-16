@@ -46,7 +46,7 @@ pub struct Session {
     pub endpoint: Option<String>,
 }
 
-/// Share only checks currently in flight. A later request must prove public access again.
+/// Coalesce anonymous access checks for concurrent downloads.
 pub fn verify_public(repository: &super::Repository) -> Result<()> {
     use std::sync::{Arc, Condvar, LazyLock, Mutex};
     type Check = Arc<(Mutex<Option<std::result::Result<(), String>>>, Condvar)>;

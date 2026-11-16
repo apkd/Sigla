@@ -567,7 +567,7 @@ mod tests {
         let expected = generation(&workspace.manifest).unwrap();
         let dependencies = workspace.leases();
         let branch = Arc::new(Branch::for_test(root.into()));
-        *branch.state.write().await = Some(crate::repository::manager::State {
+        *branch.state.write().await = Some(Arc::new(crate::repository::manager::State {
             repository: branch.repository.identity.clone(),
             transport: branch.repository.transport.clone(),
             branch: branch.name.clone(),
@@ -591,7 +591,7 @@ mod tests {
             indexed_revision: None,
             repair: false,
             additional: Default::default(),
-        });
+        }));
         let assets = cache.join("unity-assets/test");
         let leases = crate::cache::views::LeaseSet::new(cache).unwrap();
         leases.retain(&assets).unwrap();
@@ -720,9 +720,11 @@ mod tests {
                     .is_none()
             );
             if changed {
-                refreshing.as_mut().unwrap().prepared.revision = "changed".into();
+                Arc::make_mut(refreshing.as_mut().unwrap())
+                    .prepared
+                    .revision = "changed".into();
             }
-            refreshing.as_mut().unwrap().repair = repair;
+            Arc::make_mut(refreshing.as_mut().unwrap()).repair = repair;
             drop(refreshing);
             let result = publication.await;
             if changed || repair {
@@ -755,17 +757,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let completed = completed(root.path(), cache.path()).await;
-        completed
-            .request
-            .branch
-            .as_ref()
-            .unwrap()
-            .state
-            .write()
-            .await
-            .as_mut()
-            .unwrap()
-            .repair = true;
+        Arc::make_mut(
+            completed
+                .request
+                .branch
+                .as_ref()
+                .unwrap()
+                .state
+                .write()
+                .await
+                .as_mut()
+                .unwrap(),
+        )
+        .repair = true;
         let jobs = Jobs::default();
         let error = wait(jobs.start(completed.request)).await.err().unwrap();
         assert!(

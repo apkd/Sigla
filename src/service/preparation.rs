@@ -317,7 +317,30 @@ impl App {
             return Ok(result);
         }
         tracing::Span::current().record("stage", "acquisition");
-        self.remote.as_ref().unwrap().sources_ready(&branch).await?;
+        let remote = self.remote.as_ref().unwrap();
+        if let super::Request::View(path, mode) = &request
+            && crate::unity::assets::view::requested(path)
+        {
+            let branch = branch.clone();
+            let remote = remote.clone();
+            let path = path.clone();
+            let mode = *mode;
+            let activity = activity.clone();
+            tokio::spawn(async move {
+                let _activity = activity;
+                remote
+                    .asset_file(
+                        &branch,
+                        &path,
+                        mode,
+                        &crate::telemetry::Operation::default(),
+                    )
+                    .await
+            })
+            .await??;
+        } else {
+            remote.sources_ready(&branch).await?;
+        }
         self.navigate_repository_snapshot(branch, request, activity)
             .await
     }

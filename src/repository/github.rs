@@ -32,6 +32,7 @@ pub fn sizes(
     repository: &Repository,
     revision: &str,
     store: &Path,
+    allow_private: bool,
 ) -> Result<Option<BTreeMap<String, u64>>> {
     if repository.identity.endpoint != Endpoint::Github {
         return Ok(None);
@@ -39,6 +40,9 @@ pub fn sizes(
     let cache = store.join(format!("github-tree-{revision}.bin"));
     if let Ok(saved) = crate::cache::records::read::<Inventory>(&cache, u64::MAX) {
         return Ok(Some(saved.sizes));
+    }
+    if !allow_private {
+        super::transport::verify_public(repository)?;
     }
     let repo = repository.identity.components.join("/");
     let (client, token) = client(repository)?;
@@ -203,11 +207,16 @@ fn commit_response(
 pub(super) fn blob(
     repository: &Repository,
     oid: &str,
+    allow_private: bool,
+    limit: u64,
     cancel: &dyn crate::cancellation::Cancellation,
 ) -> Result<Option<crate::memory::Source<Vec<u8>>>> {
     cancel.check()?;
     if repository.identity.endpoint != Endpoint::Github {
         return Ok(None);
+    }
+    if !allow_private {
+        super::transport::verify_public(repository)?;
     }
     let id = gix_hash::ObjectId::from_hex(oid.as_bytes())?;
     let (client, token) = client(repository)?;
@@ -223,16 +232,11 @@ pub(super) fn blob(
     let response = request
         .send()
         .map_err(|_| anyhow::anyhow!("GitHub source request failed"))?;
-    if !response.status().is_success()
-        || response
-            .content_length()
-            .is_some_and(|size| size > super::materialize::TRANSFER_LIMIT)
+    if !response.status().is_success() || response.content_length().is_some_and(|size| size > limit)
     {
         return Ok(None);
     }
-    let limit = response
-        .content_length()
-        .unwrap_or(super::materialize::TRANSFER_LIMIT);
+    let limit = response.content_length().unwrap_or(limit);
     read_blob(id, response, limit, cancel)
 }
 
@@ -344,7 +348,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            sizes(&repository, revision, root.path()).unwrap(),
+            sizes(&repository, revision, root.path(), false).unwrap(),
             Some(expected)
         );
     }

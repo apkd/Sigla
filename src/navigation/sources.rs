@@ -25,7 +25,9 @@ pub(crate) fn repository(
     let files: BTreeMap<_, _> = prepared
         .selected
         .keys()
+        .chain(prepared.deferred_assets.iter())
         .filter(|p| !prepared.unavailable.contains(*p))
+        .filter(|p| !prepared.omitted.contains_key(*p))
         .filter_map(|p| {
             let path = std::path::Path::new(p);
             let language = language(path);
@@ -48,7 +50,12 @@ pub(crate) fn repository(
     };
     let files: BTreeMap<_, _> = files
         .into_iter()
-        .filter_map(|(p, l)| l.map(|l| (p.clone(), (p, l))))
+        .filter_map(|(p, l)| {
+            l.or_else(|| {
+                (mode == crate::navigation::Mode::Raw).then_some(crate::model::Language::Text)
+            })
+            .map(|l| (p.clone(), (p, l)))
+        })
         .collect();
     let mut resolved = false;
     let text = view(
@@ -60,16 +67,26 @@ pub(crate) fn repository(
         cancel,
         |(path, language)| {
             resolved = true;
-            let local = contents.map(|contents| contents.join(path));
+            let local = contents
+                .filter(|_| prepared.selected.contains_key(path))
+                .map(|contents| contents.join(path))
+                .filter(|path| path.is_file());
             let bytes = if let Some(path) = local {
-                crate::memory::Source::read(std::fs::metadata(&path)?.len(), cancel, || {
-                    Ok(std::fs::read(path)?)
-                })?
+                let size = std::fs::metadata(&path)?.len();
+                ensure!(
+                    !crate::unity::assets::is_asset(&path)
+                        || size <= crate::repository::selection::ASSET_LIMIT,
+                    "Asset exceeds size limit ({size} bytes)"
+                );
+                crate::memory::Source::read(size, cancel, || Ok(std::fs::read(path)?))?
             } else if let Some(bytes) = read_remote(path)? {
                 bytes
             } else {
                 return Ok(None);
             };
+            if bytes.starts_with(b"version https://git-lfs.github.com/spec/") {
+                return Ok(None);
+            }
             Ok(Some((
                 *language,
                 bytes.map(|bytes| {
@@ -560,6 +577,64 @@ mod tests {
             .unwrap();
             assert_eq!(selected, Some(expected), "{path}");
         }
+    }
+
+    #[test]
+    fn raw_assets_read_selected_or_deferred_bytes_without_code_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = "Assets/Selected.prefab";
+        let source = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Selected\n";
+        let mut prepared = crate::repository::materialize::Prepared {
+            deferred_assets: BTreeSet::from([path.into()]),
+            omitted: Default::default(),
+            transfer_bytes: 0,
+            unavailable: Default::default(),
+            transport: None,
+            resolved_target: None,
+            branch: None,
+            revision: String::new(),
+            selected: Default::default(),
+            tracked: BTreeMap::from([(path.into(), "object".into())]),
+            directories: Default::default(),
+        };
+        for selected in [false, true] {
+            if selected {
+                prepared.selected = prepared.tracked.clone();
+                prepared.deferred_assets.clear();
+            }
+            let raw = repository(
+                root.path(),
+                Some(root.path()),
+                &prepared,
+                path,
+                Some(crate::navigation::Mode::Raw),
+                &(),
+                |resolved| {
+                    assert_eq!(resolved, path);
+                    crate::memory::Source::read(source.len() as u64, &(), || {
+                        Ok(source.as_bytes().to_vec())
+                    })
+                    .map(Some)
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(raw, source);
+        }
+        prepared.omitted.insert(path.into(), "too large".into());
+        assert!(
+            repository(
+                root.path(),
+                None,
+                &prepared,
+                path,
+                Some(crate::navigation::Mode::Raw),
+                &(),
+                |_| panic!("omitted asset fetched")
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

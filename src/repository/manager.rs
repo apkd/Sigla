@@ -92,12 +92,12 @@ mod refresh_tests {
     }
 
     #[tokio::test]
-    async fn cancelled_acquisition_links_the_refresh_it_waited_for() {
+    async fn public_cached_acquisition_links_its_refresh_without_a_network_check() {
         let cache = tempfile::tempdir().unwrap();
         let mut options = options();
         options
             .rules
-            .push(crate::repository::Rule::parse_private("https://github.com/owner/*").unwrap());
+            .push(crate::repository::Rule::parse("https://github.com/owner/*").unwrap());
         let manager = Manager::new(cache.path().into(), options).unwrap();
         let repository = Repository::parse("https://github.com/owner/repo#refs/heads/main")
             .unwrap()
@@ -146,6 +146,51 @@ mod refresh_tests {
     }
 
     #[tokio::test]
+    async fn optional_publication_preserves_active_analysis_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let branch = Arc::new(Branch::for_test(root.path().into()));
+        *branch.state.write().await = Some(Arc::new(state()));
+        let analysis = branch.analyze().await;
+        let old = analysis.as_ref().unwrap().prepared.deferred_assets.clone();
+        {
+            let mut publication =
+                tokio::time::timeout(Duration::from_secs(1), branch.publication(true))
+                    .await
+                    .unwrap();
+            publication
+                .as_mut()
+                .unwrap()
+                .prepared
+                .deferred_assets
+                .clear();
+        }
+        assert_eq!(analysis.as_ref().unwrap().prepared.deferred_assets, old);
+        assert!(
+            branch
+                .state
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .prepared
+                .deferred_assets
+                .is_empty()
+        );
+        let mut publication = Box::pin(branch.publish());
+        std::future::poll_fn(|cx| {
+            assert!(publication.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(analysis);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), publication)
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
     async fn asset_acquisition_wait_does_not_hold_the_index_worker() {
         use crate::unity::assets::jobs::{Jobs, Request, generation, wait};
 
@@ -159,7 +204,7 @@ mod refresh_tests {
         let branch = Arc::new(Branch::for_test(root.path().into()));
         let mut branch_state = state();
         branch_state.prepared.deferred_assets.clear();
-        *branch.state.write().await = Some(branch_state);
+        *branch.state.write().await = Some(Arc::new(branch_state));
         let held_state = branch.state.write().await;
 
         let mut workspace = crate::workspace::Workspace::open(
@@ -389,7 +434,7 @@ mod refresh_tests {
         let mut saved = state();
         saved.last_use = 1;
         branch.persist(&saved).unwrap();
-        *branch.state.try_write().unwrap() = Some(saved.clone());
+        *branch.state.try_write().unwrap() = Some(Arc::new(saved.clone()));
         let branch = Arc::new(branch);
         manager
             .branches
@@ -720,7 +765,7 @@ mod refresh_tests {
             repair: false,
             additional: Default::default(),
         };
-        *branch.state.try_write().unwrap() = Some(state.clone());
+        *branch.state.try_write().unwrap() = Some(Arc::new(state.clone()));
         branch.last_use.store(0, Ordering::Relaxed);
         assert!(manager.branch_expired(&branch).unwrap());
         branch.record_use();
@@ -822,22 +867,27 @@ pub(crate) struct Inventory {
 }
 
 pub(crate) struct AnalysisGuard {
-    state: OwnedRwLockReadGuard<Option<State>>,
+    state: Option<Arc<State>>,
     _analysis: OwnedRwLockReadGuard<()>,
+    _branch: Arc<Branch>,
 }
-impl std::ops::Deref for AnalysisGuard {
-    type Target = Option<State>;
-    fn deref(&self) -> &Self::Target {
-        &self.state
+impl AnalysisGuard {
+    pub(crate) fn as_ref(&self) -> Option<&State> {
+        self.state.as_deref()
     }
 }
 
 pub(crate) struct PublicationGuard {
-    state: OwnedRwLockWriteGuard<Option<State>>,
-    _analysis: OwnedRwLockWriteGuard<()>,
+    state: OwnedRwLockWriteGuard<Option<Arc<State>>>,
+    _analysis: Option<OwnedRwLockWriteGuard<()>>,
+}
+impl PublicationGuard {
+    pub(crate) fn as_mut(&mut self) -> Option<&mut State> {
+        self.state.as_mut().map(Arc::make_mut)
+    }
 }
 impl std::ops::Deref for PublicationGuard {
-    type Target = Option<State>;
+    type Target = Option<Arc<State>>;
     fn deref(&self) -> &Self::Target {
         &self.state
     }
@@ -853,8 +903,8 @@ pub struct Branch {
     pub repository: Repository,
     pub name: String,
     pub target: Target,
-    /// Short metadata/navigation reads. Long readers use analyze(); writers use publish().
-    pub state: Arc<AsyncRwLock<Option<State>>>,
+    /// Short metadata reads. Long readers pin snapshots with analyze().
+    pub state: Arc<AsyncRwLock<Option<Arc<State>>>>,
     analysis: Arc<AsyncRwLock<()>>,
     pub last_use: AtomicU64,
     persisted_use: AtomicU64,
@@ -903,26 +953,37 @@ impl Branch {
 
     /// Publishers wait for long analyses before queuing a state writer. Short
     /// navigation readers can therefore use the stable files while analyses run.
-    pub(crate) async fn analyze(&self) -> AnalysisGuard {
+    pub(crate) async fn analyze(self: &Arc<Self>) -> AnalysisGuard {
         let analysis = self.analysis.clone().read_owned().await;
-        let state = self.state.clone().read_owned().await;
+        let state = self.state.read().await.clone();
         AnalysisGuard {
             state,
             _analysis: analysis,
+            _branch: self.clone(),
         }
     }
 
-    pub(crate) fn try_analyze(&self) -> Option<AnalysisGuard> {
+    pub(crate) fn try_analyze(self: &Arc<Self>) -> Option<AnalysisGuard> {
         let analysis = self.analysis.clone().try_read_owned().ok()?;
-        let state = self.state.clone().try_read_owned().ok()?;
+        let state = self.state.try_read().ok()?.clone();
         Some(AnalysisGuard {
             state,
             _analysis: analysis,
+            _branch: self.clone(),
         })
     }
 
     pub(crate) async fn publish(&self) -> PublicationGuard {
-        let analysis = self.analysis.clone().write_owned().await;
+        self.publication(false).await
+    }
+
+    /// Optional assets only add deferred files; active code snapshots stay valid.
+    async fn publication(&self, assets: bool) -> PublicationGuard {
+        let analysis = if assets {
+            None
+        } else {
+            Some(self.analysis.clone().write_owned().await)
+        };
         let state = self.state.clone().write_owned().await;
         self.sources.lock().unwrap().take();
         PublicationGuard {
@@ -1069,7 +1130,7 @@ impl Manager {
                 state.as_ref().map_or(0, |state| state.last_use),
                 Ordering::Relaxed,
             );
-            *branch.state.blocking_write() = state;
+            *branch.state.blocking_write() = state.map(Arc::new);
             *initialized = true;
             Ok::<_, anyhow::Error>(())
         })
@@ -1492,7 +1553,7 @@ impl Manager {
             {
                 return true;
             }
-            if let Some(state) = state.as_mut() {
+            if let Some(state) = state.as_mut().map(Arc::make_mut) {
                 let last_use = branch.last_use.load(Ordering::Relaxed);
                 if state.last_use != last_use {
                     let previous = state.last_use;
@@ -1622,9 +1683,21 @@ impl Manager {
         let oid = prepared
             .selected
             .get(path)
+            .or_else(|| {
+                prepared
+                    .deferred_assets
+                    .contains(path)
+                    .then(|| prepared.tracked.get(path))
+                    .flatten()
+            })
             .context("Source is not selected")?;
-        authorize(&self.options.rules, &branch.repository)?;
-        match super::github::blob(&branch.repository, oid, cancel) {
+        let allow_private = authorize(&self.options.rules, &branch.repository)?;
+        let limit = if crate::unity::assets::is_asset(Path::new(path)) {
+            super::selection::ASSET_LIMIT
+        } else {
+            super::materialize::TRANSFER_LIMIT
+        };
+        match super::github::blob(&branch.repository, oid, allow_private, limit, cancel) {
             Ok(bytes) => Ok(bytes),
             Err(error) => {
                 cancel.check()?;
@@ -1640,11 +1713,7 @@ impl Manager {
         inventory_only: bool,
         operation: Option<&crate::telemetry::Operation>,
     ) -> Result<Arc<Branch>> {
-        if !authorize(&self.options.rules, &repository)? {
-            let repository = repository.clone();
-            tokio::task::spawn_blocking(move || super::transport::verify_public(&repository))
-                .await??;
-        }
+        authorize(&self.options.rules, &repository)?;
         let default = self
             .default_branch(&repository, repository.selector.is_none(), operation)
             .await?;
@@ -1818,7 +1887,7 @@ impl Manager {
         mode: crate::navigation::Mode,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
-        self.sources_ready(branch).await?;
+        self.ready(branch, telemetry).await?;
         let (path, _) = crate::navigation::location(path)?;
         let guard = branch.state.read().await;
         let state = guard
@@ -1999,7 +2068,7 @@ impl Manager {
                 .extend(before.prepared.unavailable.iter().cloned());
         }
         telemetry.stage("required_input_publication");
-        let mut next = before.clone();
+        let mut next = (*before).clone();
         next.additional.extend(paths);
         next.prepared = prepared;
         let unchanged = !assets
@@ -2025,21 +2094,31 @@ impl Manager {
         };
         let mut state = {
             let _wait = telemetry.wait("repository_publication");
-            branch.publish().await
+            branch.publication(assets).await
         };
+        if assets {
+            ensure!(
+                state
+                    .as_ref()
+                    .is_some_and(|state| !state.repair && state.prepared.revision == revision),
+                crate::diagnostics::RefreshRequired(
+                    "Repository changed during asset acquisition; retry query"
+                )
+            );
+        }
         next.indexed_revision = state
             .as_ref()
             .and_then(|state| state.indexed_revision.clone());
         if unchanged {
             branch.persist_header(&next)?;
-            *state = Some(next);
+            *state = Some(Arc::new(next));
             return Ok(());
         }
         let mut staged_inventory = staged_inventory;
         if !assets {
             next.repair = true;
             branch.publish_inventory(&next, staged_inventory.take().unwrap())?;
-            *state = Some(next.clone());
+            *state = Some(Arc::new(next.clone()));
         }
         for path in next.prepared.selected.keys() {
             let staged = stage.path().join(path);
@@ -2062,7 +2141,7 @@ impl Manager {
         } else {
             branch.persist_header(&next)?;
         }
-        *state = Some(next);
+        *state = Some(Arc::new(next));
         if !assets {
             branch.generation.fetch_add(1, Ordering::Release);
         }
@@ -2275,11 +2354,11 @@ impl Manager {
             next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
             next.repair = false;
             branch.persist_header(&next)?;
-            *state = Some(next);
+            *state = Some(Arc::new(next));
             return Ok(());
         }
         branch.publish_inventory(&next, staged_inventory.unwrap())?;
-        *state = Some(next.clone());
+        *state = Some(Arc::new(next.clone()));
         fs::create_dir_all(&source)?;
         if let Some(before) = &before {
             for path in before
@@ -2329,7 +2408,7 @@ impl Manager {
             next.indexed_revision = Some(next.prepared.revision.clone());
         }
         branch.persist_header(&next)?;
-        *state = Some(next);
+        *state = Some(Arc::new(next));
         branch.generation.fetch_add(1, Ordering::Release);
         branch.inventory.send_replace(None);
         Ok(())

@@ -16,6 +16,10 @@ fn decode(input: &str) -> Option<(String, String)> {
     ))
 }
 fn selection(q: &Query) -> impl Fn(&Asset) -> bool + '_ {
+    let selected = path_selection(q);
+    move |asset| selected(&asset.path, &asset.project)
+}
+pub(super) fn path_selection(q: &Query) -> impl Fn(&str, &str) -> bool + '_ {
     let filters: Vec<_> = q
         .filters
         .iter()
@@ -30,17 +34,18 @@ fn selection(q: &Query) -> impl Fn(&Asset) -> bool + '_ {
             (f, matcher)
         })
         .collect();
-    move |asset| {
+    move |path, project| {
         filters.iter().all(|(f, matcher)| {
             let matches = match f.key.as_str() {
                 "path" => {
-                    matcher.as_ref().is_some_and(|g| g.is_match(&asset.path))
-                        || asset
-                            .path
+                    matcher.as_ref().is_some_and(|g| g.is_match(path))
+                        || path
                             .strip_prefix(f.value.trim_end_matches('/'))
                             .is_some_and(|s| s.starts_with('/'))
                 }
-                "unity-project" => crate::query::wildcard(&f.value, &asset.project),
+                "unity-project" if q.selector != "file" => {
+                    crate::query::wildcard(&f.value, project)
+                }
                 _ => return true,
             };
             matches != f.negate

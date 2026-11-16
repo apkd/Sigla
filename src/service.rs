@@ -1131,6 +1131,7 @@ impl App {
             if preparation.discovering()
                 && let Some(branch) = &branch
                 && (matches!(request, Request::Browse(_))
+                    || matches!(&request, Request::View(path, crate::navigation::Mode::Raw) if crate::unity::assets::view::requested(path))
                     || matches!(request, Request::View(..)) && indexes::source_only(&request, None))
             {
                 operation.stage("navigation");
@@ -1235,6 +1236,58 @@ impl App {
                 return Ok(indexes::pending("Code indexing"));
             }
         }
+        let asset_selection_generation = branch
+            .as_ref()
+            .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
+        let assets_relevant = if let Some(query) = query.as_ref().filter(|q| {
+            matches!(q.selector.as_str(), "text" | "file")
+                && (q.filters.iter().any(|f| f.key == "path")
+                    || q.selector == "file" && q.target.name != "*")
+                && !q
+                    .filters
+                    .iter()
+                    .any(|f| matches!(f.key.as_str(), "in" | "project" | "lang"))
+        }) {
+            let manifest = inventory.manifest.clone();
+            let snapshot = match &branch {
+                Some(branch) => branch.state.read().await.clone(),
+                None => None,
+            };
+            let query = query.clone();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let guard = cancel.clone().drop_guard();
+            let activity = activity.clone();
+            let inventory = inventory.clone();
+            let result = wait
+                .until(async {
+                    tokio::task::spawn_blocking(move || {
+                        let _activity = activity;
+                        let _inventory = inventory;
+                        if !indexes::has_unity(&manifest)
+                            && snapshot
+                                .as_ref()
+                                .is_none_or(|s| s.prepared.deferred_assets.is_empty())
+                        {
+                            return Ok(false);
+                        }
+                        crate::unity::assets::selection::matches(
+                            &manifest,
+                            snapshot.as_ref().map(|s| &s.prepared),
+                            &query,
+                            &cancel,
+                        )
+                    })
+                    .await?
+                })
+                .await?;
+            let Some(relevant) = result else {
+                return Ok(indexes::pending("Asset file inventory"));
+            };
+            guard.disarm();
+            relevant
+        } else {
+            true
+        };
         let asset_workspace = workspace.clone();
         let state = {
             let _wait = operation.wait("workspace_lock");
@@ -1259,46 +1312,44 @@ impl App {
         let branch_generation = branch
             .as_ref()
             .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
+        ensure!(
+            branch_generation == asset_selection_generation,
+            crate::diagnostics::RefreshRequired(
+                "Repository changed during asset selection; retry query"
+            )
+        );
         let repository_root = branch
             .as_ref()
             .map(|branch| branch.source().canonicalize())
             .transpose()?;
         let allow_absolute = self.remote.is_none();
-        let asset_request = match &request {
-            Request::History(_) => unreachable!("history bypasses snapshot preparation"),
-            Request::Search(_) => query.as_ref().is_some_and(|q| {
-                matches!(
-                    q.selector.as_str(),
-                    "instance" | "references" | "dependencies"
-                ) || matches!(q.selector.as_str(), "text" | "file")
-                    && !q.filters.iter().any(|f| {
-                        matches!(f.key.as_str(), "in" | "project" | "lang")
-                            || f.key == "path"
-                                && !f.negate
-                                && matches!(
-                                    std::path::Path::new(&f.value)
-                                        .extension()
-                                        .and_then(|e| e.to_str()),
-                                    Some("cs" | "rs" | "md")
-                                )
-                    })
-                    && !(q.selector == "file"
-                        && crate::native::language(Path::new(&q.target.name)).is_some())
-            }),
-            Request::View(path, _) => {
-                path.starts_with("unity@")
-                    || crate::navigation::location(path).is_ok_and(|(p, _)| {
-                        crate::unity::assets::is_asset(Path::new(p))
-                            || crate::documents::language(Path::new(p)).is_none()
-                                && !matches!(
-                                    Path::new(p).extension().and_then(|s| s.to_str()),
-                                    Some("cs" | "rs")
-                                )
-                                && crate::native::language(Path::new(p)).is_none()
-                    })
-            }
-            Request::Browse(_) => true,
-        };
+        let asset_request = assets_relevant
+            && match &request {
+                Request::History(_) => unreachable!("history bypasses snapshot preparation"),
+                Request::Search(_) => query.as_ref().is_some_and(|q| {
+                    matches!(
+                        q.selector.as_str(),
+                        "instance" | "references" | "dependencies"
+                    ) || matches!(q.selector.as_str(), "text" | "file")
+                        && !q
+                            .filters
+                            .iter()
+                            .any(|f| matches!(f.key.as_str(), "in" | "project" | "lang"))
+                }),
+                Request::View(path, _) => {
+                    path.starts_with("unity@")
+                        || crate::navigation::location(path).is_ok_and(|(p, _)| {
+                            crate::unity::assets::is_asset(Path::new(p))
+                                || crate::documents::language(Path::new(p)).is_none()
+                                    && !matches!(
+                                        Path::new(p).extension().and_then(|s| s.to_str()),
+                                        Some("cs" | "rs")
+                                    )
+                                    && crate::native::language(Path::new(p)).is_none()
+                        })
+                }
+                Request::Browse(_) => true,
+            };
         let admitted_manifest = state.as_ref().unwrap().manifest.clone();
         let ticket = asset_request
             .then(|| {
@@ -2704,6 +2755,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_text_skips_unrelated_assets() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        for directory in ["Editor", "Assets", "ProjectSettings"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        std::fs::write(root.path().join("Editor/code.rs"), "pub struct Available;").unwrap();
+        std::fs::write(
+            root.path().join("ProjectSettings/ProjectVersion.txt"),
+            "version",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("Assets/Other.asset"), "Other: Available\n").unwrap();
+        std::fs::create_dir(root.path().join("Assets/Editor.cs")).unwrap();
+        std::fs::write(
+            root.path().join("Assets/Editor.cs/Settings.asset"),
+            "Name: Available\n",
+        )
+        .unwrap();
+        let mut app = App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap();
+        app.index_wait = Duration::from_millis(50);
+        let app = Arc::new(app);
+        let project = root.path().to_str().unwrap();
+        app.search(project, "type:Available lang:rust wait:complete")
+            .await
+            .unwrap();
+        let pause = app.assets.pause().await;
+        for (query, expected) in [
+            ("text:Available path:Editor/**", "Available"),
+            (
+                "text:Available -path:Assets -path:ProjectSettings",
+                "Available",
+            ),
+            ("file:Editor/** wait:complete", "code.rs"),
+        ] {
+            let result = app
+                .dispatch(project, Request::Search(query.into()))
+                .await
+                .unwrap();
+            assert!(
+                result
+                    .structured_content
+                    .as_ref()
+                    .is_none_or(|v| v.get("complete") != Some(&serde_json::json!(false)))
+            );
+            assert!(result_text(result).unwrap().contains(expected));
+            assert_eq!(app.assets.stats().entries, 0);
+        }
+        let result = app
+            .dispatch(
+                project,
+                Request::Search("text:Available path:Assets/Editor.cs".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["complete"],
+            false
+        );
+        assert!(app.assets.stats().entries > 0);
+        drop(pause);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn asset_deadline_returns_partial_results_or_pending_without_stopping_indexing() {
         use std::time::Duration;
         let root = tempfile::tempdir().unwrap();
@@ -2927,6 +3049,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(source.join("src/lib.rs"), "pub struct Prepared;").unwrap();
+        std::fs::create_dir(source.join("Assets")).unwrap();
+        let asset = "--- !u!1 &1\nGameObject:\n  m_Name: Selected\n";
+        std::fs::write(source.join("Assets/Selected.prefab"), asset).unwrap();
         let selection = crate::repository::selection::Selection::new(&[], &[]).unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2935,6 +3060,7 @@ mod tests {
         let files = std::collections::BTreeMap::from([
             ("Cargo.toml".into(), "b".into()),
             ("src/lib.rs".into(), "c".into()),
+            ("Assets/Selected.prefab".into(), "d".into()),
         ]);
         let saved = State {
             repository: repository.identity.clone(),
@@ -3058,6 +3184,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(source.contains("pub struct Prepared;"));
+        let raw = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.view(project, "Assets/Selected.prefab", "raw"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw, asset);
         assert!(!request.is_finished());
         drop(discovery_pause);
         let mut ticket = app
@@ -3101,8 +3235,8 @@ mod tests {
         .unwrap();
         assert!(source.contains("pub struct Prepared;"), "{source}");
         assert!(
-            branch.state.try_write().is_err(),
-            "Indexing must protect its source generation from publication"
+            branch.state.try_write().is_ok(),
+            "Indexing must allow independent metadata publication"
         );
         drop(pause);
         drop(

@@ -5,6 +5,7 @@ mod native;
 mod parse;
 mod query;
 mod records;
+pub(crate) mod selection;
 mod snapshot;
 pub(crate) mod view;
 mod yaml;

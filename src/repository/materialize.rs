@@ -784,7 +784,7 @@ fn materialize_inventory(
             super::selection::asset(Path::new(path))
                 || super::selection::visual_graph(Path::new(path))
         }) {
-        super::github::sizes(repository, &revision, &request.store)?
+        super::github::sizes(repository, &revision, &request.store, request.allow_private)?
     } else {
         None
     };

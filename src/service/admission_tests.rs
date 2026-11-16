@@ -556,10 +556,16 @@ async fn queued_remote_discovery_releases_locks_and_does_not_reserve_a_worker() 
     tokio::time::timeout(Duration::from_secs(5), app.discovery_started.notified())
         .await
         .expect("discovery did not start");
-    assert!(
-        branch.state.try_write().is_err(),
-        "active discovery must protect the branch"
-    );
+    let mut publication = Box::pin(branch.publish());
+    std::future::poll_fn(|cx| {
+        assert!(
+            publication.as_mut().poll(cx).is_pending(),
+            "active discovery must protect source files"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    drop(publication);
     assert!(
         workspace.try_lock().is_err(),
         "active discovery must protect the workspace"
@@ -639,10 +645,16 @@ async fn queued_remote_index_rebuilds_plan_after_branch_publication() {
     })
     .await
     .expect("rebuilt plan did not start indexing");
-    assert!(
-        branch.state.try_write().is_err(),
-        "active indexing must protect the branch"
-    );
+    let mut publication = Box::pin(branch.publish());
+    std::future::poll_fn(|cx| {
+        assert!(
+            publication.as_mut().poll(cx).is_pending(),
+            "active indexing must protect source files"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    drop(publication);
     assert!(
         workspace.try_lock().is_err(),
         "active indexing must protect the workspace"
