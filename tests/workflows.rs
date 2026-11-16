@@ -1358,3 +1358,60 @@ async fn count_limits_and_outgoing_calls_keep_unresolved_call_sites() {
         1
     );
 }
+
+#[tokio::test]
+async fn outgoing_limits_preserve_first_results_across_shared_files() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for project in ["First", "Second"] {
+        write(
+            root.path(),
+            &format!("{project}.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include="Shared/*.cs" /></ItemGroup></Project>"#,
+        );
+    }
+    write(
+        root.path(),
+        "Shared/A.cs",
+        "partial class Worker { void First() { Helper.One(); Helper.Two(); } }\n",
+    );
+    write(
+        root.path(),
+        "Shared/B.cs",
+        "partial class Worker { void Second() { Helper.Three(); Helper.One(); } }\n",
+    );
+    write(
+        root.path(),
+        "Shared/Helper.cs",
+        "static class Helper { public static void One() {} public static void Two() {} public static void Three() {} }\n",
+    );
+    let app = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    let full = app
+        .search(project, "calls:* in:Worker limit:20")
+        .await
+        .unwrap();
+    let limited = app
+        .search(project, "calls:* in:Worker limit:2")
+        .await
+        .unwrap();
+    let rows = |text: &str| {
+        text.lines()
+            .filter(|line| line.contains(" → "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let all_rows = rows(&full);
+    let limited_rows = rows(&limited);
+    assert!(all_rows.len() > limited_rows.len(), "{full}");
+    assert_eq!(
+        limited_rows,
+        all_rows[..limited_rows.len()],
+        "full: {full}\nlimited: {limited}"
+    );
+    assert!(
+        full.contains("Helper.One") && full.contains("Helper.Two") && full.contains("Helper.Three"),
+        "{full}"
+    );
+    assert!(limited.contains("call sites"), "{limited}");
+}

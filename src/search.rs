@@ -1688,6 +1688,19 @@ impl<'a> Search<'a> {
                     if !self.filters(q, file, m, containing.as_ref(), o.span.start, inside) {
                         continue;
                     }
+                    let display = self.manifest.display(file, m);
+                    let rank = (
+                        display.to_string(),
+                        o.span.start,
+                        containing.as_ref().map(|d| d.name_span.start),
+                        o.name.clone(),
+                    );
+                    // Every outgoing occurrence contributes a result, including
+                    // unresolved calls. Count discarded sites without binding them.
+                    // Retained sites still merge bindings across memberships.
+                    if outgoing && !units.accepts(&rank) && units.get_mut(&rank).is_none() {
+                        continue;
+                    }
                     let bindings = self.bind(&key, m, o, &data)?;
                     if !outgoing && bindings.is_empty() {
                         unresolved = true;
@@ -1718,7 +1731,6 @@ impl<'a> Search<'a> {
                         relevant
                     };
                     {
-                        let display = self.manifest.display(file, m);
                         let lines = crate::render::lines(&data.source, o.span.clone());
                         if relevant.is_empty() {
                             continue;
@@ -1748,13 +1760,6 @@ impl<'a> Search<'a> {
                                 .cloned()
                                 .unwrap_or_else(|| format!("unresolved:{}", o.name))
                         };
-                        let rank = (
-                            display.to_string(),
-                            o.span.start,
-                            containing.as_ref().map(|d| d.name_span.start),
-                            // Implicit operations can share a source span.
-                            o.name.clone(),
-                        );
                         if let Some(unit) = units.get_mut(&rank) {
                             let unit: &mut crate::render::SearchResult = unit;
                             unit.uncertain |= uncertain;
