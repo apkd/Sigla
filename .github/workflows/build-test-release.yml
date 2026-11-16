@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - uses: actions/setup-dotnet@v5
@@ -89,7 +89,7 @@ jobs:
 
           EOF
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-dotnet@v5
@@ -202,7 +202,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-dotnet@v5

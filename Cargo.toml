@@ -2,7 +2,7 @@
 name = "sigla"
 version = "0.1.44"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 license = "MIT"
 description = "Shared C# and Rust source navigation over MCP"
 autotests = false
