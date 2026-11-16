@@ -770,9 +770,11 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         send.send_replace(progress);
         drop(workspace);
         drop(preparing_branch);
-        drop(preparing_activity);
         drop(lifecycle);
         preparing_app.trim_idle_after_completion().await;
+        // Shutdown waits on activity, including final trimming and its cache owner.
+        drop(preparing_app);
+        drop(preparing_activity);
     });
     Ticket {
         progress: receive,
@@ -784,6 +786,74 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_preparation_trimming_before_reopening_cache() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("code.rs"), "pub struct Ready;").unwrap();
+        let policy = Policy::new(vec![root.path().into()]).unwrap();
+        let app = Arc::new(App::new(policy.clone(), cache.path().into(), 1).unwrap());
+        let pause = app.indexing_pause.clone().acquire_owned().await.unwrap();
+        let workspace = Arc::new(tokio::sync::Mutex::new(None));
+        let mut ticket = start(
+            app.clone(),
+            Request {
+                workspace: workspace.clone(),
+                entry: root.path().into(),
+                policy: policy.clone(),
+                cache: cache.path().into(),
+                branch: None,
+                activity: Arc::new(app.activity.clone().read_owned().await),
+            },
+        );
+        app.workspaces.lock().unwrap().insert(
+            root.path().into(),
+            super::super::WorkspaceSlot {
+                state: workspace,
+                preparing: Some(ticket.clone()),
+                used: std::time::Instant::now(),
+            },
+        );
+        let mut stopping = Box::pin(app.shutdown());
+        std::future::poll_fn(|cx| {
+            assert!(stopping.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        // Hold the registry after shutdown captures its preparation tickets.
+        // The final trim must wait for this owner to release the registry.
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let owner = app.clone();
+        let holder = std::thread::spawn(move || {
+            let _registry = owner.workspaces.lock().unwrap();
+            started.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        ready.await.unwrap();
+        drop(pause);
+        tokio::time::timeout(Duration::from_secs(5), ticket.complete())
+            .await
+            .unwrap()
+            .unwrap();
+        let stopped =
+            std::future::poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_ready())).await;
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            !stopped,
+            "Shutdown returned while preparation still owned the cache"
+        );
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .unwrap();
+        drop(app);
+        App::new(policy, cache.path().into(), 1).unwrap();
+    }
 
     #[test]
     fn retained_inventory_does_not_double_count_the_workspace_manifest() {

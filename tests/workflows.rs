@@ -569,6 +569,7 @@ async fn csharp_navigation_refresh_and_restart() {
             .unwrap()
             .contains("class Changed")
     );
+    a.shutdown().await;
     drop(a);
     let a = app(root, cache.path());
     assert!(
@@ -577,6 +578,7 @@ async fn csharp_navigation_refresh_and_restart() {
             .unwrap()
             .contains("class Changed")
     );
+    a.shutdown().await;
 }
 
 #[tokio::test]
