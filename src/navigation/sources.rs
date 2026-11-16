@@ -17,9 +17,16 @@ pub(crate) fn repository(
     cancel: &dyn crate::cancellation::Cancellation,
     read_remote: impl FnOnce(&str) -> Result<Option<crate::memory::Source<Vec<u8>>>>,
 ) -> Result<Option<String>> {
+    let metadata = mode.is_some()
+        && crate::navigation::location(path).is_ok_and(|(path, _)| {
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension == "meta")
+        });
     let language = |path: &std::path::Path| match path.extension().and_then(|e| e.to_str()) {
         Some("cs") => Some(crate::model::Language::CSharp),
         Some("rs") => Some(crate::model::Language::Rust),
+        Some("meta") if metadata => Some(crate::model::Language::Text),
         _ => crate::native::language(path).or_else(|| crate::documents::language(path)),
     };
     let files: BTreeMap<_, _> = prepared
@@ -74,7 +81,7 @@ pub(crate) fn repository(
             let bytes = if let Some(path) = local {
                 let size = std::fs::metadata(&path)?.len();
                 ensure!(
-                    !crate::unity::assets::is_asset(&path)
+                    !crate::unity::assets::view::supported(&path)
                         || size <= crate::repository::selection::ASSET_LIMIT,
                     "Asset exceeds size limit ({size} bytes)"
                 );
@@ -362,7 +369,7 @@ fn browse<T>(
     }
     Ok(tree.at(matches[0]).render(matches[0]))
 }
-fn view<T>(
+pub(crate) fn view<T>(
     files: &BTreeMap<String, T>,
     root: &std::path::Path,
     path: &str,
@@ -580,61 +587,62 @@ mod tests {
     }
 
     #[test]
-    fn raw_assets_read_selected_or_deferred_bytes_without_code_preparation() {
+    fn raw_assets_and_metadata_read_selected_or_deferred_bytes_without_code_preparation() {
         let root = tempfile::tempdir().unwrap();
-        let path = "Assets/Selected.prefab";
-        let source = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Selected\n";
-        let mut prepared = crate::repository::materialize::Prepared {
-            deferred_assets: BTreeSet::from([path.into()]),
-            omitted: Default::default(),
-            transfer_bytes: 0,
-            unavailable: Default::default(),
-            transport: None,
-            resolved_target: None,
-            branch: None,
-            revision: String::new(),
-            selected: Default::default(),
-            tracked: BTreeMap::from([(path.into(), "object".into())]),
-            directories: Default::default(),
-        };
-        for selected in [false, true] {
-            if selected {
-                prepared.selected = prepared.tracked.clone();
-                prepared.deferred_assets.clear();
+        for path in ["Assets/Selected.prefab", "Assets/Selected.prefab.meta"] {
+            let source = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Selected\n";
+            let mut prepared = crate::repository::materialize::Prepared {
+                deferred_assets: BTreeSet::from([path.into()]),
+                omitted: Default::default(),
+                transfer_bytes: 0,
+                unavailable: Default::default(),
+                transport: None,
+                resolved_target: None,
+                branch: None,
+                revision: String::new(),
+                selected: Default::default(),
+                tracked: BTreeMap::from([(path.into(), "object".into())]),
+                directories: Default::default(),
+            };
+            for selected in [false, true] {
+                if selected {
+                    prepared.selected = prepared.tracked.clone();
+                    prepared.deferred_assets.clear();
+                }
+                let raw = repository(
+                    root.path(),
+                    Some(root.path()),
+                    &prepared,
+                    path,
+                    Some(crate::navigation::Mode::Raw),
+                    &(),
+                    |resolved| {
+                        assert_eq!(resolved, path);
+                        crate::memory::Source::read(source.len() as u64, &(), || {
+                            Ok(source.as_bytes().to_vec())
+                        })
+                        .map(Some)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(raw, source);
             }
-            let raw = repository(
-                root.path(),
-                Some(root.path()),
-                &prepared,
-                path,
-                Some(crate::navigation::Mode::Raw),
-                &(),
-                |resolved| {
-                    assert_eq!(resolved, path);
-                    crate::memory::Source::read(source.len() as u64, &(), || {
-                        Ok(source.as_bytes().to_vec())
-                    })
-                    .map(Some)
-                },
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(raw, source);
+            prepared.omitted.insert(path.into(), "too large".into());
+            assert!(
+                repository(
+                    root.path(),
+                    None,
+                    &prepared,
+                    path,
+                    Some(crate::navigation::Mode::Raw),
+                    &(),
+                    |_| panic!("omitted asset fetched")
+                )
+                .unwrap()
+                .is_none()
+            );
         }
-        prepared.omitted.insert(path.into(), "too large".into());
-        assert!(
-            repository(
-                root.path(),
-                None,
-                &prepared,
-                path,
-                Some(crate::navigation::Mode::Raw),
-                &(),
-                |_| panic!("omitted asset fetched")
-            )
-            .unwrap()
-            .is_none()
-        );
     }
 
     #[test]

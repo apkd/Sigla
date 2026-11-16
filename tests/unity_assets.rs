@@ -8,6 +8,41 @@ fn write(root: &Path, path: &str, text: &str) {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(file, text).unwrap();
 }
+
+#[tokio::test]
+async fn metadata_sidecars_support_explicit_views_without_source_indexing() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "ProjectSettings/ProjectVersion.txt",
+        "m_EditorVersion: 6000.3.0f1\n",
+    );
+    let contents = "fileFormatVersion: 2\nguid: abcdef0123456789abcdef0123456789\n";
+    write(root.path(), "Assets/Image.png.meta", contents);
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap(),
+    );
+    let path = root.path().to_str().unwrap();
+    assert_eq!(
+        app.view(path, "Assets/Image.png.meta", "raw")
+            .await
+            .unwrap(),
+        contents
+    );
+    let selected = app.view(path, "Image.png.meta:2", "exact").await.unwrap();
+    assert!(selected.contains("guid:"));
+    assert!(!selected.contains("fileFormatVersion:"));
+    let files = app.search(path, "file:*.meta lang:text").await.unwrap();
+    assert!(!files.contains("Image.png.meta"));
+    app.shutdown().await;
+}
+
 #[tokio::test]
 async fn populated_results_report_limits_and_coverage_without_folder_placeholders() {
     let root = tempfile::tempdir().unwrap();

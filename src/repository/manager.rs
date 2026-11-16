@@ -1692,7 +1692,7 @@ impl Manager {
             })
             .context("Source is not selected")?;
         let allow_private = authorize(&self.options.rules, &branch.repository)?;
-        let limit = if crate::unity::assets::is_asset(Path::new(path)) {
+        let limit = if crate::unity::assets::view::supported(Path::new(path)) {
             super::selection::ASSET_LIMIT
         } else {
             super::materialize::TRANSFER_LIMIT
@@ -1898,7 +1898,7 @@ impl Manager {
             .selected
             .keys()
             .chain(state.prepared.deferred_assets.iter())
-            .filter(|path| crate::unity::assets::is_asset(Path::new(path)))
+            .filter(|path| crate::unity::assets::view::supported(Path::new(path)))
             .map(|path| (path.as_str(), ()))
             .collect();
         let selected = crate::navigation::file_matches(paths.keys().copied(), path, mode);
@@ -1911,8 +1911,9 @@ impl Manager {
         }
         let mut only = std::collections::BTreeSet::from([selected[0].to_owned()]);
         let meta = format!("{}.meta", selected[0]);
-        if state.prepared.selected.contains_key(&meta)
-            || state.prepared.deferred_assets.contains(&meta)
+        if crate::unity::assets::is_asset(Path::new(selected[0]))
+            && (state.prepared.selected.contains_key(&meta)
+                || state.prepared.deferred_assets.contains(&meta))
         {
             only.insert(meta);
         }
@@ -2357,6 +2358,15 @@ impl Manager {
             *state = Some(Arc::new(next));
             return Ok(());
         }
+        // Discovery may have completed or lost dependencies during acquisition.
+        // Read its current completion marker while holding publication admission.
+        let indexed = state.as_ref().is_some_and(|s| {
+            !s.repair
+                && s.prepared.selected == next.prepared.selected
+                && s.prepared.unavailable == next.prepared.unavailable
+                && s.indexed_revision.as_ref() == Some(&s.prepared.revision)
+        });
+        next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
         branch.publish_inventory(&next, staged_inventory.unwrap())?;
         *state = Some(Arc::new(next.clone()));
         fs::create_dir_all(&source)?;
@@ -2399,12 +2409,7 @@ impl Manager {
             fs::create_dir_all(source.join(directory))?;
         }
         next.repair = false;
-        if before.as_ref().is_some_and(|s| {
-            !s.repair
-                && s.prepared.selected == next.prepared.selected
-                && s.prepared.unavailable == next.prepared.unavailable
-                && s.indexed_revision.as_ref() == Some(&s.prepared.revision)
-        }) {
+        if indexed {
             next.indexed_revision = Some(next.prepared.revision.clone());
         }
         branch.persist_header(&next)?;

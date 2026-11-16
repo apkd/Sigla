@@ -52,6 +52,7 @@ pub struct Packages {
     pub selected: Vec<Package>,
     pub diagnostics: Vec<String>,
     pub watched: BTreeSet<PathBuf>,
+    pub dependency_retry: Option<crate::discovery::DependencyRetry>,
 }
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -183,6 +184,7 @@ impl Packages {
             }
         }
         let lock = Lock { dependencies };
+        let mut dependency_retry = None;
         let mut watched = BTreeSet::from([manifest_path, lock_path, root.join("Packages")]);
         let mut embedded = BTreeMap::new();
         for (path, kind) in super::entries(&root.join("Packages"), &mut diagnostics) {
@@ -326,7 +328,11 @@ impl Packages {
                         .get(&package_name)
                         .map_or(node.version.as_str(), String::as_str);
                     let (path, identity) =
-                        acquire(cache, &package_name, requested, editor.selected)?;
+                        acquire(cache, &package_name, requested, editor.selected).context(
+                            crate::diagnostics::DependencyUnavailable(
+                                "Unity package metadata is unavailable",
+                            ),
+                        )?;
                     return package(path, &package_name, None, identity, testable);
                 }
                 match node.source.as_str() {
@@ -421,7 +427,7 @@ impl Packages {
                 }
             })();
             let available = available.or_else(|error| {
-                if official { return Err(error); }
+                if official || error.chain().any(|cause| cause.is::<crate::diagnostics::Cancelled>()) { return Err(error); }
                 let mut matching: Vec<_> = candidates.iter().filter(|(info, _)| info.name == package_name).collect();
                 matching.sort_by(|a, b| a.1.cmp(&b.1));
                 if let Some((info, path)) = matching.first() {
@@ -434,8 +440,14 @@ impl Packages {
                     if official {
                         for (dependency, requested) in &package.manifest.dependencies {
                             let increased = requirements.get(dependency).is_none_or(|previous| {
-                                if requested == "default" { false } else if previous == "default" { true }
-                                else { super::package_version(requested) > super::package_version(previous) }
+                                if requested == "default" {
+                                    false
+                                } else if previous == "default" {
+                                    true
+                                } else {
+                                    super::package_version(requested)
+                                        > super::package_version(previous)
+                                }
                             });
                             if increased {
                                 requirements.insert(dependency.clone(), requested.clone());
@@ -446,10 +458,21 @@ impl Packages {
                             }
                         }
                     }
-                    if matches!(node.source.as_str(), "registry" | "builtin") && package.manifest.version != node.version {
-                        tracing::info!("Package {package_name} requests {}, using available version {}.", node.version, package.manifest.version);
+                    if matches!(node.source.as_str(), "registry" | "builtin")
+                        && package.manifest.version != node.version
+                    {
+                        tracing::info!(
+                            "Package {package_name} requests {}, using available version {}.",
+                            node.version,
+                            package.manifest.version
+                        );
                     }
-                    if node.source == "local" && package.manifest.dependencies != node.dependencies { tracing::info!("Local package dependencies disagree with the lock for {package_name}; using available contents."); }
+                    if node.source == "local" && package.manifest.dependencies != node.dependencies
+                    {
+                        tracing::info!(
+                            "Local package dependencies disagree with the lock for {package_name}; using available contents."
+                        );
+                    }
                     if node.source == "builtin" {
                         for (dependency, requested) in &package.manifest.dependencies {
                             if lock
@@ -457,14 +480,30 @@ impl Packages {
                                 .get(dependency)
                                 .is_none_or(|selected| &selected.version != requested)
                             {
-                                tracing::info!("Selected editor requests {dependency} {requested}, which differs from the lock; using available contents.");
+                                tracing::info!(
+                                    "Selected editor requests {dependency} {requested}, which differs from the lock; using available contents."
+                                );
                             }
                         }
                     }
                     watched.insert(package.root.join("package.json"));
                     selected.push(package);
                 }
-                Err(error) => diagnostics.push(format!("Excluded package {package_name}: {error}. References to this package remain unresolved.")),
+                Err(error) => {
+                    if error
+                        .chain()
+                        .any(|cause| cause.is::<crate::diagnostics::Cancelled>())
+                    {
+                        return Err(error);
+                    }
+                    if error
+                        .downcast_ref::<crate::diagnostics::DependencyUnavailable>()
+                        .is_some()
+                    {
+                        dependency_retry = Some(crate::discovery::DependencyRetry::new());
+                    }
+                    diagnostics.push(format!("Excluded package {package_name}: {error:#}. References to this package remain unresolved."));
+                }
             }
         }
         if policy.remote.is_some() {
@@ -487,6 +526,7 @@ impl Packages {
             selected,
             diagnostics,
             watched,
+            dependency_retry,
         })
     }
 }
@@ -563,6 +603,38 @@ mod tests {
                 .selected
                 .iter()
                 .all(|p| p.manifest.version == "2.0.0" && p.identity.starts_with("archive:"))
+        );
+        assert!(packages.dependency_retry.is_none());
+        let leases = crate::cache::views::LeaseSet::new(&temp.path().join("cache")).unwrap();
+        let failed = Packages::resolve(
+            &root,
+            &policy,
+            &editor,
+            temp.path(),
+            &leases,
+            |_, _, _, _| anyhow::bail!("temporarily unavailable"),
+        )
+        .unwrap();
+        assert!(failed.selected.is_empty());
+        assert!(failed.dependency_retry.is_some());
+        let cancelled = Packages::resolve(
+            &root,
+            &policy,
+            &editor,
+            temp.path(),
+            &leases,
+            |_, _, _, _| {
+                Err(crate::diagnostics::shared_error(std::sync::Arc::new(
+                    crate::diagnostics::Cancelled.into(),
+                )))
+            },
+        );
+        assert!(
+            cancelled
+                .err()
+                .unwrap()
+                .chain()
+                .any(|cause| cause.is::<crate::diagnostics::Cancelled>())
         );
     }
 

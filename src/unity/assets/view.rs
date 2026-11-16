@@ -5,7 +5,14 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) fn requested(path: &str) -> bool {
     !path.starts_with("unity@")
-        && crate::navigation::location(path).is_ok_and(|(path, _)| is_asset(Path::new(path)))
+        && crate::navigation::location(path).is_ok_and(|(path, _)| supported(Path::new(path)))
+}
+
+pub(crate) fn supported(path: &Path) -> bool {
+    is_asset(path)
+        || path
+            .extension()
+            .is_some_and(|extension| extension == "meta")
 }
 
 pub(crate) struct Reader<'a> {
@@ -79,7 +86,7 @@ impl Reader<'_> {
                 if scope.is_dir() {
                     inventory(scope, &mut files, &mut observed, 0, true, self.cancel)?;
                 }
-                for file in files.into_iter().filter(|file| is_asset(file)) {
+                for file in files.into_iter().filter(|file| supported(file)) {
                     let logical = logical_path(self.root, project, &file, self.manifest);
                     candidates
                         .entry(logical)
@@ -91,7 +98,7 @@ impl Reader<'_> {
                 .omitted
                 .keys()
                 .chain(self.unavailable.iter())
-                .filter(|logical| is_asset(Path::new(logical)))
+                .filter(|logical| supported(Path::new(logical)))
             {
                 let file = self.root.join(logical);
                 if projects.iter().any(|project| file.starts_with(project)) {
@@ -115,6 +122,36 @@ impl Reader<'_> {
         let logical = matches[0];
         let file = candidates[logical].first().unwrap();
         self.leases.retain(file)?;
+        if file
+            .extension()
+            .is_some_and(|extension| extension == "meta")
+        {
+            ensure!(
+                self.unavailable(logical).is_none(),
+                "Metadata source is unavailable"
+            );
+            let size = std::fs::metadata(file)?.len();
+            ensure!(
+                size <= if self.remote {
+                    crate::repository::selection::ASSET_LIMIT
+                } else {
+                    LOCAL_LIMIT
+                },
+                "Metadata exceeds size limit ({size} bytes)"
+            );
+            let source =
+                crate::memory::Source::read(size, self.cancel, || Ok(std::fs::read(file)?))?
+                    .map(|bytes| crate::model::decode_raw(bytes, Language::Text))?;
+            return crate::navigation::sources::view(
+                &BTreeMap::from([(logical.to_owned(), ())]),
+                self.root,
+                path,
+                mode,
+                !self.remote,
+                self.cancel,
+                |_| Ok(Some((Language::Text, source))),
+            );
+        }
         std::fs::create_dir_all(self.cache)?;
         let limit = if self.remote {
             crate::repository::selection::ASSET_LIMIT
@@ -175,7 +212,7 @@ fn exact(scope: &Path, relative: &str, cancel: &dyn Cancellation) -> Result<Opti
             Err(error) => return Err(error.into()),
         };
         if components.peek().is_none() {
-            return Ok((kind.is_file() && is_asset(&path)).then_some(path));
+            return Ok((kind.is_file() && supported(&path)).then_some(path));
         }
         if !kind.is_dir() || is_root(&path) || crate::discovery::linked_worktree(&path) {
             return Ok(None);

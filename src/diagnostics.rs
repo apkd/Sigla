@@ -2,6 +2,15 @@
 use std::{error::Error, fmt, sync::Arc};
 
 #[derive(Debug)]
+pub(crate) struct DependencyUnavailable(pub &'static str);
+impl fmt::Display for DependencyUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl Error for DependencyUnavailable {}
+
+#[derive(Debug)]
 pub(crate) struct RefreshRequired(pub &'static str);
 impl fmt::Display for RefreshRequired {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -111,6 +120,10 @@ impl fmt::Display for Cancelled {
     }
 }
 impl Error for Cancelled {}
+
+pub(crate) fn cancelled(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<Cancelled>())
+}
 
 pub(crate) fn enforce_limit(
     resource: &'static str,

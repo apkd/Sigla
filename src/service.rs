@@ -1105,6 +1105,10 @@ impl App {
                             cache: cache.clone(),
                             branch: branch.clone(),
                             activity: activity.clone(),
+                            retry: slot
+                                .preparing
+                                .as_ref()
+                                .and_then(|ticket| ticket.retry_inventory(generation)),
                         },
                     ));
                 }
@@ -1230,12 +1234,18 @@ impl App {
         }
         tracing::Span::current().record("stage", "source_indexing");
         operation.stage("source_indexing");
-        {
+        let (inventory, prepared_generation) = {
             let _wait = operation.wait("workspace_preparation");
-            if wait.until(preparation.complete()).await?.is_none() {
+            let Some(inventory) = wait
+                .until(
+                    preparation.readable(query.as_ref().is_some_and(|query| query.wait_complete)),
+                )
+                .await?
+            else {
                 return Ok(indexes::pending("Code indexing"));
-            }
-        }
+            };
+            inventory
+        };
         let asset_selection_generation = branch
             .as_ref()
             .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
@@ -1313,7 +1323,9 @@ impl App {
             .as_ref()
             .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
         ensure!(
-            branch_generation == asset_selection_generation,
+            branch_generation == asset_selection_generation
+                && branch_generation == prepared_generation
+                && Arc::ptr_eq(&inventory.manifest, &state.as_ref().unwrap().manifest),
             crate::diagnostics::RefreshRequired(
                 "Repository changed during asset selection; retry query"
             )
@@ -1507,6 +1519,9 @@ impl App {
                 });
                 let mut ready = Vec::new();
                 let mut pending = std::collections::BTreeSet::new();
+                if base_manifest.dependency_retry.is_some() {
+                    pending.insert("Dependency metadata (acquisition incomplete)".to_owned());
+                }
                 let mut remaining = None;
                 for (group, ticket) in &source_tickets {
                     match ticket.ready() {

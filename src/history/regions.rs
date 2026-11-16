@@ -529,8 +529,13 @@ impl Sources {
 pub(super) fn anchor_language(query: &crate::query::Query, language: Language) -> bool {
     query.loose
         || query.target.location.is_some()
-        || language != Language::CSharp
-        || !query.target.name.contains("::")
+        || if query.target.name.contains("::") {
+            language != Language::CSharp
+        } else if query.target.name.contains('.') {
+            language == Language::CSharp
+        } else {
+            true
+        }
 }
 
 /// A necessary spelling check, never evidence that a matching declaration exists.
@@ -576,7 +581,7 @@ pub(super) fn language(path: &str) -> Option<Language> {
         return Some(language);
     }
     let extension = extension.to_ascii_lowercase();
-    if let Some(language) = crate::documents::language_name(name, &extension) {
+    if let Some(language) = crate::documents::view_language(file) {
         return Some(language);
     }
     Some(match extension.as_str() {

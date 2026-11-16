@@ -99,6 +99,7 @@ pub(crate) fn discover_with_editor(
         .diagnostics
         .extend(references.diagnostics.iter().cloned());
     let packages = Packages::local(root, policy, editor, cache, &result.leases)?;
+    result.dependency_retry = packages.dependency_retry.or(result.dependency_retry);
     result.metadata.extend(packages.watched);
     result.metadata.extend([
         root.join("ProjectSettings/ProjectSettings.asset"),
@@ -1107,6 +1108,7 @@ mod tests {
             metadata: BTreeSet::new(),
             dependencies: BTreeSet::new(),
             diagnostics: Vec::new(),
+            dependency_retry: None,
         };
         let error = discover_with_editor(root.path(), &policy, cache.path(), &mut empty(), &editor)
             .unwrap_err();
@@ -1339,6 +1341,7 @@ PluginImporter:
                     metadata: BTreeSet::new(),
                     dependencies: BTreeSet::new(),
                     diagnostics: Vec::new(),
+                    dependency_retry: None,
                 };
                 discover_with_editor(root.path(), &policy, cache.path(), &mut actual, &editor)
                     .unwrap();

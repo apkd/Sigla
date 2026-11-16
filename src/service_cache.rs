@@ -1015,20 +1015,21 @@ impl App {
         }
         if crate::cache::views::is_metadata_root(&self.cache, &candidate.owner.entry) {
             let root = &candidate.owner.entry;
-            if root
-                .parent()
-                .is_some_and(|parent| parent.ends_with("unity-metadata"))
-                && self.remote.as_ref().is_some_and(|remote| {
-                    crate::metadata_archive::configured(root, &remote.options.unity_versions)
-                })
-            {
-                return Ok(false);
-            }
             let retired = crate::cache::views::Registry::open(&self.cache)?.try_retire_checked(
                 root,
                 || {
-                    Ok(crate::cache::views::metadata_last_use(root)?
-                        > candidate.owner.usage.last_use
+                    let configured = root
+                        .parent()
+                        .is_some_and(|parent| parent.ends_with("unity-metadata"))
+                        && self.remote.as_ref().is_some_and(|remote| {
+                            crate::metadata_archive::configured(
+                                root,
+                                &remote.options.unity_versions,
+                            )
+                        });
+                    Ok(configured
+                        || crate::cache::views::metadata_last_use(root)?
+                            > candidate.owner.usage.last_use
                         || self.owners.lock().unwrap().referenced_metadata(root))
                 },
             )?;

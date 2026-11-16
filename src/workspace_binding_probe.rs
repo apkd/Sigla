@@ -55,6 +55,7 @@ fn replay_unity_bindings() -> Result<()> {
         metadata: BTreeSet::new(),
         dependencies: BTreeSet::new(),
         diagnostics: Vec::new(),
+        dependency_retry: None,
     };
     crate::unity::discover_with_editor(&root, &policy, &cache, &mut discovery, &editor)?;
     eprintln!(

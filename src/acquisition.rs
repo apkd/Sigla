@@ -16,11 +16,73 @@ use std::{
 struct Failure {
     at: Instant,
     version: String,
-    message: String,
+    error: Arc<anyhow::Error>,
 }
 type Preparation = Arc<Mutex<Option<Failure>>>;
-static PREPARATIONS: LazyLock<Mutex<HashMap<String, Preparation>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+struct Preparations {
+    entries: Mutex<HashMap<String, Preparation>>,
+    limit: usize,
+}
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+static PREPARATIONS: LazyLock<Preparations> = LazyLock::new(|| Preparations {
+    entries: Mutex::new(HashMap::new()),
+    limit: 1024,
+});
+
+impl Preparations {
+    fn enter<'a>(&'a self, identity: &'a str) -> Result<PreparationEntry<'a>> {
+        let mut entries = self.entries.lock().unwrap();
+        if !entries.contains_key(identity) {
+            entries.retain(|_, entry| !Self::removable(entry));
+            ensure!(
+                entries.len() < self.limit,
+                crate::diagnostics::DependencyUnavailable(
+                    "Dependency preparation is busy; retry shortly"
+                )
+            );
+        }
+        let state = entries
+            .entry(identity.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        Ok(PreparationEntry {
+            registry: self,
+            identity,
+            state,
+        })
+    }
+
+    fn removable(entry: &Preparation) -> bool {
+        Arc::strong_count(entry) == 1 && Self::finished(entry, true)
+    }
+
+    fn finished(entry: &Preparation, expired: bool) -> bool {
+        let state = match entry.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        state
+            .as_ref()
+            .is_none_or(|failure| expired && failure.at.elapsed() >= FAILURE_COOLDOWN)
+    }
+}
+
+struct PreparationEntry<'a> {
+    registry: &'a Preparations,
+    identity: &'a str,
+    state: Preparation,
+}
+impl Drop for PreparationEntry<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.registry.entries.lock().unwrap();
+        // This owner and the registry are the only remaining references. A
+        // waiter clones its entry under the same registry lock before waiting.
+        if Arc::strong_count(&self.state) == 2 && Preparations::finished(&self.state, false) {
+            entries.remove(self.identity);
+        }
+    }
+}
 static CAPACITY: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
 static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn shutdown() {
@@ -52,7 +114,7 @@ pub(crate) fn shared_versioned<T>(
         }
         ensure!(
             !STOPPED.load(std::sync::atomic::Ordering::Acquire),
-            "Service is shutting down"
+            crate::diagnostics::Cancelled
         );
         *active += 1;
         drop(active);
@@ -71,33 +133,40 @@ fn serialized_versioned<T>(
     version: &str,
     prepare: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let state = PREPARATIONS
+    let entry = PREPARATIONS.enter(identity)?;
+    let mut state = entry
+        .state
         .lock()
-        .unwrap()
-        .entry(identity.to_owned())
-        .or_insert_with(|| Arc::new(Mutex::new(None)))
-        .clone();
-    let mut state = state.lock().unwrap();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(failure) = &*state
         && failure.version == version
+        && failure.at.elapsed() < FAILURE_COOLDOWN
     {
-        ensure!(
-            failure.at.elapsed() >= Duration::from_secs(30),
-            "{}",
-            failure.message
-        );
+        return Err(crate::diagnostics::shared_error(failure.error.clone()));
     }
     ensure!(
         !STOPPED.load(std::sync::atomic::Ordering::Acquire),
-        "Service is shutting down"
+        crate::diagnostics::Cancelled
     );
-    let result = prepare();
-    *state = result.as_ref().err().map(|error| Failure {
-        at: Instant::now(),
-        version: version.into(),
-        message: error.to_string(),
-    });
-    result
+    match prepare() {
+        Ok(value) => {
+            *state = None;
+            Ok(value)
+        }
+        Err(error) => {
+            if crate::diagnostics::cancelled(&error) {
+                *state = None;
+                return Err(error);
+            }
+            let error = Arc::new(error);
+            *state = Some(Failure {
+                at: Instant::now(),
+                version: version.into(),
+                error: error.clone(),
+            });
+            Err(crate::diagnostics::shared_error(error))
+        }
+    }
 }
 
 pub fn client() -> Result<reqwest::blocking::Client> {
@@ -221,7 +290,7 @@ fn transfer_verified(
     loop {
         ensure!(
             !STOPPED.load(std::sync::atomic::Ordering::Acquire),
-            "Service is shutting down"
+            crate::diagnostics::Cancelled
         );
         let count = response.read(&mut bytes)?;
         if count == 0 {
@@ -309,6 +378,79 @@ pub fn analysis_input(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_registry_preserves_waiters_and_bounds_failure_bursts() {
+        let registry = Preparations {
+            entries: Mutex::new(HashMap::new()),
+            limit: 1,
+        };
+        std::thread::scope(|scope| {
+            let registry = &registry;
+            let first = registry.enter("one").unwrap();
+            let state = first.state.lock().unwrap();
+            let (entered, ready) = std::sync::mpsc::channel();
+            let waiter = scope.spawn(move || {
+                let second = registry.enter("one").unwrap();
+                entered.send(()).unwrap();
+                let _state = second.state.lock().unwrap();
+            });
+            ready.recv().unwrap();
+            assert!(registry.enter("two").is_err());
+            drop(state);
+            drop(first);
+            waiter.join().unwrap();
+        });
+        assert!(registry.entries.lock().unwrap().is_empty());
+
+        let failed = registry.enter("one").unwrap();
+        *failed.state.lock().unwrap() = Some(Failure {
+            at: Instant::now(),
+            version: "release".into(),
+            error: Arc::new(anyhow::anyhow!("unavailable")),
+        });
+        drop(failed);
+        assert!(registry.enter("two").is_err());
+        let failed = registry.enter("one").unwrap();
+        failed.state.lock().unwrap().as_mut().unwrap().at = Instant::now() - FAILURE_COOLDOWN;
+        drop(failed);
+        drop(registry.enter("two").unwrap());
+        assert!(registry.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn changed_acquisition_version_bypasses_a_preserved_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().to_str().unwrap();
+        let failed = serialized_versioned::<()>(key, "old", || {
+            Err(crate::diagnostics::DependencyUnavailable("unavailable").into())
+        });
+        assert!(failed.is_err());
+        let cached = serialized_versioned::<()>(key, "old", || panic!("failure cooldown was lost"));
+        assert!(
+            cached
+                .unwrap_err()
+                .chain()
+                .any(|cause| cause.is::<crate::diagnostics::DependencyUnavailable>())
+        );
+        serialized_versioned(key, "new", || Ok(())).unwrap();
+        assert!(!PREPARATIONS.entries.lock().unwrap().contains_key(key));
+    }
+
+    #[test]
+    fn cancelled_or_panicking_acquisitions_allow_an_immediate_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().to_str().unwrap();
+        let cancelled = serialized::<()>(key, || Err(crate::diagnostics::Cancelled.into()));
+        assert!(crate::diagnostics::cancelled(&cancelled.unwrap_err()));
+        serialized(key, || Ok(())).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| serialized::<()>(key, || panic!("failed worker"))).is_err()
+        );
+        serialized(key, || Ok(())).unwrap();
+        assert!(!PREPARATIONS.entries.lock().unwrap().contains_key(key));
+    }
+
     fn archive(bytes: &[u8]) -> File {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(bytes).unwrap();

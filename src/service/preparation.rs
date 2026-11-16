@@ -101,6 +101,8 @@ impl Inventory {
 enum Progress {
     Pending(&'static str),
     Files(Arc<Inventory>),
+    Refreshing(Arc<Inventory>, Option<u64>),
+    RetryFailed(Arc<Inventory>, Option<u64>, std::time::Instant),
     Ready(Arc<Inventory>, Option<u64>),
     Failed(Arc<anyhow::Error>, Option<Arc<Inventory>>),
 }
@@ -123,16 +125,43 @@ impl Ticket {
     pub fn running(&self) -> bool {
         matches!(
             *self.progress.borrow(),
-            Progress::Pending(_) | Progress::Files(_)
+            Progress::Pending(_) | Progress::Files(_) | Progress::Refreshing(..)
         )
     }
     pub fn needs_refresh(&self, generation: Option<u64>) -> bool {
         match &*self.progress.borrow() {
             Progress::Ready(inventory, prepared) => {
-                *prepared != generation || inventory.watch.changed()
+                *prepared != generation
+                    || inventory.watch.changed()
+                    || inventory
+                        .manifest
+                        .dependency_retry
+                        .is_some_and(|retry| retry.due(crate::cache::now()))
             }
             Progress::Failed(..) => true,
+            Progress::RetryFailed(inventory, prepared, after) => {
+                *prepared != generation
+                    || inventory.watch.changed()
+                    || std::time::Instant::now() >= *after
+            }
+            Progress::Refreshing(inventory, prepared) => {
+                *prepared != generation || inventory.watch.changed()
+            }
             Progress::Pending(_) | Progress::Files(_) => false,
+        }
+    }
+    pub fn retry_inventory(
+        &self,
+        generation: Option<u64>,
+    ) -> Option<(Arc<Inventory>, Option<u64>)> {
+        match &*self.progress.borrow() {
+            Progress::Ready(inventory, prepared)
+            | Progress::RetryFailed(inventory, prepared, _)
+                if *prepared == generation && !inventory.watch.changed() =>
+            {
+                Some((inventory.clone(), *prepared))
+            }
+            _ => None,
         }
     }
     pub fn retained_inventory(&self) -> bool {
@@ -142,6 +171,8 @@ impl Ticket {
         let progress = self.progress.borrow();
         let inventory = match &*progress {
             Progress::Failed(_, Some(inventory))
+            | Progress::Refreshing(inventory, _)
+            | Progress::RetryFailed(inventory, _, _)
             | Progress::Files(inventory)
             | Progress::Ready(inventory, _) => inventory,
             _ => return (0, 0),
@@ -164,6 +195,8 @@ impl Ticket {
         loop {
             match self.progress.borrow().clone() {
                 Progress::Files(files)
+                | Progress::Refreshing(files, _)
+                | Progress::RetryFailed(files, _, _)
                 | Progress::Ready(files, _)
                 | Progress::Failed(_, Some(files)) => return Ok(files),
                 Progress::Failed(error, None) => {
@@ -179,20 +212,44 @@ impl Ticket {
     pub async fn complete(&mut self) -> Result<()> {
         loop {
             match self.progress.borrow().clone() {
-                Progress::Ready(..) => return Ok(()),
+                Progress::Ready(..) | Progress::RetryFailed(..) => return Ok(()),
                 Progress::Failed(error, _) => {
                     return Err(crate::diagnostics::shared_error(error));
                 }
                 Progress::Pending(stage) => {
                     tracing::Span::current().record("stage", stage);
                 }
-                Progress::Files(_) => {
+                Progress::Files(_) | Progress::Refreshing(..) => {
                     tracing::Span::current().record("stage", "source_indexing");
                 }
             }
             self.progress.changed().await?;
         }
     }
+    pub async fn readable(&mut self, wait: bool) -> Result<(Arc<Inventory>, Option<u64>)> {
+        if !wait && let Progress::Refreshing(inventory, generation) = &*self.progress.borrow() {
+            return Ok((inventory.clone(), *generation));
+        }
+        self.complete().await?;
+        match &*self.progress.borrow() {
+            Progress::Ready(inventory, generation)
+            | Progress::RetryFailed(inventory, generation, _) => {
+                Ok((inventory.clone(), *generation))
+            }
+            _ => unreachable!("completed preparation retains its inventory"),
+        }
+    }
+}
+
+fn publish_progress(send: &watch::Sender<Progress>, next: Progress) {
+    send.send_if_modified(|current| {
+        if matches!(current, Progress::Refreshing(..)) {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    });
 }
 fn context(
     branch: Option<&crate::repository::manager::Branch>,
@@ -479,6 +536,7 @@ pub(super) struct Request {
     pub cache: PathBuf,
     pub branch: Option<Arc<crate::repository::manager::Branch>>,
     pub activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    pub retry: Option<(Arc<Inventory>, Option<u64>)>,
 }
 pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     let Request {
@@ -488,8 +546,14 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         cache,
         branch: preparing_branch,
         activity: preparing_activity,
+        retry,
     } = request;
-    let (send, receive) = watch::channel(Progress::Pending("preparation"));
+    let retrying = retry.is_some();
+    let retry_base = retry.clone();
+    let (send, receive) = watch::channel(retry.map_or(
+        Progress::Pending("preparation"),
+        |(inventory, generation)| Progress::Refreshing(inventory, generation),
+    ));
     static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let job = NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let repository = preparing_branch
@@ -507,7 +571,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
         let mut lifecycle = None;
         let outcome = async {
             if let Some(branch) = &preparing_branch {
-                send.send_replace(Progress::Pending("acquisition"));
+                publish_progress(&send, Progress::Pending("acquisition"));
                 operation.stage("repository_acquisition");
                 preparing_app
                     .remote
@@ -515,10 +579,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     .unwrap()
                     .ready(branch, &operation)
                     .await?;
-                send.send_replace(Progress::Pending("preparation"));
+                publish_progress(&send, Progress::Pending("preparation"));
             }
             operation.stage("preparation_admission");
-            send.send_replace(Progress::Pending("preparation_admission"));
+            publish_progress(&send, Progress::Pending("preparation_admission"));
             #[cfg(test)]
             if preparing_app.preparation_lifecycle.available_permits() == 0 {
                 preparing_app.preparation_admission_started.notify_one();
@@ -537,7 +601,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             let mut discovery_budget = None;
             let (state, branch_state) = loop {
                 operation.stage("discovery_admission");
-                let (permit, mut state, branch_state) = preparing_app
+                let (mut permit, mut state, mut branch_state) = preparing_app
                     .admit_work(
                         workspace.clone(),
                         preparing_branch.as_ref(),
@@ -572,6 +636,49 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                         applied.discovery_identity()?,
                     );
                 }
+                let rediscovered = if retrying {
+                    let code = state.as_mut().unwrap();
+                    let (inventory, generation) = retry_base.as_ref().unwrap();
+                    ensure!(Arc::ptr_eq(&inventory.manifest, &code.manifest)
+                        && !inventory.watch.changed()
+                        && *generation == preparing_branch.as_ref().map(|branch|
+                            branch.generation.load(std::sync::atomic::Ordering::Acquire)),
+                        crate::diagnostics::RefreshRequired("Workspace changed before dependency retry"));
+                    code.update_policy(policy.clone());
+                    let base = code.manifest.clone();
+                    let watch = code.watch_snapshot();
+                    let work = code.rediscovery();
+                    let generation = preparing_branch.as_ref().map(|branch|
+                        branch.generation.load(std::sync::atomic::Ordering::Acquire));
+                    drop(branch_state);
+                    drop(state);
+                    #[cfg(test)]
+                    let pause = {
+                        preparing_app.discovery_started.notify_one();
+                        preparing_app.discovery_pause.clone().acquire_owned().await?
+                    };
+                    operation.stage("dependency_retry");
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        work.run(budget)
+                    }).await?;
+                    #[cfg(test)]
+                    drop(pause);
+                    (permit, state, branch_state) = preparing_app.admit_work(
+                        workspace.clone(), preparing_branch.as_ref(),
+                        &preparing_app.preparation_workers, "discovery_admission", &operation,
+                    ).await?;
+                    if !Arc::ptr_eq(&base, &state.as_ref().unwrap().manifest)
+                        || watch.changed()
+                        || generation != preparing_branch.as_ref().map(|branch|
+                            branch.generation.load(std::sync::atomic::Ordering::Acquire))
+                    {
+                        return Err(crate::diagnostics::RefreshRequired(
+                            "Workspace changed during dependency discovery; retry query"
+                        ).into());
+                    }
+                    Some(result)
+                } else { None };
                 let app = preparing_app.clone();
                 let discovery_entry = entry.clone();
                 let cache = cache.clone();
@@ -597,8 +704,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     }
                     state.as_mut().unwrap().update_policy(current_policy);
                     let code = state.as_mut().unwrap();
-                    let result = code
-                        .prepare_with_budget(budget)
+                    let result = rediscovered.map_or_else(
+                        || code.prepare_with_budget(budget),
+                        |prepared| prepared.map(Some),
+                    )
                         .and_then(|p| p.map(|p| code.plan(p)).transpose());
                     crate::memory::reclaim();
                     Ok((state, result))
@@ -629,7 +738,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .clone();
                         drop(branch_state);
                         drop(state);
-                        send.send_replace(Progress::Pending("acquisition"));
+                        publish_progress(&send, Progress::Pending("acquisition"));
                         operation.stage("required_input_acquisition");
                         preparing_app
                             .remote
@@ -637,14 +746,14 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .unwrap()
                             .require_inputs(branch, &revision, paths, &operation)
                             .await?;
-                        send.send_replace(Progress::Pending("preparation"));
+                        publish_progress(&send, Progress::Pending("preparation"));
                         continue;
                     }
                 };
                 let Some(prepared) = prepared else {
                     break (state, branch_state);
                 };
-                send.send_replace(Progress::Files(Arc::new(Inventory {
+                publish_progress(&send, Progress::Files(Arc::new(Inventory {
                     manifest: prepared.manifest.clone(),
                     context: context(
                         preparing_branch.as_deref(),
@@ -674,6 +783,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     || generation != preparing_branch.as_ref().map(|branch|
                     branch.generation.load(std::sync::atomic::Ordering::Acquire))
                 {
+                    ensure!(!retrying, crate::diagnostics::RefreshRequired("Workspace changed before dependency publication"));
                     // Publication replaced the inputs while indexing was queued.
                     // Rebuild the plan from the newly admitted repository view.
                     send.send_replace(Progress::Pending("preparation"));
@@ -698,6 +808,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 })
                 .await??;
                 if !indexed {
+                    ensure!(!retrying, crate::diagnostics::RefreshRequired("Sources changed before dependency publication"));
                     send.send_replace(Progress::Pending("preparation"));
                     continue;
                 }
@@ -725,14 +836,16 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     branch.publish().await
                 };
                 let metadata = gate.as_mut().unwrap();
+                let indexed_revision = inventory.manifest.dependency_retry.is_none()
+                    .then(|| metadata.prepared.revision.clone());
                 // Publication can win the gap between releasing the read guard and
                 // acquiring the writer. Only mark the generation we actually indexed.
                 if !metadata.repair
                     && Some(branch.generation.load(std::sync::atomic::Ordering::Acquire))
                         == generation
-                    && metadata.indexed_revision.as_ref() != Some(&metadata.prepared.revision)
+                    && metadata.indexed_revision != indexed_revision
                 {
-                    metadata.indexed_revision = Some(metadata.prepared.revision.clone());
+                    metadata.indexed_revision = indexed_revision;
                     metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
                     let branch = branch.clone();
                     tokio::task::spawn_blocking(move || {
@@ -760,11 +873,24 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                     operation.diagnose(diagnostic);
                 }
                 operation.finish("failure");
-                let inventory = match &*send.borrow() {
-                    Progress::Files(inventory) => Some(inventory.clone()),
-                    _ => None,
-                };
-                Progress::Failed(Arc::new(error), inventory)
+                let previous = send.borrow().clone();
+                match previous {
+                    Progress::Refreshing(inventory, generation)
+                        if workspace.lock().await.as_ref().is_some_and(|code| {
+                            code.published_current(&inventory.manifest).unwrap_or(false)
+                        }) =>
+                    {
+                        Progress::RetryFailed(
+                            inventory,
+                            generation,
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        )
+                    }
+                    Progress::Files(inventory) => {
+                        Progress::Failed(Arc::new(error), Some(inventory))
+                    }
+                    _ => Progress::Failed(Arc::new(error), None),
+                }
             }
         };
         send.send_replace(progress);
@@ -788,6 +914,86 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn dependency_retry_keeps_searches_available_and_rechecks_changed_sources() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = root.path().join("code.rs");
+        std::fs::write(&source, "pub struct Ready;").unwrap();
+        let policy = Policy::new(vec![root.path().into()]).unwrap();
+        let app = Arc::new(App::new(policy.clone(), cache.path().into(), 2).unwrap());
+        let path = root.path().to_str().unwrap();
+        assert!(
+            app.search(path, "type:Ready")
+                .await
+                .unwrap()
+                .contains("Ready")
+        );
+        app.discovery_started.notified().await;
+        let pause = app.discovery_pause.clone().acquire_owned().await.unwrap();
+        let activity = Arc::new(app.activity.clone().read_owned().await);
+        let mut ticket = {
+            let mut registry = app.workspaces.lock().unwrap();
+            let slot = registry.get_mut(root.path()).unwrap();
+            let retry = slot
+                .preparing
+                .as_ref()
+                .unwrap()
+                .retry_inventory(None)
+                .unwrap();
+            let ticket = start(
+                app.clone(),
+                Request {
+                    workspace: slot.state.clone(),
+                    entry: root.path().into(),
+                    policy,
+                    cache: cache.path().into(),
+                    branch: None,
+                    activity,
+                    retry: Some(retry),
+                },
+            );
+            slot.preparing = Some(ticket.clone());
+            ticket
+        };
+        tokio::time::timeout(Duration::from_secs(5), app.discovery_started.notified())
+            .await
+            .unwrap();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                app.search(path, "type:Ready"),
+                app.search(path, "type:Ready")
+            )
+        })
+        .await
+        .unwrap();
+        assert!(first.unwrap().contains("Ready"));
+        assert!(second.unwrap().contains("Ready"));
+        assert_eq!(
+            app.workspaces.lock().unwrap()[root.path()]
+                .preparing
+                .as_ref()
+                .unwrap()
+                .id(),
+            ticket.id()
+        );
+        assert!(ticket.running());
+        std::fs::write(&source, "pub struct Updated;").unwrap();
+        drop(pause);
+        tokio::time::timeout(Duration::from_secs(5), ticket.complete())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            app.search(path, "type:Updated")
+                .await
+                .unwrap()
+                .contains("Updated")
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn shutdown_waits_for_preparation_trimming_before_reopening_cache() {
         use std::{future::Future, task::Poll, time::Duration};
 
@@ -807,6 +1013,7 @@ mod tests {
                 cache: cache.path().into(),
                 branch: None,
                 activity: Arc::new(app.activity.clone().read_owned().await),
+                retry: None,
             },
         );
         app.workspaces.lock().unwrap().insert(

@@ -3,6 +3,18 @@
 use crate::model::Language;
 use std::path::Path;
 
+/// Sidecars remain outside normal indexing; explicit views and history can read them.
+pub(crate) fn view_language(path: &Path) -> Option<Language> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "meta")
+    {
+        Some(Language::Text)
+    } else {
+        language(path)
+    }
+}
+
 pub fn language(path: &Path) -> Option<Language> {
     let name = path.file_name()?.to_str()?;
     let extension = path

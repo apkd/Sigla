@@ -3,6 +3,109 @@
 use super::*;
 
 #[test]
+fn dependency_retry_survives_reopen_and_source_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let editors = tempfile::tempdir().unwrap();
+    let write = |base: &Path, relative: &str, text: &str| {
+        let path = base.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    for (path, text) in [
+        ("Assets/A.cs", "class A {}"),
+        (
+            "ProjectSettings/ProjectVersion.txt",
+            "m_EditorVersion: 6000.3.0f1",
+        ),
+        (
+            "ProjectSettings/ProjectSettings.asset",
+            "PlayerSettings: {}",
+        ),
+        ("Packages/manifest.json", r#"{"dependencies":{}}"#),
+        ("Packages/packages-lock.json", r#"{"dependencies":{}}"#),
+    ] {
+        write(root.path(), path, text);
+    }
+    let mut policy = Policy::new(vec![root.path().into(), editors.path().into()]).unwrap();
+    policy.unity_editors = Some(editors.path().into());
+    let open = || {
+        Workspace::open(
+            root.path().into(),
+            cache.path(),
+            policy.clone(),
+            &cache.path().join("analysis"),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+    };
+    let mut workspace = open();
+    workspace.refresh().unwrap();
+    assert!(workspace.published_current(&workspace.manifest).unwrap());
+    let retry = workspace
+        .manifest
+        .dependency_retry
+        .expect("missing editor must retry");
+    let now = crate::cache::now();
+    assert!(!retry.due(now));
+    assert!(
+        workspace
+            .prepare_at(Default::default(), now)
+            .unwrap()
+            .is_none()
+    );
+    drop(workspace);
+
+    write(root.path(), "Assets/A.cs", "class A { void Changed() {} }");
+    let mut workspace = open();
+    let prepared = workspace
+        .prepare_at(Default::default(), now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.discovery.dependency_retry, Some(retry));
+    workspace.apply(prepared).unwrap();
+    drop(workspace);
+
+    let data = editors.path().join("6000.3.0f1/Editor/Data");
+    for reference in [
+        "Managed/UnityEngine/UnityEngine.CoreModule.dll",
+        "NetStandard/ref/2.1.0/netstandard.dll",
+        "UnityReferenceAssemblies/unity-4.8-api/mscorlib.dll",
+    ] {
+        write(&data, reference, "fixture");
+    }
+    write(
+        &data,
+        "Resources/modules.asset",
+        "PlatformModuleSetup:\n  modules:\n  - name: Core\n    controlledByBuiltinPackage: 0\n",
+    );
+    let mut workspace = open();
+    assert!(
+        workspace
+            .prepare_at(Default::default(), now)
+            .unwrap()
+            .is_none()
+    );
+    let prepared = workspace
+        .prepare_at(Default::default(), u64::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(prepared.discovery.dependency_retry.is_none());
+    assert!(
+        prepared
+            .discovery
+            .projects
+            .iter()
+            .any(|project| project.compiler_options.contains_key("UnityVersion"))
+    );
+    let plan = workspace.plan(prepared).unwrap();
+    assert!(plan.manifest.dependency_retry.is_none());
+    workspace.store.begin_refresh().unwrap();
+    assert!(!workspace.published_current(&workspace.manifest).unwrap());
+}
+
+#[test]
 #[ignore = "measures optional asset publication on a generated source tree"]
 fn optional_asset_discovery_benchmark() {
     let root = tempfile::tempdir().unwrap();
@@ -241,6 +344,7 @@ fn benchmark_all_indexes(manifest: Manifest, cache: &Path) {
                 metadata: manifest.metadata.into_keys().collect(),
                 dependencies: manifest.dependencies,
                 diagnostics: manifest.diagnostics,
+                dependency_retry: manifest.dependency_retry,
             },
             fence: 0,
             started,
@@ -417,6 +521,7 @@ fn highland_keep_full_context() {
                 metadata: manifest.metadata.into_keys().collect(),
                 dependencies: manifest.dependencies,
                 diagnostics: manifest.diagnostics,
+                dependency_retry: manifest.dependency_retry,
             },
             fence: 0,
             started: std::time::Instant::now(),

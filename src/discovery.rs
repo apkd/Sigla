@@ -216,6 +216,30 @@ pub struct Discovery {
     pub metadata: BTreeSet<PathBuf>,
     pub dependencies: BTreeSet<PathBuf>,
     pub diagnostics: Vec<String>,
+    pub dependency_retry: Option<DependencyRetry>,
+}
+
+/// Persist failed dependency acquisition independently of source-file watches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DependencyRetry {
+    after_ms: u64,
+}
+impl DependencyRetry {
+    const INTERVAL_MS: u64 = 5 * 60 * 1000;
+
+    pub(crate) fn new() -> Self {
+        Self::after(crate::cache::now())
+    }
+
+    fn after(now: u64) -> Self {
+        Self {
+            after_ms: now.saturating_add(Self::INTERVAL_MS),
+        }
+    }
+
+    pub(crate) fn due(self, now: u64) -> bool {
+        now >= self.after_ms || self.after_ms - now > Self::INTERVAL_MS
+    }
 }
 
 pub fn discover(entry: &Path, policy: &Policy) -> Result<Discovery> {
@@ -281,6 +305,7 @@ pub(crate) fn discover_with_budget(
         metadata: BTreeSet::new(),
         dependencies: BTreeSet::new(),
         diagnostics: Vec::new(),
+        dependency_retry: None,
     };
     let mut inputs = BTreeSet::new();
     if entry.is_dir() {
@@ -323,8 +348,18 @@ pub(crate) fn discover_with_budget(
             fallback_sources(&input, policy, &mut result)
         };
         if let Err(error) = loaded {
-            if error.downcast_ref::<RequiredInputs>().is_some() {
+            if error.downcast_ref::<RequiredInputs>().is_some()
+                || error
+                    .chain()
+                    .any(|cause| cause.is::<crate::diagnostics::Cancelled>())
+            {
                 return Err(error);
+            }
+            if error
+                .downcast_ref::<crate::diagnostics::DependencyUnavailable>()
+                .is_some()
+            {
+                result.dependency_retry = Some(DependencyRetry::new());
             }
             result.projects.truncate(projects);
             result.sources.truncate(sources);
@@ -1608,6 +1643,7 @@ pub(crate) mod tests {
             metadata: BTreeSet::new(),
             dependencies: BTreeSet::new(),
             diagnostics: Vec::new(),
+            dependency_retry: None,
         }
     }
 
@@ -1638,6 +1674,7 @@ pub(crate) mod tests {
                     metadata: BTreeSet::new(),
                     dependencies: BTreeSet::new(),
                     diagnostics: Vec::new(),
+                    dependency_retry: None,
                 };
                 let mut scan = FallbackScan::default();
                 let start = std::time::Instant::now();

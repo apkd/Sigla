@@ -4619,7 +4619,7 @@ async fn a_named_anchor_ignores_unrelated_incomplete_sources() {
             ("Other.cs", "#if FEATURE\nclass Other { int Broken(\n"),
             (
                 "Other.cpp",
-                "const char* marker = \"\\\\u\"; class Other { int Broken(\n",
+                "const char* marker = \"\\\\u\"; class Worker { int Target(\n",
             ),
             (
                 "Other.h",
@@ -4636,6 +4636,28 @@ async fn a_named_anchor_ignores_unrelated_incomplete_sources() {
     // A broad selector cannot prove the incomplete file irrelevant.
     let error = f.error(&root, "log method:*").await;
     assert!(error.contains("Unresolved anchor"), "{error}");
+}
+
+#[tokio::test]
+async fn unity_metadata_sidecars_support_whole_file_and_text_history() {
+    let f = Fixture::new();
+    let path = "Assets/Image.png.meta";
+    let root = f.commit(
+        &[(path, "fileFormatVersion: 2\ntextureType: 0\n")],
+        &[],
+        "initial metadata",
+    );
+    let tip = f.commit(
+        &[(path, "fileFormatVersion: 2\ntextureType: 1\n")],
+        &[&root],
+        "change import settings",
+    );
+    for query in [format!("log file:{path}"), format!("log @{path}:2-2")] {
+        let history = f.history(&tip, &query).await;
+        assert_eq!(ids(&history), [tip.as_str(), root.as_str()], "{history}");
+    }
+    let contents = f.history(&tip, &format!("show {tip} file:{path}")).await;
+    assert!(contents.contains("textureType: 1"), "{contents}");
 }
 
 #[tokio::test]

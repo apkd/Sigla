@@ -269,7 +269,9 @@ impl Editor {
                 &default
             }
         };
-        Self::from_installations(project, installations, declared, revision, leases)
+        Self::from_installations(project, installations, declared, revision, leases).context(
+            crate::diagnostics::DependencyUnavailable("Unity editor installation is unavailable"),
+        )
     }
 
     fn from_installations(

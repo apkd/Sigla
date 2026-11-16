@@ -25,6 +25,14 @@ fn smoke_anchor_language_filter_is_not_a_rust_language_guess() {
         let query = Query::parse(selector).unwrap();
         assert!(anchor_language(&query, Language::CSharp));
     }
+    let query = Query::parse("method:Request.parse").unwrap();
+    for language in [Language::Rust, Language::Cpp, Language::C] {
+        assert!(!anchor_language(&query, language));
+    }
+    let query = Query::parse("method:parse").unwrap();
+    for language in [Language::Rust, Language::Cpp, Language::C, Language::CSharp] {
+        assert!(anchor_language(&query, language));
+    }
 }
 
 #[test]

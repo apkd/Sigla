@@ -149,6 +149,7 @@ pub struct Manifest {
     pub inputs: Vec<SourceInput>,
     pub dependencies: BTreeSet<PathBuf>,
     pub diagnostics: Vec<String>,
+    pub dependency_retry: Option<discovery::DependencyRetry>,
 }
 
 impl Manifest {
@@ -234,7 +235,43 @@ pub struct Preparation {
     validation: std::time::Duration,
     discovery_time: std::time::Duration,
 }
+
+/// Dependency retries can discover a replacement while readers keep using the
+/// published workspace. The service rechecks its input snapshot before planning.
+pub(crate) struct Rediscovery {
+    entry: PathBuf,
+    policy: Policy,
+    cache: PathBuf,
+    fence: u64,
+}
+impl Rediscovery {
+    pub(crate) fn run(self, budget: crate::msbuild::Budget) -> Result<Preparation> {
+        let started = std::time::Instant::now();
+        let discovery =
+            discovery::discover_with_budget(&self.entry, &self.policy, &self.cache, budget)?;
+        Ok(Preparation {
+            discovery,
+            fence: self.fence,
+            started,
+            validation: std::time::Duration::ZERO,
+            discovery_time: started.elapsed(),
+        })
+    }
+}
 impl Workspace {
+    pub(crate) fn published_current(&self, manifest: &Arc<Manifest>) -> Result<bool> {
+        Ok(self.initialized
+            && Arc::ptr_eq(manifest, &self.manifest)
+            && self.store.manifest_current()?)
+    }
+    pub(crate) fn rediscovery(&self) -> Rediscovery {
+        Rediscovery {
+            entry: self.entry.clone(),
+            policy: self.policy.clone(),
+            cache: self.cache.clone(),
+            fence: self.fence,
+        }
+    }
     pub(crate) fn leases(&self) -> crate::cache::views::LeaseSet {
         self.leases.clone()
     }
@@ -310,6 +347,14 @@ impl Workspace {
         &mut self,
         budget: crate::msbuild::Budget,
     ) -> Result<Option<Preparation>> {
+        self.prepare_at(budget, crate::cache::now())
+    }
+
+    fn prepare_at(
+        &mut self,
+        budget: crate::msbuild::Budget,
+        now: u64,
+    ) -> Result<Option<Preparation>> {
         let start = std::time::Instant::now();
         let managed = self.policy.managed_root(self.manifest.metadata.keys());
         if !self.initialized {
@@ -337,7 +382,16 @@ impl Workspace {
             == self
                 .policy
                 .discovery_identity(self.manifest.metadata.keys())?;
-        if self.initialized && !changes.any() && policy_current && self.store.manifest_current()? {
+        let retry = self
+            .manifest
+            .dependency_retry
+            .is_some_and(|retry| retry.due(now));
+        if self.initialized
+            && !changes.any()
+            && policy_current
+            && !retry
+            && self.store.manifest_current()?
+        {
             return Ok(None);
         }
         let cache_current = self.store.manifest_current()?;
@@ -356,8 +410,10 @@ impl Workspace {
             .filter(|file| !self.initialized || changes.affects(&file.path))
             .find(|f| Stamp::read(&f.path).as_ref().ok() != Some(&f.stamp))
             .map(|file| &file.path);
-        let metadata_changed =
-            !policy_current || self.manifest.projects.is_empty() || changed_metadata.is_some();
+        let metadata_changed = retry
+            || !policy_current
+            || self.manifest.projects.is_empty()
+            || changed_metadata.is_some();
         let sources_changed = changed_source.is_some();
         if cache_current && !metadata_changed && !sources_changed {
             self.fence = fence;
@@ -379,6 +435,7 @@ impl Workspace {
                 metadata: self.manifest.metadata.keys().cloned().collect(),
                 dependencies: self.manifest.dependencies.clone(),
                 diagnostics: self.manifest.diagnostics.clone(),
+                dependency_retry: self.manifest.dependency_retry,
             }
         };
         Ok(Some(Preparation {
@@ -421,6 +478,7 @@ impl Workspace {
             inputs: discovery.sources.clone(),
             dependencies: discovery.dependencies,
             diagnostics: discovery.diagnostics,
+            dependency_retry: discovery.dependency_retry,
         };
         for p in discovery.metadata {
             if p.is_dir() && managed.is_some_and(|root| p.starts_with(root)) {
