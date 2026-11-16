@@ -32,6 +32,8 @@ impl Reader<'_> {
     pub fn view(&self, path: &str, mode: Mode) -> Result<Option<String>> {
         self.leases.retain(self.root)?;
         self.leases.retain(self.cache)?;
+        let normalized = crate::navigation::normalize(path, self.root, !self.remote)?;
+        let path = normalized.as_str();
         let (selected, _) = crate::navigation::location(path)?;
         let mut projects = Vec::new();
         let mut observed = BTreeMap::new();
@@ -100,13 +102,15 @@ impl Reader<'_> {
                 }
             }
         }
-        let matches = crate::navigation::matches(candidates.keys().map(String::as_str), selected);
+        let matches =
+            crate::navigation::file_matches(candidates.keys().map(String::as_str), selected, mode);
         if matches.is_empty() {
+            ensure!(mode != Mode::Raw, "Asset source is unavailable");
             return Ok(None);
         }
         ensure!(
             matches.len() == 1 && candidates[matches[0]].len() == 1,
-            "Asset path is ambiguous across Unity projects"
+            "Asset path is ambiguous; use a full path or select a Unity project"
         );
         let logical = matches[0];
         let file = candidates[logical].first().unwrap();

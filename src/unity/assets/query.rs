@@ -405,8 +405,11 @@ impl Index {
             "Raw view requires a file path; Unity object IDs describe composed objects. Use exact or minified mode to inspect an object."
         );
         let (path, range) = crate::navigation::location(path)?;
-        let matches =
-            crate::navigation::matches(self.assets.values().map(|a| a.path.as_str()), path);
+        let matches = crate::navigation::file_matches(
+            self.assets.values().map(|a| a.path.as_str()),
+            path,
+            crate::navigation::Mode::Raw,
+        );
         let assets: Vec<_> = self
             .assets
             .values()
@@ -417,7 +420,7 @@ impl Index {
         }
         ensure!(
             assets.len() == 1,
-            "Asset path is ambiguous across Unity projects"
+            "Asset path is ambiguous; use a full path or select a Unity project"
         );
         let asset = assets[0];
         if asset.content.is_none() && asset.path.ends_with(".cs") {
@@ -551,8 +554,11 @@ impl Index {
             return Ok(Some(result));
         }
         let (path, range) = crate::navigation::location(path)?;
-        let paths: Vec<_> = self.assets.values().map(|a| a.path.as_str()).collect();
-        let matches = crate::navigation::matches(paths.into_iter(), path);
+        let matches = crate::navigation::file_matches(
+            self.assets.values().map(|a| a.path.as_str()),
+            path,
+            crate::navigation::Mode::Exact,
+        );
         let assets: Vec<_> = self
             .assets
             .values()
@@ -563,7 +569,7 @@ impl Index {
         }
         ensure!(
             assets.len() == 1,
-            "Asset path is ambiguous across Unity projects"
+            "Asset path is ambiguous; use a full path or select a Unity project"
         );
         let asset = assets[0];
         if let Some(reason) = &asset.unavailable {
@@ -752,6 +758,13 @@ mod tests {
             "  m_Name: Example"
         );
         assert!(index.view_raw(&handle("fixture", "1"), &()).is_err());
+        assert!(
+            index
+                .view_raw("Assets/Objcet.prefab", &())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(index.view_raw("Object", &()).unwrap().unwrap(), source);
     }
 
     fn search(index: &Index, needle: &str) -> Vec<(usize, SearchResult)> {

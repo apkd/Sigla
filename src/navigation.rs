@@ -45,6 +45,56 @@ mod tests {
         assert_eq!(matches(paths.into_iter(), "Othre.cs"), vec!["a/Other.cs"]);
         assert!(matches(paths.into_iter(), "NoSuchSource.rs").is_empty());
     }
+
+    #[test]
+    fn raw_paths_allow_literal_suffixes_and_stems_but_never_correct_spelling() {
+        let paths = ["docs/settings.toml", "src/Other.cs", "nested/Other.cs"];
+        for query in [
+            "docs/settings.yaml",
+            "docs/setting.toml",
+            "Othre.cs",
+            "docs/setti",
+        ] {
+            assert!(
+                file_matches(paths.into_iter(), query, Mode::Raw).is_empty(),
+                "{query}"
+            );
+        }
+        for query in [
+            "docs/settings.toml",
+            "settings.toml",
+            "SETTINGS.TOML",
+            "docs/settings",
+            "settings",
+        ] {
+            assert_eq!(
+                file_matches(paths.into_iter(), query, Mode::Raw),
+                [paths[0]],
+                "{query}"
+            );
+        }
+        assert_eq!(file_matches(paths.into_iter(), "Other", Mode::Raw).len(), 2);
+        assert_eq!(
+            file_matches(paths.into_iter(), "src/Othre.cs", Mode::Exact),
+            [paths[1]]
+        );
+    }
+
+    #[test]
+    fn file_aliases_preserve_literal_names_before_normalizing() {
+        for mode in [Mode::Raw, Mode::Exact, Mode::Minified] {
+            let paths = ["src/Other.cs", r"src\Other.cs", "…/src/Other.cs"];
+            for literal in paths {
+                assert_eq!(file_matches(paths.into_iter(), literal, mode), [literal]);
+            }
+            for alias in [r"src\Other.cs", "…/src/Other.cs"] {
+                assert_eq!(
+                    file_matches([paths[0]].into_iter(), alias, mode),
+                    [paths[0]]
+                );
+            }
+        }
+    }
     #[test]
     fn tree_is_complete_when_small_and_reports_omitted_descendants() {
         let small = [
@@ -168,23 +218,62 @@ pub fn normalize_indexed(
 
 /// All matches from the best qualifying tier; ranking never hides ambiguity.
 pub fn matches<'a>(paths: impl Iterator<Item = &'a str>, query: &str) -> Vec<&'a str> {
+    ranked_matches(paths, query, true)
+}
+
+/// Raw content has no resolved-path heading, so it cannot safely correct typos.
+pub(crate) fn file_matches<'a>(
+    paths: impl Iterator<Item = &'a str> + Clone,
+    query: &str,
+    mode: Mode,
+) -> Vec<&'a str> {
+    if !query.starts_with("…/") && !query.contains('\\') {
+        return ranked_matches(paths, query, mode != Mode::Raw);
+    }
+    // Pasted aliases must not hide an actual filename containing these characters.
+    let literal = ranked_matches(paths.clone(), query, false);
+    if !literal.is_empty() {
+        return literal;
+    }
+    let normalized = query.strip_prefix("…/").unwrap_or(query).replace('\\', "/");
+    ranked_matches(paths, &normalized, mode != Mode::Raw)
+}
+
+fn ranked_matches<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    query: &str,
+    fuzzy: bool,
+) -> Vec<&'a str> {
     if query.is_empty() {
         return Vec::new();
     }
     let lower = query.to_lowercase();
+    let suffix = format!("/{query}");
+    let lower_suffix = format!("/{lower}");
+    let stem_query = Path::new(query).extension().is_none();
     let mut best = u8::MAX;
     let mut found = Vec::new();
     for path in paths {
         let candidate = path.to_lowercase();
         let (tier, distance) = if path == query {
             (0, 0)
-        } else if path.ends_with(&format!("/{query}")) {
+        } else if path.ends_with(&suffix) {
             (1, 0)
-        } else if candidate == lower || candidate.ends_with(&format!("/{lower}")) {
+        } else if candidate == lower || candidate.ends_with(&lower_suffix) {
             (2, 0)
-        } else if candidate.contains(&lower) {
+        } else if candidate.contains(&lower)
+            && (fuzzy
+                || stem_query && {
+                    let stem = Path::new(&candidate).with_extension("");
+                    let stem = stem.to_string_lossy();
+                    stem == lower || stem.ends_with(&lower_suffix)
+                })
+        {
             (3, candidate.len() - lower.len())
         } else {
+            if !fuzzy {
+                continue;
+            }
             let segments = query.bytes().filter(|&b| b == b'/').count();
             let candidate = candidate
                 .rmatch_indices('/')

@@ -278,6 +278,12 @@ impl Sources<'_> {
         absolute: bool,
     ) -> Result<String> {
         self.check()?;
+        let normalized = if path.starts_with("unity@") {
+            path.to_owned()
+        } else {
+            crate::navigation::normalize(path, root, absolute)?
+        };
+        let path = normalized.as_str();
         if let Some(assets) = self.assets
             && let Some(text) = if mode == crate::navigation::Mode::Raw {
                 assets.view_raw(path, self.cancel)?
@@ -391,7 +397,8 @@ fn view<T>(
     let (path, file) = if let Some((path, file)) = files.get_key_value(&path) {
         (path.as_str(), file)
     } else {
-        let matches = crate::navigation::matches(files.keys().map(String::as_str), &path);
+        let matches =
+            crate::navigation::file_matches(files.keys().map(String::as_str), &path, mode);
         if mode == crate::navigation::Mode::Raw && matches.is_empty() {
             return Ok(None);
         }

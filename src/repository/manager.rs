@@ -1815,6 +1815,7 @@ impl Manager {
         &self,
         branch: &Branch,
         path: &str,
+        mode: crate::navigation::Mode,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
         self.sources_ready(branch).await?;
@@ -1831,10 +1832,10 @@ impl Manager {
             .filter(|path| crate::unity::assets::is_asset(Path::new(path)))
             .map(|path| (path.as_str(), ()))
             .collect();
-        let selected = crate::navigation::matches(paths.keys().copied(), path);
+        let selected = crate::navigation::file_matches(paths.keys().copied(), path, mode);
         ensure!(
             selected.len() <= 1,
-            "Asset path is ambiguous across Unity projects"
+            "Asset path is ambiguous; use a full path or select a Unity project"
         );
         if selected.is_empty() || !state.prepared.deferred_assets.contains(selected[0]) {
             return Ok(());

@@ -1,9 +1,9 @@
 //! Reset incompatible cache data while holding exclusive cache ownership.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -43,10 +43,32 @@ pub fn current(cache: &Path) -> Result<bool> {
 
 fn remove(path: &Path) -> std::io::Result<()> {
     if fs::symlink_metadata(path)?.file_type().is_dir() {
-        fs::remove_dir_all(path)
+        match fs::remove_dir_all(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                remove_restricted_directory(path)
+            }
+            result => result,
+        }
     } else {
         fs::remove_file(path)
     }
+}
+
+// OverlayFS leaves mode-000 work directories behind. Reset owns this tree
+// exclusively; change only directory permissions, never shared files or links.
+fn remove_restricted_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return fs::remove_file(path);
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    for entry in fs::read_dir(path)? {
+        remove_restricted_directory(&entry?.path())?;
+    }
+    fs::remove_dir(path)
 }
 
 fn prepare_with(
@@ -66,7 +88,8 @@ fn prepare_with(
     for entry in fs::read_dir(cache)? {
         let entry = entry?;
         if entry.file_name() != "ownership.lock" {
-            remove_entry(&entry.path())?;
+            remove_entry(&entry.path())
+                .with_context(|| format!("Cannot reset cache entry {}", entry.path().display()))?;
         }
     }
     File::open(cache)?.sync_all()?;
@@ -126,6 +149,40 @@ mod tests {
         assert!(prepare(root.path()).unwrap());
         assert!(!root.path().join("alias").exists());
         assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn reset_removes_restricted_directories_without_changing_external_files() {
+        check_restricted_cleanup(false);
+        // CI also runs as root, where the standard deletion can bypass mode 000.
+        check_restricted_cleanup(true);
+    }
+
+    fn check_restricted_cleanup(explicit_fallback: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let retained = outside.path().join("retained");
+        fs::write(&retained, b"shared").unwrap();
+        fs::set_permissions(&retained, fs::Permissions::from_mode(0o444)).unwrap();
+        let work = root
+            .path()
+            .join("repositories/old/generated/overlay-work/work");
+        fs::create_dir_all(&work).unwrap();
+        fs::hard_link(&retained, work.join("shared")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), work.join("outside")).unwrap();
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(work.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
+        if explicit_fallback {
+            remove_restricted_directory(&root.path().join("repositories")).unwrap();
+        }
+        assert!(prepare(root.path()).unwrap());
+        assert!(!root.path().join("repositories").exists());
+        assert_eq!(fs::read(&retained).unwrap(), b"shared");
+        assert_eq!(
+            fs::metadata(&retained).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert!(current(root.path()).unwrap());
     }
 
     #[test]

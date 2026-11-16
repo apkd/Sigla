@@ -226,7 +226,7 @@ impl App {
             let operation = operation.clone();
             tokio::spawn(async move {
                 let _activity = activity;
-                remote.asset_file(&branch, &path, &operation).await
+                remote.asset_file(&branch, &path, mode, &operation).await
             })
             .await??;
         }

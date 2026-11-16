@@ -1896,7 +1896,7 @@ impl Mcp {
         }
     }
 }
-#[tool_handler(router = self.tool_router, name = "sigla", version = "0.1.0")]
+#[tool_handler(router = self.tool_router, name = "sigla")]
 impl ServerHandler for Mcp {
     async fn call_tool(
         &self,
@@ -2028,6 +2028,11 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let source = "\u{feff}first\r\n```\r\nlast";
         std::fs::write(root.path().join("source.md"), source).unwrap();
+        std::fs::write(
+            root.path().join("settings.toml"),
+            "title = 'Other format'\n",
+        )
+        .unwrap();
         for directory in ["one", "two"] {
             std::fs::create_dir(root.path().join(directory)).unwrap();
             std::fs::write(root.path().join(directory).join("same.md"), "text").unwrap();
@@ -2047,6 +2052,9 @@ mod tests {
         for (path, expected) in [
             ("source.md", Some(source)),
             ("source.md:2-3", Some("```\r\nlast")),
+            ("source", Some(source)),
+            ("sourc.md", None),
+            ("settings.yaml", None),
             ("same.md", None),
             ("missing.md", None),
             ("unity@object", None),
@@ -2641,20 +2649,35 @@ mod tests {
         let pause_assets = app.assets.pause().await;
         let project = source.to_str().unwrap();
         for mode in ["raw", "exact", "minified"] {
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                app.view(project, "Selected.prefab", mode),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(result, asset);
+            for path in [
+                "Selected.prefab".to_owned(),
+                r"Assets\Selected.prefab".to_owned(),
+                "…/Assets/Selected.prefab".to_owned(),
+                root.path()
+                    .join("Assets/Selected.prefab")
+                    .to_string_lossy()
+                    .into_owned(),
+            ] {
+                let result =
+                    tokio::time::timeout(Duration::from_secs(5), app.view(project, &path, mode))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(result, asset);
+            }
         }
         let result = app
             .view(project, "Assets/Selected.prefab:4-4", "raw")
             .await
             .unwrap();
         assert_eq!(result, "  m_Name: Selected\n");
+        let missing = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.view(project, "Assets/Seleted.prefab", "raw"),
+        )
+        .await
+        .unwrap();
+        assert!(missing.is_err());
         assert_eq!(
             app.assets.stats().entries,
             0,
@@ -2667,6 +2690,16 @@ mod tests {
             .unwrap();
         assert!(result.contains("Selected"), "{result}");
         assert!(app.assets.stats().entries > 0);
+        for path in [
+            r"Assets\Selected".to_owned(),
+            "…/Assets/Selected".to_owned(),
+            root.path()
+                .join("Assets/Selected")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert_eq!(app.view(project, &path, "raw").await.unwrap(), asset);
+        }
         app.shutdown().await;
     }
 
