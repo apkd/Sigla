@@ -137,6 +137,54 @@ fn consume<T>(x: T) {}
 }
 
 #[tokio::test]
+async fn rust_imports_do_not_shadow_qualified_members() {
+    let f = Fixture::new(
+        "lib.rs",
+        r#"
+mod other { pub fn /*free*/parse() {} }
+mod parser {
+ pub struct Parser;
+ impl Parser {
+  pub fn /*associated*/parse() {}
+  pub fn /*method*/run(&self) {}
+ }
+}
+use other::parse;
+use other::parse as run;
+use parser::Parser as Alias;
+fn example(value: parser::Parser) {
+ crate::parser::Parser::/*qualified*/parse();
+ parser::Parser::/*relative*/parse();
+ Alias::/*type_alias*/parse();
+ value./*receiver*/run();
+ /*imported*/parse();
+ /*renamed*/run();
+}
+"#,
+    );
+    std::fs::write(
+        f.root.path().join("Cargo.toml"),
+        "[package]\nname='imports'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n",
+    )
+    .unwrap();
+    f.binds(
+        "/*associated*/",
+        &["/*qualified*/", "/*relative*/", "/*type_alias*/"],
+    )
+    .await;
+    f.binds("/*method*/", &["/*receiver*/"]).await;
+    f.binds("/*free*/", &["/*imported*/", "/*renamed*/"]).await;
+    let calls = f
+        .query(&format!("calls:{}", f.position("/*associated*/")))
+        .await;
+    for marker in ["/*qualified*/", "/*relative*/", "/*type_alias*/"] {
+        assert!(calls.contains(marker), "{calls}");
+    }
+    assert!(!calls.contains("/*imported*/"), "{calls}");
+    f.app.shutdown().await;
+}
+
+#[tokio::test]
 async fn cpp_while_condition_has_loop_scope() {
     let f = Fixture::new(
         "test.cpp",

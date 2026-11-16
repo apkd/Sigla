@@ -652,11 +652,10 @@ impl<'a> Search<'a> {
             )]);
         }
         let mut name = o.name.clone();
-        let alias = data
-            .facts
-            .imports
-            .iter()
-            .find(|i| i.alias == name && i.scope.contains(&o.span.start));
+        let alias =
+            data.facts.imports.iter().find(|i| {
+                o.receiver.is_empty() && i.alias == name && i.scope.contains(&o.span.start)
+            });
         if let Some(alias) = alias {
             name = alias.path.clone();
         }
