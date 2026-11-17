@@ -11,8 +11,11 @@ fn child<'a>(n: Node<'a>, kind: &str) -> Option<Node<'a>> {
     n.named_children(&mut c).find(|n| n.kind() == kind)
 }
 fn field(n: Node<'_>, name: &str, source: &str) -> String {
+    field_text(n, name, source).to_owned()
+}
+fn field_text<'a>(n: Node<'_>, name: &str, source: &'a str) -> &'a str {
     n.child_by_field_name(name)
-        .map(|n| text(n, source).to_owned())
+        .map(|n| text(n, source))
         .unwrap_or_default()
 }
 fn ancestor<'a>(parents: &[Node<'a>], kinds: &[&str]) -> Option<Node<'a>> {
@@ -181,7 +184,9 @@ fn extract_analysis(analysis: &str) -> Result<Facts> {
             });
         }
         if node.kind() == "identifier" || node.kind() == "predefined_type" {
-            occurrence(node, &parents, analysis, &mut facts);
+            facts
+                .occurrences
+                .extend(occurrence(node, &parents, analysis, false));
         }
         if node.kind() == "element_access_expression"
             && let Some(arguments) = node.child_by_field_name("subscript")
@@ -463,9 +468,17 @@ fn declaration<'a>(
     scopes.push(index, &facts.declarations[index], s);
 }
 
-fn occurrence<'tree>(n: Node<'tree>, mut parents: &[Node<'tree>], s: &str, facts: &mut Facts) {
+fn occurrence<'tree>(
+    n: Node<'tree>,
+    mut parents: &[Node<'tree>],
+    s: &str,
+    calls_only: bool,
+) -> Option<Occurrence> {
+    if calls_only && n.has_error() {
+        return None;
+    }
     let mut current = n;
-    let mut receiver = String::new();
+    let mut receiver = "";
     if let Some((&p, rest)) = parents.split_last()
         && p.kind() == "generic_name"
     {
@@ -477,7 +490,7 @@ fn occurrence<'tree>(n: Node<'tree>, mut parents: &[Node<'tree>], s: &str, facts
         && let Some((&conditional, rest)) = rest.split_last()
         && conditional.kind() == "conditional_access_expression"
     {
-        receiver = field(conditional, "condition", s);
+        receiver = field_text(conditional, "condition", s);
         current = conditional;
         parents = rest;
     }
@@ -487,9 +500,9 @@ fn occurrence<'tree>(n: Node<'tree>, mut parents: &[Node<'tree>], s: &str, facts
             .or_else(|| p.child_by_field_name("right"))
             .is_some_and(|name| name.byte_range().contains(&n.start_byte()))
     {
-        receiver = field(p, "expression", s);
+        receiver = field_text(p, "expression", s);
         if receiver.is_empty() {
-            receiver = field(p, "qualifier", s);
+            receiver = field_text(p, "qualifier", s);
         }
         current = p;
         parents = rest;
@@ -538,17 +551,20 @@ fn occurrence<'tree>(n: Node<'tree>, mut parents: &[Node<'tree>], s: &str, facts
                 .unwrap_or(write);
         }
     }
-    facts.occurrences.push(Occurrence {
+    if calls_only && !call {
+        return None;
+    }
+    Some(Occurrence {
         role: crate::model::OccurrenceRole::Value,
         name: normalize_name(text(n, s)),
         span: n.byte_range(),
         call,
         construction,
         write,
-        receiver,
+        receiver: receiver.to_owned(),
         arguments,
         opaque: n.has_error(),
-    });
+    })
 }
 
 #[cfg(test)]

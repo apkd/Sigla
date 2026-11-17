@@ -263,14 +263,9 @@ fn parse(tree: &tree_sitter::Tree, analysis: &str, guard: Guard, calls: bool) ->
             scopes.push(before, &facts.declarations[before], analysis);
         }
         if calls && matches!(node.kind(), "identifier" | "predefined_type") {
-            occurrence(node, &parents, analysis, &mut facts);
-            if facts
+            facts
                 .occurrences
-                .last()
-                .is_some_and(|o| !o.call || o.opaque)
-            {
-                facts.occurrences.pop();
-            }
+                .extend(occurrence(node, &parents, analysis, true));
         }
         if node.child_count() == 0 && node.kind() != "comment" && !node.is_missing() {
             tokens.push(node.byte_range());
