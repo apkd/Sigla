@@ -802,12 +802,11 @@ pub(crate) fn allocated_with_owners(
     }
 
     fn record<T: Ownership>(
-        path: &Path,
         metadata: &fs::Metadata,
         category: u32,
         repository: Option<u32>,
         inodes: &mut BTreeMap<(u64, u64), Inode<T>>,
-        owner_roots: &BTreeMap<PathBuf, Vec<u32>>,
+        owners: &[u32],
     ) {
         let inode = inodes
             .entry((metadata.dev(), metadata.ino()))
@@ -816,14 +815,8 @@ pub(crate) fn allocated_with_owners(
                 tags: Tags::new(),
                 owners: T::default(),
             });
-        if !owner_roots.is_empty() {
-            for ancestor in path.ancestors() {
-                if let Some(owners) = owner_roots.get(ancestor) {
-                    for &owner in owners {
-                        inode.owners.insert(owner);
-                    }
-                }
-            }
+        for &owner in owners {
+            inode.owners.insert(owner);
         }
         if let Some(repository) = repository {
             if inode.tags.first == NONE || inode.tags.first & CATEGORY != 0 {
@@ -842,7 +835,7 @@ pub(crate) fn allocated_with_owners(
         inherited_repository: Option<u32>,
         repository_roots: &BTreeMap<PathBuf, u32>,
         inodes: &mut BTreeMap<(u64, u64), Inode<T>>,
-        owner_roots: &BTreeMap<PathBuf, Vec<u32>>,
+        (owner_roots, inherited_owners): (&BTreeMap<PathBuf, Vec<u32>>, &[u32]),
     ) -> Result<()> {
         let metadata = match metadata {
             Ok(metadata) => metadata,
@@ -852,7 +845,17 @@ pub(crate) fn allocated_with_owners(
             }
         };
         let repository = repository_roots.get(path).copied().or(inherited_repository);
-        record(path, &metadata, category, repository, inodes, owner_roots);
+        let owners = match owner_roots.get(path) {
+            Some(owners) => std::borrow::Cow::Owned(
+                inherited_owners
+                    .iter()
+                    .chain(owners)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
+            None => std::borrow::Cow::Borrowed(inherited_owners),
+        };
+        record(&metadata, category, repository, inodes, &owners);
         if metadata.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
@@ -878,7 +881,7 @@ pub(crate) fn allocated_with_owners(
                     repository,
                     repository_roots,
                     inodes,
-                    owner_roots,
+                    (owner_roots, &owners),
                 )?;
             }
         }
@@ -959,14 +962,14 @@ pub(crate) fn allocated_with_owners(
         let mut category_ids = BTreeMap::new();
         let other = intern("other".to_owned(), &mut category_names, &mut category_ids)?;
         let root_repository = repository_roots.get(root).copied();
+        let root_owners = owner_roots.get(root).map_or(&[][..], Vec::as_slice);
         let mut inodes = BTreeMap::<(u64, u64), Inode<T>>::new();
         record(
-            root,
             &root_metadata,
             other,
             root_repository,
             &mut inodes,
-            &owner_roots,
+            root_owners,
         );
         let mut repo_bytes = vec![0u64; repository_names.len()];
         let mut shared_bytes = vec![0u64; category_names.len()];
@@ -999,7 +1002,7 @@ pub(crate) fn allocated_with_owners(
                     root_repository,
                     &repository_roots,
                     &mut inodes,
-                    &owner_roots,
+                    (&owner_roots, root_owners),
                 )?;
             }
         }
@@ -1248,6 +1251,7 @@ mod tests {
             (repo_b.clone(), "repository-b".into()),
         ]);
         let owners = vec![
+            (root.join("owner-root"), vec![root.to_owned()]),
             (
                 root.join("owner-a"),
                 vec![repo_a.clone(), nested.clone(), repo_a.clone()],
