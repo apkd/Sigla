@@ -158,6 +158,11 @@ pub(super) fn load(
                 .is_none_or(super::records::available)),
             "Asset records are unavailable"
         );
+        for asset in index.assets.values_mut() {
+            if let Some(content) = &asset.content {
+                asset.objects = super::records::intern(content, asset.objects.clone());
+            }
+        }
         let objects: BTreeMap<_, _> = index
             .assets
             .iter()
@@ -297,6 +302,46 @@ mod tests {
     }
 
     #[test]
+    fn restored_records_share_live_definitions_before_composition() {
+        let cache = tempfile::tempdir().unwrap();
+        let source = cache.path().join("Object.prefab");
+        std::fs::write(&source, "--- !u!1 &7\nGameObject:\n  m_Name: Shared\n").unwrap();
+        let record = super::super::records::load(
+            cache.path(),
+            None,
+            &source,
+            &Stamp::read(&source).unwrap(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let mut index = Index::default();
+        index.assets.insert(
+            "asset".into(),
+            Asset {
+                project: "project".into(),
+                path: "Object.prefab".into(),
+                guid: "guid".into(),
+                objects: record.objects,
+                content: record.content,
+                unavailable: None,
+            },
+        );
+        compose::build(&mut index).unwrap();
+        save(cache.path(), [1; 32], &index).unwrap();
+        let restored = load(cache.path(), [1; 32], &()).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            &index.assets["asset"].objects,
+            &restored.assets["asset"].objects
+        ));
+        let instance = &restored.instances["asset"].objects[0];
+        assert!(Arc::ptr_eq(
+            &instance.object,
+            &index.assets["asset"].objects[0]
+        ));
+        assert_eq!(instance.name, index.instances["asset"].objects[0].name);
+    }
+
+    #[test]
     fn borrowed_snapshot_preserves_the_owned_record_format() {
         let object = Arc::new(super::super::parse::Object {
             id: 7,
@@ -315,7 +360,7 @@ mod tests {
                 project: "project".into(),
                 path: "Assets/Object.prefab".into(),
                 guid: "guid".into(),
-                objects: vec![object.clone()],
+                objects: Arc::new(vec![object.clone()]),
                 content: None,
                 unavailable: None,
             },

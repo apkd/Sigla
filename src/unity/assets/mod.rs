@@ -36,7 +36,7 @@ pub struct Asset {
     pub project: String,
     pub path: String,
     pub guid: String,
-    pub objects: Vec<std::sync::Arc<Object>>,
+    pub objects: std::sync::Arc<Vec<std::sync::Arc<Object>>>,
     pub content: Option<PathBuf>,
     pub unavailable: Option<String>,
 }
@@ -49,6 +49,7 @@ pub struct Index {
     native_types: BTreeMap<String, BTreeMap<i32, native::Resolved>>,
     observed: BTreeMap<PathBuf, Stamp>,
     retained_bytes: usize,
+    retained_records: BTreeMap<usize, usize>,
 }
 impl Index {
     fn current(&self, cancel: &dyn crate::cancellation::Cancellation) -> Result<bool> {
@@ -99,13 +100,26 @@ impl Index {
                 count_shared(native.ty.as_ref(), native.issue.as_ref());
             }
         }
+        // Distinct public vectors can overlap individual objects. Charge those
+        // groups independently while reusing their composed references.
+        self.retained_records.clear();
         for (key, asset) in &self.assets {
             bytes += 256 + key.len() + asset.project.len() + asset.path.len() + asset.guid.len();
-            for object in &asset.objects {
-                if objects.insert(std::sync::Arc::as_ptr(object)) {
-                    bytes += crate::memory::encoded_size(object) * 3;
+            let identity = std::sync::Arc::as_ptr(&asset.objects) as usize;
+            self.retained_records.entry(identity).or_insert_with(|| {
+                let mut unique = std::collections::HashSet::new();
+                let mut size = 2 * std::mem::size_of::<usize>()
+                    + std::mem::size_of::<Vec<std::sync::Arc<Object>>>()
+                    + asset.objects.capacity() * std::mem::size_of::<std::sync::Arc<Object>>();
+                for object in asset.objects.iter() {
+                    let identity = std::sync::Arc::as_ptr(object);
+                    objects.insert(identity);
+                    if unique.insert(identity) {
+                        size += crate::memory::encoded_size(object) * 3;
+                    }
                 }
-            }
+                size
+            });
         }
         for (key, composed) in &self.instances {
             bytes += 128
@@ -126,7 +140,11 @@ impl Index {
                 }
             }
         }
-        self.retained_bytes = bytes + type_bytes + issue_bytes;
+        self.retained_bytes = bytes
+            + type_bytes
+            + issue_bytes
+            + self.retained_records.len() * 64
+            + self.retained_records.values().sum::<usize>();
         tracing::debug!(
             retained_bytes = self.retained_bytes,
             shared_types = types.len(),
@@ -136,6 +154,17 @@ impl Index {
             elapsed_ms = started.elapsed().as_millis(),
             "Unity asset allocations measured"
         );
+    }
+    fn private_bytes(&self) -> usize {
+        self.retained_bytes - self.retained_records.values().sum::<usize>()
+    }
+    fn retained_with(&self, seen: &mut std::collections::HashSet<usize>) -> usize {
+        self.private_bytes()
+            + self
+                .retained_records
+                .iter()
+                .filter_map(|(key, bytes)| seen.insert(*key).then_some(*bytes))
+                .sum::<usize>()
     }
 }
 
@@ -534,7 +563,7 @@ pub fn build(
                     project: project_name.clone(),
                     path: logical,
                     guid: String::new(),
-                    objects: Vec::new(),
+                    objects: records::empty(),
                     content: None,
                     unavailable: None,
                 });
@@ -606,7 +635,7 @@ pub fn build(
                     project: name.into(),
                     path: path.clone(),
                     guid: String::new(),
-                    objects: Vec::new(),
+                    objects: records::empty(),
                     content: None,
                     unavailable: Some(reason.clone()),
                 },

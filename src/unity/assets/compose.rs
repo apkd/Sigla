@@ -109,7 +109,7 @@ fn compose(
     if let Some(reason) = &asset.unavailable {
         result.incomplete.push(format!("{}: {reason}", asset.path));
     }
-    for object in &asset.objects {
+    for object in asset.objects.iter() {
         if object.stripped || object.prefab.is_some() {
             continue;
         }
@@ -450,7 +450,8 @@ mod tests {
                     .objects
                     .into_iter()
                     .map(Arc::new)
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
                 content: None,
                 unavailable: None,
             },
@@ -474,7 +475,7 @@ mod tests {
                     project: ".".into(),
                     path: path.into(),
                     guid: guid.into(),
-                    objects: Vec::new(),
+                    objects: Default::default(),
                     content: None,
                     unavailable: None,
                 },
@@ -638,7 +639,7 @@ mod tests {
             let actual = &saved.instances[key];
             assert_eq!(actual.aliases, expected.aliases);
             assert_eq!(actual.objects.len(), expected.objects.len());
-            for (actual, expected) in actual.objects.iter().zip(&expected.objects) {
+            for (actual, expected) in actual.objects.iter().zip(expected.objects.iter()) {
                 assert_eq!(actual.references, expected.references);
                 assert_eq!(actual.name, expected.name);
                 let definition = saved.assets[&actual.definition]

@@ -162,7 +162,7 @@ impl Reader<'_> {
             project: String::new(),
             path: logical.into(),
             guid: String::new(),
-            objects: Vec::new(),
+            objects: super::records::empty(),
             content: None,
             unavailable: self.unavailable(logical).map(str::to_owned),
         };

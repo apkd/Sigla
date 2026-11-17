@@ -103,12 +103,14 @@ impl Jobs {
             entries: jobs.len(),
             ..Default::default()
         };
+        let mut retained = std::collections::HashSet::new();
+        let mut pinned = std::collections::HashSet::new();
         for job in jobs.values() {
             let outcome = job.ticket.borrow();
             if let Some(result) = outcome.as_ref() {
                 let bytes = result
                     .as_ref()
-                    .map_or(256, |index| index.retained_bytes + 256)
+                    .map_or(256, |index| index.retained_with(&mut retained) + 256)
                     as u64;
                 stats.retained_bytes += bytes;
                 if Arc::strong_count(&job.ticket.outcome) > 1
@@ -116,7 +118,10 @@ impl Jobs {
                         .as_ref()
                         .is_ok_and(|index| Arc::strong_count(index) > 1)
                 {
-                    stats.pinned_bytes += bytes;
+                    stats.pinned_bytes += result
+                        .as_ref()
+                        .map_or(256, |index| index.retained_with(&mut pinned) + 256)
+                        as u64;
                 }
             } else {
                 stats.active_entries += 1;
@@ -130,16 +135,23 @@ impl Jobs {
     }
     pub fn trim_to(&self, limit: usize) {
         let mut jobs = self.running.lock().unwrap();
+        let mut records = HashMap::<usize, (usize, usize)>::new();
         let mut completed: Vec<_> = jobs
             .iter()
             .filter_map(|(key, job)| {
                 job.ticket.borrow().as_ref().map(|result| {
+                    if let Ok(index) = result {
+                        for (&identity, &bytes) in &index.retained_records {
+                            let entry = records.entry(identity).or_insert((bytes, 0));
+                            entry.1 += 1;
+                        }
+                    }
                     (
                         key.clone(),
                         job.used,
                         result
                             .as_ref()
-                            .map_or(256, |index| index.retained_bytes + 256),
+                            .map_or(256, |index| index.private_bytes() + 256),
                         Arc::strong_count(&job.ticket.outcome) == 1
                             && result
                                 .as_ref()
@@ -149,7 +161,8 @@ impl Jobs {
             })
             .collect();
         completed.sort_by_key(|(_, used, _, _)| *used);
-        let mut bytes: usize = completed.iter().map(|(_, _, size, _)| size).sum();
+        let mut bytes: usize = completed.iter().map(|(_, _, size, _)| size).sum::<usize>()
+            + records.values().map(|(size, _)| size).sum::<usize>();
         let mut retired = Vec::new();
         for (key, _, size, idle) in completed {
             if bytes <= limit {
@@ -159,7 +172,17 @@ impl Jobs {
                 continue;
             }
             tracing::debug!(workspace = %key.display(), retained_bytes = size, total_bytes = bytes, budget_bytes = limit, "Evicting Unity asset index");
-            retired.push(jobs.remove(&key).unwrap());
+            let job = jobs.remove(&key).unwrap();
+            if let Some(Ok(index)) = job.ticket.borrow().as_ref() {
+                for identity in index.retained_records.keys() {
+                    let (shared_bytes, owners) = records.get_mut(identity).unwrap();
+                    *owners -= 1;
+                    if *owners == 0 {
+                        bytes -= *shared_bytes;
+                    }
+                }
+            }
+            retired.push(job);
             bytes -= size;
         }
         // Large graphs can take time to free. Let unrelated roots start first.
@@ -507,6 +530,76 @@ mod tests {
         assert_eq!(jobs.stats().retained_bytes, 0);
     }
 
+    #[test]
+    fn budgets_count_shared_records_once_and_preserve_pinned_owners() {
+        let objects = Arc::new(
+            super::super::parse::parse("--- !u!1 &1\nGameObject:\n  m_Name: Shared\n")
+                .unwrap()
+                .objects
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
+        );
+        let make_index = |objects| {
+            let mut index = Index::default();
+            index.assets.insert(
+                "asset".into(),
+                super::super::Asset {
+                    project: String::new(),
+                    path: String::new(),
+                    guid: String::new(),
+                    objects,
+                    content: None,
+                    unavailable: None,
+                },
+            );
+            index.measure();
+            index
+        };
+        let first = make_index(objects.clone());
+        let full = first.retained_bytes + 256;
+        let private = first.private_bytes() + 256;
+        let mut overlapping = make_index(objects.clone());
+        let mut duplicate = overlapping.assets["asset"].clone();
+        duplicate.objects = Arc::new((*objects).clone());
+        overlapping.assets.insert("duplicate".into(), duplicate);
+        overlapping.measure();
+        assert_eq!(overlapping.retained_records.len(), 2);
+        assert!(overlapping.retained_bytes >= first.retained_bytes);
+        let jobs = Jobs::default();
+        let mut pinned = None;
+        for (key, index) in [("first", first), ("second", make_index(objects))] {
+            let (_, outcome) = watch::channel(Some(Ok(Arc::new(index))));
+            let ticket = Ticket {
+                outcome: Arc::new(outcome),
+                telemetry_id: None,
+            };
+            if key == "second" {
+                pinned = Some(ticket.clone());
+            }
+            jobs.running.lock().unwrap().insert(
+                key.into(),
+                Job {
+                    generation: [0; 32],
+                    ticket,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    used: std::time::Instant::now(),
+                    retry_after: std::time::Instant::now(),
+                },
+            );
+        }
+        assert_eq!(jobs.stats().retained_bytes, (full + private) as u64);
+        assert_eq!(jobs.stats().pinned_bytes, full as u64);
+        jobs.trim_to(full);
+        assert_eq!(jobs.stats().entries, 1);
+        assert_eq!(jobs.stats().retained_bytes, full as u64);
+        jobs.trim_completed();
+        assert_eq!(jobs.stats().entries, 1);
+        drop(pinned);
+        jobs.trim_completed();
+        assert_eq!(jobs.stats().retained_bytes, 0);
+    }
+
     #[tokio::test]
     async fn concurrent_waiters_observe_the_same_publication() {
         use std::{future::Future, task::Poll};
@@ -672,7 +765,7 @@ mod tests {
                 project: "project".into(),
                 path: "Assets/SnapshotOnly.prefab".into(),
                 guid: "guid".into(),
-                objects: Vec::new(),
+                objects: Default::default(),
                 content: None,
                 unavailable: None,
             },

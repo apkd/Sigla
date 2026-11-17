@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -20,9 +20,50 @@ struct Cached {
 }
 
 pub(super) struct Record {
-    pub objects: Vec<Arc<Object>>,
+    pub objects: Arc<Vec<Arc<Object>>>,
     pub content: Option<PathBuf>,
     pub unavailable: Option<String>,
+}
+
+type Objects = Arc<Vec<Arc<Object>>>;
+type ObjectCache = lru::LruCache<std::ffi::OsString, Weak<Vec<Arc<Object>>>>;
+pub(super) fn empty() -> Objects {
+    static EMPTY: LazyLock<Objects> = LazyLock::new(|| Arc::new(Vec::new()));
+    EMPTY.clone()
+}
+// Weak Vec owners release the object array when the last index retires. Only
+// small weak entries remain, bounded independently of the live graph budget.
+static OBJECTS: LazyLock<Mutex<ObjectCache>> = LazyLock::new(|| {
+    Mutex::new(lru::LruCache::new(
+        std::num::NonZeroUsize::new(16_384).unwrap(),
+    ))
+});
+
+fn shared(path: &Path) -> Option<Objects> {
+    OBJECTS
+        .lock()
+        .unwrap()
+        .get(path.file_name().unwrap())
+        .and_then(Weak::upgrade)
+}
+
+pub(super) fn intern(path: &Path, objects: Objects) -> Objects {
+    if objects.is_empty() {
+        return empty();
+    }
+    let existing = {
+        let mut cache = OBJECTS.lock().unwrap();
+        let key = path.file_name().unwrap();
+        match cache.get(key).and_then(Weak::upgrade) {
+            Some(existing) => Some(existing),
+            None => {
+                cache.put(key.to_owned(), Arc::downgrade(&objects));
+                None
+            }
+        }
+    };
+    // Release a racing duplicate graph after unlocking the cache.
+    existing.unwrap_or(objects)
 }
 
 pub(super) fn load(
@@ -60,6 +101,17 @@ pub(super) fn load(
     if let Some(shared) = shared {
         shared.restore(&text)?;
         shared.restore(&record)?;
+    }
+    if record.is_file()
+        && text.is_file()
+        && let Some(objects) = self::shared(&text)
+    {
+        cancel.check()?;
+        return Ok(Record {
+            objects,
+            content: Some(text),
+            unavailable: None,
+        });
     }
     let cached = read::<Cached>(&record, cancel)
         .ok()
@@ -112,8 +164,16 @@ pub(super) fn load(
         }
         cached
     };
+    let objects = Arc::new(cached.parsed.objects.into_iter().map(Arc::new).collect());
+    let objects = if cached.unavailable.is_none() {
+        intern(&text, objects)
+    } else if objects.is_empty() {
+        empty()
+    } else {
+        objects
+    };
     Ok(Record {
-        objects: cached.parsed.objects.into_iter().map(Arc::new).collect(),
+        objects,
         content: cached.unavailable.is_none().then_some(text),
         unavailable: cached.unavailable,
     })
@@ -205,10 +265,14 @@ mod tests {
         let second = tempfile::tempdir_in(root.path()).unwrap();
         let cancel = CancellationToken::new();
         let mut paths = Vec::new();
-        let text = "--- !u!1 &1\nGameObject:\n  m_Name: Example\n";
+        let mut objects = Vec::new();
+        let text = format!(
+            "--- !u!1 &1\nGameObject:\n  m_Name: {}\n",
+            root.path().display()
+        );
         for view in [&first, &second] {
             let source = view.path().join("Object.prefab");
-            std::fs::write(&source, text).unwrap();
+            std::fs::write(&source, &text).unwrap();
             let record = load(
                 view.path(),
                 Some(&shared),
@@ -218,7 +282,16 @@ mod tests {
             )
             .unwrap();
             paths.push(record.content.unwrap());
+            objects.push(record.objects);
         }
+        assert!(Arc::ptr_eq(&objects[0], &objects[1]));
+        assert_ne!(paths[0], paths[1]);
+        let weak = Arc::downgrade(&objects[0]);
+        drop(objects);
+        assert!(
+            weak.upgrade().is_none(),
+            "the shared cache must not retain objects"
+        );
         assert_eq!(
             std::fs::metadata(&paths[0]).unwrap().ino(),
             std::fs::metadata(&paths[1]).unwrap().ino()
@@ -237,6 +310,35 @@ mod tests {
         );
         drop(second);
         assert!(shared.collect(true).unwrap() > 0);
+    }
+
+    #[test]
+    fn concurrent_record_publications_share_objects() {
+        let cache = tempfile::tempdir().unwrap();
+        let key = cache.path().file_name().unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let objects = std::thread::scope(|scope| {
+            (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let objects = Arc::new(
+                            parse::parse("--- !u!1 &1\nGameObject:\n  m_Name: Shared\n")
+                                .unwrap()
+                                .objects
+                                .into_iter()
+                                .map(Arc::new)
+                                .collect(),
+                        );
+                        barrier.wait();
+                        intern(Path::new(key), objects)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(objects.iter().all(|value| Arc::ptr_eq(value, &objects[0])));
     }
 
     #[test]

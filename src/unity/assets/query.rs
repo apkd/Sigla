@@ -688,7 +688,7 @@ mod tests {
             project: project.into(),
             path: path.into(),
             guid: String::new(),
-            objects: Vec::new(),
+            objects: Default::default(),
             content: None,
             unavailable: None,
         });
