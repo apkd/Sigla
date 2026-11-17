@@ -121,13 +121,38 @@ pub struct Prepared {
     pub directories: BTreeSet<String>,
 }
 
+impl Prepared {
+    /// A later materialization rebuilds selection and availability from the tree.
+    pub(super) fn inventory(&self) -> Self {
+        Self {
+            deferred_assets: BTreeSet::new(),
+            omitted: BTreeMap::new(),
+            unavailable: BTreeSet::new(),
+            selected: BTreeMap::new(),
+            transfer_bytes: self.transfer_bytes,
+            transport: self.transport.clone(),
+            resolved_target: self.resolved_target.clone(),
+            branch: self.branch.clone(),
+            revision: self.revision.clone(),
+            tracked: self.tracked.clone(),
+            directories: self.directories.clone(),
+        }
+    }
+}
+
 /// Provenance accompanies inventories reused by a later acquisition job.
 #[derive(Clone, Serialize, Deserialize)]
-pub(super) struct Pinned {
+pub(super) struct Inventory {
     pub repository: super::Identity,
     pub policy: String,
     pub subdirectory: Option<String>,
     pub prepared: Prepared,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) enum Reuse {
+    Pinned(Inventory),
+    Previous(Inventory),
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -484,13 +509,13 @@ fn cached_tree_inventory(store: &Path, revision: &str, listing: &File) -> Result
 
 pub(super) fn prepare(
     request: &Request,
-    pinned: Option<Pinned>,
+    reuse: Option<Reuse>,
     cache: &Path,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
     prepare_inventory(
         request,
-        pinned,
+        reuse,
         cache,
         |repository| {
             Session::connect(
@@ -519,20 +544,32 @@ fn prepare_with(
 
 fn prepare_inventory(
     request: &Request,
-    pinned: Option<Pinned>,
+    reuse: Option<Reuse>,
     cache: &Path,
     connect: impl Fn(&Repository) -> Result<Session>,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
-    if let Some(pinned) = pinned {
+    if let Some(reuse) = reuse {
+        let inventory = match &reuse {
+            Reuse::Pinned(inventory) | Reuse::Previous(inventory) => inventory,
+        };
         let repository =
             Repository::parse(&request.repository)?.context("Expected a repository identifier")?;
         ensure!(
             repository.selector.is_none()
-                && repository.identity == pinned.repository
-                && Selection::new(&request.include, &request.exclude)?.identity == pinned.policy
-                && request.subdirectory == pinned.subdirectory
-                && request.target == Target::Commit(pinned.prepared.revision.clone())
+                && repository.identity == inventory.repository
+                && Selection::new(&request.include, &request.exclude)?.identity == inventory.policy
+                && request.subdirectory == inventory.subdirectory,
+            "Repository inventory does not match acquisition"
+        );
+        let pinned = match reuse {
+            Reuse::Pinned(pinned) => pinned,
+            Reuse::Previous(previous) => {
+                return prepare_fresh(request, Some(previous.prepared), cache, connect, metrics);
+            }
+        };
+        ensure!(
+            request.target == Target::Commit(pinned.prepared.revision.clone())
                 && request.transfer_used >= pinned.prepared.transfer_bytes,
             "Pinned repository inventory does not match acquisition"
         );
@@ -542,16 +579,17 @@ fn prepare_inventory(
             prepared.transfer_bytes = request.transfer_used;
             return materialize_inventory(request, &repository, prepared, cache, connect, metrics);
         }
-        let mut prepared = prepare_fresh(request, cache, connect, metrics)?;
+        let mut prepared = prepare_fresh(request, None, cache, connect, metrics)?;
         prepared.branch = pinned.prepared.branch;
         prepared.resolved_target = pinned.prepared.resolved_target;
         return Ok(prepared);
     }
-    prepare_fresh(request, cache, connect, metrics)
+    prepare_fresh(request, None, cache, connect, metrics)
 }
 
 fn prepare_fresh(
     request: &Request,
+    previous: Option<Prepared>,
     cache: &Path,
     connect: impl Fn(&Repository) -> Result<Session>,
     metrics: &mut Metrics,
@@ -562,6 +600,7 @@ fn prepare_fresh(
         repository.selector.is_none(),
         "Internal transport must not contain a fragment"
     );
+    let store_exists = request.store.join("HEAD").is_file();
     let mut session = connect(&repository)?;
     let resolved = super::revision::resolve(&mut session, &request.target, |session, prefix| {
         super::revision::init(&request.store, session.object_format()?)?;
@@ -594,6 +633,18 @@ fn prepare_fresh(
             tracked: BTreeMap::new(),
             directories: BTreeSet::new(),
         });
+    }
+    if store_exists
+        && let Some(mut previous) = previous
+        && previous.revision == revision
+    {
+        previous.branch = branch;
+        previous.resolved_target = resolved_target;
+        previous.transport = session.endpoint.clone();
+        previous.transfer_bytes = request.transfer_used + resolved.bytes;
+        drop(session);
+        metrics.inventory_reused = true;
+        return materialize_inventory(request, &repository, previous, cache, connect, metrics);
     }
     if !request.store.join("HEAD").is_file() {
         fs::create_dir_all(&request.store)?;
@@ -979,8 +1030,8 @@ fn materialize_inventory(
 mod tests {
     use super::*;
 
-    fn pinned(request: &Request, prepared: Prepared) -> Pinned {
-        Pinned {
+    fn pinned(request: &Request, prepared: Prepared) -> Reuse {
+        Reuse::Pinned(Inventory {
             repository: Repository::parse(&request.repository)
                 .unwrap()
                 .unwrap()
@@ -990,7 +1041,7 @@ mod tests {
                 .identity,
             subdirectory: request.subdirectory.clone(),
             prepared,
-        }
+        })
     }
 
     #[test]
@@ -1120,6 +1171,115 @@ mod tests {
             fs::read(request.staging.join("Code.cs")).unwrap(),
             fs::read(upstream_path.join("Code.cs")).unwrap()
         );
+    }
+
+    #[test]
+    fn previous_inventory_resolves_refs_and_repairs_selected_files() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let mut request = request(root.path());
+        let first = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        let Reuse::Pinned(inventory) = pinned(&request, first.clone()) else {
+            unreachable!()
+        };
+        request.previous = first.selected.clone();
+        request.previous.remove("Code.cs");
+        request.previous.remove("asset.bin");
+        request.required.push("asset.bin".into());
+        request.staging = root.path().join("repair");
+        let mut metrics = Metrics::default();
+        let connections = std::cell::Cell::new(0);
+        let repaired = prepare_inventory(
+            &request,
+            Some(Reuse::Previous(inventory.clone())),
+            root.path(),
+            |_| {
+                connections.set(connections.get() + 1);
+                Session::local(&upstream_path)
+            },
+            &mut metrics,
+        )
+        .unwrap();
+        assert!(connections.get() > 0, "live refs must be resolved");
+        assert!(metrics.inventory_reused);
+        assert_eq!(repaired.revision, first.revision);
+        assert!(
+            repaired.transfer_bytes > 0,
+            "newly required blobs must be fetched"
+        );
+        for path in ["Code.cs", "asset.bin"] {
+            assert_eq!(
+                fs::read(request.staging.join(path)).unwrap(),
+                fs::read(upstream_path.join(path)).unwrap()
+            );
+        }
+        request.staging = root.path().join("cached-repair");
+        let cached = prepare_inventory(
+            &request,
+            Some(Reuse::Previous(inventory.clone())),
+            root.path(),
+            |_| Session::local(&upstream_path),
+            &mut Metrics::default(),
+        )
+        .unwrap();
+        assert_eq!(cached.selected, repaired.selected);
+        assert_eq!(
+            cached.transfer_bytes, 0,
+            "earlier transfers are not charged again"
+        );
+
+        fs::write(upstream_path.join("Added.rs"), "fn added() {}\n").unwrap();
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&upstream_path)
+            .args(["add", "Added.rs"]))
+        .unwrap();
+        run(Command::new("git").arg("-C").arg(&upstream_path).args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Extend fixture sources\n\nAdd a Rust source to move the branch.",
+        ]))
+        .unwrap();
+        // Warm the newer tree too: a cached commit is not proof that refs stayed fixed.
+        request.staging = root.path().join("fresh");
+        let fresh = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+        request.staging = root.path().join("moved");
+        let mut metrics = Metrics::default();
+        let moved = prepare_inventory(
+            &request,
+            Some(Reuse::Previous(inventory.clone())),
+            root.path(),
+            |_| Session::local(&upstream_path),
+            &mut metrics,
+        )
+        .unwrap();
+        assert!(!metrics.inventory_reused);
+        assert_ne!(moved.revision, first.revision);
+        assert_eq!(moved.revision, fresh.revision);
+        assert_eq!(moved.tracked, fresh.tracked);
+        assert_eq!(moved.selected, fresh.selected);
+
+        request.target = Target::Commit(first.revision.clone());
+        request.store = root.path().join("absent-store");
+        request.staging = root.path().join("restored-previous");
+        let mut metrics = Metrics::default();
+        let restored = prepare_inventory(
+            &request,
+            Some(Reuse::Previous(inventory)),
+            root.path(),
+            |_| Session::local(&upstream_path),
+            &mut metrics,
+        )
+        .unwrap();
+        assert!(!metrics.inventory_reused);
+        assert_eq!(restored.revision, first.revision);
+        assert!(restored.transfer_bytes > 0);
     }
 
     fn write_object(store: &Path, kind: &str, contents: &[u8]) -> String {

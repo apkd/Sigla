@@ -2024,12 +2024,12 @@ impl Manager {
         let staged = stage.clone();
         let worker_staging = staging.clone();
         let worker_telemetry = telemetry.clone();
-        let pinned = super::materialize::Pinned {
+        let pinned = super::materialize::Reuse::Pinned(super::materialize::Inventory {
             repository: before.repository.clone(),
             policy: before.policy.clone(),
             subdirectory: None,
-            prepared: before.prepared.clone(),
-        };
+            prepared: before.prepared.inventory(),
+        });
         let (mut prepared, _pool_pin) = tokio::task::spawn_blocking(move || {
             let _stage = staged;
             let (prepared, pin) =
@@ -2249,17 +2249,32 @@ impl Manager {
         let git_cache = cache.clone();
         let staged = stage.clone();
         let worker_telemetry = telemetry.clone();
-        let pinned = inventory
+        let reuse = inventory
             .as_ref()
-            .map(|inventory| super::materialize::Pinned {
-                repository: branch.repository.identity.clone(),
-                policy: self.options.selection.identity.clone(),
-                subdirectory: request.subdirectory.clone(),
-                prepared: inventory.prepared.clone(),
+            .map(|inventory| {
+                super::materialize::Reuse::Pinned(super::materialize::Inventory {
+                    repository: branch.repository.identity.clone(),
+                    policy: self.options.selection.identity.clone(),
+                    subdirectory: request.subdirectory.clone(),
+                    prepared: inventory.prepared.inventory(),
+                })
+            })
+            .or_else(|| {
+                before
+                    .as_ref()
+                    .filter(|state| state.policy == self.options.selection.identity)
+                    .map(|state| {
+                        super::materialize::Reuse::Previous(super::materialize::Inventory {
+                            repository: state.repository.clone(),
+                            policy: state.policy.clone(),
+                            subdirectory: request.subdirectory.clone(),
+                            prepared: state.prepared.inventory(),
+                        })
+                    })
             });
         let (mut prepared, pin) = tokio::task::spawn_blocking(move || {
             let _stage = staged;
-            acquisition.git(&git_request, &git_cache, pinned, &worker_telemetry)
+            acquisition.git(&git_request, &git_cache, reuse, &worker_telemetry)
         })
         .await??;
         let _pool_pin = Arc::new(pin);

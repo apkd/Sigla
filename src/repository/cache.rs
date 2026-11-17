@@ -442,7 +442,7 @@ impl Acquisition {
         &mut self,
         request: &Request,
         cache: &Path,
-        pinned: Option<super::materialize::Pinned>,
+        reuse: Option<super::materialize::Reuse>,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<(Prepared, Pin)> {
         ensure!(
@@ -463,8 +463,8 @@ impl Acquisition {
         let mut request = request.clone();
         request.store = pool.root.join("current");
         // execute() is synchronous and does not return until its bounded child is stopped.
-        let prepared = match pinned {
-            Some(pinned) => super::job::materialize(&request, cache, pinned)?,
+        let prepared = match reuse {
+            Some(reuse) => super::job::materialize(&request, cache, reuse)?,
             None => super::job::execute(&request, cache)?,
         };
         state.used = now();

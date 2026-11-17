@@ -1,5 +1,5 @@
 //! Network jobs run in the same executable, under a subprocess deadline.
-use super::materialize::{Metrics, Pinned, Prepared, Request};
+use super::materialize::{Metrics, Prepared, Request, Reuse};
 use anyhow::{Result, ensure};
 use std::{fs, path::Path, process::Command, time::Duration};
 
@@ -55,7 +55,7 @@ struct Input {
 #[derive(serde::Serialize, serde::Deserialize)]
 enum Action {
     Prepare,
-    Materialize(Pinned),
+    Materialize(Reuse),
     Hydrate(Prepared),
 }
 
@@ -63,8 +63,8 @@ pub fn execute(request: &Request, cache: &Path) -> Result<Prepared> {
     run(request, cache, Action::Prepare)
 }
 
-pub(super) fn materialize(request: &Request, cache: &Path, pinned: Pinned) -> Result<Prepared> {
-    run(request, cache, Action::Materialize(pinned))
+pub(super) fn materialize(request: &Request, cache: &Path, reuse: Reuse) -> Result<Prepared> {
+    run(request, cache, Action::Materialize(reuse))
 }
 
 pub fn hydrate(request: &Request, cache: &Path, prepared: Prepared) -> Result<Prepared> {
@@ -182,8 +182,8 @@ pub fn worker(input: &Path, output: &Path) -> Result<()> {
             })
         }
         Action::Prepare => super::materialize::prepare(&request, None, cache, &mut metrics),
-        Action::Materialize(pinned) => {
-            super::materialize::prepare(&request, Some(pinned), cache, &mut metrics)
+        Action::Materialize(reuse) => {
+            super::materialize::prepare(&request, Some(reuse), cache, &mut metrics)
         }
     }
     .map_err(Failure::from_error);
