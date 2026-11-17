@@ -262,7 +262,7 @@ pub(crate) fn write(
 pub(crate) struct Reader<'a, F> {
     read: F,
     pub directory: Arc<Directory>,
-    strings: HashMap<u32, String>,
+    strings: HashMap<u32, &'a str>,
     pages: std::cell::RefCell<HashMap<(u8, usize), ReadPage<'a>>>,
     remaining: usize,
     identity: Option<super::ObjectId>,
@@ -361,7 +361,7 @@ impl<'a, F: Fn(&[u8]) -> Result<Option<&'a [u8]>>> Reader<'a, F> {
             Ok(())
         };
         for id in 0..counts[1] {
-            self.item::<String>(STRINGS, id)?;
+            crate::binary::decode::<&str>(self.item_bytes(STRINGS, id)?)?;
         }
         let mut depths = Vec::new();
         for id in 0..counts[2] {
@@ -434,6 +434,18 @@ impl<'a, F: Fn(&[u8]) -> Result<Option<&'a [u8]>>> Reader<'a, F> {
         {
             return Ok(value.clone());
         }
+        let value: T = crate::binary::decode(self.item_bytes(tag, id)?)?;
+        if let Some(key) = cache_key {
+            let size = value.bytes() + std::mem::size_of::<Shared>();
+            super::DECODED.lock().unwrap().put(
+                key,
+                super::Decoded::Shared(std::sync::Arc::new(value.clone().shared())),
+                size,
+            );
+        }
+        Ok(value)
+    }
+    fn item_bytes(&self, tag: u8, id: u32) -> Result<&'a [u8]> {
         let starts = &self.directory.pages[(tag - ROWS) as usize];
         let page = starts
             .partition_point(|&first| first <= id)
@@ -455,21 +467,10 @@ impl<'a, F: Fn(&[u8]) -> Result<Option<&'a [u8]>>> Reader<'a, F> {
             .offsets
             .get(slot + 1)
             .context("Invalid shared record ID")? as usize;
-        let value: T = crate::binary::decode(
-            page_data
-                .data
-                .get(start..end)
-                .context("Invalid shared record offsets")?,
-        )?;
-        if let Some(key) = cache_key {
-            let size = value.bytes() + std::mem::size_of::<Shared>();
-            super::DECODED.lock().unwrap().put(
-                key,
-                super::Decoded::Shared(std::sync::Arc::new(value.clone().shared())),
-                size,
-            );
-        }
-        Ok(value)
+        page_data
+            .data
+            .get(start..end)
+            .context("Invalid shared record offsets")
     }
     fn page(&self, tag: u8, number: u32) -> Result<ReadPage<'a>> {
         let bytes = (self.read)(&key(tag, number))?.context("Missing shared record page")?;
@@ -506,16 +507,20 @@ impl<'a, F: Fn(&[u8]) -> Result<Option<&'a [u8]>>> Reader<'a, F> {
             index,
         })
     }
-    fn string(&mut self, id: u32) -> Result<String> {
+    fn string_ref(&mut self, id: u32) -> Result<&'a str> {
         if !self.strings.contains_key(&id) {
-            self.strings.insert(id, self.item(STRINGS, id)?);
+            self.strings
+                .insert(id, crate::binary::decode(self.item_bytes(STRINGS, id)?)?);
         }
-        let value = &self.strings[&id];
+        Ok(self.strings[&id])
+    }
+    fn string(&mut self, id: u32) -> Result<String> {
+        let value = self.string_ref(id)?;
         self.remaining = self
             .remaining
             .checked_sub(value.len())
             .context("Shared record expansion limit exceeded")?;
-        Ok(value.clone())
+        Ok(value.to_owned())
     }
     fn strings(&mut self, ids: &[u32]) -> Result<Vec<String>> {
         self.reserve::<String>(ids.len())?;
@@ -625,8 +630,19 @@ impl<'a, F: Fn(&[u8]) -> Result<Option<&'a [u8]>>> Reader<'a, F> {
         })
     }
     pub fn declarations(&mut self) -> Result<Vec<Declaration>> {
+        self.select_declarations(None)
+    }
+    pub fn named_declarations(&mut self, name: &str) -> Result<Vec<Declaration>> {
+        self.select_declarations(Some(name))
+    }
+    fn select_declarations(&mut self, name: Option<&str>) -> Result<Vec<Declaration>> {
         let mut declarations = Vec::new();
         for id in 0..self.directory.count {
+            if let Some(name) = name
+                && self.string_ref(Row::name(self.item_bytes(ROWS, id)?)?)? != name
+            {
+                continue;
+            }
             let row: Row = self.item(ROWS, id)?;
             ensure!(row.declaration == id, "Invalid declaration ordinal");
             declarations.push(self.expand_declaration(&row)?);
@@ -782,9 +798,20 @@ record! {
     }
 }
 
+impl Row {
+    fn name(bytes: &[u8]) -> Result<u32> {
+        // The current row starts with its fixed-size text IDs. Read that prefix
+        // before allocating any of the row's parameter or attribute vectors.
+        #[derive(Deserialize)]
+        struct Prefix {
+            text: [u32; 7],
+        }
+        Ok(postcard::take_from_bytes::<Prefix>(bytes)?.0.text[0])
+    }
+}
+
 pub(crate) enum Shared {
     Row(Row),
-    Text(String),
     Type(TypeNode),
     Signature(Signature),
 }
@@ -857,7 +884,6 @@ macro_rules! shared_record {
         }
     };
 }
-shared_record!(String, Text, value, value.capacity());
 shared_record!(
     Row,
     Row,

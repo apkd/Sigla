@@ -310,6 +310,14 @@ impl Store {
     ) -> Result<Vec<crate::model::Declaration>> {
         format::Reader::new(|key| self.scope.record(tx, file, key))?.declarations()
     }
+    pub(crate) fn named_declarations_in(
+        &self,
+        tx: &RoTxn<'_>,
+        file: &str,
+        name: &str,
+    ) -> Result<Vec<crate::model::Declaration>> {
+        format::Reader::new(|key| self.scope.record(tx, file, key))?.named_declarations(name)
+    }
     fn headers_record(
         &self,
         tx: &RoTxn<'_>,

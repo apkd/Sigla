@@ -335,7 +335,28 @@ impl<'a> Search<'a> {
         for key in keys {
             self.check()?;
             let file = self.manifest.files[&key].clone();
-            let declarations = self.summary(&key)?;
+            if from.is_some_and(|from| {
+                !file
+                    .memberships
+                    .iter()
+                    .any(|membership| self.visible_membership(&file, membership, from))
+            }) {
+                continue;
+            }
+            // Assemblies contain large declaration tables. Source files reuse
+            // their full summaries across the query's different name lookups.
+            let declarations =
+                if file.metadata && !file.language.native() && !loose && !simple.contains('*') {
+                    match self.summaries.get(&key) {
+                        Some(declarations) => declarations.clone(),
+                        None => Arc::new(
+                            self.source_store(&key)
+                                .named_declarations_in(&self.tx, &key, simple)?,
+                        ),
+                    }
+                } else {
+                    self.summary(&key)?
+                };
             let native_data = if file.language.native()
                 && (target.qualifiers.is_some()
                     || projection.is_some_and(|q| q.filters.iter().any(|f| f.key == "lang")))
@@ -347,13 +368,7 @@ impl<'a> Search<'a> {
             let mut projected_contexts = BTreeSet::new();
             for membership in &file.memberships {
                 self.check()?;
-                if from.is_some_and(|from| {
-                    if file.metadata {
-                        membership.project != from || !self.manifest.metadata_visible(&file, from)
-                    } else {
-                        !self.visible(from, membership.project)
-                    }
-                }) {
+                if from.is_some_and(|from| !self.visible_membership(&file, membership, from)) {
                     continue;
                 }
                 if let Some(query) = projection {
@@ -484,6 +499,13 @@ impl<'a> Search<'a> {
                 .references
                 .iter()
                 .any(|reference| reference.visible(&self.manifest.projects[to].identity))
+    }
+    fn visible_membership(&self, file: &FileEntry, membership: &Membership, from: usize) -> bool {
+        if file.metadata {
+            membership.project == from && self.manifest.metadata_visible(file, from)
+        } else {
+            self.visible(from, membership.project)
+        }
     }
     fn same_domain(&self, a: &Hit, b: &Hit) -> bool {
         match (
