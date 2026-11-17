@@ -32,6 +32,14 @@ const PAYLOAD: &[(&str, &[u8])] = &[
     ),
 ];
 
+fn measured<T>(phase: &'static str, scope: &Path, run: impl FnOnce() -> Result<T>) -> Result<T> {
+    let started = std::time::Instant::now();
+    let result = run();
+    tracing::info!(phase, scope = %scope.display(), elapsed_ms = started.elapsed().as_millis(),
+        failed = result.is_err(), "MSBuild discovery phase finished");
+    result
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct Snapshot {
@@ -348,10 +356,12 @@ pub(crate) fn discover_in(
             }
             #[cfg(test)]
             INVENTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
-            let sdks = process::run(
-                command(cache).arg("--list-sdks"),
-                session.budget.remaining(Duration::from_secs(30))?,
-            )?;
+            let sdks = measured("sdk_inventory", cache, || {
+                process::run(
+                    command(cache).arg("--list-sdks"),
+                    session.budget.remaining(Duration::from_secs(30))?,
+                )
+            })?;
             let installed: Vec<(String, PathBuf)> = std::str::from_utf8(&sdks)?
                 .lines()
                 .filter_map(|line| {
@@ -461,12 +471,14 @@ pub(crate) fn discover_in(
             };
             #[cfg(test)]
             RESOLVER_CALLS.with(|calls| calls.set(calls.get() + 1));
-            let resolution = process::capture(
-                &mut resolve,
-                session.budget.remaining(Duration::from_secs(30))?,
-                None,
-                None,
-            );
+            let resolution = measured("sdk_resolution", directory, || {
+                process::capture(
+                    &mut resolve,
+                    session.budget.remaining(Duration::from_secs(30))?,
+                    None,
+                    None,
+                )
+            });
             if let Some(sandbox) = &sandbox {
                 sandbox.validate_writes()?;
             }
@@ -577,21 +589,31 @@ pub(crate) fn discover_in(
                 command
             }
         };
-        let discovery_result = process::run(
-            &mut discovery,
-            session.budget.remaining(Duration::from_secs(120))?,
+        let discovery_result = measured(
+            if restored {
+                "graph_after_restore"
+            } else {
+                "graph_before_restore"
+            },
+            directory,
+            || {
+                process::run(
+                    &mut discovery,
+                    session.budget.remaining(Duration::from_secs(120))?,
+                )
+            },
         );
         if let Some(sandbox) = &sandbox {
             sandbox.validate_writes()?;
         }
         discovery_result?;
-        match &sandbox {
-            Some(s) => s.packages.seal(&host, &root, session.budget.0)?,
+        measured("package_sealing", directory, || match &sandbox {
+            Some(s) => s.packages.seal(&host, &root, session.budget.0),
             None => local_packages
                 .as_ref()
                 .unwrap()
-                .seal(&host, &root, session.budget.0)?,
-        }
+                .seal(&host, &root, session.budget.0),
+        })?;
         let mut snapshot: Snapshot =
             serde_json::from_slice(&crate::sandbox::read_job_file(&output, 64 * 1024 * 1024)?)?;
         ensure!(
@@ -665,12 +687,14 @@ pub(crate) fn discover_in(
                     .arg(format!("-p:ArtifactsPath={path}"));
             }
             let mut log = tempfile::tempfile()?;
-            let captured = process::capture(
-                &mut restore,
-                session.budget.remaining(Duration::from_secs(300))?,
-                None,
-                Some(log.try_clone()?),
-            );
+            let captured = measured("restore", entry, || {
+                process::capture(
+                    &mut restore,
+                    session.budget.remaining(Duration::from_secs(300))?,
+                    None,
+                    Some(log.try_clone()?),
+                )
+            });
             if let Some(sandbox) = &sandbox {
                 sandbox.validate_writes()?;
             }
