@@ -366,12 +366,50 @@ fn lifecycle() -> Result<()> {
         &upstream,
         &["config", "uploadpack.allowAnySHA1InWant", "true"],
     )?;
-    fs::create_dir(upstream.join("src"))?;
+    fs::create_dir_all(upstream.join("src/bin/child"))?;
     fs::write(
         upstream.join("Cargo.toml"),
-        "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n",
+        "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[[bin]]\nname='tool'\npath='src/bin/tool.rs'\n[workspace]\nmembers=['extra']\n",
     )?;
     fs::write(upstream.join("src/lib.rs"), "pub struct Main;\n")?;
+    fs::write(
+        upstream.join("src/bin/tool.rs"),
+        "mod witness; mod child; fn main() {}",
+    )?;
+    fs::write(
+        upstream.join("src/bin/witness.rs"),
+        "pub fn tracked_sibling() {}",
+    )?;
+    fs::write(
+        upstream.join("src/bin/child/mod.rs"),
+        "pub fn tracked_child() {}",
+    )?;
+    fs::write(
+        upstream.join("src/bin/unrelated.rs"),
+        "pub fn unrelated_bin() {}",
+    )?;
+    fs::create_dir_all(upstream.join("extra/src/bin/implicit"))?;
+    fs::create_dir_all(upstream.join("extra/commands"))?;
+    fs::write(
+        upstream.join("extra/Cargo.toml"),
+        "[package]\nname='extra-app'\nversion='0.1.0'\nedition='2021'\n[[bin]]\nname='tool'\npath='commands/custom.rs'\n",
+    )?;
+    fs::write(
+        upstream.join("extra/src/main.rs"),
+        "pub fn package_main() {} fn main() {}",
+    )?;
+    fs::write(
+        upstream.join("extra/commands/custom.rs"),
+        "pub fn custom_entry() {} fn main() {}",
+    )?;
+    fs::write(
+        upstream.join("extra/src/bin/tool.rs"),
+        "pub fn overridden_bin() {} fn main() {}",
+    )?;
+    fs::write(
+        upstream.join("extra/src/bin/implicit/main.rs"),
+        "pub fn implicit_entry() {} fn main() {}",
+    )?;
     fs::write(
         upstream.join("Surface.ngsurface"),
         "BEGIN_PROPERTIES\n_Tint(\"Tint\", Color) = (1,1,1,1)\nEND_PROPERTIES\nBEGIN_CODE\nfloat4 SurfaceFunction() { return _Tint; }\nEND_CODE\n",
@@ -454,6 +492,26 @@ fn lifecycle() -> Result<()> {
         "Initial summary missing: {first}"
     );
     let count = fs::read(root.path().join("requests.log"))?.len();
+    for (symbol, path) in [
+        ("tracked_sibling", "src/bin/witness.rs"),
+        ("tracked_child", "src/bin/child/mod.rs"),
+        ("implicit_entry", "extra/src/bin/implicit/main.rs"),
+        ("package_main", "extra/src/main.rs"),
+        ("custom_entry", "extra/commands/custom.rs"),
+    ] {
+        let (error, result) = server.query(main, &format!("function:{symbol} wait:complete"))?;
+        ensure!(
+            !error && result.contains(path),
+            "Missing tracked Rust input: {result}"
+        );
+    }
+    for symbol in ["unrelated_bin", "overridden_bin"] {
+        let (error, result) = server.query(main, &format!("function:{symbol} wait:complete"))?;
+        ensure!(
+            !error && result.starts_with("No matches."),
+            "Unexpected automatic binary: {result}"
+        );
+    }
     server.until(main, "property:_Tint lang:shaders", "Surface.ngsurface")?;
     server.until(
         main,

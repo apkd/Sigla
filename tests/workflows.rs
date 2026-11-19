@@ -620,6 +620,80 @@ async fn rust_module_ownership_and_calls() {
 }
 
 #[tokio::test]
+async fn rust_module_children_follow_cargo_target_and_module_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        r#"
+        [package]
+        name = "sample"
+        version = "0.1.0"
+        [lib]
+        name = "named_library"
+        path = "checks/lib.rs"
+        [[bin]]
+        name = "reader-bin"
+        path = "checks/lib.rs"
+        [[test]]
+        name = "suite"
+        path = "checks/entry.rs"
+    "#,
+    );
+    // Cargo compiles entry.rs twice: as a target root and as a library module.
+    write(root, "checks/lib.rs", "pub mod entry;");
+    write(root, "checks/entry.rs", "pub mod child;");
+    let target_source = "pub struct TargetChild;";
+    write(root, "checks/child.rs", target_source);
+    write(
+        root,
+        "checks/entry/child.rs",
+        "pub struct LibraryChild; mod main;",
+    );
+    write(root, "checks/entry/child/main.rs", "mod inner;");
+    write(
+        root,
+        "checks/entry/child/main/inner.rs",
+        "pub struct NestedChild;",
+    );
+    write(root, "checks/entry/child/inner.rs", "pub struct Unused;");
+    // An automatic single-file example is a target root too.
+    write(root, "examples/demo.rs", "mod helpers; fn main() {}");
+    write(root, "examples/helpers/mod.rs", "pub struct ExampleHelper;");
+    let a = app(root, cache.path());
+    let path = root.to_str().unwrap();
+    for name in [
+        "TargetChild",
+        "LibraryChild",
+        "NestedChild",
+        "ExampleHelper",
+    ] {
+        let result = a.search(path, &format!("type:{name}")).await.unwrap();
+        assert!(result.contains(&format!("struct {name}")), "{result}");
+    }
+    for qualified in [
+        "named_library::entry::child::LibraryChild",
+        "reader_bin::entry::child::LibraryChild",
+        "suite::child::TargetChild",
+        "demo::helpers::ExampleHelper",
+    ] {
+        let member = a.search(path, &format!("type:{qualified}")).await.unwrap();
+        let name = qualified.rsplit("::").next().unwrap();
+        assert!(
+            member.contains(&format!("struct {name}")),
+            "{qualified}: {member}"
+        );
+    }
+    assert_eq!(
+        a.view(path, "checks/child.rs", "raw").await.unwrap(),
+        target_source
+    );
+    assert_eq!(a.search(path, "type:Unused").await.unwrap(), "No matches.");
+}
+
+#[tokio::test]
 async fn removing_and_restoring_membership_rebuilds_the_record() {
     let dir = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

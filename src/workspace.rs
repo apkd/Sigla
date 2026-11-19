@@ -98,6 +98,11 @@ fn planning_stamp(stamps: &mut BTreeMap<PathBuf, Stamp>, path: &Path) -> Result<
     Ok(stamp)
 }
 
+struct RustAncestor {
+    path: PathBuf,
+    parent: Option<std::rc::Rc<Self>>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Membership {
     pub project: usize,
@@ -509,7 +514,20 @@ impl Workspace {
                 )),
             }
         }
-        let mut queue: VecDeque<_> = discovery.sources.into();
+        let mut queue: VecDeque<_> = discovery
+            .sources
+            .into_iter()
+            .map(|input| {
+                // Cargo discovery seeds target roots. Loose sources have no target graph.
+                let owns_directory = input.language == Language::Rust
+                    && (manifest.projects[input.project].origin.is_some()
+                        || matches!(
+                            input.path.file_name().and_then(|name| name.to_str()),
+                            Some("lib.rs" | "main.rs" | "mod.rs")
+                        ));
+                (input, owns_directory, None::<std::rc::Rc<RustAncestor>>)
+            })
+            .collect();
         for (project, p) in manifest.projects.iter().enumerate() {
             for assembly in &p.assemblies {
                 if !assembly.path.is_file() {
@@ -530,19 +548,24 @@ impl Workspace {
                             }
                         }
                     };
-                    queue.push_back(SourceInput {
-                        path,
-                        project,
-                        module: String::new(),
-                        language: Language::CSharp,
-                        metadata: true,
-                    });
+                    queue.push_back((
+                        SourceInput {
+                            path,
+                            project,
+                            module: String::new(),
+                            language: Language::CSharp,
+                            metadata: true,
+                        },
+                        false,
+                        None,
+                    ));
                 }
             }
         }
         let mut visited = BTreeSet::new();
         let mut stamps = BTreeMap::new();
-        while let Some(input) = queue.pop_front() {
+        let mut missing_modules = BTreeSet::new();
+        while let Some((input, owns_directory, parent)) = queue.pop_front() {
             if let Some(dir) = input.path.parent()
                 && !managed.is_some_and(|root| dir.starts_with(root))
             {
@@ -551,7 +574,12 @@ impl Workspace {
                     self.monitor.register(dir);
                 }
             }
-            if !visited.insert((input.path.clone(), input.project, input.module.clone())) {
+            if !visited.insert((
+                input.path.clone(),
+                input.project,
+                input.module.clone(),
+                owns_directory,
+            )) {
                 continue;
             }
             if visited.len() >= 1_000_000 {
@@ -576,75 +604,60 @@ impl Workspace {
             } else {
                 &mut manifest.files
             };
-            if let Some(file) = files.get_mut(&key) {
-                file.memberships.push(Membership {
-                    project: input.project,
-                    module: input.module,
-                });
-                continue;
-            }
-            if !input.metadata && stamp.size as usize > MAX_SOURCE_BYTES {
-                manifest.metadata.insert(input.path.clone(), stamp);
-                manifest.diagnostics.push(format!(
-                    "Skipped source exceeding {} MiB: {}",
-                    MAX_SOURCE_BYTES / 1024 / 1024,
-                    input.path.display()
-                ));
-                continue;
-            }
-            let modules = if input.language == Language::Rust {
-                // The key includes the Rust edition; matching stamps keep syntax facts valid.
-                let retained = self
-                    .manifest
-                    .files
-                    .get(&key)
-                    .filter(|file| file.stamp == stamp)
-                    .map(|file| file.modules.clone());
-                let modules = retained
-                    .map_or_else(
-                        || self.store.current(&key, &stamp),
-                        |modules| Ok(Some(modules)),
-                    )
-                    .and_then(|cached| {
-                        cached.map_or_else(
-                            || {
-                                if let Some(identity) = input_identity(&input, project, &stamp)?
-                                    && let Some(object) = self.store.scope.input(&identity)?
-                                    && let Some(modules) = self.store.object_modules(&object)?
-                                {
-                                    return Ok(modules);
-                                }
-                                let _admission = crate::memory::admit_file(stamp.size, false, &())?;
-                                Ok(crate::extract::rust_modules(
-                                    &read_stable(&input.path, input.language)?,
-                                    &project.edition,
-                                ))
-                            },
-                            Ok,
-                        )
-                    });
-                match modules {
-                    Ok(modules) => modules,
-                    Err(error) => {
+            let file = match files.entry(key) {
+                std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    if !input.metadata && stamp.size as usize > MAX_SOURCE_BYTES {
                         manifest.metadata.insert(input.path.clone(), stamp);
-                        manifest
-                            .diagnostics
-                            .push(format!("Skipped {}: {error:#}", input.path.display()));
+                        manifest.diagnostics.push(format!(
+                            "Skipped source exceeding {} MiB: {}",
+                            MAX_SOURCE_BYTES / 1024 / 1024,
+                            input.path.display()
+                        ));
                         continue;
                     }
+                    let modules = if input.language == Language::Rust {
+                        match self.rust_modules(slot.key(), &input, project, &stamp) {
+                            Ok(modules) => modules,
+                            Err(error) => {
+                                manifest.metadata.insert(input.path.clone(), stamp);
+                                manifest
+                                    .diagnostics
+                                    .push(format!("Skipped {}: {error:#}", input.path.display()));
+                                continue;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    slot.insert(FileEntry {
+                        display: input
+                            .path
+                            .strip_prefix(&manifest.root)
+                            .unwrap_or(&input.path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        path: input.path,
+                        stamp,
+                        language: input.language,
+                        memberships: Vec::new(),
+                        modules,
+                        metadata: input.metadata,
+                    })
                 }
-            } else {
-                Vec::new()
             };
-            if input.language == Language::Rust {
-                let base = input.path.parent().unwrap();
-                let stem = input.path.file_stem().unwrap().to_string_lossy();
-                let module_base = if matches!(stem.as_ref(), "lib" | "main" | "mod") {
+            if !file.modules.is_empty() {
+                let ancestors = std::rc::Rc::new(RustAncestor {
+                    path: file.path.clone(),
+                    parent,
+                });
+                let base = file.path.parent().unwrap();
+                let module_base = if owns_directory {
                     base.to_owned()
                 } else {
-                    base.join(stem.as_ref())
+                    file.path.with_extension("")
                 };
-                for m in &modules {
+                for m in &file.modules {
                     let mut dir = module_base.clone();
                     for part in &m.inline {
                         dir.push(part);
@@ -657,16 +670,16 @@ impl Workspace {
                         }
                     } else {
                         let p = dir.join(format!("{}.rs", m.name));
-                        if p.exists() {
+                        if self.policy.has_file(&p)? {
                             p
                         } else {
                             dir.join(&m.name).join("mod.rs")
                         }
                     };
-                    if let Some(remote) = &self.policy.remote {
-                        remote.require([path.clone()])?;
-                    }
-                    if !path.exists() {
+                    if !path.is_file() {
+                        if self.policy.remote.is_some() {
+                            missing_modules.insert(path.clone());
+                        }
                         // watch the nearest existing parent so later module creation
                         // triggers discovery, even when its directory is created first.
                         if let Some(parent) = path.ancestors().skip(1).find(|p| p.is_dir()) {
@@ -689,6 +702,8 @@ impl Workspace {
                         }
                         continue;
                     } // cfg/build-generated module files may not exist without a build.
+                    let owns_directory =
+                        m.path.is_some() || path.file_name().is_some_and(|name| name == "mod.rs");
                     let path = match self.policy.canonical(&path) {
                         Ok(path) => path,
                         Err(error) => {
@@ -698,42 +713,46 @@ impl Workspace {
                             continue;
                         }
                     };
+                    if std::iter::successors(Some(ancestors.as_ref()), |node| {
+                        node.parent.as_deref()
+                    })
+                    .any(|node| node.path == path)
+                    {
+                        continue;
+                    }
                     let module = std::iter::once(input.module.as_str())
                         .chain(m.inline.iter().map(String::as_str))
                         .chain(std::iter::once(m.name.as_str()))
                         .collect::<Vec<_>>()
                         .join("::");
-                    queue.push_back(SourceInput {
-                        path,
-                        project: input.project,
-                        module,
-                        language: Language::Rust,
-                        metadata: false,
-                    });
+                    queue.push_back((
+                        SourceInput {
+                            path,
+                            project: input.project,
+                            module,
+                            language: Language::Rust,
+                            metadata: false,
+                        },
+                        owns_directory,
+                        Some(ancestors.clone()),
+                    ));
                 }
             }
-            let file = FileEntry {
-                display: input
-                    .path
-                    .strip_prefix(&manifest.root)
-                    .unwrap_or(&input.path)
-                    .to_string_lossy()
-                    .into_owned(),
-                path: input.path,
-                stamp,
-                language: input.language,
-                memberships: vec![Membership {
+            // Two targets can reach the same Rust name with different module directories.
+            if input.language != Language::Rust
+                || !file
+                    .memberships
+                    .iter()
+                    .any(|m| m.project == input.project && m.module == input.module)
+            {
+                file.memberships.push(Membership {
                     project: input.project,
                     module: input.module,
-                }],
-                modules,
-                metadata: input.metadata,
-            };
-            if input.language.native() {
-                manifest.deferred.insert(key, file);
-            } else {
-                manifest.files.insert(key, file);
+                });
             }
+        }
+        if let Some(remote) = &self.policy.remote {
+            remote.require(missing_modules)?;
         }
         for directory in &directories {
             if let Ok(stamp) = Stamp::read(directory) {
@@ -753,6 +772,38 @@ impl Workspace {
             validation,
             discovery_time,
         })
+    }
+
+    fn rust_modules(
+        &self,
+        key: &str,
+        input: &SourceInput,
+        project: &Project,
+        stamp: &Stamp,
+    ) -> Result<Vec<ModuleFile>> {
+        // The key includes the Rust edition; matching stamps keep syntax facts valid.
+        if let Some(file) = self
+            .manifest
+            .files
+            .get(key)
+            .filter(|file| &file.stamp == stamp)
+        {
+            return Ok(file.modules.clone());
+        }
+        if let Some(modules) = self.store.current(key, stamp)? {
+            return Ok(modules);
+        }
+        if let Some(identity) = input_identity(input, project, stamp)?
+            && let Some(object) = self.store.scope.input(&identity)?
+            && let Some(modules) = self.store.object_modules(&object)?
+        {
+            return Ok(modules);
+        }
+        let _admission = crate::memory::admit_file(stamp.size, false, &())?;
+        Ok(crate::extract::rust_modules(
+            &read_stable(&input.path, input.language)?,
+            &project.edition,
+        ))
     }
 
     pub(crate) fn apply_plan(&mut self, plan: IndexPlan) -> Result<()> {

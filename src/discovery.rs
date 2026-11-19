@@ -1,3 +1,5 @@
+mod cargo;
+
 use crate::model::{Language, MetadataReference, Project, ProjectReference, SourceInput};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -38,30 +40,34 @@ impl std::fmt::Display for RequiredInputs {
 impl std::error::Error for RequiredInputs {}
 
 impl RemoteContext {
+    fn tracked_file(&self, path: &Path) -> Result<Option<&str>> {
+        let Ok(relative) = path.strip_prefix(&self.workspace) else {
+            return Ok(None);
+        };
+        // Compiler paths may use parent segments within the managed repository.
+        let mut normalized = PathBuf::new();
+        for part in relative.components() {
+            match part {
+                std::path::Component::Normal(part) => normalized.push(part),
+                std::path::Component::CurDir => (),
+                std::path::Component::ParentDir if normalized.pop() => (),
+                _ => return Ok(None),
+            }
+        }
+        let relative = normalized
+            .to_str()
+            .context("Invalid discovery input path")?;
+        crate::repository::selection::validate_path(relative)?;
+        Ok(self.tracked.get(relative).map(String::as_str))
+    }
+
     pub fn require(&self, paths: impl IntoIterator<Item = PathBuf>) -> Result<()> {
         let mut missing = BTreeSet::new();
-        'inputs: for path in paths {
-            if path.is_file() {
-                continue;
-            }
-            if let Ok(relative) = path.strip_prefix(&self.workspace) {
-                // Explicit compiler inputs may use parent segments within the repository.
-                // Managed source trees contain no symlinks.
-                let mut normalized = PathBuf::new();
-                for part in relative.components() {
-                    match part {
-                        std::path::Component::Normal(part) => normalized.push(part),
-                        std::path::Component::CurDir => (),
-                        std::path::Component::ParentDir if normalized.pop() => (),
-                        _ => continue 'inputs,
-                    }
-                }
-                let relative = normalized.as_path();
-                let relative = relative.to_str().context("Invalid discovery input path")?;
-                crate::repository::selection::validate_path(relative)?;
-                if self.tracked.contains(relative) {
-                    missing.insert(relative.to_owned());
-                }
+        for path in paths {
+            if !path.is_file()
+                && let Some(relative) = self.tracked_file(&path)?
+            {
+                missing.insert(relative.to_owned());
             }
         }
         if !missing.is_empty() {
@@ -85,10 +91,10 @@ impl RemoteContext {
         self.require(inputs.into_iter().flatten())
     }
 
-    fn analysis_inputs<'a>(
+    fn tracked_files_in<'a>(
         &'a self,
-        directory: &'a Path,
-    ) -> Result<impl Iterator<Item = PathBuf> + 'a> {
+        directory: &Path,
+    ) -> Result<impl Iterator<Item = &'a String> + 'a> {
         let prefix = match directory.strip_prefix(&self.workspace) {
             Ok(relative) if relative.as_os_str().is_empty() => Some(String::new()),
             Ok(relative) => Some(format!(
@@ -97,13 +103,19 @@ impl RemoteContext {
             )),
             Err(_) => None,
         };
-        Ok(prefix
-            .into_iter()
-            .flat_map(move |prefix| {
-                self.tracked
-                    .range(prefix.clone()..)
-                    .take_while(move |path| path.starts_with(&prefix))
-            })
+        Ok(prefix.into_iter().flat_map(move |prefix| {
+            self.tracked
+                .range(prefix.clone()..)
+                .take_while(move |path| path.starts_with(&prefix))
+        }))
+    }
+
+    fn analysis_inputs<'a>(
+        &'a self,
+        directory: &'a Path,
+    ) -> Result<impl Iterator<Item = PathBuf> + 'a> {
+        Ok(self
+            .tracked_files_in(directory)?
             .map(move |p| self.workspace.join(p))
             .filter(move |p| {
                 p.strip_prefix(directory).is_ok_and(|relative| {
@@ -116,6 +128,16 @@ impl RemoteContext {
 }
 
 impl Policy {
+    /// Compare compiler input alternatives before sparse files are materialized.
+    pub(crate) fn has_file(&self, path: &Path) -> Result<bool> {
+        if path.is_file() {
+            return Ok(true);
+        }
+        match &self.remote {
+            Some(remote) => Ok(remote.tracked_file(path)?.is_some()),
+            None => Ok(false),
+        }
+    }
     /// Repository publication supplies a durable identity for code and build inputs.
     pub(crate) fn materialized(&mut self, root: PathBuf, identity: [u8; 32]) {
         self.materialization = Some((root, identity));
@@ -1316,11 +1338,11 @@ fn load_cargo(
     let Some(package) = value.get("package") else {
         return Ok(());
     };
-    let name = package
+    let package_name = package
         .get("name")
         .and_then(toml::Value::as_str)
-        .context("Cargo package missing name")?
-        .replace('-', "_");
+        .context("Cargo package missing name")?;
+    let name = package_name.replace('-', "_");
     let edition = cargo_edition(package, base, policy, &mut result.metadata).unwrap_or_else(|error| {
         result.diagnostics.push(format!("Cannot determine Rust edition for {}: {error:#}. Parsing with the latest supported edition.", path.display()));
         "2024".into()
@@ -1340,6 +1362,14 @@ fn load_cargo(
             }
         }
     }
+    let roots = cargo::roots(
+        base,
+        &value,
+        package_name,
+        &edition,
+        policy,
+        &mut result.diagnostics,
+    )?;
     let project = result.projects.len();
     result.projects.push(Project {
         identity: path.to_string_lossy().into_owned(),
@@ -1358,106 +1388,6 @@ fn load_cargo(
         compiler_options: Default::default(),
         source_roots: Vec::new(),
     });
-    let mut roots = Vec::new();
-    for (kind, default) in [("lib", "src/lib.rs"), ("bin", "src/main.rs")] {
-        if let Some(t) = value.get(kind).and_then(toml::Value::as_table) {
-            roots.push((
-                base.join(
-                    t.get("path")
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or(default),
-                ),
-                t.get("name")
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or(&name)
-                    .replace('-', "_"),
-            ));
-        } else if let Some(ts) = value.get(kind).and_then(toml::Value::as_array) {
-            for t in ts {
-                if let Some(p) = t.get("path").and_then(toml::Value::as_str) {
-                    roots.push((base.join(p), name.clone()));
-                } else if let Some(target_name) = t.get("name").and_then(toml::Value::as_str) {
-                    let single = base.join("src/bin").join(format!("{target_name}.rs"));
-                    let root = if target_name == name && base.join(default).is_file() {
-                        base.join(default)
-                    } else if single.is_file() {
-                        single
-                    } else {
-                        base.join("src/bin").join(target_name).join("main.rs")
-                    };
-                    roots.push((root, name.clone()));
-                }
-            }
-        } else if package
-            .get(if kind == "lib" { "autolib" } else { "autobins" })
-            .and_then(toml::Value::as_bool)
-            != Some(false)
-            && base.join(default).is_file()
-            && !crosses_worktree(base, base.join(default).parent().unwrap())
-        {
-            roots.push((base.join(default), name.clone()));
-        }
-    }
-    for (kind, dir, automatic) in [
-        ("bin", "src/bin", "autobins"),
-        ("test", "tests", "autotests"),
-        ("example", "examples", "autoexamples"),
-        ("bench", "benches", "autobenches"),
-    ] {
-        if kind != "bin"
-            && let Some(targets) = value.get(kind).and_then(toml::Value::as_array)
-        {
-            for target in targets {
-                if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
-                    roots.push((base.join(path), name.clone()));
-                } else if let Some(target_name) = target.get("name").and_then(toml::Value::as_str) {
-                    let single = base.join(dir).join(format!("{target_name}.rs"));
-                    roots.push((
-                        if single.is_file() {
-                            single
-                        } else {
-                            base.join(dir).join(target_name).join("main.rs")
-                        },
-                        name.clone(),
-                    ));
-                }
-            }
-        }
-        if package.get(automatic).and_then(toml::Value::as_bool) == Some(false) {
-            continue;
-        }
-        if crosses_worktree(base, &base.join(dir)) {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(base.join(dir)) {
-            for e in entries {
-                let p = match e {
-                    Ok(entry) => entry.path(),
-                    Err(error) => {
-                        result
-                            .diagnostics
-                            .push(format!("Cannot read Rust target in {dir}: {error}"));
-                        continue;
-                    }
-                };
-                if linked_worktree(&p) {
-                    continue;
-                }
-                if p.extension().is_some_and(|e| e == "rs") {
-                    roots.push((p, name.clone()));
-                } else if p.join("main.rs").exists() {
-                    roots.push((p.join("main.rs"), name.clone()));
-                }
-            }
-        }
-    }
-    match package.get("build") {
-        Some(toml::Value::Boolean(false)) => (),
-        Some(toml::Value::String(path)) => roots.push((base.join(path), name.clone())),
-        _ if base.join("build.rs").is_file() => roots.push((base.join("build.rs"), name.clone())),
-        _ => (),
-    }
-    let mut target_paths = BTreeSet::new();
     if let Some(remote) = &policy.remote {
         remote.require(roots.iter().map(|(path, _)| path.clone()))?;
     }
@@ -1471,9 +1401,6 @@ fn load_cargo(
                 continue;
             }
         };
-        if !target_paths.insert(root.clone()) {
-            continue;
-        }
         result.sources.push(SourceInput {
             path: root,
             project,
