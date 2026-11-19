@@ -217,7 +217,7 @@ fn edge_record(tracker: &mut Tracker, state: &State, mapping: &Mapping) -> Resul
         scope_unresolved: state.scope_unresolved || mapping.state.scope_unresolved,
         file_ancestry_unresolved: state.file_ancestry_unresolved
             || mapping.state.file_ancestry_unresolved,
-        counted: true,
+        counted: !(state.uncertain || mapping.state.uncertain),
         ..Record::default()
     };
     for link in &mapping.links {
@@ -243,51 +243,15 @@ fn edge_record(tracker: &mut Tracker, state: &State, mapping: &Mapping) -> Resul
     }
     // Identity is independent of line numbers and blob IDs. Unchanged selected
     // bytes moving past an unrelated edit do not create a source-history record.
-    let canonical = render::comparison(
+    render::summarize(
         &mut tracker.store,
-        &mut tracker.sources,
+        &tracker.sources,
         &mapping.state.regions,
         &state.regions,
         &linked_files(&mapping.state.regions, &state.regions, &mapping.links),
-        &[],
-        &[],
+        &mut record,
     )?;
-    record.changed = canonical != "No changes.\n" || !record.notes.is_empty();
-    if !record.changed {
-        return Ok(record);
-    }
-    let identical_files = matches!(
-        (mapping.state.regions.as_slice(), state.regions.as_slice()),
-        ([old], [new]) if old.kind == "file" && new.kind == "file" && old.blob == new.blob
-            && !mapping.state.absent && !state.absent
-    );
-    if identical_files {
-        // Equal Git objects prove zero content changes without loading source.
-        // This also covers moves and executable-mode changes in partial clones.
-        record.counted = !record.uncertain;
-    } else {
-        let (old, new) = (
-            single_value(tracker, &mapping.state)?,
-            single_value(tracker, state)?,
-        );
-        if let (Some(old), Some(new)) = (old, new) {
-            (record.plus, record.minus) = render::counts(old.text(), new.text());
-        } else {
-            // Counts in canonical patches already exclude unrelated source. Union
-            // alternatives are not a single edit and therefore have no aggregate count.
-            record.counted = !record.uncertain;
-            if record.counted {
-                record.plus = canonical
-                    .lines()
-                    .filter(|l| l.starts_with('+') && !l.starts_with("+++ "))
-                    .count();
-                record.minus = canonical
-                    .lines()
-                    .filter(|l| l.starts_with('-') && !l.starts_with("--- "))
-                    .count();
-            }
-        }
-    }
+    record.changed |= !record.notes.is_empty();
     if record.notes.is_empty() && record.changed {
         record.notes.insert(
             if mapping.state.regions.is_empty() {
@@ -748,13 +712,45 @@ fn endpoints(
     Ok((trace.states, order))
 }
 
-fn repository_regions(tree: &cache::SourceTree) -> BTreeMap<String, Region> {
-    tree.iter()
-        .filter(|(path, e)| {
-            matches!(e.mode, 0o100644 | 0o100755) && regions::language(path).is_some()
-        })
-        .map(|(path, e)| (path.clone(), Region::whole(path, &e.id, e.mode)))
-        .collect()
+fn repository_changes(
+    tree: &cache::SourceTree,
+    other: Option<&cache::SourceTree>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<BTreeMap<String, Region>> {
+    let mut changes = BTreeMap::new();
+    for (path, entry) in tree.iter() {
+        check(cancel)?;
+        if matches!(entry.mode, 0o100644 | 0o100755)
+            && !other.is_some_and(|other| other.get(path) == Some(entry))
+            && regions::language(path).is_some()
+        {
+            changes.insert(path.clone(), Region::whole(path, &entry.id, entry.mode));
+        }
+    }
+    Ok(changes)
+}
+
+fn prune_selected_files(old: &mut Vec<Region>, new: &mut Vec<Region>) {
+    fn file_id(region: &Region) -> Option<(&str, &str, u32)> {
+        region
+            .file_mode
+            .map(|mode| (region.path.as_str(), region.blob.as_str(), mode))
+    }
+    let old_files: std::collections::HashSet<_> = old.iter().filter_map(file_id).collect();
+    let unchanged: std::collections::HashSet<_> = new
+        .iter()
+        .filter_map(file_id)
+        .filter(|id| old_files.contains(id))
+        .collect();
+    if unchanged.is_empty() {
+        return;
+    }
+    let keep = |r: &Region| !file_id(r).is_some_and(|id| unchanged.contains(&id));
+    old.retain(keep);
+    // Save the mask before modifying the regions that own the borrowed keys.
+    let mask: Vec<_> = new.iter().map(keep).collect();
+    let mut mask = mask.into_iter();
+    new.retain(|_| mask.next().unwrap());
 }
 
 fn reconcile_repository_visibility(
@@ -1001,18 +997,12 @@ fn comparison_files(
                     if candidates.peek().is_none() {
                         continue;
                     }
-                    let current =
-                        tracker
-                            .sources
-                            .get(&mut tracker.store, &new[j].path, &new[j].blob)?;
+                    let current = tracker.sources.region(&mut tracker.store, &new[j])?;
                     let tokens =
                         std::cell::LazyCell::new(|| regions::BodyTokens::new(&current.text));
                     for i in candidates {
                         check(&tracker.store.cancel)?;
-                        let previous =
-                            tracker
-                                .sources
-                                .get(&mut tracker.store, &old[i].path, &old[i].blob)?;
+                        let previous = tracker.sources.region(&mut tracker.store, &old[i])?;
                         let Some(remaining) = bytes
                             .checked_sub(current.text.len().saturating_add(previous.text.len()))
                         else {
@@ -1112,7 +1102,7 @@ fn compare(
             .collect();
         tracker.store.prefetch(&trees, "tree")?;
     }
-    let (mut old, mut new, mut notes, order, opaque) = if repository {
+    let (mut old, mut new, notes, order, opaque) = if repository {
         let order = if parent
             .as_ref()
             .is_some_and(|p| child.parents.contains(&p.id))
@@ -1133,20 +1123,33 @@ fn compare(
         let after = tracker.tree(&child)?;
         let mut old = before
             .as_deref()
-            .map(repository_regions)
+            .map(|tree| repository_changes(tree, Some(&after), &tracker.store.cancel))
+            .transpose()?
             .unwrap_or_default();
-        let mut new = repository_regions(&after);
+        let mut new = repository_changes(&after, before.as_deref(), &tracker.store.cancel)?;
         let mut notes =
             vec!["source files only; binary, symlink, submodule and LFS payloads excluded".into()];
         let opaque = if let Some(before) = before.as_deref() {
-            reconcile_repository_visibility(
+            let opaque = reconcile_repository_visibility(
                 before,
                 &after,
                 &mut old,
                 &mut new,
                 &mut notes,
                 &tracker.store.cancel,
-            )?
+            )?;
+            for (path, entry) in after.iter() {
+                check(&tracker.store.cancel)?;
+                if let Some(old) = before.get(path).filter(|old| {
+                    old.mode != entry.mode
+                        && (regions::language(path).is_none()
+                            || !matches!(old.mode, 0o100644 | 0o100755)
+                            || !matches!(entry.mode, 0o100644 | 0o100755))
+                }) {
+                    notes.push(format!("mode {path} {:06o}→{:06o}", old.mode, entry.mode));
+                }
+            }
+            opaque
         } else {
             Vec::new()
         };
@@ -1200,42 +1203,13 @@ fn compare(
         && new.regions.len() == 1;
     // Prune only equal whole-file entries. A mode change must reach the same
     // pairing and rendering path as a content edit, including selected files.
-    let unchanged: BTreeSet<_> = old
-        .regions
-        .iter()
-        .filter(|a| {
-            a.kind == "file"
-                && new.regions.iter().any(|b| {
-                    b.kind == "file"
-                        && a.path == b.path
-                        && a.blob == b.blob
-                        && a.file_mode == b.file_mode
-                })
-        })
-        .map(|r| (r.path.clone(), r.blob.clone(), r.file_mode))
-        .collect();
-    old.regions
-        .retain(|r| !unchanged.contains(&(r.path.clone(), r.blob.clone(), r.file_mode)));
-    new.regions
-        .retain(|r| !unchanged.contains(&(r.path.clone(), r.blob.clone(), r.file_mode)));
-    if repository && let Some(parent) = &parent {
-        let before = tracker.tree(parent)?;
-        let after = tracker.tree(&child)?;
-        for (path, entry) in after.iter() {
-            if let Some(old) = before.get(path).filter(|old| {
-                old.mode != entry.mode
-                    && (regions::language(path).is_none()
-                        || !matches!(old.mode, 0o100644 | 0o100755)
-                        || !matches!(entry.mode, 0o100644 | 0o100755))
-            }) {
-                notes.push(format!("mode {path} {:06o}→{:06o}", old.mode, entry.mode));
-            }
-        }
+    if !repository {
+        prune_selected_files(&mut old.regions, &mut new.regions);
     }
     let files = comparison_files(tracker, parent.as_ref(), &child, &old, &new, lineage, order)?;
     let canonical = render::comparison(
         &mut tracker.store,
-        &mut tracker.sources,
+        &tracker.sources,
         &old.regions,
         &new.regions,
         &files,

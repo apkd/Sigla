@@ -345,6 +345,10 @@ impl Sources {
             ..self.clone()
         }
     }
+    pub fn region(&self, store: &mut Store, region: &Region) -> Result<Arc<Source>> {
+        self.for_region(region)
+            .get(store, &region.path, &region.blob)
+    }
     pub fn parse_totals(&self) -> (u64, u64) {
         (
             self.stats.count.load(Ordering::Relaxed),
@@ -412,7 +416,10 @@ impl Sources {
                 file_only,
             } => (key, bytes, language, java, file_only),
         };
-        let _admission = {
+        let _admission = if file_only {
+            let _wait = self.operation.wait("source_admission");
+            crate::memory::admit_source(bytes.len() as u64, cancel)?
+        } else {
             let _wait = self.operation.wait("parser_admission");
             crate::memory::admit_file(bytes.len() as u64, false, cancel)?
         };
@@ -430,26 +437,29 @@ impl Sources {
         let text: Arc<str> = String::from_utf8(bytes)
             .map_err(|error| UnreadableSource(format!("non-UTF-8 source at {path}: {error}")))?
             .into();
-        let started = std::time::Instant::now();
         let facts = if file_only {
             Ok(crate::extract::HistoricalFacts::default())
-        } else if java {
-            java::extract(&text, cancel)
         } else {
-            crate::extract::historical_cancellable(&text, language, cancel)
+            let started = std::time::Instant::now();
+            let facts = if java {
+                java::extract(&text, cancel)
+            } else {
+                crate::extract::historical_cancellable(&text, language, cancel)
+            };
+            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.stats.count.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .elapsed_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                ?language,
+                bytes = text.len(),
+                elapsed_us,
+                "Historical source parse"
+            );
+            facts
         };
-        self.stats.count.fetch_add(1, Ordering::Relaxed);
-        self.stats.elapsed_us.fetch_add(
-            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-        tracing::trace!(
-            path,
-            ?language,
-            bytes = text.len(),
-            elapsed_us = started.elapsed().as_micros(),
-            "Historical source parse"
-        );
         cancel.check()?;
         let (declarations, calls, presence, incomplete) = match facts {
             Ok(facts) => (
@@ -500,9 +510,7 @@ impl Sources {
         Ok(self.cache.put_source(key, source))
     }
     pub fn text(&mut self, store: &mut Store, region: &Region) -> Result<String> {
-        let source = self
-            .for_region(region)
-            .get(store, &region.path, &region.blob)?;
+        let source = self.region(store, region)?;
         Ok(source
             .text
             .get(region.range(&source))

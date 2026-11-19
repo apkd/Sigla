@@ -3007,6 +3007,23 @@ async fn renamed_directory_includes_members_deleted_before_anchor() {
 }
 
 #[tokio::test]
+async fn directory_log_counts_edits_whose_text_looks_like_patch_headers() {
+    let f = Fixture::new();
+    let base = f.commit(
+        &[("docs/a.txt", "-- old A\n"), ("docs/b.txt", "-- old B")],
+        &[],
+        "before",
+    );
+    let tip = f.commit(
+        &[("docs/a.txt", "++ new A\n"), ("docs/b.txt", "++ new B")],
+        &[&base],
+        "after",
+    );
+    let log = f.history(&tip, "log path:docs limit:1").await;
+    assert!(log.contains("+2 -2"), "{log}");
+}
+
+#[tokio::test]
 async fn directory_history_ignores_unrelated_changes_and_keeps_member_additions_and_deletions() {
     let f = Fixture::new();
     let base = [

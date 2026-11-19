@@ -359,6 +359,25 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_log_and_patch_need_no_language_parser() {
+        use super::super::{execute, matching::Tracker, query::Request};
+        let root = repository();
+        let base = commit(root.path(), None, "fn before() {}\n");
+        let tip = commit(root.path(), Some(&base), "fn after() {}\n");
+        for (query, expected) in [
+            ("log file:code.rs limit:1".to_owned(), "+1 -1"),
+            (format!("show {tip} file:code.rs"), "+fn after() {}"),
+        ] {
+            let store = Store::local(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
+            let mut tracker = Tracker::new(store, Arc::new(Cache::new(1 << 20)));
+            let request = Request::parse(&query).unwrap();
+            let result = execute(&mut tracker, Some(&tip), &request).unwrap();
+            assert!(result.contains(expected), "{result}");
+            assert_eq!(tracker.sources.parse_totals().0, 0, "{query}");
+        }
+    }
+
+    #[test]
     fn whole_file_text_is_independent_of_syntax_and_symbol_cache() {
         use super::super::regions::{Region, Sources};
         let root = repository();

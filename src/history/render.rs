@@ -1,5 +1,6 @@
 use super::{
-    regions::{Region, Sources},
+    Record,
+    regions::{Region, Source, Sources},
     sequence,
 };
 use crate::repository::history::Store;
@@ -141,7 +142,7 @@ pub(super) fn mode_change(old: &Region, new: &Region) -> Option<String> {
 
 pub(super) fn comparison(
     store: &mut Store,
-    sources: &mut Sources,
+    sources: &Sources,
     old: &[Region],
     new: &[Region],
     files: &[FilePair],
@@ -164,6 +165,38 @@ pub(super) fn comparison(
             "canonical diff exceeds history memory bound"
         );
     }
+    pairs(old, new, files, |a, b, file| {
+        compare_pair(store, sources, Output::Patch(&mut out), a, b, file)
+    })?;
+    if out.is_empty() {
+        out.push_str("No changes.\n");
+    }
+    ensure!(
+        out.len() <= CANONICAL_LIMIT,
+        "canonical diff exceeds history memory bound"
+    );
+    Ok(out)
+}
+
+pub(super) fn summarize(
+    store: &mut Store,
+    sources: &Sources,
+    old: &[Region],
+    new: &[Region],
+    files: &[FilePair],
+    record: &mut Record,
+) -> Result<()> {
+    pairs(old, new, files, |a, b, file| {
+        compare_pair(store, sources, Output::Log(record), a, b, file)
+    })
+}
+
+fn pairs(
+    old: &[Region],
+    new: &[Region],
+    files: &[FilePair],
+    mut visit: impl FnMut(Option<&Region>, Option<&Region>, Option<&FilePair>) -> Result<()>,
+) -> Result<()> {
     // Whole files use path continuity or explicit evidence. Selected regions
     // retain their context pairing; unmatched occurrences stay independent.
     let mut file_paths = BTreeMap::<&str, Vec<usize>>::new();
@@ -213,30 +246,29 @@ pub(super) fn comparison(
             consumed[i] = true;
             &old[i]
         });
-        append(store, sources, &mut out, previous, Some(current), file)?;
+        visit(previous, Some(current), file)?;
     }
     for (i, previous) in old.iter().enumerate() {
         if !consumed[i] {
-            append(store, sources, &mut out, Some(previous), None, None)?;
+            visit(Some(previous), None, None)?;
         }
     }
-    if out.is_empty() {
-        out.push_str("No changes.\n");
-    }
-    ensure!(
-        out.len() <= CANONICAL_LIMIT,
-        "canonical diff exceeds history memory bound"
-    );
-    Ok(out)
+    Ok(())
 }
-fn append(
+enum Output<'a> {
+    Log(&'a mut Record),
+    Patch(&'a mut String),
+}
+
+fn compare_pair(
     store: &mut Store,
-    sources: &mut Sources,
-    out: &mut String,
+    sources: &Sources,
+    output: Output<'_>,
     old: Option<&Region>,
     new: Option<&Region>,
     file: Option<&FilePair>,
 ) -> Result<()> {
+    super::check(&store.cancel)?;
     let mode = old.zip(new).and_then(|(a, b)| mode_change(a, b));
     if old.zip(new).is_some_and(|(a, b)| {
         a.path == b.path
@@ -248,38 +280,46 @@ fn append(
     {
         return Ok(());
     }
-    let ((a, astart), (b, bstart)) = if old
+    let (a_source, b_source) = if old
         .zip(new)
         .is_some_and(|(a, b)| a.kind == "file" && b.kind == "file" && a.blob == b.blob)
     {
         // Equal whole-file objects have no content diff, even across a move or
         // mode change. Their metadata needs no source hydration.
-        ((String::new(), 1), (String::new(), 1))
+        (None, None)
     } else {
         // Only this already-selected pair is needed next. Do not hydrate the
         // remaining comparison ahead of rendering or its memory bound.
         let blobs: Vec<_> = old.into_iter().chain(new).map(|r| r.blob.clone()).collect();
         store.prefetch(&blobs, "blob")?;
-        let mut read = |region: Option<&Region>| -> Result<(String, usize)> {
-            if let Some(region) = region {
-                let source = sources.get(store, &region.path, &region.blob)?;
-                Ok((
-                    source.text[region.range(&source)].to_owned(),
-                    crate::model::position(&source.text, region.span.start).0,
-                ))
-            } else {
-                Ok((String::new(), 1))
-            }
-        };
-        (read(old)?, read(new)?)
+        let mut read = |region: &Region| sources.region(store, region);
+        (old.map(&mut read).transpose()?, new.map(read).transpose()?)
     };
-    let old_name = old.map_or("/dev/null".into(), |r| format!("a/{}", r.path));
-    let new_name = new.map_or("/dev/null".into(), |r| format!("b/{}", r.path));
+    fn selected<'a>(region: Option<&Region>, source: Option<&'a Source>) -> &'a str {
+        region.zip(source).map_or("", |(r, s)| &s.text[r.range(s)])
+    }
+    let a = selected(old, a_source.as_deref());
+    let b = selected(new, b_source.as_deref());
     let changed_identity = old
         .zip(new)
         .is_some_and(|(a, b)| a.path != b.path || a.name != b.name);
     let changed_existence = old.is_some() != new.is_some();
-    if a != b || changed_identity || changed_existence || mode.is_some() {
+    let text_changed = a != b;
+    if text_changed || changed_identity || changed_existence || mode.is_some() {
+        let out = match output {
+            Output::Log(record) => {
+                record.changed = true;
+                if record.counted && text_changed {
+                    let (plus, minus) = counts(a, b);
+                    record.plus += plus;
+                    record.minus += minus;
+                }
+                return Ok(());
+            }
+            Output::Patch(out) => out,
+        };
+        let old_name = old.map_or("/dev/null".into(), |r| format!("a/{}", r.path));
+        let new_name = new.map_or("/dev/null".into(), |r| format!("b/{}", r.path));
         writeln!(out, "diff --git {old_name} {new_name}").unwrap();
         if let Some(mode) = mode {
             writeln!(out, "# {mode}").unwrap();
@@ -318,16 +358,28 @@ fn append(
                 .unwrap();
             }
         }
-        if changed_existence && a == b {
+        if changed_existence && !text_changed {
             writeln!(out, "--- {old_name}\n+++ {new_name}").unwrap();
-        } else {
-            out.push_str(&unified(&a, &b, astart, bstart, &old_name, &new_name));
+        } else if text_changed {
+            let start = |region: Option<&Region>, source: Option<&Source>| {
+                region
+                    .zip(source)
+                    .map_or(1, |(r, s)| crate::model::position(&s.text, r.span.start).0)
+            };
+            out.push_str(&unified(
+                a,
+                b,
+                start(old, a_source.as_deref()),
+                start(new, b_source.as_deref()),
+                &old_name,
+                &new_name,
+            ));
         }
+        ensure!(
+            out.len() <= CANONICAL_LIMIT,
+            "canonical diff exceeds history memory bound"
+        );
     }
-    ensure!(
-        out.len() <= CANONICAL_LIMIT,
-        "canonical diff exceeds history memory bound"
-    );
     Ok(())
 }
 
