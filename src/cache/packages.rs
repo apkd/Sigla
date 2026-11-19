@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const GENERATION: &str = ".sigla-generation";
@@ -144,6 +144,7 @@ impl View {
         integration: &Path,
         deadline: crate::process::Deadline,
     ) -> Result<()> {
+        let started = Instant::now();
         match validate_upper(&self.upper()) {
             Ok(false) => return Ok(()),
             Ok(true) => (),
@@ -152,6 +153,7 @@ impl View {
                 return Err(error);
             }
         }
+        let validated = Instant::now();
         let stage = tempfile::Builder::new()
             .prefix("package-snapshot-")
             .tempdir_in(&self.root)?;
@@ -193,7 +195,11 @@ impl View {
             .arg(&contents)
             .env("XDG_RUNTIME_DIR", stage.path());
         crate::process::run(&mut command, deadline.remaining(Duration::from_secs(300))?)?;
-        self.store.import_tree(&contents)?;
+        let snapshotted = Instant::now();
+        // The helper has exited. Changed files are private copies; unchanged
+        // files already link to the immutable lower view.
+        self.store.import_owned_tree(&contents)?;
+        let imported = Instant::now();
         let generation = stage
             .path()
             .file_name()
@@ -216,7 +222,16 @@ impl View {
         File::open(&self.root)?.sync_all()?;
         // The journal owns both sides until cleanup completes, including after a crash.
         let _ = stage.keep();
-        self.recover()
+        self.recover()?;
+        tracing::info!(
+            root = %self.root.display(),
+            validate_ms = (validated - started).as_millis(),
+            snapshot_ms = (snapshotted - validated).as_millis(),
+            import_ms = (imported - snapshotted).as_millis(),
+            publish_ms = imported.elapsed().as_millis(),
+            "Published changed package snapshot"
+        );
+        Ok(())
     }
 }
 
