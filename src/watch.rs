@@ -17,7 +17,15 @@ pub(crate) struct Snapshot {
 }
 impl Snapshot {
     pub fn changed(&self) -> bool {
-        self.monitor.fence(&self.paths, self.generation).0
+        self.change_reason().is_some()
+    }
+    pub(crate) fn change_reason(&self) -> Option<&'static str> {
+        let changes = self.changes();
+        if changes.full {
+            Some("directory watch coverage lost")
+        } else {
+            changes.any().then_some("watched files changed")
+        }
     }
     pub(crate) fn changes(&self) -> Changes {
         self.monitor.changes(&self.paths, self.generation).0

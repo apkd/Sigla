@@ -128,27 +128,35 @@ impl Ticket {
             Progress::Pending(_) | Progress::Files(_) | Progress::Refreshing(..)
         )
     }
-    pub fn needs_refresh(&self, generation: Option<u64>) -> bool {
-        match &*self.progress.borrow() {
-            Progress::Ready(inventory, prepared) => {
-                *prepared != generation
-                    || inventory.watch.changed()
-                    || inventory
+    pub fn refresh_reason(&self, generation: Option<u64>) -> Option<&'static str> {
+        let progress = self.progress.borrow();
+        let (inventory, prepared) = match &*progress {
+            Progress::Ready(inventory, prepared)
+            | Progress::RetryFailed(inventory, prepared, _)
+            | Progress::Refreshing(inventory, prepared) => (inventory, prepared),
+            Progress::Failed(..) => return Some("previous preparation failed"),
+            Progress::Pending(_) | Progress::Files(_) => return None,
+        };
+        if *prepared != generation {
+            return Some("repository generation changed");
+        }
+        inventory
+            .watch
+            .change_reason()
+            .or_else(|| match &*progress {
+                Progress::Ready(..)
+                    if inventory
                         .manifest
                         .dependency_retry
-                        .is_some_and(|retry| retry.due(crate::cache::now()))
-            }
-            Progress::Failed(..) => true,
-            Progress::RetryFailed(inventory, prepared, after) => {
-                *prepared != generation
-                    || inventory.watch.changed()
-                    || std::time::Instant::now() >= *after
-            }
-            Progress::Refreshing(inventory, prepared) => {
-                *prepared != generation || inventory.watch.changed()
-            }
-            Progress::Pending(_) | Progress::Files(_) => false,
-        }
+                        .is_some_and(|retry| retry.due(crate::cache::now())) =>
+                {
+                    Some("dependency retry due")
+                }
+                Progress::RetryFailed(_, _, after) if std::time::Instant::now() >= *after => {
+                    Some("retry after preparation failure")
+                }
+                _ => None,
+            })
     }
     pub fn retry_inventory(
         &self,
@@ -530,6 +538,7 @@ impl App {
     }
 }
 pub(super) struct Request {
+    pub reason: &'static str,
     pub workspace: Arc<tokio::sync::Mutex<Option<Workspace>>>,
     pub entry: PathBuf,
     pub policy: Policy,
@@ -540,6 +549,7 @@ pub(super) struct Request {
 }
 pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     let Request {
+        reason,
         workspace,
         entry,
         policy,
@@ -567,7 +577,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     }
     let telemetry_id = operation.id();
     tokio::spawn(async move {
-        tracing::debug!(shared_job = job, workspace = %entry.display(), "Workspace preparation started");
+        tracing::info!(shared_job = job, workspace = %entry.display(), reason, "Workspace preparation started");
         let mut lifecycle = None;
         let outcome = async {
             if let Some(branch) = &preparing_branch {
@@ -944,6 +954,7 @@ mod tests {
             let ticket = start(
                 app.clone(),
                 Request {
+                    reason: "dependency retry due",
                     workspace: slot.state.clone(),
                     entry: root.path().into(),
                     policy,
@@ -1007,6 +1018,7 @@ mod tests {
         let mut ticket = start(
             app.clone(),
             Request {
+                reason: "new workspace",
                 workspace: workspace.clone(),
                 entry: root.path().into(),
                 policy: policy.clone(),

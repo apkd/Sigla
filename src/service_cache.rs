@@ -744,10 +744,12 @@ impl App {
                 .map(|(entry, _)| entry.clone())
                 .collect::<Vec<_>>();
             idle.into_iter()
-                .filter_map(|entry| workspaces.remove(&entry))
+                .filter_map(|entry| workspaces.remove_entry(&entry))
                 .collect::<Vec<_>>()
         };
-        drop(retired);
+        for entry in retired {
+            WorkspaceSlot::retire(entry, "analysis compaction");
+        }
         drop(read);
         if self.inspection_shutdown.is_cancelled() {
             return Ok(outcome);
@@ -1054,10 +1056,14 @@ impl App {
                 pressure,
                 || self.owner_scopes(root),
                 |scopes| {
-                    self.workspaces
+                    let retired = self
+                        .workspaces
                         .lock()
                         .unwrap()
-                        .remove(&candidate.owner.entry);
+                        .remove_entry(&candidate.owner.entry);
+                    if let Some(entry) = retired {
+                        WorkspaceSlot::retire(entry, "disk eviction");
+                    }
                     self.retire_owner(scopes)?;
                     self.owners.lock().unwrap().remove(&candidate.owner.entry);
                     Ok(())
@@ -1099,25 +1105,30 @@ impl App {
                 }
                 // Keep leases until the catalog guard is released, including
                 // when a storage operation fails below.
-                let removed = registry.remove(&candidate.owner.entry);
+                let removed = registry.remove_entry(&candidate.owner.entry);
                 if !started {
                     self.sources.forget(&candidate.owner.entry);
                 }
                 started = true;
-                if let Some(scope) = scopes.next()
-                    && let Some(current) = scope.database.existing(scope.fingerprint)?
-                    && current.id == scope.id
-                {
-                    current.mark_deleting()?;
-                }
+                let marked: Result<()> = scopes.next().map_or(Ok(()), |scope| {
+                    if let Some(current) = scope.database.existing(scope.fingerprint)?
+                        && current.id == scope.id
+                    {
+                        current.mark_deleting()?;
+                    }
+                    Ok(())
+                });
                 let done = scopes.peek().is_none();
-                if done {
+                if done && marked.is_ok() {
                     self.owners.lock().unwrap().remove(&candidate.owner.entry);
                 }
                 drop(registry);
-                drop(removed);
+                if let Some(entry) = removed {
+                    WorkspaceSlot::retire(entry, "disk eviction");
+                }
+                marked?;
                 if done {
-                    return Ok(true);
+                    break;
                 }
                 std::thread::yield_now();
             }

@@ -92,6 +92,16 @@ impl App {
                 resources
                     .retained
                     .insert("workspaces".into(), app.workspace_cache_usage());
+                let history = app.history_cache.stats();
+                // History may evict any entry; active readers own their references separately.
+                resources.retained.insert(
+                    "history".into(),
+                    crate::memory::CacheUsage {
+                        entries: history.entries,
+                        retained_bytes: history.bytes as u64,
+                        ..Default::default()
+                    },
+                );
             }
             Ok(report)
         })

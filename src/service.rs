@@ -29,6 +29,40 @@ struct WorkspaceSlot {
     preparing: Option<preparation::Ticket>,
     used: Instant,
 }
+impl WorkspaceSlot {
+    /// Drop a detached entry after releasing the workspace registry lock.
+    fn retire((path, slot): (PathBuf, Self), reason: &'static str) {
+        if tracing::enabled!(tracing::Level::INFO) {
+            let retired_bytes = slot.heap_usage().0;
+            let start = Instant::now();
+            drop(slot);
+            tracing::info!(workspace = %path.display(), reason, retired_bytes,
+                drop_ms = start.elapsed().as_millis() as u64, "Retired workspace from memory");
+        }
+    }
+
+    fn heap_usage(&self) -> (u64, u64) {
+        let state = self.state.try_lock().ok();
+        let workspace = state.as_ref().and_then(|state| state.as_ref());
+        let manifest = workspace.map(|workspace| &workspace.manifest);
+        let workspace_bytes = workspace.map_or(0, |workspace| {
+            workspace.retained_bytes as u64 + workspace.manifest.derived.heap_bytes()
+        });
+        let (extra, pinned) = self
+            .preparing
+            .as_ref()
+            .map_or((0, 0), |ticket| ticket.retained_heap_bytes(manifest));
+        let retained = workspace_bytes + extra;
+        (
+            retained,
+            if Arc::strong_count(&self.state) > 1 {
+                retained
+            } else {
+                pinned
+            },
+        )
+    }
+}
 const WORKSPACE_CACHE_ENTRIES: usize = 256;
 #[derive(Clone, Debug)]
 enum Request {
@@ -214,41 +248,46 @@ impl App {
         let budget = crate::memory::cache_budget();
         self.assets.trim_to(budget / 2);
         self.sources.trim_to(budget / 4);
-        let workspace_budget = (budget / 4).saturating_sub(self.history_cache.stats().bytes);
+        let history_bytes = self.history_cache.stats().bytes;
+        let workspace_budget = (budget / 4).saturating_sub(history_bytes) as u64;
         loop {
             let retired = {
                 let mut registry = self.workspaces.lock().unwrap();
-                let mut bytes = 0usize;
-                for slot in registry.values() {
-                    let state = slot.state.try_lock().ok();
-                    let workspace = state.as_ref().and_then(|state| state.as_ref());
-                    let manifest = workspace.map(|workspace| &workspace.manifest);
-                    bytes = bytes.saturating_add(workspace.map_or(0, |workspace| {
-                        workspace
-                            .retained_bytes
-                            .saturating_add(workspace.manifest.derived.heap_bytes() as usize)
-                    }));
-                    if let Some(ticket) = &slot.preparing {
-                        bytes = bytes.saturating_add(
-                            usize::try_from(ticket.retained_heap_bytes(manifest).0)
-                                .unwrap_or(usize::MAX),
-                        );
+                let mut bytes = 0u64;
+                let mut oldest = None;
+                for (path, slot) in registry.iter() {
+                    let retained = slot.heap_usage().0;
+                    bytes = bytes.saturating_add(retained);
+                    if Arc::strong_count(&slot.state) == 1
+                        && oldest.is_none_or(|(_, used)| slot.used < used)
+                    {
+                        oldest = Some((path, slot.used));
                     }
                 }
                 if bytes <= workspace_budget && registry.len() <= WORKSPACE_CACHE_ENTRIES {
                     None
                 } else {
-                    let oldest = registry
-                        .iter()
-                        .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
-                        .min_by_key(|(_, slot)| slot.used)
-                        .map(|(path, _)| path.clone());
-                    oldest.and_then(|path| registry.remove(&path))
+                    let reason = if bytes > workspace_budget {
+                        "heap budget"
+                    } else {
+                        "entry limit"
+                    };
+                    oldest
+                        .map(|(path, _)| path.clone())
+                        .and_then(|path| registry.remove_entry(&path))
+                        .map(|entry| (entry, bytes, reason))
                 }
             };
-            let Some(retired) = retired else { break };
-            // Drop cached heap outside the registry lock.
-            drop(retired);
+            let Some((entry, workspace_bytes, reason)) = retired else {
+                break;
+            };
+            tracing::info_span!(
+                "workspace_trim",
+                workspace_bytes,
+                workspace_budget,
+                history_bytes
+            )
+            .in_scope(|| WorkspaceSlot::retire(entry, reason));
             crate::memory::reclaim();
         }
         if let Some(remote) = &self.remote
@@ -285,21 +324,9 @@ impl App {
             if active {
                 usage.active_entries += 1;
             }
-            let state = slot.state.try_lock().ok();
-            let workspace = state.as_ref().and_then(|state| state.as_ref());
-            let workspace_bytes = workspace.map_or(0, |workspace| {
-                workspace.retained_bytes as u64 + workspace.manifest.derived.heap_bytes()
-            });
-            usage.retained_bytes += workspace_bytes;
-            if state_pinned {
-                usage.pinned_bytes += workspace_bytes;
-            }
-            if let Some(ticket) = &slot.preparing {
-                let (retained, pinned) =
-                    ticket.retained_heap_bytes(workspace.map(|workspace| &workspace.manifest));
-                usage.retained_bytes += retained;
-                usage.pinned_bytes += if state_pinned { retained } else { pinned };
-            }
+            let (retained, pinned) = slot.heap_usage();
+            usage.retained_bytes += retained;
+            usage.pinned_bytes += pinned;
         }
         usage
     }
@@ -683,9 +710,11 @@ impl App {
                     {
                         continue;
                     }
-                    registry.remove(&path)
+                    registry.remove_entry(&path)
                 };
-                drop(retired);
+                if let Some(entry) = retired {
+                    WorkspaceSlot::retire(entry, "branch expired");
+                }
                 let scopes = app.owner_scopes(&branch.root)?;
                 remote.expire(&branch, || app.retire_owner(scopes))?;
             }
@@ -806,14 +835,19 @@ impl App {
                 progress: false,
             });
         }
-        registry.remove(&info.entry);
+        let retired = registry.remove_entry(&info.entry);
         self.sources.forget(&info.entry);
-        scope.mark_deleting()?;
         // Preserve activity -> registry -> storage ordering and exclude opens
         // until this transaction commits. Deleting remains durable between turns.
-        let done = scope.delete_batch(now, 128)?;
+        let result = scope
+            .mark_deleting()
+            .and_then(|_| scope.delete_batch(now, 128));
+        drop(registry);
+        if let Some(entry) = retired {
+            WorkspaceSlot::retire(entry, "analysis retired");
+        }
         Ok(disk::Retirement {
-            done,
+            done: result?,
             progress: true,
         })
     }
@@ -1091,14 +1125,17 @@ impl App {
                 let generation = branch
                     .as_ref()
                     .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
-                if slot
+                if let Some(reason) = slot
                     .preparing
                     .as_ref()
-                    .is_none_or(|ticket| ticket.needs_refresh(generation))
+                    .map_or(Some("new workspace"), |ticket| {
+                        ticket.refresh_reason(generation)
+                    })
                 {
                     slot.preparing = Some(preparation::start(
                         self.clone(),
                         preparation::Request {
+                            reason,
                             workspace: slot.state.clone(),
                             entry: entry.clone(),
                             policy: policy.clone(),
@@ -1123,11 +1160,13 @@ impl App {
                     let Some(oldest) = oldest else {
                         break;
                     };
-                    retired.push(registry.remove(&oldest));
+                    retired.push(registry.remove_entry(&oldest).unwrap());
                 }
                 (state, preparation, retired)
             };
-            drop(retired);
+            for entry in retired {
+                WorkspaceSlot::retire(entry, "entry limit");
+            }
             tracing::Span::current().record("shared_job", preparation.id());
             if let Some(job_id) = preparation.telemetry_id() {
                 operation.link(&job_id);
@@ -3218,9 +3257,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ticket.running());
-        assert!(!ticket.needs_refresh(Some(
-            branch.generation.load(std::sync::atomic::Ordering::Acquire) + 1
-        )));
+        assert!(
+            ticket
+                .refresh_reason(Some(
+                    branch.generation.load(std::sync::atomic::Ordering::Acquire) + 1
+                ))
+                .is_none()
+        );
         let mut publication = Box::pin(branch.publish());
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
@@ -3261,7 +3304,7 @@ mod tests {
         assert!(reacquired, "Queued preparation retained branch state");
         assert!(result.contains("Prepared"), "{result}");
         let generation = branch.generation.load(std::sync::atomic::Ordering::Acquire);
-        assert!(ticket.needs_refresh(Some(generation + 1)));
+        assert!(ticket.refresh_reason(Some(generation + 1)).is_some());
         let repeated = app.search(project, "Prepared").await.unwrap();
         assert!(repeated.contains("Prepared"), "{repeated}");
         assert_eq!(job(), original_job);
