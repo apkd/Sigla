@@ -435,7 +435,7 @@ pub(crate) fn discover_with_editor(
                 return Ok(None);
             }
             let response = assembly.directory.join("csc.rsp");
-            let mut response_refs = Vec::new();
+            let mut response_refs = BTreeSet::new();
             let mut response_defines = BTreeSet::new();
             if response.is_file() {
                 result.metadata.insert(response.clone());
@@ -443,6 +443,10 @@ pub(crate) fn discover_with_editor(
                     &response,
                     root,
                     policy,
+                    |name| {
+                        editor
+                            .profile_reference(name, settings.compilation_api(assembly.editor_only))
+                    },
                     &mut response_defines,
                     &mut response_refs,
                 ) {
@@ -511,10 +515,13 @@ pub(crate) fn discover_with_editor(
             let mut metadata: Vec<_> = inputs
                 .references
                 .into_iter()
-                .map(|path| MetadataReference {
-                    path,
-                    aliases: Vec::new(),
-                    provenance: format!("Unity editor {}", editor.selected),
+                .map(|path| {
+                    response_refs.remove(&path);
+                    MetadataReference {
+                        path,
+                        aliases: Vec::new(),
+                        provenance: format!("Unity editor {}", editor.selected),
+                    }
                 })
                 .collect();
             metadata.extend(response_refs.into_iter().map(|path| MetadataReference {
@@ -603,6 +610,7 @@ pub(crate) fn discover_with_editor(
         let project = match prepared {
             Ok(Some(project)) => project,
             Ok(None) => continue,
+            Err(error) if error.is::<crate::discovery::RequiredInputs>() => return Err(error),
             Err(error) => {
                 result.diagnostics.push(format!(
                     "Excluded assembly {}: {error:#}",
@@ -903,8 +911,9 @@ fn response_file(
     path: &Path,
     root: &Path,
     policy: &Policy,
+    profile_reference: impl Fn(&str) -> Option<PathBuf>,
     defines: &mut BTreeSet<String>,
-    references: &mut Vec<PathBuf>,
+    references: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
     let mut quoted = false;
@@ -945,19 +954,32 @@ fn response_file(
             .strip_prefix("reference:")
             .or_else(|| token.strip_prefix("r:"))
         {
-            let relative = crate::metadata_archive::reference(root.join(value));
-            if let Some(remote) = &policy.remote {
-                remote.require([relative.clone()])?;
+            let dll = (!value.ends_with(".dll")).then(|| format!("{value}.dll"));
+            let mut found = None;
+            'directories: for directory in [root, path.parent().unwrap()] {
+                for name in std::iter::once(value).chain(dll.as_deref()) {
+                    let path = directory.join(name);
+                    let path = if name.ends_with(".dll") {
+                        crate::metadata_archive::reference(path)
+                    } else {
+                        path
+                    };
+                    if let Some(remote) = &policy.remote {
+                        remote.require([path.clone()])?;
+                    }
+                    if path.is_file() {
+                        found = Some(policy.canonical(&path)?);
+                        break 'directories;
+                    }
+                }
             }
-            let path = if relative.is_file() {
-                relative
-            } else {
-                crate::metadata_archive::reference(path.parent().unwrap().join(value))
-            };
-            if let Some(remote) = &policy.remote {
-                remote.require([path.clone()])?;
-            }
-            references.push(policy.canonical(&path)?);
+            references.insert(
+                found
+                    .or_else(|| profile_reference(value))
+                    .with_context(|| {
+                        format!("Cannot resolve Unity response-file reference {value}")
+                    })?,
+            );
         } else if token.starts_with('@') {
             bail!("Nested Unity response files are not supported");
         }
@@ -967,6 +989,64 @@ fn response_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn response_references_use_only_the_selected_unity_profile_after_project_files() {
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let response = root.join("Assets/csc.rsp");
+        std::fs::create_dir(root.join("Assets")).unwrap();
+        let framework = install
+            .path()
+            .join("UnityReferenceAssemblies/unity-4.8-api/System.IO.Compression.sigla");
+        let standard = install
+            .path()
+            .join("NetStandard/compat/2.1.0/shims/netstandard/System.IO.Compression.dll");
+        for file in [&standard, &framework] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, []).unwrap();
+        }
+        let version = "6000.3.10f1".parse().unwrap();
+        let editor = Editor {
+            declared: version,
+            selected: version,
+            data: install.path().into(),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let settings = Settings {
+            api: 6,
+            editor_api: 2,
+            defines: Default::default(),
+            backend: 0,
+            input: 0,
+        };
+        let policy = Policy::new(vec![root.into()]).unwrap();
+        let resolve = |input, editor_only| -> Result<BTreeSet<PathBuf>> {
+            std::fs::write(&response, input)?;
+            let mut references = BTreeSet::new();
+            response_file(
+                &response,
+                root,
+                &policy,
+                |name| editor.profile_reference(name, settings.compilation_api(editor_only)),
+                &mut BTreeSet::new(),
+                &mut references,
+            )?;
+            Ok(references)
+        };
+        let input = "-r:System.IO.Compression.dll -r:System.IO.Compression";
+        assert_eq!(resolve(input, true).unwrap(), [framework.clone()].into());
+        assert_eq!(resolve(input, false).unwrap(), [standard].into());
+        std::fs::remove_file(framework).unwrap();
+        assert!(resolve(input, true).is_err());
+        assert!(resolve("-r:Missing.dll", false).is_err());
+        assert!(resolve("-r:subdir/System.IO.Compression.dll", false).is_err());
+        let plugin = root.join("Assets/System.IO.Compression.dll");
+        std::fs::write(&plugin, []).unwrap();
+        assert_eq!(resolve(input, false).unwrap(), [plugin].into());
+    }
+
     #[test]
     fn response_references_request_deferred_inputs_before_resolving_fallbacks() {
         let root = tempfile::tempdir().unwrap();
@@ -986,11 +1066,12 @@ mod tests {
             selection_identity: String::new(),
             tracked: std::sync::Arc::new(["Plugin.asset".into()].into()),
         });
-        let mut references = Vec::new();
+        let mut references = BTreeSet::new();
         let error = response_file(
             &response,
             source,
             &policy,
+            |_| panic!("A deferred project reference must be acquired before using the editor"),
             &mut BTreeSet::new(),
             &mut references,
         )
@@ -1007,11 +1088,12 @@ mod tests {
             &response,
             source,
             &policy,
+            |_| None,
             &mut BTreeSet::new(),
             &mut references,
         )
         .unwrap();
-        assert_eq!(references, [source.join("Plugin.asset")]);
+        assert_eq!(references, BTreeSet::from([source.join("Plugin.asset")]));
 
         references.clear();
         policy.remote.as_mut().unwrap().tracked =
@@ -1022,6 +1104,7 @@ mod tests {
             &response,
             source,
             &policy,
+            |_| panic!("A deferred response-directory reference must take precedence"),
             &mut BTreeSet::new(),
             &mut references,
         )

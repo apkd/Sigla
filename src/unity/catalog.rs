@@ -10,6 +10,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const STANDARD_DIRS: &[&str] = &[
+    "NetStandard/ref/2.1.0",
+    "NetStandard/compat/2.1.0/shims/netfx",
+    "NetStandard/compat/2.1.0/shims/netstandard",
+    "NetStandard/Extensions/2.0.0",
+];
+const FRAMEWORK_DIR: &str = "UnityReferenceAssemblies/unity-4.8-api";
+const FACADES_DIR: &str = "UnityReferenceAssemblies/unity-4.8-api/Facades";
+
 fn supported(version: UnityVersion) -> bool {
     matches!(
         (version.branch.major, version.branch.minor),
@@ -165,19 +174,16 @@ impl References {
             "PlaybackEngines/LinuxStandaloneSupport/Variations/il2cpp/Managed"
         })?;
         let mut standard = Vec::new();
-        for group in [
-            "NetStandard/ref/2.1.0",
-            "NetStandard/compat/2.1.0/shims/netfx",
-            "NetStandard/compat/2.1.0/shims/netstandard",
-            "NetStandard/Extensions/2.0.0",
-        ] {
+        for group in STANDARD_DIRS {
             standard.extend(directory(group)?);
         }
-        let mut framework = directory("UnityReferenceAssemblies/unity-4.8-api/Facades")?;
-        framework.extend(FRAMEWORK.split_whitespace().map(|name| {
-            data.join("UnityReferenceAssemblies/unity-4.8-api")
-                .join(format!("{name}.dll"))
-        }));
+        let mut framework = directory(FACADES_DIR)?;
+        watched.insert(data.join(FRAMEWORK_DIR));
+        framework.extend(
+            FRAMEWORK
+                .split_whitespace()
+                .map(|name| data.join(FRAMEWORK_DIR).join(format!("{name}.dll"))),
+        );
         for path in standard.iter().chain(&framework) {
             if !path.is_file() {
                 diagnostics.push(format!(
@@ -243,6 +249,24 @@ pub struct AssemblyContext {
 }
 
 impl Editor {
+    /// Resolve a simple assembly name in the same API profile used for compilation.
+    pub(super) fn profile_reference(&self, name: &str, api: u32) -> Option<PathBuf> {
+        if Path::new(name).file_name()?.to_str()? != name || name.contains('\\') {
+            return None;
+        }
+        let filename = format!("{}.dll", name.strip_suffix(".dll").unwrap_or(name));
+        let directories = if api == 6 {
+            STANDARD_DIRS
+        } else {
+            &[FRAMEWORK_DIR, FACADES_DIR]
+        };
+        directories.iter().find_map(|directory| {
+            let path =
+                crate::metadata_archive::reference(self.data.join(directory).join(&filename));
+            path.is_file().then_some(path)
+        })
+    }
+
     pub fn local(
         project: &Path,
         installations: Option<&Path>,
@@ -333,13 +357,7 @@ impl Editor {
             no_engine,
             editor_compatible,
         } = assembly;
-        let api = if editor_only {
-            // Unity 6 serializes Default=1, NET_Unity_4_8=2, NET_Standard=3.
-            // Earlier supported editors use the default Framework profile.
-            if settings.editor_api == 3 { 6 } else { 3 }
-        } else {
-            settings.api
-        };
+        let api = settings.compilation_api(editor_only);
         let mut defines = symbols(self.selected, platform, api, editor_only);
         let version = self.selected;
         defines.extend([
