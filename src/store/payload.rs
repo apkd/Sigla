@@ -11,6 +11,18 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+pub(super) const MAX_POSTING_BYTES: usize = 480;
+pub(super) const OVERSIZED_TERM: &str = "\0";
+
+// Archived postings identify candidate files. Readers check the original names.
+pub(super) fn posting_term(name: &str) -> &str {
+    if name.len() > MAX_POSTING_BYTES {
+        OVERSIZED_TERM
+    } else {
+        name
+    }
+}
+
 pub const DATA: &[u8] = &[1];
 pub const HEADERS: &[u8] = &[3];
 pub const BODY_INDEX: &[u8] = &[4];
@@ -116,19 +128,23 @@ pub fn decode<T: serde::de::DeserializeOwned>(
     crate::binary::decode_with_size(bytes)
 }
 
-pub(super) fn source(bytes: &[u8]) -> Result<&str> {
+pub(super) fn source_bytes(bytes: &[u8]) -> Result<&[u8]> {
     ensure!(
         bytes.len() <= MAX_SOURCE_BYTES * 32,
         "Analysis record exceeds safety bound"
     );
     // FileData begins with its UTF-8 source. Borrow it directly from the read
     // transaction; callers that need facts still use the full validated reader.
-    let (source, _) = postcard::take_from_bytes::<&str>(bytes)?;
+    let (source, _) = postcard::take_from_bytes::<&[u8]>(bytes)?;
+    Ok(source)
+}
+pub(super) fn source(bytes: &[u8]) -> Result<&str> {
+    let source = source_bytes(bytes)?;
     ensure!(
         source.len() <= MAX_SOURCE_BYTES,
         "Source exceeds safety bound"
     );
-    Ok(source)
+    Ok(std::str::from_utf8(source)?)
 }
 
 pub fn encode(mut data: FileData) -> Result<Encoded> {
@@ -299,7 +315,7 @@ fn relationship_names(facts: &Facts) -> BTreeSet<String> {
                 .filter(|i| !i.alias.is_empty())
                 .map(|i| format!("@alias:{}", simple(&i.path))),
         )
-        .filter(|name| name.len() <= 480)
+        .map(|name| posting_term(&name).to_owned())
         .collect()
 }
 pub fn validate(data: &FileData) -> Result<()> {
@@ -383,7 +399,7 @@ pub fn validate(data: &FileData) -> Result<()> {
 }
 
 pub(crate) fn names(data: &FileData) -> Names {
-    let eligible = |name: &&str| !name.is_empty() && name.len() <= 480;
+    let eligible = |name: &&str| !name.is_empty();
     Names {
         declarations: data
             .facts
@@ -391,6 +407,7 @@ pub(crate) fn names(data: &FileData) -> Names {
             .iter()
             .map(|d| d.name.as_str())
             .filter(eligible)
+            .map(posting_term)
             .map(str::to_owned)
             .chain(relationship_names(&data.facts))
             .collect(),
@@ -401,6 +418,7 @@ pub(crate) fn names(data: &FileData) -> Names {
             .map(|o| o.name.as_str())
             .chain(data.facts.imports.iter().map(|i| i.alias.as_str()))
             .filter(eligible)
+            .map(posting_term)
             .map(str::to_owned)
             .collect(),
         global_imports: data

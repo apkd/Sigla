@@ -94,6 +94,10 @@ impl Derived {
         paths
     }
 
+    pub(crate) fn cached_paths(&self) -> Option<&Paths> {
+        self.search.get()
+    }
+
     pub(crate) fn paths(&self, manifest: &Manifest) -> &Paths {
         self.search.get_or_init(|| Paths::new(manifest))
     }
@@ -181,6 +185,14 @@ impl Paths {
 
     pub fn display(&self, file: &str, membership: usize) -> &str {
         &self.by_file[file][membership]
+    }
+
+    /// A literal filter can name a directory. Stop as soon as it spans two rows.
+    pub(crate) fn at_most_one_file(&self, literal: &str) -> bool {
+        self.ordered(Some(literal))
+            .flat_map(|(_, files)| files)
+            .nth(1)
+            .is_none()
     }
 
     pub fn matching(

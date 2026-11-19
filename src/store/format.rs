@@ -630,19 +630,14 @@ impl<'a, F: Fn(&[u8]) -> Result<Option<&'a [u8]>>> Reader<'a, F> {
         })
     }
     pub fn declarations(&mut self) -> Result<Vec<Declaration>> {
-        self.select_declarations(None)
+        self.declarations_at(0..self.directory.count)
     }
-    pub fn named_declarations(&mut self, name: &str) -> Result<Vec<Declaration>> {
-        self.select_declarations(Some(name))
-    }
-    fn select_declarations(&mut self, name: Option<&str>) -> Result<Vec<Declaration>> {
+    pub fn declarations_at(
+        &mut self,
+        ids: impl IntoIterator<Item = u32>,
+    ) -> Result<Vec<Declaration>> {
         let mut declarations = Vec::new();
-        for id in 0..self.directory.count {
-            if let Some(name) = name
-                && self.string_ref(Row::name(self.item_bytes(ROWS, id)?)?)? != name
-            {
-                continue;
-            }
+        for id in ids {
             let row: Row = self.item(ROWS, id)?;
             ensure!(row.declaration == id, "Invalid declaration ordinal");
             declarations.push(self.expand_declaration(&row)?);
@@ -795,18 +790,6 @@ record! {
     pub struct Signature {
         pub ty: u32, pub parameters: Vec<Param>, pub generics: Vec<Generic>, pub bases: Vec<u32>,
         pub explicit: Option<u32>, pub implementations: Vec<Member>, pub constant: Option<Constant>, pub accessors: Vec<Access>,
-    }
-}
-
-impl Row {
-    fn name(bytes: &[u8]) -> Result<u32> {
-        // The current row starts with its fixed-size text IDs. Read that prefix
-        // before allocating any of the row's parameter or attribute vectors.
-        #[derive(Deserialize)]
-        struct Prefix {
-            text: [u32; 7],
-        }
-        Ok(postcard::take_from_bytes::<Prefix>(bytes)?.0.text[0])
     }
 }
 

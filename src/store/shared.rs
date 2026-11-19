@@ -5,6 +5,7 @@ mod names;
 #[path = "publication.rs"]
 mod publication;
 
+use super::payload::{MAX_POSTING_BYTES, OVERSIZED_TERM, posting_term};
 use anyhow::{Context, Result, ensure};
 use heed::{
     Database as Table, DatabaseFlags, Env, EnvOpenOptions, RoTxn, RwTxn,
@@ -1184,7 +1185,7 @@ impl Scope {
         {
             ensure!(
                 !name.is_empty()
-                    && name.len() <= 480
+                    && name.len() <= MAX_POSTING_BYTES
                     && 8 + name.len() <= self.database.env.max_key_size(),
                 "Indexed name exceeds LMDB limit"
             );
@@ -1385,11 +1386,12 @@ impl Scope {
         };
         let mut result = BTreeSet::new();
         let partitions = self.partitions(tx)?;
+        let mut broad_match = |term: &str| term == OVERSIZED_TERM || matches(term);
         if !exact
             && let Some(dictionary) =
                 names::dictionary(&self.database, tx, &partitions, occurrences)?
         {
-            for (term, partitions) in dictionary.terms().filter(|(term, _)| matches(term)) {
+            for (term, partitions) in dictionary.terms().filter(|(term, _)| broad_match(term)) {
                 for &index in partitions {
                     let partition = dictionary.partition(index);
                     if let Some(rows) =
@@ -1406,9 +1408,9 @@ impl Scope {
         // Exact lookup never builds a vocabulary. Oversized broad vocabularies
         // stream distinct keys, not every (term, object) posting.
         for &partition in partitions.iter() {
-            if exact && name.len() <= 480 {
-                if let Some(rows) =
-                    table.get_duplicates(tx, &scope_key(partition, name.as_bytes()))?
+            if exact {
+                if let Some(rows) = table
+                    .get_duplicates(tx, &scope_key(partition, posting_term(name).as_bytes()))?
                 {
                     for row in rows {
                         self.member_files(tx, row?.1, &mut result)?;
@@ -1420,7 +1422,7 @@ impl Scope {
                     .move_between_keys()
                 {
                     let (key, _) = row?;
-                    if matches(std::str::from_utf8(&key[8..])?)
+                    if broad_match(std::str::from_utf8(&key[8..])?)
                         && let Some(rows) = table.get_duplicates(tx, key)?
                     {
                         for row in rows {

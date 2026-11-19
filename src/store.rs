@@ -282,6 +282,21 @@ impl Store {
             .map(payload::source)
             .transpose()
     }
+    pub(crate) fn assembly_signature<'t>(
+        &self,
+        tx: &'t RoTxn<'_>,
+        file: &str,
+        header: std::ops::Range<usize>,
+    ) -> Result<&'t str> {
+        let data = self
+            .scope
+            .record(tx, file, payload::DATA)?
+            .context("Missing assembly source")?;
+        let bytes = payload::source_bytes(data)?
+            .get(header)
+            .context("Invalid assembly declaration span")?;
+        Ok(std::str::from_utf8(bytes)?.trim())
+    }
     pub fn load(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<FileData>> {
         self.scope
             .record(tx, file, payload::DATA)?
@@ -310,13 +325,19 @@ impl Store {
     ) -> Result<Vec<crate::model::Declaration>> {
         format::Reader::new(|key| self.scope.record(tx, file, key))?.declarations()
     }
-    pub(crate) fn named_declarations_in(
+    pub(crate) fn named_assembly_declarations(
         &self,
         tx: &RoTxn<'_>,
         file: &str,
         name: &str,
     ) -> Result<Vec<crate::model::Declaration>> {
-        format::Reader::new(|key| self.scope.record(tx, file, key))?.named_declarations(name)
+        // Assembly headers index every declaration. Read just the matching rows;
+        // callers still check the kind and full name, including wrong-kind hints.
+        let ids = self.csharp_lookup(tx, file, name, DeclarationLookup::Name)?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        format::Reader::new(|key| self.scope.record(tx, file, key))?.declarations_at(ids)
     }
     fn headers_record(
         &self,

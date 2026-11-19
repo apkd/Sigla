@@ -239,7 +239,7 @@ impl<'a> Search<'a> {
         target: &Target,
         loose: bool,
         projection: Option<&Query>,
-        restricted_files: Option<&BTreeSet<String>>,
+        contained_files: Option<BTreeSet<String>>,
         from: Option<usize>,
         mut visit: impl FnMut(&mut Self, Hit) -> Result<()>,
     ) -> Result<()> {
@@ -322,19 +322,47 @@ impl<'a> Search<'a> {
         };
         let native_simple = crate::native::simple_name(&native_pattern);
         let mut parsed_parameters = None;
-        let keys = match restricted_files {
-            Some(files) => files.clone(),
-            None => {
+        let exact = !loose && !simple.contains('*') && !native_simple.contains('*');
+        // Exact terms need only their postings until a cheaper scope is known.
+        // Never construct the full path index just to intersect an empty posting.
+        let (scope, filter_candidates) = match projection {
+            Some(q)
+                if !exact
+                    || contained_files.is_none()
+                        && self
+                            .source_manifest
+                            .derived
+                            .cached_paths()
+                            .zip(crate::workspace::derived::literal_filter(q))
+                            .is_some_and(|(paths, literal)| paths.at_most_one_file(literal)) =>
+            {
+                (self.filtered_files(q, contained_files), None)
+            }
+            _ => (contained_files, projection),
+        };
+        self.check()?;
+        let keys = match scope {
+            // A single known file needs no workspace-wide posting lookup. Broad
+            // matches already have a cheaper scan when the filters bound the set.
+            Some(files) if !exact || files.len() <= 1 => files,
+            scope => {
                 let mut keys = self.candidates(simple, loose, false)?;
                 if native_simple != simple {
                     keys.extend(self.candidates(&native_simple, loose, false)?);
+                }
+                if let Some(files) = scope {
+                    keys.retain(|key| files.contains(key));
                 }
                 keys
             }
         };
         for key in keys {
             self.check()?;
-            let file = self.manifest.files[&key].clone();
+            let file = &self.manifest.files[&key];
+            if filter_candidates.is_some_and(|q| !self.file_allowed(q, file)) {
+                continue;
+            }
+            let file = file.clone();
             if from.is_some_and(|from| {
                 !file
                     .memberships
@@ -351,7 +379,7 @@ impl<'a> Search<'a> {
                         Some(declarations) => declarations.clone(),
                         None => Arc::new(
                             self.source_store(&key)
-                                .named_declarations_in(&self.tx, &key, simple)?,
+                                .named_assembly_declarations(&self.tx, &key, simple)?,
                         ),
                     }
                 } else {
@@ -990,6 +1018,14 @@ impl<'a> Search<'a> {
                     .strip_prefix(pattern.trim_end_matches('/'))
                     .is_some_and(|rest| rest.starts_with('/')))
     }
+    fn file_allowed(&self, q: &Query, file: &FileEntry) -> bool {
+        Self::file_language_filters(q, file.language)
+            && file.memberships.iter().any(|m| {
+                q.filters.iter().filter(|f| f.key == "path").all(|f| {
+                    self.path_matches(&f.value, &self.manifest.display(file, m)) != f.negate
+                })
+            })
+    }
     fn filtered_files(
         &self,
         q: &Query,
@@ -999,15 +1035,7 @@ impl<'a> Search<'a> {
             .iter()
             .any(|f| matches!(f.key.as_str(), "path" | "lang"))
         {
-            let allowed = |key: &String| {
-                let file = &self.manifest.files[key];
-                Self::file_language_filters(q, file.language)
-                    && file.memberships.iter().any(|m| {
-                        q.filters.iter().filter(|f| f.key == "path").all(|f| {
-                            self.path_matches(&f.value, &self.manifest.display(file, m)) != f.negate
-                        })
-                    })
-            };
+            let allowed = |key: &String| self.file_allowed(q, &self.manifest.files[key]);
             if let Some(files) = files.as_mut() {
                 files.retain(allowed);
             } else if q.filters.iter().any(|filter| filter.key == "path") {
@@ -1299,56 +1327,48 @@ impl<'a> Search<'a> {
         }
         let mut units = crate::selection::Selection::new(q.limit);
         let files = self.containment_files(&inside)?;
-        let files = self.filtered_files(q, files);
         let mut other_kinds = BTreeSet::new();
-        self.visit_declarations(
-            &q.target,
-            q.loose,
-            Some(q),
-            files.as_ref(),
-            None,
-            |this, h| {
-                let file = &this.manifest.files[&h.file];
-                if !this.filters(
-                    q,
-                    file,
-                    &h.membership,
-                    Some(&h.decl),
-                    h.decl.name_span.start,
-                    &inside,
-                ) {
-                    return Ok(());
-                }
-                let native_function = file.language.native()
-                    && match q.selector.as_str() {
-                        "function" => matches!(h.decl.kind.as_str(), "function" | "method"),
-                        "method" => h.decl.kind == "function" && !h.decl.owner.is_empty(),
-                        _ => false,
-                    };
-                if !native_function && !selector_matches(&q.selector, &h.decl) {
-                    if !q.loose && !q.target.name.contains('*') && q.target.parameters.is_none() {
-                        other_kinds.insert(format!("{}:{}", h.decl.kind, h.decl.qualified));
-                        if other_kinds.len() > 4 {
-                            other_kinds.pop_last();
-                        }
+        self.visit_declarations(&q.target, q.loose, Some(q), files, None, |this, h| {
+            let file = &this.manifest.files[&h.file];
+            if !this.filters(
+                q,
+                file,
+                &h.membership,
+                Some(&h.decl),
+                h.decl.name_span.start,
+                &inside,
+            ) {
+                return Ok(());
+            }
+            let native_function = file.language.native()
+                && match q.selector.as_str() {
+                    "function" => matches!(h.decl.kind.as_str(), "function" | "method"),
+                    "method" => h.decl.kind == "function" && !h.decl.owner.is_empty(),
+                    _ => false,
+                };
+            if !native_function && !selector_matches(&q.selector, &h.decl) {
+                if !q.loose && !q.target.name.contains('*') && q.target.parameters.is_none() {
+                    other_kinds.insert(format!("{}:{}", h.decl.kind, h.decl.qualified));
+                    if other_kinds.len() > 4 {
+                        other_kinds.pop_last();
                     }
-                    return Ok(());
                 }
-                let rank = (
-                    h.rank,
-                    file.metadata,
-                    h.decl.local(),
-                    this.manifest.display(file, &h.membership).into_owned(),
-                    h.decl.name_span.start,
-                    h.decl.qualified.clone(),
-                );
-                if !units.accepts(&rank) {
-                    return Ok(());
-                }
-                units.insert(rank, this.declaration_unit(&h)?);
-                Ok(())
-            },
-        )?;
+                return Ok(());
+            }
+            let rank = (
+                h.rank,
+                file.metadata,
+                h.decl.local(),
+                this.manifest.display(file, &h.membership).into_owned(),
+                h.decl.name_span.start,
+                h.decl.qualified.clone(),
+            );
+            if !units.accepts(&rank) {
+                return Ok(());
+            }
+            units.insert(rank, this.declaration_unit(&h)?);
+            Ok(())
+        })?;
         let result = self.finish_results(units);
         if result == "No matches." && !other_kinds.is_empty() {
             return Ok(format!(
@@ -2201,9 +2221,12 @@ impl<'a> Search<'a> {
     }
     fn declaration_unit(&mut self, h: &Hit) -> Result<crate::render::SearchResult> {
         let f = &self.manifest.files[&h.file];
-        let data = self.data(&h.file)?;
-        let header = data.source[h.decl.header.clone()].trim();
         if f.metadata {
+            let header = self.source_store(&h.file).assembly_signature(
+                &self.tx,
+                &h.file,
+                h.decl.header.clone(),
+            )?;
             let signature = crate::render::external_declaration(&h.decl, header);
             Ok(crate::render::SearchResult {
                 symbol: Some((
@@ -2218,16 +2241,7 @@ impl<'a> Search<'a> {
                     .into_owned(),
                 lines: None,
                 source: signature,
-                language: data
-                    .facts
-                    .native
-                    .as_ref()
-                    .and_then(|n| {
-                        n.regions
-                            .iter()
-                            .find(|r| r.span.contains(&h.decl.name_span.start))
-                    })
-                    .map_or(f.language, |r| r.language),
+                language: f.language,
                 uncertain: false,
                 target: None,
                 occurrences: BTreeSet::new(),
@@ -2235,6 +2249,7 @@ impl<'a> Search<'a> {
                 possible_write: false,
             })
         } else {
+            let data = self.data(&h.file)?;
             let source = if f.language == Language::CSharp
                 && matches!(h.decl.kind.as_str(), "field" | "const" | "event")
                 && h.decl.span.start == h.decl.name_span.start

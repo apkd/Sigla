@@ -33,16 +33,6 @@ fn shared_records_preserve_declarations_and_headers() {
         encode(&restored.imports).unwrap(),
         encode(&syntax.imports).unwrap()
     );
-    for name in ["Convert", "Inner", "absent"] {
-        let mut reader = Reader::new(|key| Ok(records.get(key).map(Vec::as_slice))).unwrap();
-        let selected = reader.named_declarations(name).unwrap();
-        let expected: Vec<_> = facts
-            .declarations
-            .iter()
-            .filter(|declaration| declaration.name == name)
-            .collect();
-        assert_eq!(encode(&selected).unwrap(), encode(&expected).unwrap());
-    }
     let mut limited = Reader::new(|key| Ok(records.get(key).map(Vec::as_slice))).unwrap();
     limited.remaining = std::mem::size_of::<Declaration>();
     assert!(limited.declarations().is_err());

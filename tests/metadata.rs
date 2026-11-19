@@ -136,6 +136,29 @@ async fn external_generic_return_binds_a_source_receiver() {
     assert!(calls.contains("player.Play()"), "{calls}");
     assert!(calls.contains("nested.Value.Play()"), "{calls}");
     assert!(!calls.contains("Possible"), "{calls}");
+    let project = source.path().to_str().unwrap();
+    let methods = app
+        .search(project, "method:MetadataFixture.Parser.Parse")
+        .await
+        .unwrap();
+    assert!(
+        methods.contains("string") && methods.contains("int"),
+        "{methods}"
+    );
+    assert_eq!(
+        methods,
+        app.search(project, "method:MetadataFixture.Parser.Parse lang:cs")
+            .await
+            .unwrap()
+    );
+    let hint = app
+        .search(project, "property:MetadataFixture.Parser.Parse lang:cs")
+        .await
+        .unwrap();
+    assert!(
+        hint.contains("method:MetadataFixture.Parser.Parse"),
+        "{hint}"
+    );
     // Resolve a metadata target twice to exercise exact declaration restoration
     // from the binding cache as well as the cold member lookup.
     for _ in 0..2 {

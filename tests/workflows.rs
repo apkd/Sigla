@@ -11,6 +11,47 @@ fn app(root: &Path, cache: &Path) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn oversized_identifiers_support_declarations_and_calls_with_or_without_filters() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let name = format!("needle_{}_target", "x".repeat(550));
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[package]\nname='longnames'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        root.path(),
+        "src/lib.rs",
+        &format!("pub fn {name}() {{}}\npub fn caller() {{ {name}(); }}"),
+    );
+    let a = app(root.path(), cache.path());
+    let project = root.path().to_str().unwrap();
+    let expected = a
+        .search(project, &format!("function:{name} path:src/lib.rs"))
+        .await
+        .unwrap();
+    assert!(expected.contains("src/lib.rs"), "{expected}");
+    for query in [
+        format!("function:{name}"),
+        format!("function:longnames::{name} lang:rust"),
+        "function:needle_*_target".into(),
+        "function:NEEDLE_*_TARGET match:loose".into(),
+    ] {
+        assert_eq!(a.search(project, &query).await.unwrap(), expected);
+    }
+    let calls = a.search(project, &format!("calls:{name}")).await.unwrap();
+    assert!(calls.contains("caller"), "{calls}");
+    for query in [
+        format!("function:{name} -lang:rust"),
+        format!("function:{name} -path:src/lib.rs"),
+        format!("function:{name}other"),
+    ] {
+        assert_eq!(a.search(project, &query).await.unwrap(), "No matches.");
+    }
+}
+
+#[tokio::test]
 async fn empty_queries_offer_only_supported_corrections() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
