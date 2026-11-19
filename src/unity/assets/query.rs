@@ -446,8 +446,7 @@ impl Index {
             source.len() == parsed.bytes,
             "Complete asset source is unavailable"
         );
-        let (range, _, _) = crate::navigation::lines(&source, range)?;
-        Ok(Some(source[range].to_owned()))
+        crate::navigation::raw_lines(source, range).map(Some)
     }
     pub(crate) fn view_with_cancel(
         &self,

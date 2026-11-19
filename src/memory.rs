@@ -397,6 +397,11 @@ impl<T> Source<T> {
             reservation: self.reservation,
         })
     }
+
+    /// Keep the reservation until the response has been rendered from the owned buffer.
+    pub fn render<U>(self, render: impl FnOnce(T) -> U) -> U {
+        render(self.value)
+    }
 }
 
 impl<T> std::ops::Deref for Source<T> {

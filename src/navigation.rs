@@ -150,6 +150,31 @@ mod tests {
         assert_eq!(&source[range], "two\r\n");
         assert_eq!((first, last), (2, 2));
     }
+
+    #[test]
+    fn clipped_ranges_keep_blank_and_unterminated_lines() {
+        for (text, last, tail) in [
+            ("", 1, ""),
+            ("\n", 1, "\n"),
+            ("first\r\n\n", 2, "\n"),
+            ("first\nδ", 2, "δ"),
+        ] {
+            assert_eq!(lines(text, None).unwrap(), (0..text.len(), 1, last));
+            let (range, first, end) = lines(text, Some((last, usize::MAX))).unwrap();
+            assert_eq!((&text[range], first, end), (tail, last, last));
+            assert!(lines(text, Some((last + 1, usize::MAX))).is_err());
+        }
+    }
+
+    #[test]
+    fn distant_range_boundaries_preserve_offsets_after_multibyte_text() {
+        let rows = "δ\r\n".repeat(70_001);
+        let source = format!("{rows}start\n{rows}end\nextra");
+        let (range, first, last) = lines(&source, Some((70_002, 140_004))).unwrap();
+        assert_eq!(first, 70_002);
+        assert_eq!(last, 140_004);
+        assert_eq!(&source[range], format!("start\n{rows}end\n"));
+    }
 }
 impl std::str::FromStr for Mode {
     type Err = anyhow::Error;
@@ -389,21 +414,50 @@ pub fn lines(
     source: &str,
     requested: Option<(usize, usize)>,
 ) -> Result<(Range<usize>, usize, usize)> {
-    let mut starts = vec![0];
-    starts.extend(
-        source
-            .match_indices('\n')
-            .map(|(i, _)| i + 1)
-            .filter(|&i| i < source.len()),
-    );
-    let (first, last) = requested.unwrap_or((1, starts.len()));
-    ensure!(first <= starts.len(), "File has {} lines", starts.len());
-    let last = last.min(starts.len());
-    Ok((
-        starts[first - 1]..starts.get(last).copied().unwrap_or(source.len()),
-        first,
-        last,
-    ))
+    // A final newline terminates the last line; it does not start another.
+    let body = source.strip_suffix('\n').unwrap_or(source).as_bytes();
+    let Some((first, last)) = requested else {
+        return Ok((
+            0..source.len(),
+            1,
+            1 + memchr::memchr_iter(b'\n', body).count(),
+        ));
+    };
+    let (mut start, mut line, mut base) = (0, 1, 0);
+    for chunk in body.chunks(8192) {
+        let breaks = memchr::memchr_iter(b'\n', chunk);
+        let next = if line < first { first } else { last };
+        // If even one newline per byte cannot reach the next boundary, count
+        // the entire chunk without visiting its newlines individually.
+        if next - line > chunk.len() {
+            line += breaks.count();
+        } else {
+            for offset in breaks {
+                if line == last {
+                    return Ok((start..base + offset + 1, first, last));
+                }
+                line += 1;
+                if line == first {
+                    start = base + offset + 1;
+                }
+            }
+        }
+        base += chunk.len();
+    }
+    ensure!(first <= line, "File has {line} lines");
+    Ok((start..source.len(), first, line))
+}
+
+pub(crate) fn raw_lines(source: String, requested: Option<(usize, usize)>) -> Result<String> {
+    let Some(requested) = requested else {
+        return Ok(source);
+    };
+    let (range, _, _) = lines(&source, Some(requested))?;
+    if range.len() == source.len() {
+        Ok(source)
+    } else {
+        Ok(source[range].to_owned())
+    }
 }
 
 #[derive(Default)]

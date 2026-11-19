@@ -26,6 +26,7 @@ heed = { git = "https://github.com/apkd/heed", rev = "1db589f0f859dfb7a92edcd3bb
 inotify = "0.11"
 libc = "0.2"
 lru = "0.16"
+memchr = "2"
 postcard = { version = "1", features = ["alloc", "use-std"] }
 zstd = "0.13"
 regex = "1"

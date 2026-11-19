@@ -440,14 +440,23 @@ pub(crate) fn view<T>(
     let Some((language, source)) = read(file)? else {
         return Ok(None);
     };
+    let minify = match mode {
+        crate::navigation::Mode::Raw => {
+            return source
+                .render(|text| crate::navigation::raw_lines(text, requested))
+                .map(Some);
+        }
+        crate::navigation::Mode::Exact => false,
+        crate::navigation::Mode::Minified => true,
+    };
     let (range, first, last) = crate::navigation::lines(&source, requested)?;
-    let (body, tag) = match mode {
-        crate::navigation::Mode::Raw => return Ok(Some(source[range].to_owned())),
-        crate::navigation::Mode::Exact => (source[range].to_owned(), language.tag()),
-        crate::navigation::Mode::Minified => (
+    let (body, tag) = if minify {
+        (
             crate::minify::render_admitted(&source, language, range, cancel)?,
             "",
-        ),
+        )
+    } else {
+        (source[range].to_owned(), language.tag())
     };
     let fence = "`".repeat(3.max(body.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1));
     let separator = if body.ends_with('\n') { "" } else { "\n" };

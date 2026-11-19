@@ -3476,6 +3476,7 @@ dependencies = [
  "libc",
  "lru",
  "md-5",
+ "memchr",
  "postcard",
  "quick-xml 0.39.4",
  "ra_ap_syntax",
