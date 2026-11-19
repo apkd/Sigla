@@ -234,6 +234,8 @@ impl Sources<'_> {
             .collect::<Result<Vec<_>>>()?;
         let mut found = Vec::new();
         let mut total = 0;
+        let filter_languages = q.filters.iter().any(|f| f.key == "lang");
+        let asset_language = crate::unity::assets::selection::language_filter(q);
         let source_paths = self.source_paths(root);
         for (path, key) in source_paths.iter() {
             self.check()?;
@@ -258,8 +260,11 @@ impl Sources<'_> {
                 .files
                 .get(key)
                 .or_else(|| self.manifest.deferred.get(key));
-            if q.filters.iter().any(|f| f.key == "lang")
-                && file.is_none_or(|file| !q.file_language_filters(file.language))
+            if filter_languages
+                && !match file {
+                    Some(file) => q.file_language_filters(file.language),
+                    None => asset_language(std::path::Path::new(path)),
+                }
             {
                 continue;
             }

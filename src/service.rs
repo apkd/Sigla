@@ -1250,13 +1250,9 @@ impl App {
             .as_ref()
             .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
         let assets_relevant = if let Some(query) = query.as_ref().filter(|q| {
-            matches!(q.selector.as_str(), "text" | "file")
+            crate::unity::assets::selection::searches_files(q)
                 && (q.filters.iter().any(|f| f.key == "path")
                     || q.selector == "file" && q.target.name != "*")
-                && !q
-                    .filters
-                    .iter()
-                    .any(|f| matches!(f.key.as_str(), "in" | "project" | "lang"))
         }) {
             let manifest = inventory.manifest.clone();
             let snapshot = match &branch {
@@ -1342,11 +1338,7 @@ impl App {
                     matches!(
                         q.selector.as_str(),
                         "instance" | "references" | "dependencies"
-                    ) || matches!(q.selector.as_str(), "text" | "file")
-                        && !q
-                            .filters
-                            .iter()
-                            .any(|f| matches!(f.key.as_str(), "in" | "project" | "lang"))
+                    ) || crate::unity::assets::selection::searches_files(q)
                 }),
                 Request::View(path, _) => {
                     path.starts_with("unity@")

@@ -2,6 +2,33 @@
 use super::*;
 use crate::{cancellation::Cancellation, query::Query, repository::materialize::Prepared};
 
+/// A sidecar may identify a file with no indexed language, such as an image.
+fn untyped(query: &Query) -> bool {
+    query.filters.iter().all(|f| f.key != "lang" || f.negate)
+}
+
+pub(crate) fn language_filter(query: &Query) -> impl Fn(&Path) -> bool {
+    let text = query.file_language_filters(crate::model::Language::Text);
+    let untyped = untyped(query);
+    move |path| {
+        if text == untyped || is_asset(path) {
+            text
+        } else {
+            untyped
+        }
+    }
+}
+
+pub(crate) fn searches_files(query: &Query) -> bool {
+    matches!(query.selector.as_str(), "file" | "text")
+        && !query
+            .filters
+            .iter()
+            .any(|f| matches!(f.key.as_str(), "in" | "project"))
+        && (query.file_language_filters(crate::model::Language::Text)
+            || query.selector == "file" && untyped(query))
+}
+
 pub(crate) fn matches(
     manifest: &Manifest,
     prepared: Option<&Prepared>,
@@ -9,6 +36,7 @@ pub(crate) fn matches(
     cancel: &dyn Cancellation,
 ) -> Result<bool> {
     let selected = super::query::path_selection(query);
+    let language = language_filter(query);
     let target = (query.selector == "file")
         .then(|| {
             globset::GlobBuilder::new(&query.target.name)
@@ -21,6 +49,7 @@ pub(crate) fn matches(
     let eligible = |path: &str, project: &str| {
         let path = path.strip_suffix(".meta").unwrap_or(path);
         (query.selector == "file" || is_asset(Path::new(path)))
+            && language(Path::new(path))
             && selected(path, project)
             && target.as_ref().is_none_or(|target| {
                 target.is_match(if query.target.name.contains('/') {

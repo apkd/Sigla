@@ -1392,11 +1392,7 @@ impl<'a> Search<'a> {
     fn text(&mut self, q: &Query, inside: &[(bool, Vec<Hit>)]) -> Result<String> {
         // One extra distinct result proves truncation without counting the full corpus.
         let mut units = crate::selection::Top::new(q.limit + 1);
-        if inside.is_empty()
-            && !q
-                .filters
-                .iter()
-                .any(|f| matches!(f.key.as_str(), "project" | "lang"))
+        if crate::unity::assets::selection::searches_files(q)
             && let Some(assets) = self.assets
         {
             assets.visit_text(q, self.cancel, |position, result| {

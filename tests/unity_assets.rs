@@ -44,6 +44,71 @@ async fn metadata_sidecars_support_explicit_views_without_source_indexing() {
 }
 
 #[tokio::test]
+async fn asset_file_and_text_searches_respect_language_filters() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "ProjectSettings/ProjectVersion.txt",
+        "m_EditorVersion: 6000.3.0f1\n",
+    );
+    write(
+        root.path(),
+        "Assets/Light.prefab",
+        "--- !u!1 &1\nGameObject:\n  m_Name: Beacon\n",
+    );
+    write(
+        root.path(),
+        "Assets/Icon.png.meta",
+        "guid: abcdef0123456789abcdef0123456789\n",
+    );
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap(),
+    );
+    let project = root.path().to_str().unwrap();
+    for query in [
+        "file:Light.prefab",
+        "file:Light*",
+        "text:Beacon path:Assets/Light.prefab",
+    ] {
+        for (filters, included) in [
+            ("-lang:cs", true),
+            ("lang:text -lang:cs", true),
+            ("lang:cs", false),
+            ("-lang:text", false),
+        ] {
+            let result = app
+                .search(project, &format!("{query} {filters}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                result.contains("Assets/Light.prefab"),
+                included,
+                "{query} {filters}: {result}"
+            );
+        }
+    }
+    // A binary file known only through its sidecar has no text language.
+    for (filter, included) in [("-lang:text", true), ("lang:text", false)] {
+        let result = app
+            .search(project, &format!("file:Icon.png {filter} wait:complete"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.contains("Assets/Icon.png"),
+            included,
+            "{filter}: {result}"
+        );
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn populated_results_report_limits_and_coverage_without_folder_placeholders() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

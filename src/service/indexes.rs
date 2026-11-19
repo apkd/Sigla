@@ -120,9 +120,7 @@ pub(super) fn source_only(request: &Request, query: Option<&Query>) -> bool {
             q.selector == "file"
                 && !q.wait_complete
                 && (source_path(&q.target.name)
-                    || q.filters
-                        .iter()
-                        .any(|f| matches!(f.key.as_str(), "lang" | "project")))
+                    || !crate::unity::assets::selection::searches_files(q))
         }),
         Request::Browse(_) => false,
     }
