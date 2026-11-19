@@ -38,8 +38,10 @@ pub(super) fn groups(
     request: &Request,
     query: Option<&Query>,
     manifest: &Manifest,
+    operation: &crate::telemetry::Operation,
 ) -> BTreeMap<Group, bool> {
-    if matches!(request, Request::Browse(_))
+    if manifest.deferred.is_empty()
+        || matches!(request, Request::Browse(_))
         || query.is_some_and(|q| q.selector == "file" && !q.wait_complete)
     {
         return BTreeMap::new();
@@ -48,16 +50,31 @@ pub(super) fn groups(
         matches!(
             q.selector.as_str(),
             "instance" | "references" | "dependencies"
-        )
+        ) || q.filters.iter().any(|f| f.key == "lang")
+            && ![Group::Native, Group::Shaders].into_iter().any(|group| {
+                group
+                    .languages()
+                    .iter()
+                    .any(|&lang| q.file_language_filters(lang))
+            })
     }) {
         return BTreeMap::new();
     }
     let selection = query.map(Selection::new);
+    let paths_for = |resume: &str| {
+        manifest.derived.cached_paths().unwrap_or_else(|| {
+            operation.stage("source_path_index");
+            let paths = manifest.derived.paths(manifest);
+            operation.stage(resume);
+            paths
+        })
+    };
     let candidates = selection
         .as_ref()
         .filter(|selection| selection.query.filters.iter().any(|f| f.key == "path"))
         .map(|selection| {
-            manifest.derived.paths(manifest).matching(
+            operation.stage("source_path_selection");
+            paths_for("source_path_selection").matching(
                 crate::workspace::derived::literal_filter(selection.query),
                 |path| {
                     selection
@@ -70,14 +87,21 @@ pub(super) fn groups(
                 },
             )
         });
-    let matches =
-        |key: &String, file: &FileEntry| selected(request, selection.as_ref(), manifest, key, file);
+    operation.stage("source_group_selection");
+    let matches = |key: &String, file: &FileEntry| {
+        selected(request, selection.as_ref(), manifest, key, file, || {
+            paths_for("source_group_selection")
+        })
+    };
     let mut groups = BTreeMap::new();
     for (_, file) in
         crate::workspace::derived::candidate_files(&manifest.deferred, candidates.as_ref())
             .filter(|(key, f)| matches(key, f))
     {
         groups.insert(Group::of(file.language).unwrap(), false);
+    }
+    if groups.is_empty() {
+        return groups;
     }
     let narrowed = match request {
         Request::History(_) => unreachable!("history bypasses snapshot indexes"),
@@ -128,6 +152,7 @@ pub(super) fn source_only(request: &Request, query: Option<&Query>) -> bool {
 
 struct Selection<'a> {
     query: &'a Query,
+    needs_display_paths: bool,
     filters: Vec<(&'a crate::query::Filter, Option<globset::GlobMatcher>)>,
     target: Option<globset::GlobMatcher>,
 }
@@ -136,6 +161,15 @@ impl<'a> Selection<'a> {
     fn new(query: &'a Query) -> Self {
         Self {
             query,
+            needs_display_paths: query.selector == "file"
+                || query.target.location.is_some()
+                || query.filters.iter().any(|f| {
+                    f.key == "path"
+                        || f.key == "in"
+                            && !f.negate
+                            && crate::query::Target::parse(&f.value)
+                                .is_ok_and(|target| target.location.is_some())
+                }),
             filters: query
                 .filters
                 .iter()
@@ -161,12 +195,13 @@ impl<'a> Selection<'a> {
     }
 }
 
-fn selected(
+fn selected<'a>(
     request: &Request,
     selection: Option<&Selection<'_>>,
     manifest: &Manifest,
     key: &str,
     file: &FileEntry,
+    paths: impl FnOnce() -> &'a crate::workspace::derived::Paths,
 ) -> bool {
     if file.metadata {
         return false;
@@ -179,16 +214,7 @@ fn selected(
         if !crate::search::Search::file_language_filters(q, file.language) {
             return false;
         }
-        let needs_path = q.selector == "file"
-            || q.target.location.is_some()
-            || q.filters.iter().any(|f| {
-                f.key == "path"
-                    || f.key == "in"
-                        && !f.negate
-                        && crate::query::Target::parse(&f.value)
-                            .is_ok_and(|target| target.location.is_some())
-            });
-        let paths = needs_path.then(|| manifest.derived.paths(manifest));
+        let paths = selection.needs_display_paths.then(paths);
         if !file.memberships.iter().enumerate().any(|(index, m)| {
             let path = paths.map_or("", |paths| paths.display(key, index));
             selection
@@ -425,6 +451,7 @@ mod tests {
             &Request::Search(text.into()),
             Some(&Query::parse(text).unwrap()),
             manifest,
+            &Default::default(),
         )
     }
 
@@ -459,6 +486,12 @@ mod tests {
                 &[(Native, true), (Shaders, true)],
             ),
             ("symbol:* path:native/ lang:hlsl", &[(Shaders, true)]),
+            ("symbol:* path:native/ lang:c++", &[(Native, true)]),
+            (
+                "symbol:* path:native/ lang:h* -lang:glsl",
+                &[(Shaders, true)],
+            ),
+            ("symbol:* path:native/ lang:csharp", &[]),
             ("symbol:*", &[(Native, false), (Shaders, false)]),
             ("symbol:* wait:complete", &[(Native, true), (Shaders, true)]),
             ("file:*", &[]),
@@ -469,6 +502,35 @@ mod tests {
                 expected.iter().copied().collect::<BTreeMap<_, _>>(),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn detailed_requests_report_the_first_path_index_build() {
+        for text in [
+            "symbol:@engine.cpp:1:1",
+            "symbol:* in:@engine.cpp:1:1",
+            "file:engine.cpp wait:complete",
+            "symbol:* path:native/",
+        ] {
+            let manifest = manifest();
+            let request = Request::Search(text.into());
+            let query = Query::parse(text).unwrap();
+            for cold in [true, false] {
+                let (operation, recorder) = crate::telemetry::test_operation();
+                assert!(!groups(&request, Some(&query), &manifest, &operation).is_empty());
+                // Cancel after selection so the journal retains even a short request's stages.
+                operation.finish("cancelled");
+                let record = recorder.completed().pop().unwrap();
+                assert_eq!(
+                    record
+                        .stages
+                        .iter()
+                        .any(|stage| stage.name == "source_path_index"),
+                    cold,
+                    "{text}"
+                );
+            }
         }
     }
 
@@ -521,17 +583,17 @@ mod tests {
         let mut query = Query::parse("symbol:* path:native/").unwrap();
         query.filters[0].value = "native[/".into();
         assert_eq!(
-            groups(&request, Some(&query), &manifest),
+            groups(&request, Some(&query), &manifest, &Default::default()),
             BTreeMap::from([(Group::Native, true)])
         );
         query.filters[0].negate = true;
         assert_eq!(
-            groups(&request, Some(&query), &manifest),
+            groups(&request, Some(&query), &manifest, &Default::default()),
             BTreeMap::from([(Group::Shaders, false)])
         );
         query.selector = "file".into();
         query.target.name = "[".into();
         query.wait_complete = true;
-        assert!(groups(&request, Some(&query), &manifest).is_empty());
+        assert!(groups(&request, Some(&query), &manifest, &Default::default()).is_empty());
     }
 }

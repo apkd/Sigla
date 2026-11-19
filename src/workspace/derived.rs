@@ -28,6 +28,7 @@ pub struct Derived {
     rendering: OnceLock<crate::render::Inventory>,
     query: Mutex<Option<QueryManifest>>,
     pub(crate) asset_generation: OnceLock<Result<[u8; 32], String>>,
+    pub(crate) source_generations: [OnceLock<Result<[u8; 32], String>>; 2],
 }
 
 impl Clone for Derived {

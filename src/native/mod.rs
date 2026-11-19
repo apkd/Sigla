@@ -17,12 +17,17 @@ pub enum Group {
 }
 
 impl Group {
-    pub fn of(language: Language) -> Option<Self> {
-        match language {
-            Language::C | Language::Cpp | Language::Header => Some(Self::Native),
-            Language::Hlsl | Language::Glsl | Language::ShaderLab => Some(Self::Shaders),
-            _ => None,
+    pub(crate) fn languages(self) -> &'static [Language] {
+        match self {
+            Self::Native => &[Language::C, Language::Cpp, Language::Header],
+            Self::Shaders => &[Language::Hlsl, Language::Glsl, Language::ShaderLab],
         }
+    }
+
+    pub fn of(language: Language) -> Option<Self> {
+        [Self::Native, Self::Shaders]
+            .into_iter()
+            .find(|group| group.languages().contains(&language))
     }
 
     pub fn name(self) -> &'static str {

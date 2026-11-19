@@ -1374,7 +1374,8 @@ impl App {
         if let Some(job_id) = ticket.as_ref().and_then(|ticket| ticket.telemetry_id()) {
             operation.link(&job_id);
         }
-        let needed = indexes::groups(&request, query.as_ref(), &state.as_ref().unwrap().manifest);
+        let needed = indexes::groups(&request, query.as_ref(), &admitted_manifest, &operation);
+        operation.stage("source_ticket_lookup");
         let mut source_tickets = std::collections::BTreeMap::new();
         for &group in needed.keys() {
             let code = state.as_ref().unwrap();
@@ -1401,6 +1402,7 @@ impl App {
         drop(state);
         // All relevant indexes share the time left from request start. Waiting
         // owns neither workspace locks nor query workers, and keeps jobs running.
+        operation.stage("source_indexing");
         let source_wait = async |group| {
             if let Some(required) = needed.get(&group) {
                 let _wait = operation.wait("source_indexing");

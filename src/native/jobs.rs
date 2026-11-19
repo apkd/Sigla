@@ -97,6 +97,14 @@ impl Default for Jobs {
 }
 
 pub fn generation(manifest: &Manifest, group: Group) -> Result<[u8; 32]> {
+    manifest.derived.source_generations[group as usize]
+        .get_or_init(|| compute_generation(manifest, group).map_err(|error| error.to_string()))
+        .as_ref()
+        .copied()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn compute_generation(manifest: &Manifest, group: Group) -> Result<[u8; 32]> {
     let files: BTreeMap<_, _> = manifest
         .deferred
         .iter()
@@ -469,6 +477,12 @@ mod tests {
             assert_eq!(
                 generation(&manifest, group).unwrap(),
                 *blake3::hash(&bytes).as_bytes()
+            );
+            let mut changed = manifest.clone();
+            changed.discovery_policy = [1; 32];
+            assert_ne!(
+                generation(&changed, group).unwrap(),
+                generation(&manifest, group).unwrap()
             );
         }
     }
