@@ -24,10 +24,38 @@ pub(crate) struct Reader<'a> {
     pub remote: bool,
     pub omitted: &'a BTreeMap<String, String>,
     pub unavailable: &'a BTreeSet<String>,
+    pub deferred: &'a BTreeSet<String>,
     pub cancel: &'a CancellationToken,
 }
 
+pub(crate) struct Resolved {
+    pub logical: String,
+    pub file: PathBuf,
+    requested: String,
+}
+
 impl Reader<'_> {
+    fn pending_file(&self, scope: &Path, relative: &str) -> Result<Option<PathBuf>> {
+        let file = scope.join(relative);
+        let Some(path) = file.strip_prefix(self.root).ok().and_then(Path::to_str) else {
+            return Ok(None);
+        };
+        if !supported(&file) || !(self.deferred.contains(path) || self.unavailable(path).is_some())
+        {
+            return Ok(None);
+        }
+        for ancestor in file.ancestors().take_while(|path| *path != scope) {
+            self.cancel.check()?;
+            if ignored(ancestor)
+                || ancestor != file
+                    && (is_root(ancestor) || crate::discovery::linked_worktree(ancestor))
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(file))
+    }
+
     fn unavailable(&self, path: &str) -> Option<&str> {
         self.omitted.get(path).map(String::as_str).or_else(|| {
             self.unavailable
@@ -36,7 +64,7 @@ impl Reader<'_> {
         })
     }
 
-    pub fn view(&self, path: &str, mode: Mode) -> Result<Option<String>> {
+    pub(crate) fn resolve(&self, path: &str, mode: Mode) -> Result<Option<Resolved>> {
         self.leases.retain(self.root)?;
         self.leases.retain(self.cache)?;
         let normalized = crate::navigation::normalize(path, self.root, !self.remote)?;
@@ -62,23 +90,15 @@ impl Reader<'_> {
             if let Some(relative) = selected
                 .strip_prefix(prefix.trim_end_matches('/'))
                 .and_then(|rest| rest.strip_prefix('/'))
-                && let Some(file) = exact(scope, relative, self.cancel)?
+                && let Some(file) =
+                    self.pending_file(scope, relative)?
+                        .or(exact(scope, relative, self.cancel)?)
             {
                 candidates
                     .entry(selected.to_owned())
                     .or_insert_with(BTreeSet::new)
                     .insert(file);
             }
-        }
-        if self.unavailable(selected).is_some()
-            && projects
-                .iter()
-                .any(|project| self.root.join(selected).starts_with(project))
-        {
-            candidates
-                .entry(selected.to_owned())
-                .or_insert_with(BTreeSet::new)
-                .insert(self.root.join(selected));
         }
         if candidates.is_empty() {
             for (project, scope) in &scopes {
@@ -98,21 +118,35 @@ impl Reader<'_> {
                 .omitted
                 .keys()
                 .chain(self.unavailable.iter())
+                .chain(self.deferred.iter())
                 .filter(|logical| supported(Path::new(logical)))
             {
                 let file = self.root.join(logical);
-                if projects.iter().any(|project| file.starts_with(project)) {
-                    candidates
-                        .entry(logical.clone())
-                        .or_insert_with(BTreeSet::new)
-                        .insert(file);
+                for (project, scope) in &scopes {
+                    if let Ok(relative) = file.strip_prefix(scope)
+                        && let Some(file) = self.pending_file(scope, &relative.to_string_lossy())?
+                    {
+                        candidates
+                            .entry(logical_path(self.root, project, &file, self.manifest))
+                            .or_insert_with(BTreeSet::new)
+                            .insert(file);
+                    }
                 }
             }
+        }
+        if !Path::new(selected)
+            .extension()
+            .is_some_and(|extension| extension == "meta")
+        {
+            candidates.retain(|logical, _| {
+                !Path::new(logical)
+                    .extension()
+                    .is_some_and(|extension| extension == "meta")
+            });
         }
         let matches =
             crate::navigation::file_matches(candidates.keys().map(String::as_str), selected, mode);
         if matches.is_empty() {
-            ensure!(mode != Mode::Raw, "Asset source is unavailable");
             return Ok(None);
         }
         ensure!(
@@ -121,6 +155,35 @@ impl Reader<'_> {
         );
         let logical = matches[0];
         let file = candidates[logical].first().unwrap();
+        Ok(Some(Resolved {
+            logical: logical.into(),
+            file: file.clone(),
+            requested: path.into(),
+        }))
+    }
+
+    #[cfg(test)]
+    pub fn view(&self, path: &str, mode: Mode) -> Result<Option<String>> {
+        let Some(resolved) = self.resolve(path, mode)? else {
+            ensure!(mode != Mode::Raw, "Asset source is unavailable");
+            return Ok(None);
+        };
+        self.render(&resolved, mode)
+    }
+
+    pub(crate) fn render(&self, resolved: &Resolved, mode: Mode) -> Result<Option<String>> {
+        self.view_resolved(&resolved.logical, &resolved.file, &resolved.requested, mode)
+    }
+
+    /// Render a file already resolved against a repository or workspace inventory.
+    pub(crate) fn view_resolved(
+        &self,
+        logical: &str,
+        file: &Path,
+        path: &str,
+        mode: Mode,
+    ) -> Result<Option<String>> {
+        self.leases.retain(self.cache)?;
         self.leases.retain(file)?;
         if file
             .extension()
@@ -287,9 +350,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let package = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        write(root.path(), "ProjectSettings/ProjectVersion.txt", "version");
+        write(
+            root.path(),
+            "Game/ProjectSettings/ProjectVersion.txt",
+            "version",
+        );
         let source = "--- !u!1 &1\nGameObject:\n  m_Name: Visible\n";
-        write(root.path(), "Assets/Selected.prefab", source);
+        write(root.path(), "Game/Assets/Selected.prefab", source);
         write(package.path(), "Selected.prefab", source);
         let manifest = Manifest {
             root: root.path().into(),
@@ -304,12 +371,16 @@ mod tests {
                 compiler_options: BTreeMap::new(),
                 source_roots: vec![
                     SourceRoot {
-                        physical: root.path().join("Assets"),
-                        logical: "Assets".into(),
+                        physical: root.path().join("Game/Assets"),
+                        logical: "Game/Assets".into(),
                     },
                     SourceRoot {
                         physical: package.path().into(),
-                        logical: "Packages/example".into(),
+                        logical: "Game/Packages/example".into(),
+                    },
+                    SourceRoot {
+                        physical: root.path().join("Shared/pkg"),
+                        logical: "Game/Packages/shared".into(),
                     },
                 ],
             }],
@@ -327,9 +398,17 @@ mod tests {
             remote: false,
             omitted: &BTreeMap::new(),
             unavailable: &BTreeSet::new(),
+            deferred: &BTreeSet::from([
+                "Game/Assets/Selected.prefab".into(),
+                "Shared/pkg/Unique.prefab".into(),
+                "Game/Docs/Unique.prefab".into(),
+            ]),
             cancel: &cancel,
         };
-        for file in ["Assets/Selected.prefab", "Packages/example/Selected.prefab"] {
+        for file in [
+            "Game/Assets/Selected.prefab",
+            "Game/Packages/example/Selected.prefab",
+        ] {
             assert_eq!(reader.view(file, Mode::Raw).unwrap().unwrap(), source);
             assert!(
                 super::selection::exact_file(
@@ -342,6 +421,29 @@ mod tests {
             );
         }
         assert!(reader.view("Selected.prefab", Mode::Raw).is_err());
+        std::fs::remove_file(root.path().join("Game/Assets/Selected.prefab")).unwrap();
+        assert!(reader.resolve("Selected.prefab", Mode::Raw).is_err());
+        let resolved = reader.resolve("Unique.prefab", Mode::Raw).unwrap().unwrap();
+        assert_eq!(resolved.file, root.path().join("Shared/pkg/Unique.prefab"));
+        assert!(
+            reader
+                .resolve("Game/Docs/Unique.prefab", Mode::Raw)
+                .unwrap()
+                .is_none()
+        );
+        assert!(reader.resolve("lib", Mode::Raw).unwrap().is_none());
+        std::fs::create_dir_all(
+            root.path()
+                .join("Game/Assets/Unrelated")
+                .join("nested/".repeat(128)),
+        )
+        .unwrap();
+        assert!(
+            reader
+                .resolve("Shared/pkg/Unique.prefab", Mode::Raw)
+                .unwrap()
+                .is_some()
+        );
         cancel.cancel();
         assert!(reader.view("Assets/Selected.prefab", Mode::Raw).is_err());
     }

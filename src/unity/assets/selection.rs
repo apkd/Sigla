@@ -57,6 +57,25 @@ pub(crate) fn exact_file(
     query: &Query,
     cancel: &dyn Cancellation,
 ) -> Result<bool> {
+    exact_file_with_memberships(manifest, prepared, query, cancel, prepared.is_none())
+}
+
+pub(crate) fn exact_workspace_file(
+    manifest: &Manifest,
+    prepared: Option<&Prepared>,
+    query: &Query,
+    cancel: &dyn Cancellation,
+) -> Result<bool> {
+    exact_file_with_memberships(manifest, prepared, query, cancel, true)
+}
+
+fn exact_file_with_memberships(
+    manifest: &Manifest,
+    prepared: Option<&Prepared>,
+    query: &Query,
+    cancel: &dyn Cancellation,
+    memberships_known: bool,
+) -> Result<bool> {
     if !exact_request(query) {
         return Ok(false);
     }
@@ -74,7 +93,7 @@ pub(crate) fn exact_file(
     if query.filters.iter().any(|filter| filter.key == "lang") {
         // A compiler can include an asset-named source. Remote inventories do
         // not yet have those memberships, so defer language-sensitive queries.
-        if prepared.is_some() {
+        if !memberships_known {
             return Ok(false);
         }
         let paths = crate::navigation::sources::source_paths(manifest, &manifest.root);
@@ -91,11 +110,14 @@ pub(crate) fn exact_file(
             return Ok(false);
         }
     }
+    let known = prepared.is_some_and(|prepared| {
+        prepared.selected.contains_key(path) || prepared.deferred_assets.contains(path)
+    });
     let mut projects = Vec::new();
     if let Some(prepared) = prepared {
         if prepared.omitted.contains_key(path)
             || prepared.unavailable.contains(path)
-            || !(prepared.selected.contains_key(path) || prepared.deferred_assets.contains(path))
+            || !known && !memberships_known
         {
             return Ok(false);
         }
@@ -119,8 +141,11 @@ pub(crate) fn exact_file(
                 })
                 .map(|project| manifest.root.join(project)),
         );
-    } else {
-        if let Some(project) = local_project(&manifest.root, path, cancel)? {
+    }
+    if memberships_known {
+        if let Some(project) = local_project(&manifest.root, path, cancel)?
+            && !projects.contains(&project)
+        {
             projects.push(project);
         }
         // Packages inside the workspace keep their physical display path, even
@@ -172,7 +197,7 @@ pub(crate) fn exact_file(
             else {
                 continue;
             };
-            if prepared.is_some() {
+            if known {
                 let physical = scope.join(relative);
                 if physical.strip_prefix(&scope)?.ancestors().any(ignored)
                     || projects.iter().any(|other| {
@@ -418,6 +443,22 @@ mod tests {
             }],
             ..Default::default()
         };
+        let prepared = Prepared {
+            selected: BTreeMap::new(),
+            deferred_assets: BTreeSet::from(["Shared/pkg/Deferred.prefab".into()]),
+            tracked: BTreeMap::from([(
+                "Game/ProjectSettings/ProjectVersion.txt".into(),
+                "version".into(),
+            )]),
+            directories: BTreeSet::from(["Game/Assets".into()]),
+            omitted: Default::default(),
+            unavailable: Default::default(),
+            transfer_bytes: 0,
+            transport: None,
+            resolved_target: None,
+            branch: None,
+            revision: String::new(),
+        };
         for (query, expected) in [
             ("file:Game/Assets/Known.prefab", true),
             ("file:Game/Assets/Known.prefab -path:Game", false),
@@ -429,7 +470,26 @@ mod tests {
                 exact_file(&manifest, None, &Query::parse(query).unwrap(), &()).unwrap(),
                 expected
             );
+            assert_eq!(
+                exact_workspace_file(
+                    &manifest,
+                    Some(&prepared),
+                    &Query::parse(query).unwrap(),
+                    &()
+                )
+                .unwrap(),
+                expected
+            );
         }
+        assert!(
+            exact_workspace_file(
+                &manifest,
+                Some(&prepared),
+                &Query::parse("file:Shared/pkg/Deferred.prefab lang:text").unwrap(),
+                &()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -607,6 +667,15 @@ mod tests {
             );
         }
         let query = Query::parse("file:Assets/Data/Settings.asset").unwrap();
+        assert!(
+            exact_workspace_file(
+                &manifest,
+                Some(&prepared),
+                &Query::parse("file:Assets/Data/Settings.asset lang:text").unwrap(),
+                &()
+            )
+            .unwrap()
+        );
         prepared
             .omitted
             .insert(query.target.name.clone(), "limit".into());

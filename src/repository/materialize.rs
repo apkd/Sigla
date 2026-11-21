@@ -125,6 +125,26 @@ pub struct Prepared {
 impl Prepared {
     /// A later materialization rebuilds selection and availability from the tree.
     pub(super) fn inventory(&self) -> Self {
+        self.inventory_with(self.tracked.clone(), self.directories.clone())
+    }
+
+    /// File views already resolved selection against the complete inventory.
+    pub(super) fn file_inventory(&self, paths: &[String]) -> Self {
+        self.inventory_with(
+            paths
+                .iter()
+                .filter_map(|path| self.tracked.get_key_value(path))
+                .map(|(path, oid)| (path.clone(), oid.clone()))
+                .collect(),
+            BTreeSet::new(),
+        )
+    }
+
+    fn inventory_with(
+        &self,
+        tracked: BTreeMap<String, String>,
+        directories: BTreeSet<String>,
+    ) -> Self {
         Self {
             deferred_assets: BTreeSet::new(),
             omitted: BTreeMap::new(),
@@ -135,8 +155,8 @@ impl Prepared {
             resolved_target: self.resolved_target.clone(),
             branch: self.branch.clone(),
             revision: self.revision.clone(),
-            tracked: self.tracked.clone(),
-            directories: self.directories.clone(),
+            tracked,
+            directories,
         }
     }
 }
@@ -390,6 +410,19 @@ impl<W: std::io::Write> std::io::Write for MeasuredWriter<'_, W> {
 }
 
 pub const TRANSFER_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// Early inventories may expose pointer files before hydration finishes.
+pub(crate) fn source_ready(path: &Path) -> Result<bool> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut prefix = Vec::new();
+    file.take(super::lfs::MAGIC.len() as u64)
+        .read_to_end(&mut prefix)?;
+    Ok(prefix != super::lfs::MAGIC)
+}
 
 #[cfg(test)]
 mod budget_tests {
@@ -925,6 +958,51 @@ fn materialize_inventory(
         }
     }
     changed.retain(|path, _| !omitted.contains_key(path));
+    // A few explicitly requested files can use GitHub's verified blob endpoint.
+    // Keep them in the normal staging/import path so aliases and transfer limits
+    // apply equally to HTTP and Git downloads.
+    if matches!(request.contents, Contents::Only(_))
+        && repository.identity.endpoint == super::Endpoint::Github
+    {
+        let mut downloaded = Vec::new();
+        for (path, oid) in &changed {
+            if blob_sizes.contains_key(oid) {
+                continue;
+            }
+            let limit = if super::selection::asset(Path::new(path))
+                || super::selection::visual_graph(Path::new(path))
+            {
+                super::selection::ASSET_LIMIT
+            } else {
+                TRANSFER_LIMIT
+            };
+            let limit = limit.min(request.remaining(transfer_bytes).unwrap_or(u64::MAX));
+            let bytes =
+                match super::github::blob(repository, oid, request.allow_private, limit, &()) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::debug!(%error, "GitHub blob unavailable; falling back to Git");
+                        continue;
+                    }
+                };
+            transfer_bytes += bytes.len() as u64;
+            let target = request.staging.join(path);
+            fs::create_dir_all(target.parent().context("Source has no parent")?)?;
+            fs::write(target, &*bytes)?;
+            metrics.extracted_files += 1;
+            metrics.extracted_bytes += bytes.len() as u64;
+            metrics.staged.push(StagedFile {
+                path: path.clone(),
+                extracted: true,
+                lfs: bytes.starts_with(super::lfs::MAGIC),
+            });
+            downloaded.push(path.clone());
+        }
+        for path in downloaded {
+            changed.remove(&path);
+        }
+    }
     let ids: BTreeSet<_> = changed.values().cloned().collect();
     missing_objects.retain(|id| ids.contains(&id.to_string()));
     let mut transfer_session = None;

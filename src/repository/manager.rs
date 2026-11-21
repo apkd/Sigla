@@ -60,10 +60,13 @@ mod refresh_tests {
             running: Mutex::new(None),
             telemetry_id: Mutex::new(None),
             retry_after: AtomicU64::new(0),
-            acquiring: AsyncMutex::new(()),
+            acquiring: Arc::new(AsyncMutex::new(())),
             sources: Mutex::new(None),
+            state_bytes: Mutex::new(None),
             inventory: watch::channel(None).0,
             initialized: Arc::new(AsyncMutex::new(true)),
+            demand: Arc::default(),
+            inventory_demand: Arc::default(),
         }
     }
 
@@ -71,7 +74,7 @@ mod refresh_tests {
     async fn readiness_releases_state_before_waiting_for_publication() {
         let cache = tempfile::tempdir().unwrap();
         let manager = Manager::new(cache.path().into(), options()).unwrap();
-        let branch = branch(Target::Branch("main".into()), 0);
+        let branch = Arc::new(branch(Target::Branch("main".into()), 0));
         let (sender, receiver) = watch::channel(None);
         *branch.running.lock().unwrap() = Some(receiver);
         let operation = crate::telemetry::Operation::default();
@@ -86,9 +89,65 @@ mod refresh_tests {
             .state
             .try_write()
             .expect("Readiness blocked publication");
-        sender.send_replace(Some(Ok(())));
+        sender.send_replace(Some(Err(Arc::new(crate::diagnostics::Cancelled.into()))));
         drop(publication);
-        ready.await.unwrap();
+        assert!(ready.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_required_input_admission_does_not_start_acquisition() {
+        use std::future::Future;
+        let cache = tempfile::tempdir().unwrap();
+        let mut options = options();
+        options
+            .rules
+            .push(crate::repository::Rule::parse_private("https://github.com/owner/*").unwrap());
+        let manager = Manager::new(cache.path().into(), options).unwrap();
+        let branch = Arc::new(branch(Target::Branch("main".into()), 0));
+        let demand = Arc::new(crate::demand::Demand::new(Duration::ZERO));
+        let caller = demand.interest();
+        let work = Arc::new(demand.work());
+        let _held = branch.acquiring.lock().await;
+        let operation = crate::telemetry::Operation::default();
+        let waiting =
+            manager.require_inputs_cancellable(&branch, "revision", Vec::new(), &operation, work);
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(caller);
+        let error = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is::<crate::demand::Paused>());
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_default_branch_lookups() {
+        use std::future::Future;
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let (send, receive) = watch::channel(None);
+        manager
+            .default_running
+            .lock()
+            .unwrap()
+            .insert("pending".into(), (0, receive, None));
+        let stopping = manager.flush_usage();
+        tokio::pin!(stopping);
+        std::future::poll_fn(|cx| {
+            assert!(stopping.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        send.send_replace(Some(Err(Arc::new(crate::diagnostics::Cancelled.into()))));
+        tokio::time::timeout(Duration::from_secs(2), stopping)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -425,6 +484,7 @@ mod refresh_tests {
                     &branch,
                     &Arc::new(before.clone()),
                     &telemetry,
+                    &(),
                     move |_, _, _, _| Ok((resolved.0, resolved.1, None))
                 )
             )
@@ -458,6 +518,7 @@ mod refresh_tests {
                         &branch,
                         &Arc::new(ineligible),
                         &telemetry,
+                        &(),
                         |_, _, _, _| panic!("Ineligible state must use normal acquisition")
                     )
                     .await
@@ -517,6 +578,54 @@ mod refresh_tests {
     }
 
     #[test]
+    fn trimming_uninitialized_branches_preserves_persisted_inputs() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        for saved in [false, true] {
+            let mut branch = branch(Target::Branch("main".into()), 0);
+            branch.root = cache.path().join("repositories/pending");
+            *branch.initialized.try_lock().unwrap() = false;
+            if saved {
+                fs::create_dir_all(branch.source()).unwrap();
+                branch.persist(&state()).unwrap();
+            }
+            manager
+                .branches
+                .lock()
+                .unwrap()
+                .insert("pending".into(), Arc::new(branch));
+            manager.trim_unreferenced(0, |_| false).unwrap();
+            assert!(manager.branches.lock().unwrap().is_empty());
+            assert_eq!(
+                cache.path().join("repositories/pending/state.bin").exists(),
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_inventory_only_selector_is_retired_from_disk() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let mut branch = branch(Target::Branch("main".into()), 0);
+        branch.root = cache.path().join("repositories/inventory-only");
+        fs::create_dir_all(branch.source()).unwrap();
+        let path = branch.root.clone();
+        manager
+            .branches
+            .lock()
+            .unwrap()
+            .insert("inventory-only".into(), Arc::new(branch));
+        manager.trim_unreferenced(0, |_| false).unwrap();
+        assert!(manager.branches.lock().unwrap().is_empty());
+        assert!(!path.exists());
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("usage.bin"), b"abandoned").unwrap();
+        manager.collect_abandoned_inventories().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn repository_inventory_trimming_preserves_requests_workspaces_and_saved_state() {
         let cache = tempfile::tempdir().unwrap();
         let manager = Manager::new(cache.path().into(), options()).unwrap();
@@ -534,26 +643,26 @@ mod refresh_tests {
             .lock()
             .unwrap()
             .insert("branch".into(), branch.clone());
-        manager.trim_unreferenced(|_| false).unwrap();
+        manager.trim_unreferenced(0, |_| false).unwrap();
         assert_eq!(manager.branches.lock().unwrap().len(), 1);
 
         let reader = branch.state.clone().try_read_owned().unwrap();
         drop(branch);
-        manager.trim_unreferenced(|_| false).unwrap();
+        manager.trim_unreferenced(0, |_| false).unwrap();
         assert_eq!(manager.branches.lock().unwrap().len(), 1);
         drop(reader);
-        manager.trim_unreferenced(|path| path == source).unwrap();
+        manager.trim_unreferenced(0, |path| path == source).unwrap();
         assert_eq!(manager.branches.lock().unwrap().len(), 1);
 
         manager.branches.lock().unwrap()["branch"]
             .retry_after
             .store(u64::MAX, Ordering::Relaxed);
-        manager.trim_unreferenced(|_| false).unwrap();
+        manager.trim_unreferenced(0, |_| false).unwrap();
         assert_eq!(manager.branches.lock().unwrap().len(), 1);
         manager.branches.lock().unwrap()["branch"]
             .retry_after
             .store(0, Ordering::Relaxed);
-        manager.trim_unreferenced(|_| false).unwrap();
+        manager.trim_unreferenced(0, |_| false).unwrap();
         assert!(manager.branches.lock().unwrap().is_empty());
         let restored =
             super::super::state_store::read(&cache.path().join("repositories/branch")).unwrap();
@@ -608,7 +717,7 @@ mod refresh_tests {
         .unwrap()
         .unwrap();
         assert!(other.root.is_dir());
-        manager.trim_unreferenced(|_| false).unwrap();
+        manager.trim_unreferenced(0, |_| false).unwrap();
         assert!(manager.branches.lock().unwrap().contains_key("pending"));
         assert!(pending.initialized.try_lock().is_err());
         let flush = manager.flush_usage();
@@ -953,10 +1062,22 @@ impl State {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Inventory {
     pub(crate) prepared: Prepared,
     pub(crate) source: Option<Arc<tempfile::TempDir>>,
     _pin: Arc<super::cache::Pin>,
+    refreshed: u64,
+    heap_bytes: std::sync::OnceLock<u64>,
+    _staging: Option<Arc<super::admission::Staging>>,
+}
+
+/// A temporary, pinned file view. Its disk reservation lasts through rendering.
+pub(crate) struct FileView {
+    pub prepared: Prepared,
+    pub source: Arc<tempfile::TempDir>,
+    _pin: super::cache::Pin,
+    _staging: Arc<super::admission::Staging>,
 }
 
 pub(crate) struct AnalysisGuard {
@@ -1005,13 +1126,69 @@ pub struct Branch {
     running: Mutex<Option<Running>>,
     telemetry_id: Mutex<Option<String>>,
     retry_after: AtomicU64,
-    acquiring: AsyncMutex<()>,
+    acquiring: Arc<AsyncMutex<()>>,
     sources: Mutex<Option<super::source_validation::Sources>>,
+    state_bytes: Mutex<Option<(std::sync::Weak<State>, u64)>>,
     pub(crate) inventory: watch::Sender<Option<Arc<Inventory>>>,
     initialized: Arc<AsyncMutex<bool>>,
+    pub(crate) demand: Arc<crate::demand::Demand>,
+    inventory_demand: Arc<crate::demand::Demand>,
 }
 
 impl Branch {
+    fn inventory_bytes(&self) -> u64 {
+        let inventory = self.inventory.borrow();
+        let inventory_bytes = inventory.as_ref().map_or(0, |inventory| {
+            *inventory.heap_bytes.get_or_init(|| {
+                crate::memory::encoded_size(&inventory.prepared).saturating_mul(3) as u64
+            })
+        });
+        let mut cached = self.state_bytes.lock().unwrap();
+        if let Ok(state) = self.state.try_read() {
+            match state.as_ref() {
+                Some(state)
+                    if cached
+                        .as_ref()
+                        .is_none_or(|(saved, _)| !saved.ptr_eq(&Arc::downgrade(state))) =>
+                {
+                    *cached = Some((
+                        Arc::downgrade(state),
+                        crate::memory::encoded_size(state.as_ref()).saturating_mul(3) as u64,
+                    ));
+                }
+                None => *cached = None,
+                _ => (),
+            }
+        }
+        inventory_bytes.saturating_add(cached.as_ref().map_or(0, |(_, bytes)| *bytes))
+    }
+    pub(crate) fn interest(&self) -> (crate::demand::Interest, crate::demand::Interest) {
+        (self.demand.interest(), self.inventory_demand.interest())
+    }
+    // The acquisition guard serializes the per-revision transfer budget.
+    fn record_transfer(&self, prepared: &Prepared) -> Result<()> {
+        self.inventory.send_if_modified(|inventory| {
+            if let Some(inventory) = inventory
+                && inventory.prepared.revision == prepared.revision
+                && inventory.prepared.transfer_bytes < prepared.transfer_bytes
+            {
+                Arc::make_mut(inventory).prepared.transfer_bytes = prepared.transfer_bytes;
+                return true;
+            }
+            false
+        });
+        let mut state = self.state.blocking_write();
+        if let Some(state) = state.as_mut()
+            && state.prepared.revision == prepared.revision
+            && state.prepared.transfer_bytes < prepared.transfer_bytes
+        {
+            let state = Arc::make_mut(state);
+            state.prepared.transfer_bytes =
+                state.prepared.transfer_bytes.max(prepared.transfer_bytes);
+            self.persist_header(state)?;
+        }
+        Ok(())
+    }
     pub(super) fn sources_current(&self, prepared: &Prepared) -> bool {
         self.sources
             .lock()
@@ -1037,10 +1214,13 @@ impl Branch {
             running: Mutex::new(None),
             telemetry_id: Mutex::new(None),
             retry_after: AtomicU64::new(0),
-            acquiring: AsyncMutex::new(()),
+            acquiring: Arc::new(AsyncMutex::new(())),
             sources: Mutex::new(None),
+            state_bytes: Mutex::new(None),
             inventory: watch::channel(None).0,
             initialized: Arc::new(AsyncMutex::new(true)),
+            demand: Arc::default(),
+            inventory_demand: Arc::default(),
         }
     }
 
@@ -1587,6 +1767,10 @@ impl Manager {
 
     /// Refresh repositories; check expiry only on the slower cleanup cycle.
     pub async fn maintain(self: &Arc<Self>, collect: bool) -> Result<Vec<Arc<Branch>>> {
+        if collect {
+            let manager = self.clone();
+            tokio::task::spawn_blocking(move || manager.collect_abandoned_inventories()).await??;
+        }
         let branches: Vec<_> = self.branches.lock().unwrap().values().cloned().collect();
         let mut expired = Vec::new();
         for branch in branches {
@@ -1596,21 +1780,82 @@ impl Manager {
             }
             let checkpoint = branch.clone();
             tokio::task::spawn_blocking(move || checkpoint.checkpoint_usage(false)).await??;
-            if let Ok(state) = branch.state.try_read()
-                && let Some(state) = state.as_ref()
-                && branch.refresh_due(&self.options, state.refreshed, now(), Some(&state.prepared))
-            {
-                self.schedule(branch.clone(), false);
+            let inventory = branch.inventory.borrow().clone();
+            let due = if let Some(inventory) = inventory {
+                branch.refresh_due(
+                    &self.options,
+                    inventory.refreshed,
+                    now(),
+                    Some(&inventory.prepared),
+                )
+            } else {
+                branch.state.try_read().is_ok_and(|state| {
+                    state.as_ref().is_some_and(|state| {
+                        branch.refresh_due(
+                            &self.options,
+                            state.refreshed,
+                            now(),
+                            Some(&state.prepared),
+                        )
+                    })
+                })
+            };
+            if due {
+                self.schedule(branch.clone(), false, branch.demand.idle());
             }
         }
         Ok(expired)
     }
 
+    fn collect_abandoned_inventories(&self) -> Result<()> {
+        // Headerless selectors contain only temporary inventory/view data. Live
+        // callers publish their Branch in this registry before creating its root.
+        let branches = self.branches.lock().unwrap();
+        let mut retired = Vec::new();
+        for entry in fs::read_dir(self.cache.join("repositories"))? {
+            let entry = entry?;
+            let root = entry.path();
+            ensure!(entry.file_type()?.is_dir(), "Invalid selector directory");
+            if !root.join("state.bin").try_exists()?
+                && !branches.values().any(|branch| branch.root == root)
+            {
+                retired.push(crate::cache::views::retire(&self.cache, &root)?);
+            }
+        }
+        drop(branches);
+        for directory in retired {
+            directory.dispose()?;
+        }
+        Ok(())
+    }
+
     pub async fn flush_usage(&self) -> Result<()> {
+        let defaults: Vec<_> = self
+            .default_running
+            .lock()
+            .unwrap()
+            .values()
+            .map(|job| job.1.clone())
+            .collect();
+        for mut running in defaults {
+            while running.borrow().is_none() {
+                if running.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
         let branches: Vec<_> = self.branches.lock().unwrap().values().cloned().collect();
         // Shutdown must also join loads whose request was cancelled.
         for branch in &branches {
             drop(branch.initialized.lock().await);
+            let running = branch.running.lock().unwrap().clone();
+            if let Some(mut running) = running {
+                while running.borrow().is_none() {
+                    if running.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
         tokio::task::spawn_blocking(move || {
             for branch in branches {
@@ -1621,20 +1866,84 @@ impl Manager {
         .await?
     }
 
-    /// Release repository inventories once neither requests nor cached workspaces use them.
-    /// The callback checks the current workspace registry while new branch lookups are excluded.
-    pub(crate) fn trim_unreferenced(&self, retained: impl Fn(&Path) -> bool) -> Result<()> {
-        let mut branches = self.branches.lock().unwrap();
-        let mut retired = Vec::new();
-        let mut failure = None;
-        branches.retain(|_, branch| {
-            if Arc::strong_count(branch) != 1 || now() < branch.retry_after.load(Ordering::Relaxed)
-            {
-                return true;
+    pub(crate) fn inventory_usage(&self) -> crate::memory::CacheUsage {
+        let mut usage = crate::memory::CacheUsage::default();
+        for branch in self.branches.lock().unwrap().values() {
+            let bytes = branch.inventory_bytes();
+            if bytes == 0 {
+                continue;
             }
-            let source = branch.source();
-            let source = source.canonicalize().unwrap_or(source);
-            if retained(&source) {
+            usage.entries += 1;
+            usage.retained_bytes += bytes;
+            if Arc::strong_count(branch) > 1 {
+                usage.active_entries += 1;
+                usage.pinned_bytes += bytes;
+            }
+        }
+        usage
+    }
+
+    /// Keep recent inventories within the unused workspace budget.
+    /// The callback checks the current workspace registry while new branch lookups are excluded.
+    pub(crate) fn trim_unreferenced(
+        &self,
+        budget: u64,
+        retained: impl Fn(&Path) -> bool,
+    ) -> Result<()> {
+        let mut branches = self.branches.lock().unwrap();
+        let mandatory: std::collections::HashSet<_> = branches
+            .iter()
+            .filter_map(|(key, branch)| {
+                let source = branch.source();
+                let source = source.canonicalize().unwrap_or(source);
+                (Arc::strong_count(branch) != 1
+                    || now() < branch.retry_after.load(Ordering::Relaxed)
+                    || retained(&source)
+                    || branch.state.try_write().is_err()
+                    || branch
+                        .running
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|job| job.borrow().is_none()))
+                .then_some(key.clone())
+            })
+            .collect();
+        let mut remaining = budget.saturating_sub(
+            branches
+                .iter()
+                .filter(|(key, _)| mandatory.contains(*key))
+                .map(|(_, branch)| branch.inventory_bytes())
+                .sum(),
+        );
+        let mut candidates: Vec<_> = branches
+            .iter()
+            .filter_map(|(key, branch)| {
+                let used = branch.last_use.load(Ordering::Relaxed);
+                let bytes = branch.inventory_bytes();
+                (!mandatory.contains(key)
+                    && bytes > 0
+                    && now().saturating_sub(used) < crate::demand::RETAIN_PAUSED.as_millis() as u64)
+                    .then_some((key.clone(), used, bytes))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, used, _)| std::cmp::Reverse(*used));
+        let keep: std::collections::HashSet<_> = candidates
+            .into_iter()
+            .take(256)
+            .filter_map(|(key, _, bytes)| {
+                if bytes > remaining {
+                    return None;
+                }
+                remaining -= bytes;
+                Some(key)
+            })
+            .collect();
+        let mut retired = Vec::new();
+        let mut directories = Vec::new();
+        let mut failure = None;
+        branches.retain(|key, branch| {
+            if mandatory.contains(key) || keep.contains(key) {
                 return true;
             }
             let Ok(mut state) = branch.state.try_write() else {
@@ -1660,12 +1969,23 @@ impl Manager {
                         return true;
                     }
                 }
+            } else if branch.root.is_dir() && !branch.root.join("state.bin").exists() {
+                match crate::cache::views::retire(&self.cache, &branch.root) {
+                    Ok(directory) => directories.push(directory),
+                    Err(error) => {
+                        failure = Some(error);
+                        return true;
+                    }
+                }
             }
             retired.push(branch.clone());
             false
         });
         drop(branches);
         drop(retired);
+        for directory in directories {
+            directory.dispose()?;
+        }
         failure.map_or(Ok(()), Err)
     }
 
@@ -1711,96 +2031,175 @@ impl Manager {
     }
 
     pub(crate) async fn ready(
-        &self,
-        branch: &Branch,
+        self: &Arc<Self>,
+        branch: &Arc<Branch>,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
-        let ready = {
-            let _wait = telemetry.wait("branch_state");
-            branch
+        loop {
+            let ready = {
+                let _wait = telemetry.wait("branch_state");
+                branch
+                    .state
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|state| self.usable(branch, state))
+            };
+            if ready {
+                return Ok(());
+            }
+            let (mut running, mut job_id) = {
+                let running = branch.running.lock().unwrap();
+                (
+                    running
+                        .clone()
+                        .context("Repository preparation was not scheduled")?,
+                    branch.telemetry_id.lock().unwrap().clone(),
+                )
+            };
+            loop {
+                if let Some(outcome) = running.borrow().clone() {
+                    if let Err(error) = outcome
+                        && !error.is::<crate::demand::Paused>()
+                    {
+                        return Err(crate::diagnostics::shared_error(error));
+                    }
+                    break;
+                }
+                if let Some(job_id) = job_id.take() {
+                    telemetry.link(&job_id);
+                }
+                let _wait = telemetry.wait("repository_refresh");
+                running
+                    .changed()
+                    .await
+                    .context("Repository preparation stopped")?;
+            }
+            let ready = branch
                 .state
                 .read()
                 .await
                 .as_ref()
-                .is_some_and(|s| !s.repair)
-        };
-        if ready {
-            return Ok(());
-        }
-        let (mut running, mut job_id) = {
-            let running = branch.running.lock().unwrap();
-            (
-                running
-                    .clone()
-                    .context("Repository preparation was not scheduled")?,
-                branch.telemetry_id.lock().unwrap().clone(),
-            )
-        };
-        loop {
-            if let Some(outcome) = running.borrow().clone() {
-                return outcome.map_err(crate::diagnostics::shared_error);
+                .is_some_and(|state| self.usable(branch, state));
+            if !ready {
+                self.schedule(branch.clone(), true, false);
             }
-            if let Some(job_id) = job_id.take() {
-                telemetry.link(&job_id);
-            }
-            let _wait = telemetry.wait("repository_refresh");
-            running
-                .changed()
-                .await
-                .context("Repository preparation stopped")?;
         }
     }
 
-    pub(crate) async fn sources_ready(&self, branch: &Branch) -> Result<()> {
-        let mut inventory = branch.inventory.subscribe();
-        let telemetry = crate::telemetry::Operation::default();
-        loop {
-            if inventory
+    pub(crate) fn usable(&self, branch: &Branch, state: &State) -> bool {
+        !state.repair
+            && branch.source().is_dir()
+            && state.policy == self.options.selection.identity
+            && branch.sources_current(&state.prepared)
+            && branch
+                .inventory
                 .borrow()
                 .as_ref()
-                .is_some_and(|i| i.source.is_some())
-            {
-                return Ok(());
-            }
-            tokio::select! {
-                result = self.ready(branch, &telemetry) => return result,
-                result = inventory.changed() => result.context("Repository inventory stopped")?,
-            }
-        }
+                .is_none_or(|inventory| inventory.prepared.revision == state.prepared.revision)
     }
 
-    pub(crate) fn source_blob(
+    /// Fetch one resolved source at the inventory's revision, including LFS fallback.
+    pub(crate) async fn source_file(
         &self,
-        branch: &Branch,
-        prepared: &Prepared,
+        branch: &Arc<Branch>,
+        revision: &str,
         path: &str,
-        cancel: &dyn crate::cancellation::Cancellation,
-    ) -> Result<Option<crate::memory::Source<Vec<u8>>>> {
-        let oid = prepared
-            .selected
-            .get(path)
+        activity: impl Send + 'static,
+    ) -> Result<FileView> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
+        let ownership = branch.acquiring.clone().lock_owned().await;
+        let inventory = branch.inventory.borrow().clone();
+        let state = branch.state.read().await.clone();
+        let prepared = inventory
+            .as_ref()
+            .map(|inventory| &inventory.prepared)
             .or_else(|| {
-                prepared
-                    .deferred_assets
-                    .contains(path)
-                    .then(|| prepared.tracked.get(path))
-                    .flatten()
+                state
+                    .as_ref()
+                    .filter(|state| !state.repair)
+                    .map(|state| &state.prepared)
             })
-            .context("Source is not selected")?;
-        let allow_private = authorize(&self.options.rules, &branch.repository)?;
-        let limit = if crate::unity::assets::view::supported(Path::new(path)) {
-            super::selection::ASSET_LIMIT
-        } else {
-            super::materialize::TRANSFER_LIMIT
-        };
-        match super::github::blob(&branch.repository, oid, allow_private, limit, cancel) {
-            Ok(bytes) => Ok(bytes),
-            Err(error) => {
-                cancel.check()?;
-                tracing::warn!(%error, "On-demand source read failed; awaiting repository acquisition");
-                Ok(None)
+            .context("Repository inventory is unavailable")?;
+        ensure!(
+            prepared.revision == revision,
+            crate::diagnostics::RefreshRequired("Repository changed before file acquisition")
+        );
+        ensure!(
+            prepared.selected.contains_key(path) || prepared.deferred_assets.contains(path),
+            "Source is not selected"
+        );
+        let path = path.to_owned();
+        let mut paths = std::collections::BTreeSet::from([path.clone()]);
+        if crate::unity::assets::is_asset(Path::new(&path)) {
+            let metadata = format!("{path}.meta");
+            if prepared.selected.contains_key(&metadata)
+                || prepared.deferred_assets.contains(&metadata)
+            {
+                paths.insert(metadata);
             }
         }
+        let operation = crate::telemetry::Operation::default();
+        let mut acquisition =
+            super::cache::Acquisition::begin(&self.cache, &branch.repository.identity, &operation)
+                .await?;
+        let staging = acquisition.staging.clone();
+        let stage = Arc::new(
+            tempfile::Builder::new()
+                .prefix("view-")
+                .tempdir_in(&branch.root)?,
+        );
+        let request = Request {
+            transfer_used: prepared.transfer_bytes,
+            contents: super::materialize::Contents::Only(paths.clone()),
+            unlimited_transfer: self
+                .options
+                .rules
+                .iter()
+                .any(|rule| rule.exact_match(&branch.repository)),
+            allow_private: authorize(&self.options.rules, &branch.repository)?,
+            repository: branch.repository.transport.clone(),
+            preferred_transport: None,
+            target: Target::Commit(prepared.revision.clone()),
+            store: PathBuf::new(),
+            staging: stage.path().into(),
+            include: self.options.selection.patterns.0.clone(),
+            exclude: self.options.selection.patterns.1.clone(),
+            required: paths.into_iter().collect(),
+            additional: Vec::new(),
+            previous: BTreeMap::new(),
+            subdirectory: None,
+        };
+        let pinned = super::materialize::Reuse::Pinned(super::materialize::Inventory {
+            repository: branch.repository.identity.clone(),
+            policy: self.options.selection.identity.clone(),
+            subdirectory: None,
+            prepared: prepared.file_inventory(&request.required),
+        });
+        let cache = self.cache.clone();
+        let branch = branch.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _activity = activity;
+            let _ownership = ownership;
+            let (acquired, pin) =
+                acquisition.git_cancellable(&request, &cache, Some(pinned), &operation, &cancel)?;
+            drop(acquisition);
+            branch.record_transfer(&acquired.prepared)?;
+            let acquired = super::cache::complete_cancellable(
+                &request, &cache, acquired, &pin, &staging, &operation, &cancel,
+            )?;
+            branch.record_transfer(&acquired.prepared)?;
+            Ok(FileView {
+                prepared: acquired.prepared,
+                source: stage,
+                _pin: pin,
+                _staging: staging,
+            })
+        })
+        .await?;
+        guard.disarm();
+        result
     }
 
     async fn resolve_with(
@@ -1847,35 +2246,64 @@ impl Manager {
                     running: Mutex::new(None),
                     telemetry_id: Mutex::new(None),
                     retry_after: AtomicU64::new(0),
-                    acquiring: AsyncMutex::new(()),
+                    acquiring: Arc::new(AsyncMutex::new(())),
                     sources: Mutex::new(None),
+                    state_bytes: Mutex::new(None),
                     inventory: watch::channel(None).0,
                     initialized: Arc::new(AsyncMutex::new(false)),
+                    demand: Arc::default(),
+                    inventory_demand: Arc::default(),
                 });
                 branches.insert(key, branch.clone());
                 branch
             }
         };
+        let _inventory_interest = branch.inventory_demand.interest();
+        let _interest = (!inventory_only).then(|| branch.demand.interest());
         self.initialize_branch(
             &branch,
             operation.unwrap_or(&crate::telemetry::Operation::default()),
         )
         .await?;
         let state = branch.state.read().await;
-        let usable = state.as_ref().is_some_and(|s| {
-            !s.repair
-                && branch.source().is_dir()
-                && s.policy == self.options.selection.identity
-                && branch.sources_current(&s.prepared)
-        });
+        let usable = state
+            .as_ref()
+            .is_some_and(|state| self.usable(&branch, state));
         let due = state.as_ref().is_none_or(|s| {
             branch.refresh_due(&self.options, s.refreshed, now(), Some(&s.prepared))
         });
         drop(state);
-        if !usable || due {
-            self.schedule(branch.clone(), !usable);
+        let inventory_current = || {
+            branch.inventory.borrow().as_ref().is_some_and(|inventory| {
+                !branch.refresh_due(
+                    &self.options,
+                    inventory.refreshed,
+                    now(),
+                    Some(&inventory.prepared),
+                )
+            })
+        };
+        let has_inventory = branch.inventory.borrow().is_some();
+        if inventory_only && inventory_current() {
+            return Ok(branch);
         }
-        if !usable {
+        if !usable || due {
+            self.schedule(
+                branch.clone(),
+                !usable && (!inventory_only || !has_inventory),
+                inventory_only,
+            );
+        }
+        if inventory_only && has_inventory {
+            return Ok(branch);
+        }
+        if !inventory_only && !usable {
+            self.ready(
+                &branch,
+                operation.unwrap_or(&crate::telemetry::Operation::default()),
+            )
+            .await?;
+        } else if inventory_only && !usable {
             let mut inventory = branch.inventory.subscribe();
             let (mut running, mut job_id) = {
                 let running = branch.running.lock().unwrap();
@@ -1887,10 +2315,20 @@ impl Manager {
                 )
             };
             loop {
-                if inventory_only && inventory.borrow().is_some() {
+                if inventory_current() {
                     break;
                 }
-                if let Some(outcome) = running.borrow().clone() {
+                let outcome = running.borrow().clone();
+                if let Some(outcome) = outcome {
+                    if outcome
+                        .as_ref()
+                        .is_err_and(|error| error.is::<crate::demand::Paused>())
+                    {
+                        self.schedule(branch.clone(), true, true);
+                        running = branch.running.lock().unwrap().as_ref().unwrap().clone();
+                        job_id = branch.telemetry_id.lock().unwrap().clone();
+                        continue;
+                    }
                     outcome.map_err(crate::diagnostics::shared_error)?;
                     break;
                 }
@@ -1906,7 +2344,7 @@ impl Manager {
         Ok(branch)
     }
 
-    fn schedule(self: &Arc<Self>, branch: Arc<Branch>, requested: bool) {
+    fn schedule(self: &Arc<Self>, branch: Arc<Branch>, requested: bool, inventory_only: bool) {
         let mut running = branch.running.lock().unwrap();
         if running.as_ref().is_some_and(|r| r.borrow().is_none())
             || !requested && now() < branch.retry_after.load(Ordering::Relaxed)
@@ -1924,17 +2362,43 @@ impl Manager {
         *running = Some(receive);
         drop(running);
         let manager = self.clone();
+        // Idle housekeeping only refreshes inventories. Recent source work uses
+        // the remaining foreground grace period without extending it.
+        let maintenance =
+            (!requested && inventory_only).then(|| branch.inventory_demand.interest());
+        let work = Arc::new(
+            if inventory_only {
+                &branch.inventory_demand
+            } else {
+                &branch.demand
+            }
+            .work(),
+        );
         tokio::spawn(async move {
+            let _maintenance = maintenance;
             telemetry.stage("repository_refresh");
-            let result = manager.refresh(&branch, &telemetry).await;
-            if let Err(error) = &result {
+            let result = manager
+                .refresh(&branch, &telemetry, inventory_only, &work)
+                .await;
+            let paused = result
+                .as_ref()
+                .is_err_and(|error| error.is::<crate::demand::Paused>());
+            if let Err(error) = &result
+                && !paused
+            {
                 tracing::warn!(error = %format!("{error:#}"), "Repository refresh failed");
                 if let Some(diagnostic) = crate::diagnostics::monitoring(error) {
                     telemetry.diagnose(diagnostic);
                 }
             }
-            telemetry.finish(if result.is_ok() { "success" } else { "failure" });
-            if result.is_err() {
+            telemetry.finish(if paused {
+                "paused"
+            } else if result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+            if result.is_err() && !paused {
                 branch.retry_after.store(now() + 30_000, Ordering::Relaxed);
             }
             let _ = send.send(Some(result.map_err(Arc::new)));
@@ -1944,7 +2408,7 @@ impl Manager {
     /// Acquires discovery-requested inputs from the applied commit, outside the publication gate.
     pub async fn require_inputs(
         &self,
-        branch: &Branch,
+        branch: &Arc<Branch>,
         revision: &str,
         paths: Vec<String>,
         telemetry: &crate::telemetry::Operation,
@@ -1955,13 +2419,33 @@ impl Manager {
             paths,
             super::materialize::Contents::Sources,
             telemetry,
+            Arc::new(()),
+        )
+        .await
+    }
+
+    pub(crate) async fn require_inputs_cancellable(
+        &self,
+        branch: &Arc<Branch>,
+        revision: &str,
+        paths: Vec<String>,
+        telemetry: &crate::telemetry::Operation,
+        work: Arc<crate::demand::Work>,
+    ) -> Result<()> {
+        self.extend_inputs(
+            branch,
+            revision,
+            paths,
+            super::materialize::Contents::Sources,
+            telemetry,
+            work,
         )
         .await
     }
 
     pub(crate) async fn complete_assets(
         &self,
-        branch: &Branch,
+        branch: &Arc<Branch>,
         revision: &str,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
@@ -1971,43 +2455,38 @@ impl Manager {
             Vec::new(),
             super::materialize::Contents::All,
             telemetry,
+            Arc::new(()),
         )
         .await
     }
 
     /// Materialize only the repository asset selected by a file-content view.
     pub(crate) async fn asset_file(
-        &self,
-        branch: &Branch,
+        self: &Arc<Self>,
+        branch: &Arc<Branch>,
+        revision: &str,
         path: &str,
-        mode: crate::navigation::Mode,
         telemetry: &crate::telemetry::Operation,
+        cancel: Arc<dyn crate::cancellation::Cancellation + Send>,
     ) -> Result<()> {
-        self.ready(branch, telemetry).await?;
-        let (path, _) = crate::navigation::location(path)?;
-        let guard = branch.state.read().await;
+        let guard =
+            crate::cancellation::until(cancel.as_ref(), async { Ok(branch.state.read().await) })
+                .await?;
         let state = guard
             .as_ref()
             .context("Repository inputs are unavailable")?;
-        let paths: BTreeMap<_, _> = state
-            .prepared
-            .selected
-            .keys()
-            .chain(state.prepared.deferred_assets.iter())
-            .filter(|path| crate::unity::assets::view::supported(Path::new(path)))
-            .map(|path| (path.as_str(), ()))
-            .collect();
-        let selected = crate::navigation::file_matches(paths.keys().copied(), path, mode);
         ensure!(
-            selected.len() <= 1,
-            "Asset path is ambiguous; use a full path or select a Unity project"
+            self.usable(branch, state) && state.prepared.revision == revision,
+            crate::diagnostics::RefreshRequired(
+                "Repository changed before asset view; retry query"
+            )
         );
-        if selected.is_empty() || !state.prepared.deferred_assets.contains(selected[0]) {
+        if !state.prepared.deferred_assets.contains(path) {
             return Ok(());
         }
-        let mut only = std::collections::BTreeSet::from([selected[0].to_owned()]);
-        let meta = format!("{}.meta", selected[0]);
-        if crate::unity::assets::is_asset(Path::new(selected[0]))
+        let mut only = std::collections::BTreeSet::from([path.to_owned()]);
+        let meta = format!("{path}.meta");
+        if crate::unity::assets::is_asset(Path::new(path))
             && (state.prepared.selected.contains_key(&meta)
                 || state.prepared.deferred_assets.contains(&meta))
         {
@@ -2022,17 +2501,19 @@ impl Manager {
             Vec::new(),
             super::materialize::Contents::Only(only),
             telemetry,
+            cancel,
         )
         .await
     }
 
     async fn extend_inputs(
         &self,
-        branch: &Branch,
+        branch: &Arc<Branch>,
         revision: &str,
         paths: Vec<String>,
         contents: super::materialize::Contents,
         telemetry: &crate::telemetry::Operation,
+        cancel: Arc<dyn crate::cancellation::Cancellation + Send>,
     ) -> Result<()> {
         let assets = matches!(
             contents,
@@ -2048,11 +2529,17 @@ impl Manager {
         }
         let _operation = {
             let _wait = telemetry.wait("repository_admission");
-            branch.acquiring.lock().await
+            crate::cancellation::until(cancel.as_ref(), async {
+                Ok(branch.acquiring.clone().lock_owned().await)
+            })
+            .await?
         };
         let before = {
             let _wait = telemetry.wait("branch_state");
-            branch.state.read().await.clone()
+            crate::cancellation::until(cancel.as_ref(), async {
+                Ok(branch.state.read().await.clone())
+            })
+            .await?
         }
         .context("Repository inputs are unavailable")?;
         if assets {
@@ -2073,9 +2560,11 @@ impl Manager {
         if before.prepared.revision != revision {
             return Ok(());
         }
-        let mut acquisition =
-            super::cache::Acquisition::begin(&self.cache, &branch.repository.identity, telemetry)
-                .await?;
+        let mut acquisition = crate::cancellation::until(
+            cancel.as_ref(),
+            super::cache::Acquisition::begin(&self.cache, &branch.repository.identity, telemetry),
+        )
+        .await?;
         let staging = acquisition.staging.clone();
         let stage = Arc::new(
             tempfile::Builder::new()
@@ -2126,20 +2615,31 @@ impl Manager {
             subdirectory: None,
             prepared: before.prepared.inventory(),
         });
-        let (prepared, _pool_pin) = tokio::task::spawn_blocking(move || {
+        let worker_cancel = cancel.clone();
+        let transfer_branch = branch.clone();
+        let (prepared, _pool_pin, _operation) = tokio::task::spawn_blocking(move || {
+            let operation = _operation;
             let _stage = staged;
-            let (prepared, pin) =
-                acquisition.git(&request, &cache, Some(pinned), &worker_telemetry)?;
+            let (prepared, pin) = acquisition.git_cancellable(
+                &request,
+                &cache,
+                Some(pinned),
+                &worker_telemetry,
+                worker_cancel.as_ref(),
+            )?;
             drop(acquisition);
-            let prepared = super::cache::complete(
+            transfer_branch.record_transfer(&prepared.prepared)?;
+            let prepared = super::cache::complete_cancellable(
                 &request,
                 &cache,
                 prepared,
                 &pin,
                 &worker_staging,
                 &worker_telemetry,
+                worker_cancel.as_ref(),
             )?;
-            Ok::<_, anyhow::Error>((prepared, pin))
+            transfer_branch.record_transfer(&prepared.prepared)?;
+            Ok::<_, anyhow::Error>((prepared, pin, operation))
         })
         .await??;
         let staged_files = prepared.staged;
@@ -2193,7 +2693,10 @@ impl Manager {
         };
         let mut state = {
             let _wait = telemetry.wait("repository_publication");
-            branch.publication(assets).await
+            crate::cancellation::until(cancel.as_ref(), async {
+                Ok(branch.publication(assets).await)
+            })
+            .await?
         };
         if assets {
             ensure!(
@@ -2265,26 +2768,50 @@ impl Manager {
         &self,
         branch: &Branch,
         telemetry: &crate::telemetry::Operation,
+        inventory_only: bool,
+        work: &Arc<crate::demand::Work>,
     ) -> Result<()> {
         authorize(&self.options.rules, &branch.repository)?;
         let _operation = {
             let _wait = telemetry.wait("repository_admission");
-            branch.acquiring.lock().await
+            work.until(async { Ok(branch.acquiring.lock().await) })
+                .await?
         };
         let before = {
             let _wait = telemetry.wait("branch_state");
             branch.state.read().await.clone()
         };
-        if let Some(before) = &before
+        let previous_inventory = branch.inventory.borrow().clone();
+        let cached_inventory = previous_inventory.clone().filter(|inventory| {
+            !branch.refresh_due(
+                &self.options,
+                inventory.refreshed,
+                now(),
+                Some(&inventory.prepared),
+            )
+        });
+        if cached_inventory.is_none()
+            && let Some(before) = &before
             && self
-                .refresh_unchanged(branch, before, telemetry, super::job::reference)
+                .refresh_unchanged(
+                    branch,
+                    before,
+                    telemetry,
+                    work.as_ref(),
+                    super::job::reference,
+                )
                 .await?
         {
+            branch.inventory.send_replace(None);
             return Ok(());
         }
-        let mut acquisition =
-            super::cache::Acquisition::begin(&self.cache, &branch.repository.identity, telemetry)
-                .await?;
+        let mut acquisition = work
+            .until(super::cache::Acquisition::begin(
+                &self.cache,
+                &branch.repository.identity,
+                telemetry,
+            ))
+            .await?;
         let staging = acquisition.staging.clone();
         telemetry.stage("repository_inventory");
         let stage = Arc::new(
@@ -2334,26 +2861,48 @@ impl Manager {
             subdirectory: None,
         };
         let cache = self.cache.clone();
-        let inventory = if before.is_none() {
+        let inventory = if let Some(inventory) = cached_inventory {
+            Some(inventory)
+        } else if before.is_none() || inventory_only || previous_inventory.is_some() {
             telemetry.stage("repository_inventory_acquisition");
             let mut inventory_request = request.clone();
             inventory_request.contents = super::materialize::Contents::Inventory;
             let cache = cache.clone();
             let staged = stage.clone();
             let worker_telemetry = telemetry.clone();
-            let (returned, prepared, pin) = tokio::task::spawn_blocking(move || {
+            let worker_cancel = work.clone();
+            let (returned, mut prepared, pin) = tokio::task::spawn_blocking(move || {
                 let _stage = staged;
-                let (prepared, pin) =
-                    acquisition.git(&inventory_request, &cache, None, &worker_telemetry)?;
+                let (prepared, pin) = acquisition.git_cancellable(
+                    &inventory_request,
+                    &cache,
+                    None,
+                    &worker_telemetry,
+                    worker_cancel.as_ref(),
+                )?;
                 Ok::<_, anyhow::Error>((acquisition, prepared, pin))
             })
             .await??;
             acquisition = returned;
+            let prior_bytes = previous_inventory
+                .as_ref()
+                .map(|inventory| &inventory.prepared)
+                .into_iter()
+                .chain(before.as_ref().map(|state| &state.prepared))
+                .filter(|prior| prior.revision == prepared.prepared.revision)
+                .map(|prior| prior.transfer_bytes)
+                .max()
+                .unwrap_or(0);
+            prepared.prepared.transfer_bytes =
+                prepared.prepared.transfer_bytes.saturating_add(prior_bytes);
             fs::create_dir_all(branch.source())?;
             let inventory = Arc::new(Inventory {
                 prepared: prepared.prepared,
                 source: None,
                 _pin: Arc::new(pin),
+                refreshed: now(),
+                heap_bytes: Default::default(),
+                _staging: None,
             });
             request.target = Target::Commit(inventory.prepared.revision.clone());
             request.transfer_used = inventory.prepared.transfer_bytes;
@@ -2362,198 +2911,227 @@ impl Manager {
         } else {
             None
         };
-        // No publication lock is held while fetching or extracting objects.
-        telemetry.stage("git_acquisition");
-        let git_request = request.clone();
-        let git_cache = cache.clone();
-        let staged = stage.clone();
-        let worker_telemetry = telemetry.clone();
-        let reuse = inventory
-            .as_ref()
-            .map(|inventory| {
-                super::materialize::Reuse::Pinned(super::materialize::Inventory {
-                    repository: branch.repository.identity.clone(),
-                    policy: self.options.selection.identity.clone(),
-                    subdirectory: request.subdirectory.clone(),
-                    prepared: inventory.prepared.inventory(),
-                })
-            })
-            .or_else(|| {
-                before
-                    .as_ref()
-                    .filter(|state| state.policy == self.options.selection.identity)
-                    .map(|state| {
-                        super::materialize::Reuse::Previous(super::materialize::Inventory {
-                            repository: state.repository.clone(),
-                            policy: state.policy.clone(),
-                            subdirectory: request.subdirectory.clone(),
-                            prepared: state.prepared.inventory(),
-                        })
-                    })
-            });
-        let (acquired, pin) = tokio::task::spawn_blocking(move || {
-            let _stage = staged;
-            acquisition.git(&git_request, &git_cache, reuse, &worker_telemetry)
-        })
-        .await??;
-        let staged_files = acquired.staged;
-        let mut prepared = acquired.prepared;
-        let _pool_pin = Arc::new(pin);
-        if let Some(inventory) = &inventory {
-            prepared.branch = inventory.prepared.branch.clone();
-            prepared.resolved_target = inventory.prepared.resolved_target.clone();
-        }
-        if resolved_target.is_some() {
-            prepared.resolved_target = resolved_target;
-        }
-        if let Some(before) = &before {
-            before.reuse_omissions(&mut prepared, &self.options.selection.identity);
-        }
-        if inventory.is_some() {
-            let mut sources = prepared.clone();
-            sources.unavailable.extend(
-                staged_files
-                    .iter()
-                    .filter(|file| file.lfs)
-                    .map(|file| file.path.clone()),
-            );
-            branch.inventory.send_replace(Some(Arc::new(Inventory {
-                prepared: sources,
-                source: Some(stage.clone()),
-                _pin: _pool_pin.clone(),
-            })));
-        }
-        telemetry.stage("repository_materialization");
-        let staged = stage.clone();
-        let worker_staging = staging.clone();
-        let worker_telemetry = telemetry.clone();
-        let worker_pin = _pool_pin.clone();
-        prepared = tokio::task::spawn_blocking(move || {
-            let _stage = staged;
-            super::cache::complete(
-                &request,
-                &cache,
-                super::materialize::Acquired {
-                    prepared,
-                    staged: staged_files,
-                },
-                &worker_pin,
-                &worker_staging,
-                &worker_telemetry,
-            )
-        })
-        .await??
-        .prepared;
-        telemetry.stage("repository_publication");
-        let mut next = State {
-            repository: branch.repository.identity.clone(),
-            transport: branch.repository.transport.clone(),
-            branch: branch.name.clone(),
-            target: branch.target.clone(),
-            last_use: branch.last_use.load(Ordering::Relaxed),
-            refreshed: now(),
-            policy: self.options.selection.identity.clone(),
-            prepared,
-            indexed_revision: before.as_ref().and_then(|s| s.indexed_revision.clone()),
-            repair: true,
-            additional: before
-                .as_ref()
-                .map(|s| s.additional.clone())
-                .unwrap_or_default(),
-        };
-        let source = branch.source();
-        let unchanged = before.as_ref().is_some_and(|s| s.same_inputs(&next))
-            && fs::read_dir(stage.path())?.next().transpose()?.is_none()
-            && source.is_dir()
-            && next
-                .prepared
-                .directories
-                .iter()
-                .all(|p| source.join(p).is_dir());
-        let staged_inventory = if unchanged {
-            None
-        } else {
-            let root = branch.root.clone();
-            let (returned, inventory) = tokio::task::spawn_blocking(move || {
-                let inventory = super::state_store::stage(&root, &next)?;
-                Ok::<_, anyhow::Error>((next, inventory))
-            })
-            .await??;
-            next = returned;
-            Some(inventory)
-        };
-        let mut state = {
-            let _wait = telemetry.wait("repository_publication");
-            branch.publish().await
-        };
-        if unchanged {
-            // Materialization already checked selected files. Keep the latest
-            // indexing marker, since indexing can finish during acquisition.
-            next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
-            next.repair = false;
-            branch.persist_header(&next)?;
-            *state = Some(Arc::new(next));
+        if inventory_only {
             return Ok(());
         }
-        // Discovery may have completed or lost dependencies during acquisition.
-        // Read its current completion marker while holding publication admission.
-        let indexed = state.as_ref().is_some_and(|s| {
-            !s.repair
-                && s.prepared.selected == next.prepared.selected
-                && s.prepared.unavailable == next.prepared.unavailable
-                && s.indexed_revision.as_ref() == Some(&s.prepared.revision)
-        });
-        next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
-        branch.publish_inventory(&next, staged_inventory.unwrap())?;
-        *state = Some(Arc::new(next.clone()));
-        fs::create_dir_all(&source)?;
-        if let Some(before) = &before {
-            for path in before
-                .prepared
-                .selected
-                .keys()
-                .filter(|p| !next.prepared.selected.contains_key(*p))
-            {
-                let target = source.join(path);
-                if target.is_file() {
-                    fs::remove_file(target)?;
-                }
-            }
+        work.check()?;
+        if let Some(inventory) = &inventory {
+            request.target = Target::Commit(inventory.prepared.revision.clone());
+            request.transfer_used = inventory.prepared.transfer_bytes;
         }
-        for path in next.prepared.selected.keys() {
-            let staged = stage.path().join(path);
-            if next.prepared.unavailable.contains(path) {
-                let target = source.join(path);
-                if target.is_file() {
-                    fs::remove_file(target)?;
-                }
-                continue;
+        // No publication lock is held while fetching or extracting objects.
+        let mut transferred = request.transfer_used;
+        let outcome = async {
+            telemetry.stage("git_acquisition");
+            let git_request = request.clone();
+            let git_cache = cache.clone();
+            let staged = stage.clone();
+            let worker_telemetry = telemetry.clone();
+            let worker_cancel = work.clone();
+            let reuse = inventory
+                .as_ref()
+                .map(|inventory| {
+                    super::materialize::Reuse::Pinned(super::materialize::Inventory {
+                        repository: branch.repository.identity.clone(),
+                        policy: self.options.selection.identity.clone(),
+                        subdirectory: request.subdirectory.clone(),
+                        prepared: inventory.prepared.inventory(),
+                    })
+                })
+                .or_else(|| {
+                    before
+                        .as_ref()
+                        .filter(|state| state.policy == self.options.selection.identity)
+                        .map(|state| {
+                            super::materialize::Reuse::Previous(super::materialize::Inventory {
+                                repository: state.repository.clone(),
+                                policy: state.policy.clone(),
+                                subdirectory: request.subdirectory.clone(),
+                                prepared: state.prepared.inventory(),
+                            })
+                        })
+                });
+            let (acquired, pin) = tokio::task::spawn_blocking(move || {
+                let _stage = staged;
+                acquisition.git_cancellable(
+                    &git_request,
+                    &git_cache,
+                    reuse,
+                    &worker_telemetry,
+                    worker_cancel.as_ref(),
+                )
+            })
+            .await??;
+            let staged_files = acquired.staged;
+            transferred = acquired.prepared.transfer_bytes;
+            work.check()?;
+            let mut prepared = acquired.prepared;
+            let _pool_pin = Arc::new(pin);
+            if let Some(inventory) = &inventory {
+                prepared.branch = inventory.prepared.branch.clone();
+                prepared.resolved_target = inventory.prepared.resolved_target.clone();
             }
-            if staged.is_file() {
-                let target = source.join(path);
-                fs::create_dir_all(target.parent().unwrap())?;
-                if inventory.is_some() {
+            if resolved_target.is_some() {
+                prepared.resolved_target = resolved_target;
+            }
+            if let Some(before) = &before {
+                before.reuse_omissions(&mut prepared, &self.options.selection.identity);
+            }
+            if inventory.is_some() {
+                branch.inventory.send_replace(Some(Arc::new(Inventory {
+                    prepared: prepared.clone(),
+                    source: Some(stage.clone()),
+                    _pin: _pool_pin.clone(),
+                    refreshed: now(),
+                    heap_bytes: Default::default(),
+                    _staging: Some(staging.clone()),
+                })));
+            }
+            telemetry.stage("repository_materialization");
+            let staged = stage.clone();
+            let worker_staging = staging.clone();
+            let worker_telemetry = telemetry.clone();
+            let worker_pin = _pool_pin.clone();
+            let worker_cancel = work.clone();
+            prepared = tokio::task::spawn_blocking(move || {
+                let _stage = staged;
+                super::cache::complete_cancellable(
+                    &request,
+                    &cache,
+                    super::materialize::Acquired {
+                        prepared,
+                        staged: staged_files,
+                    },
+                    &worker_pin,
+                    &worker_staging,
+                    &worker_telemetry,
+                    worker_cancel.as_ref(),
+                )
+            })
+            .await??
+            .prepared;
+            transferred = prepared.transfer_bytes;
+            telemetry.stage("repository_publication");
+            let mut next = State {
+                repository: branch.repository.identity.clone(),
+                transport: branch.repository.transport.clone(),
+                branch: branch.name.clone(),
+                target: branch.target.clone(),
+                last_use: branch.last_use.load(Ordering::Relaxed),
+                refreshed: now(),
+                policy: self.options.selection.identity.clone(),
+                prepared,
+                indexed_revision: before.as_ref().and_then(|s| s.indexed_revision.clone()),
+                repair: true,
+                additional: before
+                    .as_ref()
+                    .map(|s| s.additional.clone())
+                    .unwrap_or_default(),
+            };
+            let source = branch.source();
+            let unchanged = before.as_ref().is_some_and(|s| s.same_inputs(&next))
+                && fs::read_dir(stage.path())?.next().transpose()?.is_none()
+                && source.is_dir()
+                && next
+                    .prepared
+                    .directories
+                    .iter()
+                    .all(|p| source.join(p).is_dir());
+            let staged_inventory = if unchanged {
+                None
+            } else {
+                let root = branch.root.clone();
+                let (returned, inventory) = tokio::task::spawn_blocking(move || {
+                    let inventory = super::state_store::stage(&root, &next)?;
+                    Ok::<_, anyhow::Error>((next, inventory))
+                })
+                .await??;
+                next = returned;
+                Some(inventory)
+            };
+            let mut state = {
+                let _wait = telemetry.wait("repository_publication");
+                work.until(async { Ok(branch.publish().await) }).await?
+            };
+            if unchanged {
+                // Materialization already checked selected files. Keep the latest
+                // indexing marker, since indexing can finish during acquisition.
+                next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
+                next.repair = false;
+                branch.persist_header(&next)?;
+                *state = Some(Arc::new(next));
+                branch.inventory.send_replace(None);
+                return Ok(());
+            }
+            // Discovery may have completed or lost dependencies during acquisition.
+            // Read its current completion marker while holding publication admission.
+            let indexed = state.as_ref().is_some_and(|s| {
+                !s.repair
+                    && s.prepared.selected == next.prepared.selected
+                    && s.prepared.unavailable == next.prepared.unavailable
+                    && s.indexed_revision.as_ref() == Some(&s.prepared.revision)
+            });
+            next.indexed_revision = state.as_ref().and_then(|s| s.indexed_revision.clone());
+            branch.publish_inventory(&next, staged_inventory.unwrap())?;
+            *state = Some(Arc::new(next.clone()));
+            fs::create_dir_all(&source)?;
+            if let Some(before) = &before {
+                for path in before
+                    .prepared
+                    .selected
+                    .keys()
+                    .filter(|p| !next.prepared.selected.contains_key(*p))
+                {
+                    let target = source.join(path);
                     if target.is_file() {
-                        fs::remove_file(&target)?;
+                        fs::remove_file(target)?;
                     }
-                    fs::hard_link(staged, target)?;
-                } else {
-                    fs::rename(staged, target)?;
                 }
             }
+            for path in next.prepared.selected.keys() {
+                let staged = stage.path().join(path);
+                if next.prepared.unavailable.contains(path) {
+                    let target = source.join(path);
+                    if target.is_file() {
+                        fs::remove_file(target)?;
+                    }
+                    continue;
+                }
+                if staged.is_file() {
+                    let target = source.join(path);
+                    fs::create_dir_all(target.parent().unwrap())?;
+                    if inventory.is_some() {
+                        if target.is_file() {
+                            fs::remove_file(&target)?;
+                        }
+                        fs::hard_link(staged, target)?;
+                    } else {
+                        fs::rename(staged, target)?;
+                    }
+                }
+            }
+            for directory in &next.prepared.directories {
+                fs::create_dir_all(source.join(directory))?;
+            }
+            next.repair = false;
+            if indexed {
+                next.indexed_revision = Some(next.prepared.revision.clone());
+            }
+            branch.persist_header(&next)?;
+            *state = Some(Arc::new(next));
+            branch.generation.fetch_add(1, Ordering::Release);
+            branch.inventory.send_replace(None);
+            Ok(())
         }
-        for directory in &next.prepared.directories {
-            fs::create_dir_all(source.join(directory))?;
+        .await;
+        if outcome.is_err() {
+            let inventory = inventory.map(|mut inventory| {
+                Arc::make_mut(&mut inventory).prepared.transfer_bytes = transferred;
+                inventory
+            });
+            branch.inventory.send_replace(inventory);
         }
-        next.repair = false;
-        if indexed {
-            next.indexed_revision = Some(next.prepared.revision.clone());
-        }
-        branch.persist_header(&next)?;
-        *state = Some(Arc::new(next));
-        branch.generation.fetch_add(1, Ordering::Release);
-        branch.inventory.send_replace(None);
-        Ok(())
+        outcome
     }
 
     async fn refresh_unchanged(
@@ -2561,6 +3139,7 @@ impl Manager {
         branch: &Branch,
         before: &Arc<State>,
         telemetry: &crate::telemetry::Operation,
+        cancel: &dyn crate::cancellation::Cancellation,
         resolve: impl FnOnce(
             &Path,
             &Repository,
@@ -2585,7 +3164,7 @@ impl Manager {
         let target = target.clone();
         let allow_private = authorize(&self.options.rules, &repository)?;
         let cache = self.cache.clone();
-        let permit = self.capacity.transfer(telemetry).await?;
+        let permit = crate::cancellation::until(cancel, self.capacity.transfer(telemetry)).await?;
         let (revision, name, transport) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             resolve(&cache, &repository, &target, allow_private)
@@ -2594,8 +3173,11 @@ impl Manager {
         if revision != before.prepared.revision || name != before.prepared.branch {
             return Ok(false);
         }
-        self.publish_ref_refresh(branch, before, transport, telemetry)
-            .await
+        crate::cancellation::until(
+            cancel,
+            self.publish_ref_refresh(branch, before, transport, telemetry),
+        )
+        .await
     }
 
     async fn publish_ref_refresh(

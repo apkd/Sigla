@@ -270,9 +270,6 @@ fn read_blob(
         hash.try_finalize()? == id,
         "GitHub source object identity mismatch"
     );
-    if bytes.starts_with(b"version https://git-lfs.github.com/spec/") {
-        return Ok(None);
-    }
     Ok(Some(bytes))
 }
 
@@ -437,7 +434,9 @@ mod tests {
         assert!(
             read_blob(object_id(pointer), pointer.as_slice(), 1024, &())
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .as_slice()
+                == pointer
         );
     }
     #[test]

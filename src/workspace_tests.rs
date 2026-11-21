@@ -54,6 +54,89 @@ fn has_symbol(workspace: &Workspace, symbol: &str) -> bool {
 }
 
 #[test]
+fn idle_planning_releases_parser_admission_without_losing_the_source() {
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(root.path(), "source/lib.rs", "pub struct Planned;");
+    let mut workspace = open(
+        root.path(),
+        cache.path(),
+        Policy::new(vec![root.path().into()]).unwrap(),
+    );
+    let prepared = workspace.prepare().unwrap().unwrap();
+    let demand = Arc::new(crate::demand::Demand::new(Duration::ZERO));
+    let interest = demand.interest();
+    let work = demand.work();
+    let reservation = crate::memory::admit_file(u64::MAX, false, &()).unwrap();
+    let (started, ready) = std::sync::mpsc::channel();
+    let (send, receive) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = workspace.plan_cancellable(prepared, &work);
+        send.send((workspace, result.map(|_| ()))).unwrap();
+    });
+    ready.recv().unwrap();
+    // No plan can finish while the parser budget is held.
+    assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(interest);
+    let result = receive.recv_timeout(Duration::from_secs(10));
+    drop(reservation);
+    thread.join().unwrap();
+    let (mut workspace, result) = result.unwrap();
+    assert!(result.unwrap_err().is::<crate::demand::Paused>());
+    workspace.refresh().unwrap();
+    assert!(has_symbol(&workspace, "Planned"));
+}
+
+#[test]
+fn idle_indexing_never_publishes_a_partial_manifest() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(root.path(), "source/code.rs", "pub struct Before;");
+    let mut workspace = open(
+        root.path(),
+        cache.path(),
+        Policy::new(vec![root.path().into()]).unwrap(),
+    );
+    workspace.refresh().unwrap();
+    write(root.path(), "source/code.rs", "pub struct Ready;");
+    let preparation = workspace.prepare().unwrap().unwrap();
+    let plan = workspace.plan(preparation).unwrap();
+    let demand = Arc::new(crate::demand::Demand::new(Duration::ZERO));
+    let interest = demand.interest();
+    let work = demand.work();
+    let store = workspace.store.clone();
+    let original = workspace.manifest.clone();
+    let reservation = crate::memory::admit_file(u64::MAX, false, &()).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker_plan = plan.clone();
+    let thread = std::thread::spawn(move || {
+        let result = workspace.apply_plan_cancellable(worker_plan, &work);
+        send.send((workspace, result)).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.manifest_current().unwrap() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    drop(interest);
+    let result = receive.recv_timeout(Duration::from_secs(10));
+    drop(reservation);
+    thread.join().unwrap();
+    let (mut workspace, result) = result.unwrap();
+    assert!(result.unwrap_err().is::<crate::demand::Paused>());
+    assert!(Arc::ptr_eq(&workspace.manifest, &original));
+    assert!(!workspace.published_current(&original).unwrap());
+    let _interest = demand.interest();
+    workspace
+        .apply_plan_cancellable(plan, &demand.work())
+        .unwrap();
+    assert!(workspace.published_current(&workspace.manifest).unwrap());
+    assert!(has_symbol(&workspace, "Ready"));
+}
+
+#[test]
 fn scheduling_keeps_cold_work_parallel_and_bounds_warm_attachment_partitions() {
     let project = Project {
         identity: "fixture".into(),

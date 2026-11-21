@@ -32,6 +32,13 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
     )?;
     let ready = "%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Ready\n  m_Component: []\n";
     fs::write(upstream.join("Assets/Ready.asset"), ready)?;
+    fs::write(upstream.join("Assets/Single.asset"), ready)?;
+    for name in ["Ready", "Single"] {
+        fs::write(
+            upstream.join(format!("Assets/{name}.asset.meta")),
+            "fileFormatVersion: 2\nguid: 11111111111111111111111111111111\n",
+        )?;
+    }
     fs::create_dir(upstream.join("Assets/Other"))?;
     fs::write(upstream.join("Assets/Other/Ready.asset"), ready)?;
     fs::write(
@@ -55,12 +62,61 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
     fs::write(root.path().join("pause-lfs"), "")?;
     let project = "ssh://git@fixture.invalid/repo#main";
     let server =
-        Server::launch_with_refresh(root.path(), Duration::from_secs(30), false, Some("1h"))?;
+        Server::launch_with_refresh(root.path(), Duration::from_secs(30), false, Some("1ms"))?;
+    for (path, mode) in [
+        ("Assets/Ready.asset", "exact"),
+        ("Assets/Ready", "exact"),
+        ("./././Assets/Ready.asset:1-6", "exact"),
+        ("./Assets/Ready.asset", "raw"),
+    ] {
+        let (error, result) =
+            server.call("view", json!({"codebase":project,"path":path,"mode":mode}))?;
+        ensure!(
+            !error && result.contains("m_Name: Ready"),
+            "Cold asset view failed: {result}"
+        );
+    }
+    // Observe a due maintenance refresh before checking that navigation alone
+    // neither materializes the repository nor loses cached reads offline.
+    let requests = fs::read(root.path().join("requests.log"))?.len();
+    let started = Instant::now();
+    while fs::read(root.path().join("requests.log"))?.len() <= requests {
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Inventory maintenance did not run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(root.path().join("offline"), "")?;
+    let (error, result) = server.call(
+        "view",
+        json!({"codebase":project,"path":"Assets/Ready.asset","mode":"raw"}),
+    )?;
+    ensure!(
+        !error && result == ready,
+        "Due inventory lost its cached asset offline: {result}"
+    );
+    fs::remove_file(root.path().join("offline"))?;
+    ensure!(
+        !root.path().join("lfs-started").exists(),
+        "Cold asset view downloaded unrelated LFS files"
+    );
+    for entry in fs::read_dir(root.path().join("cache/repositories"))? {
+        let directory = entry?.path();
+        ensure!(
+            !directory.join("state.bin").exists(),
+            "Cold asset view prepared the repository"
+        );
+        ensure!(
+            !directory.join("source/lib.rs").exists(),
+            "Cold asset view acquired unrelated code"
+        );
+    }
     std::thread::scope(|scope| -> Result<()> {
         let (send, receive) = std::sync::mpsc::channel();
         let server = &server;
         scope.spawn(move || {
-            let _ = send.send(server.query(project, "type:Available lang:rust"));
+            let _ = send.send(server.query(project, "type:Available wait:complete"));
         });
         let (error, result) = receive.recv_timeout(Duration::from_secs(10))??;
         ensure!(
@@ -71,6 +127,39 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
             !root.path().join("lfs-started").exists(),
             "Code search started an unrelated asset download"
         );
+        let (error, result) = server.query(project, "file:Assets/Single.asset lang:text")?;
+        ensure!(
+            !error && result.contains("Single.asset"),
+            "Warm filename query failed: {result}"
+        );
+        ensure!(
+            !root.path().join("lfs-started").exists(),
+            "Filename query started unrelated LFS acquisition"
+        );
+        let (error, result) = server.call(
+            "view",
+            json!({"codebase":project,"path":"Assets/Single","mode":"exact"}),
+        )?;
+        ensure!(
+            !error && result.contains("m_Name: Ready"),
+            "Warm asset stem failed: {result}"
+        );
+        ensure!(
+            !root.path().join("lfs-started").exists(),
+            "Asset stem started unrelated LFS acquisition"
+        );
+        for mode in ["raw", "exact"] {
+            let (error, result) =
+                server.call("view", json!({"codebase":project,"path":"lib","mode":mode}))?;
+            ensure!(
+                !error && result.contains("pub struct Available"),
+                "Warm source stem failed: {result}"
+            );
+            ensure!(
+                !root.path().join("lfs-started").exists(),
+                "Source stem started unrelated LFS acquisition"
+            );
+        }
         let (error, result) = server.call(
             "view",
             json!({"codebase":project,"path":"Assets/Ready.asset","mode":"raw"}),
@@ -93,6 +182,14 @@ pub fn code_precedes_asset_downloads() -> Result<()> {
         ensure!(
             !source.join("Assets/Later.asset").exists(),
             "A single asset view fetched unrelated assets"
+        );
+        let (error, result) = server.call(
+            "view",
+            json!({"codebase":project,"path":"./Assets/Single.asset","mode":"raw"}),
+        )?;
+        ensure!(
+            !error && result == ready,
+            "Warm normalized asset view failed: {result}"
         );
         let (error, _) = server.call(
             "view",

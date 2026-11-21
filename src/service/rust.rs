@@ -33,6 +33,7 @@ pub(super) struct IndexRequest {
     pub branch: Arc<crate::repository::manager::Branch>,
     pub generation: u64,
     pub operation: crate::telemetry::Operation,
+    pub work: Arc<crate::demand::Work>,
 }
 
 pub(super) fn channel() -> (Publisher, Ticket) {
@@ -52,17 +53,18 @@ impl Publisher {
             branch,
             generation,
             operation,
+            work,
         } = request;
         let result = async {
             let state = Arc::new(tokio::sync::Mutex::new(None));
-            let (permit, mut guard, branch_state) = app
-                .admit_work(
+            let (permit, mut guard, branch_state) = work
+                .until(app.admit_work(
                     state.clone(),
                     Some(&branch),
                     &app.indexing_workers,
                     "rust_indexing_admission",
                     &operation,
-                )
+                ))
                 .await?;
             let applied = branch_state
                 .as_ref()
@@ -89,8 +91,8 @@ impl Publisher {
                     Some(&owner),
                     app.monitor.clone(),
                 )?;
-                let plan = code.plan_discovery(stage.discovery)?;
-                code.apply_plan(plan)?;
+                let plan = code.plan_discovery(stage.discovery, work.as_ref())?;
+                code.apply_plan_cancellable(plan, work.as_ref())?;
                 ensure!(
                     !stage.proof.changed(),
                     "Rust completeness proof changed during indexing"

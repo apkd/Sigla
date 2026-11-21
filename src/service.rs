@@ -260,10 +260,37 @@ impl App {
         let history_bytes = self.history_cache.stats().bytes;
         let workspace_budget = (budget / 4).saturating_sub(history_bytes) as u64;
         loop {
+            // Evict optional inventories first, then charge mandatory inventories
+            // against the same budget as resumable plans and ready workspaces.
+            let workspace_bytes: u64 = self
+                .workspaces
+                .lock()
+                .unwrap()
+                .values()
+                .map(|slot| slot.heap_usage().0)
+                .sum();
+            let repository_bytes = if let Some(remote) = &self.remote {
+                if let Err(error) = remote.trim_unreferenced(
+                    workspace_budget.saturating_sub(workspace_bytes),
+                    |source| {
+                        self.workspaces
+                            .lock()
+                            .unwrap()
+                            .keys()
+                            .any(|entry| entry.starts_with(source))
+                    },
+                ) {
+                    tracing::warn!(%error, "Cannot trim unreferenced repository branches");
+                }
+                remote.inventory_usage().retained_bytes
+            } else {
+                0
+            };
             let retired = {
                 let mut registry = self.workspaces.lock().unwrap();
-                let mut bytes = 0u64;
+                let mut bytes = repository_bytes;
                 let mut oldest = None;
+                let mut expired = None;
                 for (path, slot) in registry.iter() {
                     let retained = slot.heap_usage().0;
                     bytes = bytes.saturating_add(retained);
@@ -272,8 +299,20 @@ impl App {
                     {
                         oldest = Some((path, slot.used));
                     }
+                    if Arc::strong_count(&slot.state) == 1
+                        && slot
+                            .preparing
+                            .as_ref()
+                            .is_some_and(|ticket| ticket.expired())
+                    {
+                        expired = Some(path.clone());
+                    }
                 }
-                if bytes <= workspace_budget && registry.len() <= WORKSPACE_CACHE_ENTRIES {
+                if let Some(path) = expired {
+                    registry
+                        .remove_entry(&path)
+                        .map(|entry| (entry, bytes, "idle preparation expired"))
+                } else if bytes <= workspace_budget && registry.len() <= WORKSPACE_CACHE_ENTRIES {
                     None
                 } else {
                     let reason = if bytes > workspace_budget {
@@ -298,17 +337,6 @@ impl App {
             )
             .in_scope(|| WorkspaceSlot::retire(entry, reason));
             crate::memory::reclaim();
-        }
-        if let Some(remote) = &self.remote
-            && let Err(error) = remote.trim_unreferenced(|source| {
-                self.workspaces
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .any(|entry| entry.starts_with(source))
-            })
-        {
-            tracing::warn!(%error, "Cannot trim unreferenced repository branches");
         }
     }
 
@@ -336,6 +364,14 @@ impl App {
             let (retained, pinned) = slot.heap_usage();
             usage.retained_bytes += retained;
             usage.pinned_bytes += pinned;
+        }
+        drop(registry);
+        if let Some(remote) = &self.remote {
+            let inventory = remote.inventory_usage();
+            usage.entries += inventory.entries;
+            usage.active_entries += inventory.active_entries;
+            usage.retained_bytes += inventory.retained_bytes;
+            usage.pinned_bytes += inventory.pinned_bytes;
         }
         usage
     }
@@ -1063,6 +1099,11 @@ impl App {
             tracing::Span::current()
                 .record("selector", tracing::field::debug(&repository.selector));
         }
+        let navigation = matches!(&request, Request::Browse(_))
+            || matches!(&request, Request::View(path, _) if !path.starts_with("unity@"))
+            || query
+                .as_ref()
+                .is_some_and(crate::unity::assets::selection::exact_request);
         let branch = match repository {
             Some(repository) => {
                 let remote = self.remote.as_ref().ok_or_else(|| {
@@ -1071,11 +1112,7 @@ impl App {
                 let _wait = operation.wait("repository_acquisition");
                 let branch = wait
                     .until(async {
-                        if matches!(request, Request::Browse(_) | Request::View(..))
-                            || query
-                                .as_ref()
-                                .is_some_and(crate::unity::assets::selection::exact_request)
-                        {
+                        if navigation {
                             remote
                                 .resolve_inventory_monitored(repository, &operation)
                                 .await
@@ -1091,10 +1128,60 @@ impl App {
             }
             None => None,
         };
-        if let Some(branch) = &branch
-            && query
+        let exact_asset = query
+            .as_ref()
+            .is_some_and(crate::unity::assets::selection::exact_request);
+        if exact_asset && let Some(branch) = &branch {
+            let Some(result) = wait
+                .until(self.navigate_repository(branch.clone(), request.clone(), activity.clone()))
+                .await?
+            else {
+                return Ok(indexes::pending("Repository file inventory"));
+            };
+            if let Some(result) = result {
+                return Ok(result);
+            }
+        }
+        if navigation && let Some(branch) = &branch {
+            let Some(()) = wait
+                .until(self.restore_repository_workspace(
+                    branch.clone(),
+                    activity.clone(),
+                    &operation,
+                ))
+                .await?
+            else {
+                return Ok(indexes::pending("Cached workspace validation"));
+            };
+        }
+        let ready_workspace = branch.as_ref().is_some_and(|branch| {
+            let Ok(state) = branch.state.try_read() else {
+                return false;
+            };
+            let Some(_) = state
                 .as_ref()
-                .is_some_and(crate::unity::assets::selection::exact_request)
+                .filter(|state| self.remote.as_ref().unwrap().usable(branch, state))
+            else {
+                return false;
+            };
+            let source = branch
+                .source()
+                .canonicalize()
+                .unwrap_or_else(|_| branch.source());
+            self.workspaces
+                .lock()
+                .unwrap()
+                .get(&source)
+                .and_then(|slot| slot.preparing.as_ref())
+                .is_some_and(|ticket| {
+                    ticket.current_ready(Some(
+                        branch.generation.load(std::sync::atomic::Ordering::Acquire),
+                    ))
+                })
+        });
+        if let Some(branch) = &branch
+            && !ready_workspace
+            && navigation
         {
             let Some(result) = wait
                 .until(self.navigate_repository(branch.clone(), request.clone(), activity.clone()))
@@ -1105,34 +1192,23 @@ impl App {
             if let Some(result) = result {
                 return Ok(result);
             }
-            if wait
-                .until(self.remote.as_ref().unwrap().sources_ready(branch))
-                .await?
-                .is_none()
-            {
-                return Ok(indexes::pending("Repository source preparation"));
-            }
+            let mut result = match &request {
+                Request::View(..) => CallToolResult::error(vec![ContentBlock::text(
+                    "No matching file in the repository inventory. Dependency and generated files become available after a semantic search.",
+                )]),
+                _ => CallToolResult::success(vec![ContentBlock::text(
+                    "No matches in the repository inventory. Dependency and generated files become available after a semantic search.",
+                )]),
+            };
+            result.structured_content = Some(serde_json::json!({"complete": false}));
+            return Ok(result);
         }
+        let mut _repository_interest = branch
+            .as_ref()
+            .filter(|_| !navigation || !ready_workspace)
+            .map(|branch| branch.interest());
         let (entry, policy, cache) = if let Some(branch) = &branch {
-            let source = branch.source().canonicalize()?;
-            let mut policy = Policy::new(vec![source.clone()])?;
-            policy.unity_platform = self.policy.unity_platform;
-            policy.remote = Some(crate::discovery::RemoteContext {
-                workspace: source.clone(),
-                tracked: Default::default(),
-                writable: branch.root.join("generated"),
-                shared: self.cache.clone(),
-                repositories: self.remote.as_ref().unwrap().options.rules.clone(),
-                selection_identity: self
-                    .remote
-                    .as_ref()
-                    .unwrap()
-                    .options
-                    .selection
-                    .identity
-                    .clone(),
-            });
-            (source, policy, branch.analysis_cache())
+            self.repository_workspace(branch)?
         } else {
             let entry = self.policy.canonical(Path::new(path))?;
             let mut policy = self.policy.clone();
@@ -1169,6 +1245,7 @@ impl App {
         let usage_branch = branch.clone();
         tracing::Span::current().record("stage", "preparation");
         operation.stage("workspace_preparation");
+        let mut _preparation_interest;
         let (workspace, mut preparation, inventory) = loop {
             let (workspace, mut preparation, retired) = {
                 let mut registry = self.workspaces.lock().unwrap();
@@ -1191,6 +1268,9 @@ impl App {
                         ticket.refresh_reason(generation)
                     })
                 {
+                    if _repository_interest.is_none() {
+                        _repository_interest = branch.as_ref().map(|branch| branch.interest());
+                    }
                     slot.preparing = Some(preparation::start(
                         self.clone(),
                         preparation::Request {
@@ -1205,11 +1285,14 @@ impl App {
                                 .preparing
                                 .as_ref()
                                 .and_then(|ticket| ticket.retry_inventory(generation)),
+                            resume: slot.preparing.clone(),
                         },
                     ));
                 }
                 let state = slot.state.clone();
                 let preparation = slot.preparing.as_ref().unwrap().clone();
+                _preparation_interest = (!navigation || !preparation.current_ready(generation))
+                    .then(|| preparation.interest());
                 while registry.len() > WORKSPACE_CACHE_ENTRIES {
                     let oldest = registry
                         .iter()
@@ -1229,28 +1312,6 @@ impl App {
             tracing::Span::current().record("shared_job", preparation.id());
             if let Some(job_id) = preparation.telemetry_id() {
                 operation.link(&job_id);
-            }
-            if preparation.discovering()
-                && let Some(branch) = &branch
-                && (matches!(request, Request::Browse(_))
-                    || matches!(&request, Request::View(path, crate::navigation::Mode::Raw) if crate::unity::assets::view::requested(path))
-                    || matches!(request, Request::View(..)) && indexes::source_only(&request, None))
-            {
-                operation.stage("navigation");
-                let _wait = operation.wait("navigation");
-                let Some(result) = wait
-                    .until(self.navigate_repository(
-                        branch.clone(),
-                        request.clone(),
-                        activity.clone(),
-                    ))
-                    .await?
-                else {
-                    return Ok(indexes::pending("Repository source preparation"));
-                };
-                if let Some(result) = result {
-                    return Ok(result);
-                }
             }
             tracing::Span::current().record("stage", "preparation");
             if let Some(query) = query.as_ref().filter(|query| rust::requested(query))
@@ -1312,16 +1373,15 @@ impl App {
                 return Ok(indexes::pending("Workspace preparation"));
             }
         };
-        if branch.is_none()
-            && let Some(query) = query
-                .as_ref()
-                .filter(|q| crate::unity::assets::selection::exact_request(q))
+        if let Some(query) = query
+            .as_ref()
+            .filter(|q| crate::unity::assets::selection::exact_request(q))
         {
             let Some(result) = wait
                 .until(self.exact_asset_filename(
                     inventory.clone(),
                     query.clone(),
-                    usage_entry.clone(),
+                    (usage_entry.clone(), usage_branch.clone()),
                     activity.clone(),
                 ))
                 .await?
@@ -1332,8 +1392,15 @@ impl App {
                 return Ok(result);
             }
         }
+        let plain_view = matches!(&request, Request::View(path, _) if !path.starts_with("unity@"));
         if let Request::View(path, mode) = &request
-            && crate::unity::assets::view::requested(path)
+            && plain_view
+            && (crate::unity::assets::view::requested(path)
+                || indexes::has_unity(&inventory.manifest)
+                    && crate::navigation::location(path).is_ok_and(|(path, _)| {
+                        crate::navigation::sources::repository_language(Path::new(path), false)
+                            .is_none()
+                    }))
         {
             let Some(result) = wait
                 .until(self.view_asset_file(
@@ -1352,12 +1419,13 @@ impl App {
                 return Ok(result);
             }
         }
-        if indexes::navigation(&request, query.as_ref())
+        if (plain_view || indexes::navigation(&request, query.as_ref()))
             && (!matches!(request, Request::Search(_))
                 || indexes::source_only(&request, query.as_ref())
                 || !indexes::has_unity(&inventory.manifest))
             && (preparation.running()
                 || preparation.retained_inventory()
+                || plain_view
                 || indexes::source_only(&request, query.as_ref()))
         {
             operation.stage("query_admission");

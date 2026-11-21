@@ -226,6 +226,7 @@ pub struct Workspace {
     fence: u64,
     initialized: bool,
 }
+#[derive(Clone)]
 pub(crate) struct IndexPlan {
     leases: crate::cache::views::LeaseSet,
     pub manifest: Arc<Manifest>,
@@ -236,6 +237,12 @@ pub(crate) struct IndexPlan {
     validation: std::time::Duration,
     discovery_time: std::time::Duration,
 }
+struct CacheValidation {
+    started: std::time::Instant,
+    fence: u64,
+    metadata_changed: bool,
+}
+
 pub struct Preparation {
     discovery: discovery::Discovery,
     fence: u64,
@@ -385,14 +392,21 @@ impl Workspace {
         self.prepare_at_staged(budget, crate::cache::now(), stage)
     }
 
-    pub(crate) fn plan_discovery(&mut self, discovery: discovery::Discovery) -> Result<IndexPlan> {
-        self.plan(Preparation {
-            discovery,
-            fence: self.fence,
-            started: std::time::Instant::now(),
-            validation: std::time::Duration::ZERO,
-            discovery_time: std::time::Duration::ZERO,
-        })
+    pub(crate) fn plan_discovery(
+        &mut self,
+        discovery: discovery::Discovery,
+        cancel: &dyn crate::cancellation::Cancellation,
+    ) -> Result<IndexPlan> {
+        self.plan_cancellable(
+            Preparation {
+                discovery,
+                fence: self.fence,
+                started: std::time::Instant::now(),
+                validation: std::time::Duration::ZERO,
+                discovery_time: std::time::Duration::ZERO,
+            },
+            cancel,
+        )
     }
 
     fn prepare_at(
@@ -403,12 +417,11 @@ impl Workspace {
         self.prepare_at_staged(budget, now, None)
     }
 
-    fn prepare_at_staged(
-        &mut self,
-        budget: crate::msbuild::Budget,
-        now: u64,
-        stage: Option<&mut discovery::RustStage<'_>>,
-    ) -> Result<Option<Preparation>> {
+    pub(crate) fn validate_cached(&mut self) -> Result<bool> {
+        Ok(self.validate(crate::cache::now())?.is_none())
+    }
+
+    fn validate(&mut self, now: u64) -> Result<Option<CacheValidation>> {
         let start = std::time::Instant::now();
         let managed = self.policy.managed_root(self.manifest.metadata.keys());
         if !self.initialized {
@@ -477,9 +490,30 @@ impl Workspace {
             tracing::debug!(workspace = %self.entry.display(), elapsed_ms = start.elapsed().as_millis(), "workspace cache validated");
             return Ok(None);
         }
+        tracing::debug!(workspace = %self.entry.display(), cache_current, policy_current, ?changed_metadata, ?changed_source, "workspace refresh required");
+        Ok(Some(CacheValidation {
+            started: start,
+            fence,
+            metadata_changed,
+        }))
+    }
+
+    fn prepare_at_staged(
+        &mut self,
+        budget: crate::msbuild::Budget,
+        now: u64,
+        stage: Option<&mut discovery::RustStage<'_>>,
+    ) -> Result<Option<Preparation>> {
+        let Some(CacheValidation {
+            started: start,
+            fence,
+            metadata_changed,
+        }) = self.validate(now)?
+        else {
+            return Ok(None);
+        };
         let validation = start.elapsed();
         let discovery_started = std::time::Instant::now();
-        tracing::debug!(workspace = %self.entry.display(), cache_current, policy_current, ?changed_metadata, ?changed_source, "workspace refresh required");
         let discovery = if metadata_changed {
             discovery::discover_staged(&self.entry, &self.policy, &self.cache, budget, stage)?
         } else {
@@ -510,6 +544,15 @@ impl Workspace {
 
     /// Resolve the selected paths before extracting semantic facts.
     pub(crate) fn plan(&mut self, prepared: Preparation) -> Result<IndexPlan> {
+        self.plan_cancellable(prepared, &())
+    }
+
+    pub(crate) fn plan_cancellable(
+        &mut self,
+        prepared: Preparation,
+        cancel: &dyn crate::cancellation::Cancellation,
+    ) -> Result<IndexPlan> {
+        cancel.check()?;
         let Preparation {
             discovery,
             fence,
@@ -539,6 +582,7 @@ impl Workspace {
             dependency_retry: discovery.dependency_retry,
         };
         for p in discovery.metadata {
+            cancel.check()?;
             let directory = p.is_dir();
             if directory && managed.is_some_and(|root| p.starts_with(root)) {
                 continue;
@@ -621,6 +665,7 @@ impl Workspace {
         let mut stamps = BTreeMap::new();
         let mut missing_modules = BTreeSet::new();
         while let Some((input, owns_directory, parent)) = queue.pop_front() {
+            cancel.check()?;
             if let Some(dir) = input.path.parent()
                 && !managed.is_some_and(|root| dir.starts_with(root))
             {
@@ -672,9 +717,10 @@ impl Workspace {
                         continue;
                     }
                     let modules = if input.language == Language::Rust {
-                        match self.rust_modules(slot.key(), &input, project, &stamp) {
+                        match self.rust_modules(slot.key(), &input, project, &stamp, cancel) {
                             Ok(modules) => modules,
                             Err(error) => {
+                                cancel.check()?;
                                 manifest.metadata.insert(input.path.clone(), stamp);
                                 manifest
                                     .diagnostics
@@ -835,6 +881,7 @@ impl Workspace {
         input: &SourceInput,
         project: &Project,
         stamp: &Stamp,
+        cancel: &dyn crate::cancellation::Cancellation,
     ) -> Result<Vec<ModuleFile>> {
         // The key includes the Rust edition; matching stamps keep syntax facts valid.
         if let Some(file) = self
@@ -854,7 +901,7 @@ impl Workspace {
         {
             return Ok(modules);
         }
-        let _admission = crate::memory::admit_file(stamp.size, false, &())?;
+        let _admission = crate::memory::admit_file(stamp.size, false, cancel)?;
         Ok(crate::extract::rust_modules(
             &read_stable(&input.path, input.language)?,
             &project.edition,
@@ -862,6 +909,15 @@ impl Workspace {
     }
 
     pub(crate) fn apply_plan(&mut self, plan: IndexPlan) -> Result<()> {
+        self.apply_plan_cancellable(plan, &())
+    }
+
+    pub(crate) fn apply_plan_cancellable(
+        &mut self,
+        plan: IndexPlan,
+        cancel: &dyn crate::cancellation::Cancellation,
+    ) -> Result<()> {
+        cancel.check()?;
         // Interrupted publications must probe the persisted bindings again.
         let reuse_current = self.initialized && self.store.manifest_current()?;
         let indexing_started = std::time::Instant::now();
@@ -891,6 +947,7 @@ impl Workspace {
             })
             .collect();
         for (key, file) in &manifest.files {
+            cancel.check()?;
             let project = &manifest.projects[file.memberships[0].project];
             let unchanged = file.stamp.immutable().is_some()
                 && self
@@ -905,7 +962,7 @@ impl Workspace {
             let selected = match previous {
                 Some(value) => Some(value),
                 None => indexes.file(&file.path, || {
-                    let _admission = crate::memory::admit_file(file.stamp.size, false, &())?;
+                    let _admission = crate::memory::admit_file(file.stamp.size, false, cancel)?;
                     let source = read_stable(&file.path, file.language)?;
                     crate::store::source_id(
                         &source,
@@ -1003,8 +1060,9 @@ impl Workspace {
                 )
             })
             .collect();
-        let mut indexed = index_source_jobs(&store, changed)?;
+        let mut indexed = index_source_jobs_cancellable(&store, changed, cancel)?;
         for (key, stamp, input) in inputs {
+            cancel.check()?;
             let project = &manifest.projects[input.project];
             ensure!(
                 Stamp::read(&input.path)? == stamp,
@@ -1025,7 +1083,7 @@ impl Workspace {
                 .remove(&key)
                 .filter(|(before, _)| before == &stamp)
                 .map_or_else(
-                    || index_input(&store, &key, &input, project, &stamp),
+                    || index_input_cancellable(&store, &key, &input, project, &stamp, cancel),
                     |(_, result)| result,
                 );
             let Indexed {
@@ -1038,6 +1096,7 @@ impl Workspace {
             } = match extracted {
                 Ok(value) => value,
                 Err(error) => {
+                    cancel.check()?;
                     manifest.files.remove(&key);
                     manifest.metadata.insert(input.path.clone(), stamp);
                     manifest
@@ -1068,6 +1127,7 @@ impl Workspace {
             }
         }
         manifest.environment = *environment.finalize().as_bytes();
+        cancel.check()?;
         let manifest_bytes = store.save_manifest(&manifest)?;
         for obsolete in self.directories.difference(&directories) {
             self.monitor.unregister(obsolete);
@@ -1264,6 +1324,7 @@ impl InputContents {
     }
 }
 
+#[cfg(test)]
 fn index_input(
     store: &Store,
     key: &str,
@@ -1271,6 +1332,18 @@ fn index_input(
     project: &Project,
     stamp: &Stamp,
 ) -> Result<Indexed> {
+    index_input_cancellable(store, key, input, project, stamp, &())
+}
+
+fn index_input_cancellable(
+    store: &Store,
+    key: &str,
+    input: &SourceInput,
+    project: &Project,
+    stamp: &Stamp,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> Result<Indexed> {
+    cancel.check()?;
     let started = std::time::Instant::now();
     let verify = || {
         ensure!(
@@ -1289,7 +1362,7 @@ fn index_input(
             storage: started.elapsed(),
         });
     }
-    let _admission = crate::memory::admit_file(stamp.size, input.metadata, &())?;
+    let _admission = crate::memory::admit_file(stamp.size, input.metadata, cancel)?;
     let mut extraction = std::time::Duration::ZERO;
     let installed = (|| -> Result<_> {
         verify()?;
@@ -1299,7 +1372,7 @@ fn index_input(
             let start = std::time::Instant::now();
             let data = contents
                 .map_or_else(|| InputContents::read(input, project), Ok)?
-                .encode(&input.path, &id, &());
+                .encode(&input.path, &id, cancel);
             extraction = start.elapsed();
             data
         })
@@ -1390,6 +1463,7 @@ fn input_identity(
         .transpose()
 }
 
+#[cfg(test)]
 fn index_source_batch(store: &Store, jobs: &[SourceJob<'_>]) -> IndexedSources {
     index_source_batch_cancellable(store, jobs, &(), &crate::telemetry::Operation::default())
 }
@@ -1594,7 +1668,7 @@ fn index_source_chunk(
             key.clone(),
             (
                 stamp.clone(),
-                index_input(store, key, input, project, stamp),
+                index_input_cancellable(store, key, input, project, stamp, cancel),
             ),
         );
     }
@@ -1723,17 +1797,34 @@ fn source_job_batches<'a, 'b>(
     batches
 }
 
-fn index_source_jobs(store: &Store, mut jobs: Vec<SourceJob<'_>>) -> Result<IndexedSources> {
+#[cfg(test)]
+fn index_source_jobs(store: &Store, jobs: Vec<SourceJob<'_>>) -> Result<IndexedSources> {
+    index_source_jobs_cancellable(store, jobs, &())
+}
+
+fn index_source_jobs_cancellable(
+    store: &Store,
+    mut jobs: Vec<SourceJob<'_>>,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> Result<IndexedSources> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     // Keep each admission class together so hash order cannot fragment batches.
     jobs.sort_by_key(|(_, (_, input, _))| input.metadata);
     let batches = source_job_batches(&jobs, index_workers());
     let workers = index_workers().min(batches.len());
     if workers <= 1 {
-        return Ok(batches
-            .iter()
-            .flat_map(|batch| index_source_batch(store, batch))
-            .collect());
+        let mut indexed = BTreeMap::new();
+        for batch in &batches {
+            cancel.check()?;
+            indexed.extend(index_source_batch_cancellable(
+                store,
+                batch,
+                cancel,
+                &Default::default(),
+            ));
+        }
+        cancel.check()?;
+        return Ok(indexed);
     }
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -1742,7 +1833,15 @@ fn index_source_jobs(store: &Store, mut jobs: Vec<SourceJob<'_>>) -> Result<Inde
                 scope.spawn(|| {
                     let mut results = Vec::new();
                     while let Some(batch) = batches.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        results.extend(index_source_batch(store, batch));
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        results.extend(index_source_batch_cancellable(
+                            store,
+                            batch,
+                            cancel,
+                            &Default::default(),
+                        ));
                     }
                     results
                 })
@@ -1756,6 +1855,7 @@ fn index_source_jobs(store: &Store, mut jobs: Vec<SourceJob<'_>>) -> Result<Inde
                     .map_err(|_| anyhow::anyhow!("Source indexing worker panicked"))?,
             );
         }
+        cancel.check()?;
         Ok(indexed)
     })
 }

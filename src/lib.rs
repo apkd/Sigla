@@ -4,6 +4,7 @@ pub mod cache;
 mod cancellation;
 pub mod config;
 pub mod csharp;
+mod demand;
 mod diagnostics;
 pub mod discovery;
 mod documents;

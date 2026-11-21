@@ -30,3 +30,19 @@ impl Cancellation for () {
         false
     }
 }
+
+/// Safe admission waits also support blocking callers without a Tokio timer context.
+pub(crate) async fn until<T>(
+    cancel: &dyn Cancellation,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(future);
+    loop {
+        cancel.check()?;
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = futures_timer::Delay::new(std::time::Duration::from_millis(100)) => (),
+        }
+    }
+}

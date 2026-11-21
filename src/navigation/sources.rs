@@ -6,8 +6,20 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) fn repository_language(
+    path: &std::path::Path,
+    metadata: bool,
+) -> Option<crate::model::Language> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("cs") => Some(crate::model::Language::CSharp),
+        Some("rs") => Some(crate::model::Language::Rust),
+        Some("meta") if metadata => Some(crate::model::Language::Text),
+        _ => crate::native::language(path).or_else(|| crate::documents::language(path)),
+    }
+}
+
 /// Navigate materialized repository inputs while dependency discovery is pending.
-/// Unknown paths fall through to discovery, which may supply package or generated files.
+/// Missing file contents are acquired separately; no discovery is started here.
 pub(crate) fn repository(
     root: &std::path::Path,
     contents: Option<&std::path::Path>,
@@ -23,12 +35,6 @@ pub(crate) fn repository(
                 .extension()
                 .is_some_and(|extension| extension == "meta")
         });
-    let language = |path: &std::path::Path| match path.extension().and_then(|e| e.to_str()) {
-        Some("cs") => Some(crate::model::Language::CSharp),
-        Some("rs") => Some(crate::model::Language::Rust),
-        Some("meta") if metadata => Some(crate::model::Language::Text),
-        _ => crate::native::language(path).or_else(|| crate::documents::language(path)),
-    };
     let files: BTreeMap<_, _> = prepared
         .selected
         .keys()
@@ -37,22 +43,12 @@ pub(crate) fn repository(
         .filter(|p| !prepared.omitted.contains_key(*p))
         .filter_map(|p| {
             let path = std::path::Path::new(p);
-            let language = language(path);
+            let language = repository_language(path, metadata);
             (language.is_some() || crate::unity::assets::is_asset(path))
                 .then(|| (p.clone(), language))
         })
         .collect();
     let Some(mode) = mode else {
-        let dirs = crate::navigation::Directory::new(files.keys().map(String::as_str)).paths();
-        let normalized = crate::navigation::normalize_indexed(path, root, false, |p| {
-            files.contains_key(p) || dirs.iter().any(|d| d == p)
-        })?;
-        if !normalized.is_empty()
-            && !files.contains_key(&normalized)
-            && crate::navigation::matches(dirs.iter().map(String::as_str), &normalized).is_empty()
-        {
-            return Ok(None);
-        }
         return browse(&files, root, path, false).map(Some);
     };
     let files: BTreeMap<_, _> = files
@@ -64,49 +60,51 @@ pub(crate) fn repository(
             .map(|l| (p.clone(), (p, l)))
         })
         .collect();
-    let mut resolved = false;
-    let text = view(
-        &files,
-        root,
-        path,
-        mode,
-        false,
-        cancel,
-        |(path, language)| {
-            resolved = true;
-            let local = contents
-                .filter(|_| prepared.selected.contains_key(path))
-                .map(|contents| contents.join(path))
-                .filter(|path| path.is_file());
-            let bytes = if let Some(path) = local {
-                let size = std::fs::metadata(&path)?.len();
-                ensure!(
-                    !crate::unity::assets::view::supported(&path)
-                        || size <= crate::repository::selection::ASSET_LIMIT,
-                    "Asset exceeds size limit ({size} bytes)"
-                );
-                crate::memory::Source::read(size, cancel, || Ok(std::fs::read(path)?))?
-            } else if let Some(bytes) = read_remote(path)? {
-                bytes
-            } else {
-                return Ok(None);
-            };
-            if bytes.starts_with(b"version https://git-lfs.github.com/spec/") {
-                return Ok(None);
-            }
-            Ok(Some((
-                *language,
-                bytes.map(|bytes| {
-                    if mode == crate::navigation::Mode::Raw {
-                        crate::model::decode_raw(bytes, *language)
-                    } else {
-                        crate::model::decode_owned(bytes, *language)
-                    }
-                })?,
-            )))
-        },
-    )?;
-    Ok(resolved.then_some(text).flatten())
+    let selected = resolve_file(&files, root, path, mode, false)?;
+    if matches!(selected, FileSelection::Choices { count: 0, .. }) {
+        return Ok(None);
+    }
+    view_selected(selected, mode, cancel, |(path, language)| {
+        let local = contents
+            .filter(|_| prepared.selected.contains_key(path))
+            .map(|contents| contents.join(path))
+            .filter(|path| path.is_file());
+        let local = if let Some(path) = local {
+            let size = std::fs::metadata(&path)?.len();
+            ensure!(
+                !crate::unity::assets::view::supported(&path)
+                    || size <= crate::repository::selection::ASSET_LIMIT,
+                "Asset exceeds size limit ({size} bytes)"
+            );
+            Some(crate::memory::Source::read(size, cancel, || {
+                Ok(std::fs::read(path)?)
+            })?)
+        } else {
+            None
+        };
+        let bytes = if let Some(bytes) =
+            local.filter(|bytes| !bytes.starts_with(b"version https://git-lfs.github.com/spec/"))
+        {
+            bytes
+        } else if let Some(bytes) = read_remote(path)? {
+            bytes
+        } else {
+            return Ok(None);
+        };
+        if bytes.starts_with(b"version https://git-lfs.github.com/spec/") {
+            return Ok(None);
+        }
+        Ok(Some((
+            *language,
+            bytes.map(|bytes| {
+                if mode == crate::navigation::Mode::Raw {
+                    crate::model::decode_raw(bytes, *language)
+                } else {
+                    crate::model::decode_owned(bytes, *language)
+                }
+            })?,
+        )))
+    })
 }
 
 pub(crate) struct Sources<'a> {
@@ -396,6 +394,33 @@ pub(crate) fn view<T>(
     cancel: &dyn crate::cancellation::Cancellation,
     read: impl FnOnce(&T) -> Result<Option<(crate::model::Language, crate::memory::Source<String>)>>,
 ) -> Result<Option<String>> {
+    view_selected(
+        resolve_file(files, root, path, mode, absolute)?,
+        mode,
+        cancel,
+        read,
+    )
+}
+
+pub(crate) enum FileSelection<'a, T> {
+    File {
+        path: &'a str,
+        file: &'a T,
+        lines: Option<(usize, usize)>,
+    },
+    Choices {
+        count: usize,
+        text: String,
+    },
+}
+
+pub(crate) fn resolve_file<'a, T>(
+    files: &'a BTreeMap<String, T>,
+    root: &std::path::Path,
+    path: &str,
+    mode: crate::navigation::Mode,
+    absolute: bool,
+) -> Result<FileSelection<'a, T>> {
     let indexed = |p: &str| {
         files.contains_key(p)
             || files.keys().any(|f| {
@@ -441,19 +466,37 @@ pub(crate) fn view<T>(
     } else {
         let matches =
             crate::navigation::file_matches(files.keys().map(String::as_str), &path, mode);
-        if mode == crate::navigation::Mode::Raw && matches.is_empty() {
-            return Ok(None);
-        }
         if matches.len() != 1 {
-            ensure!(
-                mode != crate::navigation::Mode::Raw,
-                "{}",
-                crate::navigation::choices(&matches, "files", &path)
-            );
-            return Ok(Some(crate::navigation::choices(&matches, "files", &path)));
+            return Ok(FileSelection::Choices {
+                count: matches.len(),
+                text: crate::navigation::choices(&matches, "files", &path),
+            });
         }
         let path = matches[0];
         (path, &files[path])
+    };
+    Ok(FileSelection::File {
+        path,
+        file,
+        lines: requested,
+    })
+}
+
+fn view_selected<T>(
+    selected: FileSelection<'_, T>,
+    mode: crate::navigation::Mode,
+    cancel: &dyn crate::cancellation::Cancellation,
+    read: impl FnOnce(&T) -> Result<Option<(crate::model::Language, crate::memory::Source<String>)>>,
+) -> Result<Option<String>> {
+    let (path, file, requested) = match selected {
+        FileSelection::File { path, file, lines } => (path, file, lines),
+        FileSelection::Choices { count, text } => {
+            if mode == crate::navigation::Mode::Raw && count == 0 {
+                return Ok(None);
+            }
+            ensure!(mode != crate::navigation::Mode::Raw, "{text}");
+            return Ok(Some(text));
+        }
     };
     let Some((language, source)) = read(file)? else {
         return Ok(None);

@@ -275,6 +275,10 @@ impl Server {
         self.call("search", json!({"codebase":project,"query":query}))
     }
     fn call(&self, name: &str, arguments: Value) -> Result<(bool, String)> {
+        let (error, text, _) = self.call_status(name, arguments)?;
+        Ok((error, text))
+    }
+    fn call_status(&self, name: &str, arguments: Value) -> Result<(bool, String, Option<bool>)> {
         let id = self
             .request_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -313,7 +317,11 @@ impl Server {
             .filter_map(|c| c["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        Ok((result["isError"].as_bool().unwrap_or(false), text))
+        Ok((
+            result["isError"].as_bool().unwrap_or(false),
+            text,
+            result["structuredContent"]["complete"].as_bool(),
+        ))
     }
     fn until(&self, project: &str, query: &str, expected: &str) -> Result<String> {
         let started = Instant::now();
@@ -442,12 +450,130 @@ fn lifecycle() -> Result<()> {
     git(&upstream, &["commit", "--quiet", "-am", "feature"])?;
     git(&upstream, &["branch", "release"])?;
     git(&upstream, &["switch", "--quiet", "main"])?;
+    git(&upstream, &["branch", "reading"])?;
     fs::create_dir(root.path().join("bin"))?;
     std::os::unix::fs::symlink(std::env::current_exe()?, root.path().join("bin/ssh"))?;
     // Keep background polling outside the cache-only acquisition-count checks.
     let server =
         Server::launch_with_refresh(root.path(), Duration::from_secs(30), false, Some("1h"))?;
+    let reading = "ssh://git@fixture.invalid/repo#refs/heads/reading";
+    let (error, tree) = server.call("browse", json!({"codebase":reading,"path":"src"}))?;
+    ensure!(
+        !error && tree.contains("lib.rs"),
+        "Cold inventory failed: {tree}"
+    );
+    let inventory_requests = fs::read(root.path().join("requests.log"))?.len();
+    ensure!(
+        !server
+            .call("browse", json!({"codebase":reading,"path":"src"}))?
+            .0,
+        "Repeated browse failed"
+    );
+    ensure!(
+        fs::read(root.path().join("requests.log"))?.len() == inventory_requests,
+        "Repeated browse reacquired its inventory"
+    );
+    let (error, source) = server.call(
+        "view",
+        json!({"codebase":reading,"path":"src/lib.rs","mode":"raw"}),
+    )?;
+    ensure!(
+        !error && source.contains("pub struct Main;"),
+        "Cold targeted view failed: {source}"
+    );
+    let view_requests = fs::read(root.path().join("requests.log"))?.len();
+    for path in ["./src/lib.rs:1", "src/lib:1"] {
+        let (error, source) =
+            server.call("view", json!({"codebase":reading,"path":path,"mode":"raw"}))?;
+        ensure!(
+            !error && source.contains("pub struct Main;"),
+            "Targeted path resolution failed: {source}"
+        );
+    }
+    ensure!(
+        fs::read(root.path().join("requests.log"))?.len() == view_requests,
+        "Cached file views reacquired inventory or contents"
+    );
+    let identity = sigla::repository::Repository::parse(reading)?
+        .unwrap()
+        .identity;
+    let store = root
+        .path()
+        .join("cache/git")
+        .join(identity.storage_key())
+        .join("current");
+    for (path, expected) in [("src/lib.rs", true), ("src/bin/tool.rs", false)] {
+        let oid = Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args(["rev-parse", &format!("HEAD:{path}")])
+            .output()?;
+        ensure!(oid.status.success(), "Cannot resolve fixture object");
+        let available = Command::new("git")
+            .arg("--git-dir")
+            .arg(&store)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args(["cat-file", "-e", std::str::from_utf8(&oid.stdout)?.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?
+            .success();
+        ensure!(
+            available == expected,
+            "Targeted view fetched the wrong Git objects: {path}"
+        );
+    }
+    let (error, missing, complete) = server.call_status(
+        "browse",
+        json!({"codebase":reading,"path":"absent-directory"}),
+    )?;
+    ensure!(
+        !error && complete == Some(false),
+        "Cold browse miss lost inventory scope: {missing}"
+    );
+    let (error, missing, complete) = server.call_status(
+        "view",
+        json!({"codebase":reading,"path":"absent-file.cs","mode":"raw"}),
+    )?;
+    ensure!(
+        error && complete == Some(false),
+        "Cold view miss lost inventory scope: {missing}"
+    );
+    for entry in fs::read_dir(root.path().join("cache/repositories"))? {
+        let path = entry?.path();
+        ensure!(
+            !path.join("state.bin").exists(),
+            "File view published full repository state"
+        );
+        ensure!(
+            !path.join("analysis").exists(),
+            "File view started workspace preparation"
+        );
+        ensure!(
+            !path.join("source/src/bin/tool.rs").exists(),
+            "File view acquired an unrelated source"
+        );
+    }
+    let (error, promoted) = server.query(reading, "type:Main wait:complete")?;
+    ensure!(
+        !error && promoted.contains("Main"),
+        "Inventory promotion failed: {promoted}"
+    );
     fs::write(root.path().join("offline"), "")?;
+    let (error, warm) = server.call(
+        "view",
+        json!({"codebase":reading,"path":"src/lib.rs","mode":"raw"}),
+    )?;
+    ensure!(
+        !error && warm.contains("pub struct Main;"),
+        "Warm view required the network: {warm}"
+    );
+    let (error, warm, complete) =
+        server.call_status("browse", json!({"codebase":reading,"path":"src"}))?;
+    ensure!(
+        !error && complete != Some(false),
+        "Warm browse lost its prepared workspace: {warm}"
+    );
     ensure!(
         server
             .query("ssh://git@fixture.invalid/repo", "type:Main")?
@@ -663,6 +789,12 @@ fn lifecycle() -> Result<()> {
     );
     drop(server);
     let server = Server::start(root.path())?;
+    let (error, restored, complete) =
+        server.call_status("browse", json!({"codebase":main,"path":"src"}))?;
+    ensure!(
+        !error && complete != Some(false) && restored.contains("lib.rs"),
+        "Restart lost complete cached navigation: {restored}"
+    );
     fs::write(upstream.join("src/lib.rs"), "pub struct Changed;\n")?;
     fs::create_dir_all(upstream.join("Dotnet/inputs"))?;
     fs::create_dir_all(upstream.join("Dotnet/Sources"))?;
@@ -688,6 +820,38 @@ fn lifecycle() -> Result<()> {
         &["commit", "--quiet", "--amend", "-am", "force push"],
     )?;
     git(&upstream, &["branch", "-f", &original_commit[..8]])?;
+    let started = Instant::now();
+    loop {
+        let (error, source) = server.call(
+            "view",
+            json!({"codebase":main,"path":"src/lib.rs","mode":"raw"}),
+        )?;
+        ensure!(!error, "View failed during inventory refresh: {source}");
+        if source.contains("Changed") {
+            break;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Navigation did not see the refreshed inventory"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let identity = sigla::repository::Repository::parse(main)?
+        .unwrap()
+        .identity;
+    for entry in fs::read_dir(root.path().join("cache/repositories"))? {
+        let path = entry?.path();
+        if !path.join("state.bin").exists() {
+            continue;
+        }
+        let state = sigla::repository::state_store::read(&path)?;
+        if state.repository == identity && state.prepared.branch.as_deref() == Some("main") {
+            ensure!(
+                !fs::read_to_string(path.join("source/src/lib.rs"))?.contains("Changed"),
+                "Warm navigation started full source acquisition after restart"
+            );
+        }
+    }
     server.until(main, "type:Changed", "Changed")?;
     server.until(main, "type:MaterializedInput", "MaterializedInput")?;
     git(&upstream, &["tag", "--force", "release"])?;

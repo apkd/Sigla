@@ -469,13 +469,27 @@ impl Acquisition {
         reuse: Option<super::materialize::Reuse>,
         telemetry: &crate::telemetry::Operation,
     ) -> Result<(super::materialize::Acquired, Pin)> {
+        self.git_cancellable(request, cache, reuse, telemetry, &())
+    }
+
+    pub fn git_cancellable(
+        &mut self,
+        request: &Request,
+        cache: &Path,
+        reuse: Option<super::materialize::Reuse>,
+        telemetry: &crate::telemetry::Operation,
+        cancel: &dyn crate::cancellation::Cancellation,
+    ) -> Result<(super::materialize::Acquired, Pin)> {
         ensure!(
             !matches!(request.target, super::materialize::Target::DefaultBranch),
             "Default-branch discovery must keep using the metadata-only job"
         );
         let pool = &self.pool;
         let operation = &mut self.operation;
-        let _permit = futures_executor::block_on(pool.capacity.transfer(telemetry))?;
+        let _permit = futures_executor::block_on(crate::cancellation::until(
+            cancel,
+            pool.capacity.transfer(telemetry),
+        ))?;
         // Even a failed acquisition can change the pool. Invalidate earlier root snapshots.
         **operation = operation
             .checked_add(1)
@@ -499,10 +513,22 @@ impl Acquisition {
 pub(super) fn complete(
     request: &Request,
     cache: &Path,
+    acquired: super::materialize::Acquired,
+    pin: &Pin,
+    staging: &Staging,
+    telemetry: &crate::telemetry::Operation,
+) -> Result<super::materialize::Acquired> {
+    complete_cancellable(request, cache, acquired, pin, staging, telemetry, &())
+}
+
+pub(super) fn complete_cancellable(
+    request: &Request,
+    cache: &Path,
     mut acquired: super::materialize::Acquired,
     pin: &Pin,
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
+    cancel: &dyn crate::cancellation::Cancellation,
 ) -> Result<super::materialize::Acquired> {
     if matches!(request.contents, super::materialize::Contents::Inventory)
         || acquired.staged.is_empty()
@@ -513,11 +539,11 @@ pub(super) fn complete(
     import_stage(
         request,
         cache,
-        &acquired.prepared,
-        &acquired.staged,
+        &acquired,
         staging,
         telemetry,
         &pin._pool.root,
+        cancel,
     )?;
     // Hydration only uses staged pointers and the LFS cache. It must not hold
     // the Git pool gate while downloading large objects.
@@ -528,7 +554,10 @@ pub(super) fn complete(
         .map(|file| file.path.clone())
         .collect();
     if !pointers.is_empty() {
-        let _permit = futures_executor::block_on(staging.capacity.transfer(telemetry))?;
+        let _permit = futures_executor::block_on(crate::cancellation::until(
+            cancel,
+            staging.capacity.transfer(telemetry),
+        ))?;
         // Hydration publishes canonical files and syncs only affected directories.
         acquired.prepared = super::job::hydrate(request, cache, acquired.prepared, pointers)?;
     }
@@ -538,14 +567,19 @@ pub(super) fn complete(
 fn import_stage(
     request: &Request,
     cache: &Path,
-    prepared: &Prepared,
-    staged: &[super::materialize::StagedFile],
+    acquired: &super::materialize::Acquired,
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
     raw_owner: &Path,
+    cancel: &dyn crate::cancellation::Cancellation,
 ) -> Result<()> {
+    let prepared = &acquired.prepared;
+    let staged = &acquired.staged;
     if fs::read_dir(&request.staging)?.next().is_some() {
-        let _permit = futures_executor::block_on(staging.capacity.import(telemetry))?;
+        let _permit = futures_executor::block_on(crate::cancellation::until(
+            cancel,
+            staging.capacity.import(telemetry),
+        ))?;
         let started = std::time::Instant::now();
         let stats = crate::cache::blobs::Store::open(cache)?.import_owned_tree(&request.staging)?;
         if let Err(error) = super::files::record_selected(
