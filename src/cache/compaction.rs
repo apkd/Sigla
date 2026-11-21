@@ -81,8 +81,10 @@ fn remove(path: &Path) -> Result<bool> {
 /// Run before the normal environment is opened, under exclusive cache ownership.
 pub fn recover(cache: &Path) -> Result<()> {
     let root = cache.join("analysis");
-    if !root.is_dir() {
-        return Ok(());
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) => ensure!(metadata.is_dir(), "Invalid analysis directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
     let current = root.join("data.mdb");
     let previous = root.join(PREVIOUS);

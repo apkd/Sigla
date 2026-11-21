@@ -494,6 +494,10 @@ fn main() {
     ] {
         workspace.update(fs::read(file).unwrap());
     }
+    println!(
+        "cargo:rustc-env=SIGLA_CACHE_LAYOUT_FINGERPRINT={:x}",
+        cache_layout.clone().finalize()
+    );
     for (domain, hash) in [
         ("ANALYSIS", analysis),
         ("WORKSPACE", workspace),

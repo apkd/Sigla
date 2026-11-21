@@ -1632,6 +1632,51 @@ mod tests {
     }
 
     #[test]
+    fn compatible_reset_preserves_managed_inputs_through_maintenance() {
+        let cache = tempfile::tempdir().unwrap();
+        crate::cache::reset::prepare(cache.path()).unwrap();
+        let entry = cache.path().join("owner");
+        fs::create_dir(&entry).unwrap();
+        let view = cache.path().join("unity-packages/retained");
+        fs::create_dir_all(&view).unwrap();
+        fs::write(view.join("Source.cs"), "class Retained {}").unwrap();
+        let manifest = crate::workspace::Manifest {
+            root: entry.clone(),
+            dependencies: std::collections::BTreeSet::from([view.clone()]),
+            ..Default::default()
+        };
+        {
+            let database = crate::store::Database::open(&cache.path().join("analysis")).unwrap();
+            database.workspace([1; 32], &entry, None).unwrap();
+            database.checkpoint().unwrap();
+            let mut owners = crate::cache::owners::Catalog::open(cache.path()).unwrap();
+            owners.observe(&entry, None, &manifest, Some(crate::cache::now()));
+            owners.flush().unwrap();
+        }
+        let marker = cache.path().join("cache-fingerprint");
+        let mut bytes = fs::read(&marker).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        fs::write(marker, bytes).unwrap();
+        assert!(crate::cache::reset::prepare(cache.path()).unwrap());
+        let app = app(cache.path(), vec![]);
+        app.maintain_disk_shared().unwrap();
+        assert!(view.join("Source.cs").exists());
+        // Replacement discovery can release dependencies that are no longer used.
+        app.owners.lock().unwrap().observe(
+            &entry,
+            None,
+            &crate::workspace::Manifest {
+                root: entry.clone(),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(app.collect_views(true).unwrap());
+        assert!(!view.exists());
+    }
+
+    #[test]
     fn view_collection_rechecks_ownership_published_after_snapshot() {
         let cache = tempfile::tempdir().unwrap();
         let app = app(cache.path(), vec![]);

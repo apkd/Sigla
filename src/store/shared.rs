@@ -551,6 +551,24 @@ impl Database {
         Ok(result)
     }
 
+    /// Detach all graph namespaces without discarding shared immutable objects.
+    pub(crate) fn retire_workspaces(&self) -> Result<()> {
+        let mut tx = self.write()?;
+        let workspaces = self
+            .spaces
+            .iter(&tx)?
+            .map(|row| {
+                let (key, value) = row?;
+                Ok((<[u8; 32]>::try_from(key)?, decode::<WorkspaceInfo>(value)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (key, info) in workspaces {
+            self.retire(&mut tx, key, info)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn retire(
         &self,
         tx: &mut RwTxn<'_>,

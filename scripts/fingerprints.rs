@@ -67,7 +67,13 @@ pub fn domains(name: &str) -> [bool; 5] {
                 | "src/unity/assets/yaml.rs"
                 | "src/unity/assets/records.rs"
         );
-    let layout = name.starts_with("src/cache")
+    let layout = name.starts_with("Cargo.")
+        || name.starts_with("src/binary/")
+        || matches!(
+            name,
+            "src/binary.rs" | "src/model.rs" | "src/documents.rs" | "src/native/mod.rs"
+        )
+        || name.starts_with("src/cache")
         || name.starts_with("src/repository")
         || name == "src/store.rs"
         || name.starts_with("src/store/")
@@ -132,5 +138,29 @@ mod tests {
         let after = fingerprint(&[("src/cache/blobs.rs", "new")]);
         assert_eq!(before[0], after[0]);
         assert_ne!(before[4], after[4]);
+    }
+
+    #[test]
+    fn graph_changes_preserve_storage_but_schema_and_dependency_changes_do_not() {
+        for path in ["src/workspace.rs", "src/discovery.rs", "src/unity/graph.rs"] {
+            let before = fingerprint(&[(path, "old")]);
+            let after = fingerprint(&[(path, "new")]);
+            assert_ne!(before[1], after[1]);
+            assert_eq!(before[4], after[4]);
+        }
+        // Repository inventories retain selected paths across compatible resets.
+        // Changes to language recognition must also rebuild those selections.
+        for path in [
+            "Cargo.lock",
+            "src/model.rs",
+            "src/binary/bounded.rs",
+            "src/documents.rs",
+            "src/native/mod.rs",
+        ] {
+            assert_ne!(
+                fingerprint(&[(path, "old")])[4],
+                fingerprint(&[(path, "new")])[4]
+            );
+        }
     }
 }

@@ -9,9 +9,22 @@ use std::{
 
 const MARKER: &str = "cache-fingerprint";
 pub(crate) const RETIRED: &str = ".retired-cache-";
-const FINGERPRINT: &[u8] = env!("SIGLA_CACHE_FINGERPRINT").as_bytes();
+const COMPATIBLE: &[u8] = concat!(
+    "SIGLA-CACHE-2\n",
+    env!("SIGLA_CACHE_LAYOUT_FINGERPRINT"),
+    "\n"
+)
+.as_bytes();
+const FINGERPRINT: &[u8] = concat!(
+    "SIGLA-CACHE-2\n",
+    env!("SIGLA_CACHE_LAYOUT_FINGERPRINT"),
+    "\n",
+    env!("SIGLA_CACHE_FINGERPRINT")
+)
+.as_bytes();
 
-/// Returns true after clearing an incompatible or unmarked cache.
+/// Retire incompatible workspace state, retaining inputs when the storage layout matches.
+/// Returns true when any cache state was invalidated.
 /// The caller must hold exclusive cache ownership, or own a private cache.
 pub fn prepare(cache: &Path) -> Result<bool> {
     with_space_recovery(cache, || {
@@ -89,14 +102,18 @@ pub(crate) fn cleanup_step(
 
 /// Checks the cache marker without changing cache contents.
 pub fn current(cache: &Path) -> Result<bool> {
+    Ok(marker(cache)?.is_some_and(|bytes| bytes == FINGERPRINT))
+}
+
+fn marker(cache: &Path) -> Result<Option<Vec<u8>>> {
     let marker = cache.join(MARKER);
     let metadata = match fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     if !metadata.is_file() || metadata.len() != FINGERPRINT.len() as u64 {
-        return Ok(false);
+        return Ok(None);
     }
     let file = File::options()
         .read(true)
@@ -104,22 +121,26 @@ pub fn current(cache: &Path) -> Result<bool> {
         .open(marker)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() != FINGERPRINT.len() as u64 {
-        return Ok(false);
+        return Ok(None);
     }
     let mut bytes = Vec::new();
     file.take(FINGERPRINT.len() as u64 + 1)
         .read_to_end(&mut bytes)?;
-    Ok(bytes == FINGERPRINT)
+    Ok((bytes.len() == FINGERPRINT.len()
+        && bytes[COMPATIBLE.len()..].iter().all(u8::is_ascii_hexdigit))
+    .then_some(bytes))
 }
 
 fn prepare_with(
     cache: &Path,
     mut retire_entry: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<bool> {
-    let marker = cache.join(MARKER);
-    if current(cache)? {
+    let previous = marker(cache)?;
+    if previous.as_deref() == Some(FINGERPRINT) {
         return Ok(false);
     }
+    let compatible = previous.is_some_and(|bytes| bytes.starts_with(COMPATIBLE));
+    let marker = cache.join(MARKER);
     // Retire an invalid marker first, including a directory or symlink. Even a
     // corrupt marker must not introduce recursive deletion before listening.
     let mut entries = fs::read_dir(cache)?.collect::<std::io::Result<Vec<_>>>()?;
@@ -128,6 +149,7 @@ fn prepare_with(
     for entry in entries {
         if entry.file_name() == "ownership.lock"
             || entry.file_name().to_string_lossy().starts_with(RETIRED)
+            || compatible && entry.file_name() != MARKER
         {
             continue;
         }
@@ -147,6 +169,14 @@ fn prepare_with(
         File::open(retired)?.sync_all()?;
     }
     File::open(cache)?.sync_all()?;
+    if compatible {
+        // Recovery may replace the database. Finish it before opening any store.
+        crate::repository::state_store::invalidate_indexed(cache)?;
+        crate::repository::state_store::recover(cache)?;
+        super::compaction::recover(cache)?;
+        crate::store::retire_workspaces(&cache.join("analysis"))?;
+        tracing::info!("Retired workspace graphs; retained compatible cache inputs and analysis");
+    }
     let mut staged = tempfile::NamedTempFile::new_in(cache)?;
     staged.write_all(FINGERPRINT)?;
     staged.as_file().sync_all()?;
@@ -163,6 +193,140 @@ mod tests {
     fn reclaim(cache: &Path) {
         let mut pending = None;
         while !cleanup_step(cache, &mut pending).unwrap() {}
+    }
+
+    fn graph_change(cache: &Path) {
+        let mut marker = FINGERPRINT.to_vec();
+        let last = marker.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        fs::write(cache.join(MARKER), marker).unwrap();
+    }
+
+    #[test]
+    fn compatible_reset_retires_graphs_but_reuses_inputs_and_analysis() {
+        use crate::store::{Database, FileData, payload};
+        for interrupted_compaction in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path();
+            prepare(cache).unwrap();
+            let inputs = [
+                "git/repository/pack",
+                "lfs/object",
+                "blobs/object",
+                "unity-metadata/editor/section",
+                "unity-metadata-packs/pack/source",
+                "unity-packages/package/source",
+                "local-jobs/project/nuget/cache",
+                "repositories/selector/generated/packages/cache",
+                "repositories/selector/source/Code.cs",
+            ];
+            for path in inputs {
+                let path = cache.join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"retained input").unwrap();
+            }
+            let analysis = cache.join("analysis");
+            let source = "pub struct Kept;";
+            let language = crate::model::Language::Rust;
+            let id = payload::source_id(source, language, &[], "2021").unwrap();
+            let old_id = {
+                let database = Database::open(&analysis).unwrap();
+                let scope = database.workspace([1; 32], cache, None).unwrap();
+                scope
+                    .install(
+                        "Code.rs",
+                        vec![1],
+                        id,
+                        1,
+                        || Ok(()),
+                        || {
+                            payload::encode(FileData {
+                                source: source.into(),
+                                assembly: None,
+                                facts: crate::extract::extract(source, language, &[], "2021")?,
+                            })
+                        },
+                    )
+                    .unwrap();
+                scope
+                    .finish_refresh(b"obsolete graph", &["Code.rs".into()].into(), 1)
+                    .unwrap();
+                database.checkpoint().unwrap();
+                scope.id
+            };
+            if interrupted_compaction {
+                fs::rename(
+                    analysis.join("data.mdb"),
+                    analysis.join("data.mdb.previous"),
+                )
+                .unwrap();
+                fs::write(analysis.join("data.mdb"), b"interrupted copy").unwrap();
+            }
+            graph_change(cache);
+            assert!(prepare(cache).unwrap());
+            assert!(current(cache).unwrap());
+            for path in inputs {
+                assert_eq!(fs::read(cache.join(path)).unwrap(), b"retained input");
+            }
+            let database = Database::open(&analysis).unwrap();
+            assert!(database.existing([1; 32]).unwrap().is_none());
+            assert!(
+                database
+                    .namespace([1; 32], old_id)
+                    .unwrap()
+                    .unwrap()
+                    .is_retiring()
+                    .unwrap()
+            );
+            let fresh = database.workspace([1; 32], cache, None).unwrap();
+            assert_ne!(fresh.id, old_id);
+            let installed = fresh
+                .install(
+                    "Code.rs",
+                    vec![1],
+                    id,
+                    2,
+                    || Ok(()),
+                    || panic!("Compatible analysis must be reused"),
+                )
+                .unwrap();
+            assert!(installed.reused);
+            reclaim(cache);
+            assert!(analysis.join("data.mdb").is_file());
+            assert!(!prepare(cache).unwrap());
+        }
+    }
+
+    #[test]
+    fn interrupted_graph_reset_leaves_no_current_marker_and_retries_conservatively() {
+        let root = tempfile::tempdir().unwrap();
+        prepare(root.path()).unwrap();
+        fs::write(root.path().join("input"), b"raw input").unwrap();
+        // A failed database migration must leave the marker retired.
+        fs::create_dir(root.path().join("analysis")).unwrap();
+        fs::write(root.path().join("analysis/data.mdb"), b"invalid database").unwrap();
+        graph_change(root.path());
+        assert!(prepare(root.path()).is_err());
+        assert!(!current(root.path()).unwrap());
+        assert!(root.path().join("input").is_file());
+        assert!(prepare(root.path()).unwrap());
+        assert!(!root.path().join("input").exists());
+        assert!(current(root.path()).unwrap());
+    }
+
+    #[test]
+    fn layout_changes_and_legacy_markers_require_a_full_reset() {
+        let mut different_layout = FINGERPRINT.to_vec();
+        let byte = &mut different_layout[b"SIGLA-CACHE-2\n".len()];
+        *byte = if *byte == b'0' { b'1' } else { b'0' };
+        for marker in [different_layout, vec![b'a'; 64], COMPATIBLE.to_vec()] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join(MARKER), marker).unwrap();
+            fs::write(root.path().join("input"), b"old layout").unwrap();
+            assert!(prepare(root.path()).unwrap());
+            assert!(!root.path().join("input").exists());
+            assert!(current(root.path()).unwrap());
+        }
     }
 
     #[test]

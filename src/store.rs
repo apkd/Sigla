@@ -23,6 +23,17 @@ pub use payload::{ANALYSIS_VERSION, canonical_defines, metadata_id, source_id};
 pub use shared::{Database, Installed, ObjectId};
 pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Startup migration under exclusive cache ownership. Immutable objects remain reusable.
+pub(crate) fn retire_workspaces(analysis: &Path) -> Result<()> {
+    if !analysis.try_exists()? {
+        return Ok(());
+    }
+    let database = Database::open(analysis)?;
+    database.retire_workspaces()?;
+    // The compatibility marker must never survive without the retirement.
+    database.checkpoint()
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ManifestRecord<'a> {
     group: Option<crate::native::Group>,

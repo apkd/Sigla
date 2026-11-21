@@ -257,6 +257,42 @@ pub(crate) fn recover(cache: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Retain repository inventories while requiring their graphs to be rebuilt.
+/// The caller holds exclusive cache ownership before any repository is opened.
+pub(crate) fn invalidate_indexed(cache: &Path) -> Result<()> {
+    let root = cache.join("repositories");
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(metadata.is_dir(), "Invalid repository cache directory");
+    for repository in fs::read_dir(root)? {
+        let repository = repository?;
+        ensure!(
+            repository.file_type()?.is_dir(),
+            "Invalid selector directory"
+        );
+        let path = repository.path().join(HEADER);
+        let mut header: Header = match records::read(&path, MAX_HEADER) {
+            Ok(header) => header,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if header.indexed_revision.take().is_some() {
+            records::write(&path, &header)?;
+            File::open(repository.path())?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 fn cleanup(root: &Path) -> Result<()> {
     let current = match records::read::<Header>(&root.join(HEADER), MAX_HEADER) {
         Ok(header) => Some(header.inventory),
@@ -334,6 +370,29 @@ mod tests {
         assert_eq!(saved.indexed_revision, state.indexed_revision);
         assert_eq!(header(root.path()).unwrap().inventory, inventory);
         assert_eq!(fs::read(root.path().join(inventory)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn graph_reset_keeps_inventory_repair_and_usage_but_requires_indexing() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().join("repositories/selector");
+        fs::create_dir_all(&root).unwrap();
+        let mut state = state();
+        state.indexed_revision = Some(state.prepared.revision.clone());
+        state.repair = true;
+        write(&root, &state).unwrap();
+        record_use(&root, 123).unwrap();
+        let inventory = header(&root).unwrap().inventory;
+        let bytes = fs::read(root.join(&inventory)).unwrap();
+        invalidate_indexed(cache.path()).unwrap();
+        let restored = read(&root).unwrap();
+        assert!(restored.indexed_revision.is_none());
+        assert!(restored.repair);
+        assert_eq!(restored.prepared.revision, state.prepared.revision);
+        assert_eq!(restored.prepared.selected, state.prepared.selected);
+        assert_eq!(restored.last_use, 123);
+        assert_eq!(header(&root).unwrap().inventory, inventory);
+        assert_eq!(fs::read(root.join(inventory)).unwrap(), bytes);
     }
 
     #[test]
