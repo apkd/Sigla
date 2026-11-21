@@ -422,6 +422,7 @@ class Outer {
             assert!(facts.incomplete.is_none());
             let source = Source {
                 text: text.into(),
+                authored_utf8: true,
                 calls: Vec::new(),
                 declarations: facts.declarations,
                 presence: facts.presence,

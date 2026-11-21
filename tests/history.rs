@@ -1444,6 +1444,56 @@ async fn unreadable_candidate_does_not_abort_known_selected_history() {
 }
 
 #[tokio::test]
+async fn encoded_csharp_candidates_preserve_selected_patch_bytes() {
+    let sample = "// Temperature: 20°\nclass Sample { void Unrelated() {} }\n";
+    let selected =
+        "\u{feff}class Added {\r\n    int Calculate(int value) => value * value;\r\n}\r\n";
+    let legacy = sample.chars().map(|c| c as u8).collect::<Vec<_>>();
+    let utf16 = [0xff, 0xfe]
+        .into_iter()
+        .chain(sample.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect::<Vec<_>>();
+    let utf32 = [0, 0, 0xfe, 0xff]
+        .into_iter()
+        .chain(sample.chars().flat_map(|c| (c as u32).to_be_bytes()))
+        .collect::<Vec<_>>();
+    let mut expected = None;
+    for bytes in [sample.as_bytes().to_vec(), legacy, utf16, utf32] {
+        let f = Fixture::new();
+        let root = f.commit_bytes(&[("sample.cs", &bytes, 0o100644)], &[], "sample");
+        let tip = f.commit_bytes(
+            &[
+                ("sample.cs", &bytes, 0o100644),
+                ("selected.cs", selected.as_bytes(), 0o100644),
+            ],
+            &[&root],
+            "add selected source",
+        );
+        let patch = f
+            .history(
+                &tip,
+                &format!("diff {root}..{tip} method:Added.Calculate(int) path:selected.cs"),
+            )
+            .await;
+        let patch = body(&patch).to_owned();
+        if let Some(expected) = &expected {
+            assert_eq!(&patch, expected);
+        } else {
+            assert!(patch.contains("Calculate"), "{patch}");
+            expected = Some(patch);
+        }
+        if std::str::from_utf8(&bytes).is_err() {
+            assert!(
+                !f.error(&tip, &format!("show {root} file:sample.cs"))
+                    .await
+                    .is_empty()
+            );
+        }
+        f.app.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn copying_from_an_unchanged_file_retains_uncertain_origin() {
     let f = Fixture::new();
     let origin = "pub fn origin(input: &str) -> String { let trimmed = input.trim(); let canonical = trimmed.to_lowercase(); canonical.replace('-', \"_\") }\n";

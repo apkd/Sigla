@@ -199,6 +199,7 @@ pub(super) struct Call {
 }
 pub(super) struct Source {
     pub text: Arc<str>,
+    pub authored_utf8: bool,
     pub calls: Vec<Call>,
     pub declarations: Vec<HistoricalDeclaration>,
     pub presence: HistoricalPresence,
@@ -424,19 +425,33 @@ impl Sources {
             crate::memory::admit_file(bytes.len() as u64, false, cancel)?
         };
         cancel.check()?;
-        if bytes.contains(&0) {
+        ensure!(
+            !bytes.starts_with(b"version https://git-lfs.github.com/spec/"),
+            "Git LFS pointer at {path}; payload history is excluded"
+        );
+        // Candidate matching uses decoded text. UTF-8 remains byte-for-byte
+        // authored text, including its BOM, so selected patch offsets stay valid.
+        let (text, authored_utf8) = match String::from_utf8(bytes) {
+            Ok(text) => (text, true),
+            Err(error) if language == crate::model::Language::CSharp => (
+                crate::model::decode(error.as_bytes(), language).map_err(|error| {
+                    UnreadableSource(format!("unreadable source at {path}: {error}"))
+                })?,
+                false,
+            ),
+            Err(error) => {
+                return Err(
+                    UnreadableSource(format!("non-UTF-8 source at {path}: {error}")).into(),
+                );
+            }
+        };
+        if text.contains('\0') {
             return Err(UnreadableSource(format!(
                 "binary source at {path}; contents were not followed"
             ))
             .into());
         }
-        ensure!(
-            !bytes.starts_with(b"version https://git-lfs.github.com/spec/"),
-            "Git LFS pointer at {path}; payload history is excluded"
-        );
-        let text: Arc<str> = String::from_utf8(bytes)
-            .map_err(|error| UnreadableSource(format!("non-UTF-8 source at {path}: {error}")))?
-            .into();
+        let text: Arc<str> = text.into();
         let facts = if file_only {
             Ok(crate::extract::HistoricalFacts::default())
         } else {
@@ -500,6 +515,7 @@ impl Sources {
                 .sum::<usize>();
         let source = Arc::new(Source {
             text,
+            authored_utf8,
             declarations,
             calls,
             presence,

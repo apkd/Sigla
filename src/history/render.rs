@@ -295,6 +295,19 @@ fn compare_pair(
         let mut read = |region: &Region| sources.region(store, region);
         (old.map(&mut read).transpose()?, new.map(read).transpose()?)
     };
+    if matches!(output, Output::Patch(_)) {
+        for (region, source) in old
+            .zip(a_source.as_deref())
+            .into_iter()
+            .chain(new.zip(b_source.as_deref()))
+        {
+            ensure!(
+                source.authored_utf8,
+                "Cannot render a byte-preserving patch for non-UTF-8 source at {}",
+                region.path
+            );
+        }
+    }
     fn selected<'a>(region: Option<&Region>, source: Option<&'a Source>) -> &'a str {
         region.zip(source).map_or("", |(r, s)| &s.text[r.range(s)])
     }
