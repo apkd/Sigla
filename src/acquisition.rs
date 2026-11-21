@@ -48,7 +48,7 @@ impl Preparations {
         Ok(PreparationEntry {
             registry: self,
             identity,
-            state,
+            state: Some(state),
         })
     }
 
@@ -71,14 +71,21 @@ impl Preparations {
 struct PreparationEntry<'a> {
     registry: &'a Preparations,
     identity: &'a str,
-    state: Preparation,
+    state: Option<Preparation>,
+}
+impl PreparationEntry<'_> {
+    fn state(&self) -> &Mutex<Option<Failure>> {
+        self.state.as_deref().unwrap()
+    }
 }
 impl Drop for PreparationEntry<'_> {
     fn drop(&mut self) {
         let mut entries = self.registry.entries.lock().unwrap();
-        // This owner and the registry are the only remaining references. A
-        // waiter clones its entry under the same registry lock before waiting.
-        if Arc::strong_count(&self.state) == 2 && Preparations::finished(&self.state, false) {
+        // Release this owner's reference under the registry lock. Otherwise two
+        // concurrent drops can both observe the other owner and skip removal.
+        drop(self.state.take());
+        let state = &entries[self.identity];
+        if Arc::strong_count(state) == 1 && Preparations::finished(state, false) {
             entries.remove(self.identity);
         }
     }
@@ -145,7 +152,7 @@ pub(crate) fn shared_many_versioned<T>(
         .into_iter()
         .zip(entries.iter().map(|entry| {
             entry
-                .state
+                .state()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }))
@@ -209,7 +216,7 @@ pub(crate) fn serialized_versioned<T>(
 ) -> Result<T> {
     let entry = PREPARATIONS.enter(identity)?;
     let mut state = entry
-        .state
+        .state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_failure(&state, version)?;
@@ -552,12 +559,12 @@ mod tests {
         std::thread::scope(|scope| {
             let registry = &registry;
             let first = registry.enter("one").unwrap();
-            let state = first.state.lock().unwrap();
+            let state = first.state().lock().unwrap();
             let (entered, ready) = std::sync::mpsc::channel();
             let waiter = scope.spawn(move || {
                 let second = registry.enter("one").unwrap();
                 entered.send(()).unwrap();
-                let _state = second.state.lock().unwrap();
+                let _state = second.state().lock().unwrap();
             });
             ready.recv().unwrap();
             assert!(registry.enter("two").is_err());
@@ -568,7 +575,7 @@ mod tests {
         assert!(registry.entries.lock().unwrap().is_empty());
 
         let failed = registry.enter("one").unwrap();
-        *failed.state.lock().unwrap() = Some(Failure {
+        *failed.state().lock().unwrap() = Some(Failure {
             at: Instant::now(),
             version: "release".into(),
             error: Arc::new(anyhow::anyhow!("unavailable")),
@@ -576,7 +583,7 @@ mod tests {
         drop(failed);
         assert!(registry.enter("two").is_err());
         let failed = registry.enter("one").unwrap();
-        failed.state.lock().unwrap().as_mut().unwrap().at = Instant::now() - FAILURE_COOLDOWN;
+        failed.state().lock().unwrap().as_mut().unwrap().at = Instant::now() - FAILURE_COOLDOWN;
         drop(failed);
         drop(registry.enter("two").unwrap());
         assert!(registry.entries.lock().unwrap().is_empty());

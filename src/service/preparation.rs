@@ -1452,7 +1452,12 @@ mod tests {
             );
             assert!(matches!(*ticket.progress.borrow(), Progress::Paused(..)));
             assert!(ticket.continuation.lock().unwrap().is_some());
-            assert!(workspace.try_lock().is_ok());
+            // Cache trimming may briefly inspect this mutex after completion.
+            drop(
+                tokio::time::timeout(Duration::from_secs(10), workspace.lock())
+                    .await
+                    .unwrap(),
+            );
             // Completion also releases the parent lifecycle and activity guard.
             tokio::time::timeout(Duration::from_secs(10), async {
                 while app.preparation_lifecycle.available_permits() == 0 {
