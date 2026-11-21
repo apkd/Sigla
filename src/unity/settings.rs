@@ -95,7 +95,7 @@ fn standalone(value: &Value) -> Option<&Value> {
 }
 
 impl Settings {
-    pub(super) fn compilation_api(&self, editor_only: bool) -> u32 {
+    pub(crate) fn compilation_api(&self, editor_only: bool) -> u32 {
         if editor_only {
             // Unity 6 serializes Default=1, NET_Unity_4_8=2, NET_Standard=3.
             // Earlier supported editors use the default Framework profile.

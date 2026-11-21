@@ -530,6 +530,7 @@ pub(crate) fn discover_in(
         sdk
     };
     metadata.insert(sdk.join("dotnet.runtimeconfig.json"));
+    let responses = automatic_response_entries(entries, &sdk, remote, metadata)?;
     let root = payload(cache, &sdk)?;
     let mapped_entries = entries
         .iter()
@@ -559,7 +560,7 @@ pub(crate) fn discover_in(
             &request,
             &serde_json::to_vec(
                 &serde_json::json!({"Entries": mapped_entries, "DependencyState": previous, "Restored": restored,
-                    "ArtifactsPath": remote.is_none().then_some(&artifacts),
+                    "ArtifactsPath": remote.is_none().then_some(&artifacts), "RestorePolicy": responses.state,
                     "Tracked": remote.map(|r| r.tracked.iter().map(|p| Path::new("/workspace").join(p)).collect::<Vec<_>>())}),
             )?,
         )?;
@@ -650,7 +651,28 @@ pub(crate) fn discover_in(
             !restored,
             "Dependency assets remain unavailable after restore"
         );
-        for entry in &mapped_entries {
+        let grouped_entries = entries
+            .iter()
+            .zip(&mapped_entries)
+            .filter(|(entry, _)| !responses.cli.contains(*entry))
+            .map(|(_, mapped)| mapped)
+            .collect::<Vec<_>>();
+        let restore_request = job.path().join("restore-request.json");
+        crate::sandbox::write_job_file(
+            &restore_request,
+            &serde_json::to_vec(&serde_json::json!({
+                "Entries": grouped_entries,
+                "ArtifactsPath": remote.is_none().then_some(&artifacts),
+            }))?,
+        )?;
+        let restores = entries
+            .iter()
+            .zip(&mapped_entries)
+            .filter(|(entry, _)| responses.cli.contains(*entry))
+            .map(|(entry, mapped)| (entry.as_path(), Some(mapped)))
+            .chain((!grouped_entries.is_empty()).then_some((directory, None)));
+        for (entry, cli_entry) in restores {
+            let restore_output = job.path().join("restore.json");
             let mut restore = match &sandbox {
                 Some(s) => s.command(&host, &root, job.path(), directory, true)?,
                 None => {
@@ -665,26 +687,43 @@ pub(crate) fn discover_in(
                     command
                 }
             };
-            restore.arg(sdk.join("MSBuild.dll")).arg(entry).args([
-                "-target:Restore",
-                "-nodeReuse:false",
-                "-nologo",
-                "-m:1",
-            ]);
-            if remote.is_none() {
-                // MSBuild treats commas and semicolons as property separators even within one argv entry.
-                let path = artifacts
-                    .to_str()
-                    .context("Invalid artifacts path")?
-                    .replace('%', "%25")
-                    .replace(';', "%3B")
-                    .replace(',', "%2C");
+            if let Some(entry) = cli_entry {
+                restore.arg(sdk.join("MSBuild.dll")).arg(entry).args([
+                    "-target:Restore",
+                    "-nodeReuse:false",
+                    "-nologo",
+                    "-m:1",
+                ]);
+                if remote.is_none() {
+                    let path = artifacts
+                        .to_str()
+                        .context("Non-UTF-8 artifact path")?
+                        .replace('%', "%25")
+                        .replace(';', "%3B")
+                        .replace(',', "%2C");
+                    restore
+                        .args([
+                            "-p:UseArtifactsOutput=true",
+                            "-p:IncludeProjectNameInArtifactsPaths=true",
+                        ])
+                        .arg(format!("-p:ArtifactsPath={path}"));
+                }
+            } else if sandbox.is_some() {
                 restore
+                    .arg("/integration/Sigla.Discovery.dll")
+                    .arg(&sdk)
                     .args([
-                        "-p:UseArtifactsOutput=true",
-                        "-p:IncludeProjectNameInArtifactsPaths=true",
-                    ])
-                    .arg(format!("-p:ArtifactsPath={path}"));
+                        "/job/restore-request.json",
+                        "/job/restore.json",
+                        "--restore",
+                    ]);
+            } else {
+                restore
+                    .arg(root.join("Sigla.Discovery.dll"))
+                    .arg(&sdk)
+                    .arg(&restore_request)
+                    .arg(&restore_output)
+                    .arg("--restore");
             }
             let mut log = tempfile::tempfile()?;
             let captured = measured("restore", entry, || {
@@ -719,10 +758,99 @@ pub(crate) fn discover_in(
                     entry.display(),
                     restore_reason(&detail),
                 ));
+            } else if cli_entry.is_none() {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "PascalCase")]
+                struct Failure {
+                    entry: PathBuf,
+                    detail: String,
+                }
+                let failures: Vec<Failure> = serde_json::from_slice(
+                    &crate::sandbox::read_job_file(&restore_output, 64 * 1024 * 1024)?,
+                )?;
+                for failure in failures {
+                    tracing::warn!(project = %failure.entry.display(), detail = %diagnostic_tail(failure.detail.as_bytes()), "Dependency restore failed");
+                    diagnostics.push(format!(
+                        "Dependency restore failed for {}: {}. Using available project details.",
+                        failure.entry.display(),
+                        restore_reason(&failure.detail)
+                    ));
+                }
             }
         }
     }
     unreachable!()
+}
+
+/// BuildManager does not read the CLI's automatic response files. Keep those
+/// roots on the CLI path, including sparse inputs and absent-file watches.
+#[derive(Debug)]
+struct ResponseFiles {
+    cli: BTreeSet<PathBuf>,
+    state: String,
+}
+
+fn automatic_response_entries(
+    entries: &[PathBuf],
+    sdk: &Path,
+    remote: Option<&crate::discovery::RemoteContext>,
+    metadata: &mut BTreeSet<PathBuf>,
+) -> Result<ResponseFiles> {
+    let sdk_response = sdk.join("MSBuild.rsp");
+    metadata.insert(sdk_response.clone());
+    let digest = |path: &Path| -> Result<Option<[u8; 32]>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update_reader(fs::File::open(path)?)?;
+        Ok(Some(*hash.finalize().as_bytes()))
+    };
+    let sdk_digest = digest(&sdk_response)?;
+    let mut checked = BTreeMap::from([(sdk_response, sdk_digest)]);
+    let mut exists = |path: PathBuf| -> Result<bool> {
+        if let Some(found) = checked.get(&path) {
+            return Ok(found.is_some());
+        }
+        metadata.insert(path.clone());
+        if let Some(remote) = remote {
+            remote.require([path.clone()])?;
+            if path.is_file() {
+                ensure!(
+                    path.canonicalize()?
+                        .starts_with(remote.workspace.canonicalize()?),
+                    "MSBuild response file escapes the repository: {}",
+                    path.display()
+                );
+            }
+        }
+        let found = digest(&path)?;
+        checked.insert(path, found);
+        Ok(found.is_some())
+    };
+    let mut result = BTreeSet::new();
+    for entry in entries {
+        let directory = entry.parent().context("MSBuild entry has no parent")?;
+        let mut required = sdk_digest.is_some() | exists(directory.join("MSBuild.rsp"))?;
+        for ancestor in directory.ancestors() {
+            if exists(ancestor.join("Directory.Build.rsp"))? {
+                required = true;
+                break;
+            }
+            if remote.is_some_and(|remote| ancestor == remote.workspace) {
+                break;
+            }
+        }
+        if required {
+            result.insert(entry.clone());
+        }
+    }
+    Ok(ResponseFiles {
+        cli: result,
+        state: blake3::hash(&crate::binary::encode(&checked)?)
+            .to_hex()
+            .to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1082,6 +1210,115 @@ mod diagnostic_tests {
         assert!(workspace.prepare().unwrap().is_none());
         fs::write(fixture.path().join("global.json"), "{}").unwrap();
         assert!(workspace.prepare().unwrap().is_some());
+    }
+
+    #[test]
+    fn ancestor_response_watches_ignore_unrelated_sibling_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(fixture.path().join("global.json"), "{}").unwrap();
+        fs::write(
+            root.join("App.csproj"),
+            r#"<Project><ItemGroup><Compile Include="*.cs" /></ItemGroup></Project>"#,
+        )
+        .unwrap();
+        fs::write(root.join("Source.cs"), "class Source {}").unwrap();
+        let mut workspace = crate::workspace::Workspace::open(
+            root.clone(),
+            cache.path(),
+            crate::discovery::Policy::new(vec![root.clone()]).unwrap(),
+            &cache.path().join("analysis"),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        workspace.refresh().unwrap();
+        assert!(
+            workspace.manifest.diagnostics.is_empty(),
+            "{:?}",
+            workspace.manifest.diagnostics
+        );
+        fs::write(fixture.path().join("unrelated.txt"), "new sibling").unwrap();
+        assert!(workspace.prepare().unwrap().is_none());
+        let response = fixture.path().join("Directory.Build.rsp");
+        fs::write(&response, "-p:FixturePolicy=first").unwrap();
+        assert!(workspace.prepare().unwrap().is_some());
+        workspace.refresh().unwrap();
+        fs::write(&response, "-p:FixturePolicy=second").unwrap();
+        assert!(workspace.prepare().unwrap().is_some());
+        workspace.refresh().unwrap();
+        fs::remove_file(fixture.path().join("unrelated.txt")).unwrap();
+        assert!(workspace.prepare().unwrap().is_none());
+        fs::write(root.join("Added.cs"), "class Added {}").unwrap();
+        assert!(workspace.prepare().unwrap().is_some());
+    }
+
+    #[test]
+    fn response_files_request_sparse_inputs_and_respect_workspace_boundaries() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        let nested = root.join("nested");
+        let sdk = fixture.path().join("sdk");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&sdk).unwrap();
+        fs::write(
+            fixture.path().join("Directory.Build.rsp"),
+            "-p:Outside=true",
+        )
+        .unwrap();
+        let entries = [nested.join("App.csproj"), root.join("Neighbor.csproj")];
+        let mut remote = crate::discovery::RemoteContext {
+            workspace: root.clone(),
+            writable: fixture.path().join("writable"),
+            shared: fixture.path().join("cache"),
+            repositories: Vec::new(),
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new(["nested/MSBuild.rsp".into()].into_iter().collect()),
+        };
+        let mut metadata = BTreeSet::new();
+        let error =
+            automatic_response_entries(&entries, &sdk, Some(&remote), &mut metadata).unwrap_err();
+        assert!(error.is::<crate::discovery::RequiredInputs>());
+        fs::write(nested.join("MSBuild.rsp"), "-p:Feed=offline").unwrap();
+        assert_eq!(
+            automatic_response_entries(&entries, &sdk, Some(&remote), &mut metadata)
+                .unwrap()
+                .cli,
+            [entries[0].clone()].into_iter().collect()
+        );
+        assert!(metadata.contains(&root.join("Directory.Build.rsp")));
+        assert!(metadata.contains(&sdk.join("MSBuild.rsp")));
+        fs::remove_file(nested.join("MSBuild.rsp")).unwrap();
+        remote.tracked = Default::default();
+        assert!(
+            automatic_response_entries(&entries, &sdk, Some(&remote), &mut metadata)
+                .unwrap()
+                .cli
+                .is_empty()
+        );
+        assert_eq!(
+            automatic_response_entries(&entries, &sdk, None, &mut metadata)
+                .unwrap()
+                .cli
+                .len(),
+            entries.len()
+        );
+        fs::write(sdk.join("MSBuild.rsp"), "-p:Feed=offline").unwrap();
+        assert_eq!(
+            automatic_response_entries(&entries, &sdk, Some(&remote), &mut metadata)
+                .unwrap()
+                .cli
+                .len(),
+            entries.len()
+        );
+        std::os::unix::fs::symlink(
+            fixture.path().join("Directory.Build.rsp"),
+            nested.join("MSBuild.rsp"),
+        )
+        .unwrap();
+        assert!(automatic_response_entries(&entries, &sdk, Some(&remote), &mut metadata).is_err());
     }
 
     #[test]

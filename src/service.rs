@@ -14,6 +14,7 @@ mod history;
 mod indexes;
 mod inspection;
 mod preparation;
+mod rust;
 mod validation;
 use std::{
     collections::HashMap,
@@ -110,6 +111,14 @@ pub struct App {
     discovery_started: tokio::sync::Notify,
     #[cfg(test)]
     discovery_pause: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    rust_staged: tokio::sync::Notify,
+    #[cfg(test)]
+    managed_pause: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    rust_query_started: tokio::sync::Notify,
+    #[cfg(test)]
+    rust_query_pause: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     indexing_pause: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -418,6 +427,14 @@ impl App {
             discovery_started: tokio::sync::Notify::new(),
             #[cfg(test)]
             discovery_pause: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            rust_staged: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            managed_pause: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            rust_query_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            rust_query_pause: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             indexing_pause: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -1236,6 +1253,28 @@ impl App {
                 }
             }
             tracing::Span::current().record("stage", "preparation");
+            if let Some(query) = query.as_ref().filter(|query| rust::requested(query))
+                && let Some(branch) = &branch
+            {
+                let Some(ready) = wait
+                    .until(async { Ok(preparation.rust.ready().await) })
+                    .await?
+                else {
+                    return Ok(indexes::pending("Rust setup"));
+                };
+                if let Some(ready) = ready {
+                    return self
+                        .search_rust(
+                            ready,
+                            branch.clone(),
+                            query.clone(),
+                            activity.clone(),
+                            operation.clone(),
+                            &wait,
+                        )
+                        .await;
+                }
+            }
             let inventory = {
                 let _wait = operation.wait("workspace_preparation");
                 let Some(inventory) = wait.until(preparation.inventory()).await? else {
@@ -2701,9 +2740,7 @@ mod tests {
             if info.phase == crate::store::shared::Phase::Deleting {
                 continue;
             }
-            let store = crate::store::Store {
-                scope: database.existing(key).unwrap().unwrap(),
-            };
+            let store = crate::store::Store::from_scope(database.existing(key).unwrap().unwrap());
             if let Some(manifest) = store.get_manifest::<crate::workspace::Manifest>().unwrap() {
                 assert_ne!(manifest.source_group, Some(Group::Native));
             }

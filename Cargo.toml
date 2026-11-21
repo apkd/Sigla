@@ -23,6 +23,7 @@ gix-features = { version = "0.49.1", features = ["progress"] }
 gix-hash = { version = "0.26.2", features = ["sha1", "sha256"] }
 gix-url = "0.38"
 heed = { git = "https://github.com/apkd/heed", rev = "1db589f0f859dfb7a92edcd3bba2b94661efb9f2" }
+memmap2 = "0.9.11"
 inotify = "0.11"
 libc = "0.2"
 lru = "0.16"

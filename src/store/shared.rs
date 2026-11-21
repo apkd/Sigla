@@ -39,7 +39,9 @@ pub struct Names {
 /// Values are already encoded/compressed when they enter the writer.
 #[derive(Serialize, Deserialize)]
 pub struct Encoded {
+    #[serde(deserialize_with = "crate::binary::byte_vec")]
     pub names: Vec<u8>,
+    #[serde(deserialize_with = "crate::binary::byte_map")]
     pub records: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
@@ -420,19 +422,19 @@ impl Database {
             .database_options()
             .types::<Bytes, Bytes>()
             .name("shared-declarations")
-            .flags(DatabaseFlags::DUP_SORT)
+            .flags(DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED)
             .create(&mut tx)?;
         let occurrences = env
             .database_options()
             .types::<Bytes, Bytes>()
             .name("shared-occurrences")
-            .flags(DatabaseFlags::DUP_SORT)
+            .flags(DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED)
             .create(&mut tx)?;
         let globals = env
             .database_options()
             .types::<Bytes, Bytes>()
             .name("shared-global-imports")
-            .flags(DatabaseFlags::DUP_SORT)
+            .flags(DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED)
             .create(&mut tx)?;
         let members = env
             .database_options()
@@ -636,7 +638,8 @@ impl Database {
     fn postings(&self, tx: &mut RwTxn<'_>, ordinal: u64, names: &Names, add: bool) -> Result<()> {
         let partition = ordinal / PARTITION;
         names::changed(self, tx, partition)?;
-        let value = ordinal.to_be_bytes();
+        // The key already contains the high bits of the object ordinal.
+        let value = [(ordinal % PARTITION) as u8];
         for (table, names) in [
             (self.declarations, &names.declarations),
             (self.occurrences, &names.occurrences),
@@ -733,9 +736,10 @@ impl Database {
         ensure!(limit > 0, "Collection batch must be nonzero");
         let pins = self.pins.lock().unwrap();
         let mut tx = self.write()?;
+        let started = std::time::Instant::now();
         let end = unused_key(&[u8::MAX; 32], cutoff);
         let start = after.map_or(Included(UNUSED), Excluded);
-        let mut unused = Vec::<(Vec<u8>, ObjectId)>::new();
+        let mut unused = Vec::<(Vec<u8>, ObjectId, usize)>::new();
         let mut scanned = 0;
         let mut next = None;
         for row in self
@@ -746,9 +750,9 @@ impl Database {
             let id = key[UNUSED.len() + 8..].try_into()?;
             scanned += 1;
             if !pins.contains_key(&id) {
-                unused.push((key.to_vec(), id));
+                unused.push((key.to_vec(), id, scanned));
             }
-            if bound_scan && scanned == limit {
+            if bound_scan && (scanned == limit || unused.len() == BATCH) {
                 next = Some(key.to_vec());
                 break;
             }
@@ -756,14 +760,17 @@ impl Database {
                 break;
             }
         }
-        // Object records are ordered by ID, independently of retirement time.
-        unused.sort_unstable_by_key(|(_, id)| *id);
+        // The writer excludes resurrection. Snapshot builders hold the pin
+        // mutex from before opening their reader until registration finishes.
+        drop(pins);
+        if !bound_scan {
+            unused.sort_unstable_by_key(|(_, id, _)| *id);
+        }
         let mut result = Collected {
-            visited: unused.len(),
             scanned,
             ..Default::default()
         };
-        for (key, id) in &unused {
+        for (key, id, position) in &unused {
             let live = self
                 .live(&tx, id)?
                 .context("Object disappeared inside transaction")?;
@@ -793,7 +800,15 @@ impl Database {
             self.objects.delete(&mut tx, id)?;
             self.control.delete(&mut tx, key)?;
             result.objects += 1;
+            result.visited += 1;
             result.encoded_bytes += live.encoded_bytes;
+            // A resumable pressure pass yields between complete objects. Keep
+            // its cursor at the processed retirement key, not the scanned tail.
+            if bound_scan && started.elapsed() >= std::time::Duration::from_millis(20) {
+                next = Some(key.clone());
+                result.scanned = *position;
+                break;
+            }
         }
         if !unused.is_empty() {
             tx.commit()?;
@@ -999,6 +1014,7 @@ impl Scope {
         };
         Ok(binding.revision == revision)
     }
+    #[cfg(test)]
     pub(crate) fn prepare_reuse(
         &self,
         file: &str,
@@ -1007,14 +1023,25 @@ impl Scope {
         now: u64,
     ) -> Result<Reuse> {
         let tx = self.read()?;
-        if self.matches(&tx, file, &revision)? {
+        self.prepare_reuse_in(&tx, file, revision, input, now)
+    }
+
+    pub(crate) fn prepare_reuse_in(
+        &self,
+        tx: &RoTxn<'_>,
+        file: &str,
+        revision: Vec<u8>,
+        input: Option<ObjectId>,
+        now: u64,
+    ) -> Result<Reuse> {
+        if self.matches(tx, file, &revision)? {
             return Ok(Reuse::Current);
         }
-        self.writable(&tx)?;
+        self.writable(tx)?;
         let object = if let Some(input) = input {
             self.database
                 .control
-                .get(&tx, &record_key(&input, b"input"))?
+                .get(tx, &record_key(&input, b"input"))?
                 .map(|bytes| bytes.try_into())
                 .transpose()?
         } else {
@@ -1023,7 +1050,7 @@ impl Scope {
         let Some(object) = object else {
             return Ok(Reuse::Missing);
         };
-        if self.database.live(&tx, &object)?.is_none() {
+        if self.database.live(tx, &object)?.is_none() {
             // Missing objects need admission.
             return Ok(Reuse::Missing);
         }
@@ -1038,7 +1065,7 @@ impl Scope {
             revision,
             object,
             now,
-            expected: self.binding(&tx, file)?,
+            expected: self.binding(tx, file)?,
             encoded: None,
             input,
         })))
@@ -1159,7 +1186,9 @@ impl Scope {
                 } else {
                     let value = Arc::new(self.encode_object(build()?)?);
                     let mut prepared = self.database.prepared.lock().unwrap();
-                    prepared.retain(|_, object| object.strong_count() != 0);
+                    if prepared.len() == prepared.capacity() {
+                        prepared.retain(|_, object| object.strong_count() != 0);
+                    }
                     prepared.insert(object, Arc::downgrade(&value));
                     value
                 })
@@ -1398,7 +1427,7 @@ impl Scope {
                         table.get_duplicates(tx, &scope_key(partition, term.as_bytes()))?
                     {
                         for row in rows {
-                            self.member_files(tx, row?.1, &mut result)?;
+                            self.member_files(tx, partition, row?.1, &mut result)?;
                         }
                     }
                 }
@@ -1413,7 +1442,7 @@ impl Scope {
                     .get_duplicates(tx, &scope_key(partition, posting_term(name).as_bytes()))?
                 {
                     for row in rows {
-                        self.member_files(tx, row?.1, &mut result)?;
+                        self.member_files(tx, partition, row?.1, &mut result)?;
                     }
                 }
             } else {
@@ -1426,7 +1455,7 @@ impl Scope {
                         && let Some(rows) = table.get_duplicates(tx, key)?
                     {
                         for row in rows {
-                            self.member_files(tx, row?.1, &mut result)?;
+                            self.member_files(tx, partition, row?.1, &mut result)?;
                         }
                     }
                 }
@@ -1443,7 +1472,7 @@ impl Scope {
                 .get_duplicates(tx, &partition.to_be_bytes())?
             {
                 for row in rows {
-                    self.member_files(tx, row?.1, &mut files)?;
+                    self.member_files(tx, partition, row?.1, &mut files)?;
                 }
             }
         }
@@ -1476,20 +1505,23 @@ impl Scope {
     fn member_files(
         &self,
         tx: &RoTxn<'_>,
-        ordinal: &[u8],
+        partition: u64,
+        offset: &[u8],
         result: &mut BTreeSet<String>,
     ) -> Result<()> {
+        let [offset]: [u8; 1] = offset.try_into()?;
+        let ordinal = partition
+            .checked_mul(PARTITION)
+            .and_then(|base| base.checked_add(u64::from(offset)))
+            .context("Invalid posting ordinal")?;
         if let Some(snapshot) = &self.snapshot {
-            if let Some(files) = snapshot
-                .members
-                .get(&u64::from_be_bytes(ordinal.try_into()?))
-            {
+            if let Some(files) = snapshot.members.get(&ordinal) {
                 result.extend(files.iter().cloned());
             }
         } else if let Some(rows) = self
             .database
             .members
-            .get_duplicates(tx, &scope_key(self.id, ordinal))?
+            .get_duplicates(tx, &scope_key(self.id, &ordinal.to_be_bytes()))?
         {
             for row in rows {
                 result.insert(row?.1.to_owned());

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use sha2::Digest;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{Read, Write},
     os::fd::AsFd,
@@ -107,20 +107,94 @@ pub(crate) fn shared_versioned<T>(
     version: &str,
     prepare: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    serialized_versioned(identity, version, || {
-        let mut active = CAPACITY.0.lock().unwrap();
-        while *active >= 2 && !STOPPED.load(std::sync::atomic::Ordering::Acquire) {
-            active = CAPACITY.1.wait(active).unwrap();
+    serialized_versioned(identity, version, || admitted(prepare))
+}
+
+fn admitted<T>(prepare: impl FnOnce() -> Result<T>) -> Result<T> {
+    let mut active = CAPACITY.0.lock().unwrap();
+    while *active >= 2 && !STOPPED.load(std::sync::atomic::Ordering::Acquire) {
+        active = CAPACITY.1.wait(active).unwrap();
+    }
+    check_running()?;
+    *active += 1;
+    drop(active);
+    let _permit = Permit;
+    prepare()
+}
+
+/// Lock destinations before taking one permit for their combined preparation.
+/// Record each destination's preparation and publication failures independently.
+pub(crate) fn shared_many_versioned<T>(
+    identities: &[String],
+    version: &str,
+    prepare: impl FnOnce(&[usize]) -> Vec<Result<T>>,
+) -> Result<Vec<Result<T>>> {
+    let mut order: Vec<_> = (0..identities.len()).collect();
+    order.sort_unstable_by_key(|&index| &identities[index]);
+    ensure!(
+        order
+            .windows(2)
+            .all(|pair| identities[pair[0]] != identities[pair[1]]),
+        "Repeated acquisition destination"
+    );
+    let entries = order
+        .iter()
+        .map(|&index| PREPARATIONS.enter(&identities[index]))
+        .collect::<Result<Vec<_>>>()?;
+    let mut states: BTreeMap<_, _> = order
+        .into_iter()
+        .zip(entries.iter().map(|entry| {
+            entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }))
+        .collect();
+    let mut results = BTreeMap::new();
+    let mut pending = Vec::new();
+    for (&index, state) in &states {
+        match check_failure(state, version) {
+            Ok(()) => pending.push(index),
+            Err(error) => {
+                results.insert(index, Err(error));
+            }
         }
-        ensure!(
-            !STOPPED.load(std::sync::atomic::Ordering::Acquire),
-            crate::diagnostics::Cancelled
-        );
-        *active += 1;
-        drop(active);
-        let _permit = Permit;
-        prepare()
-    })
+    }
+    if !pending.is_empty() {
+        match admitted(|| Ok(prepare(&pending))) {
+            Ok(prepared) => {
+                assert_eq!(prepared.len(), pending.len(), "Missing acquisition results");
+                for (index, result) in pending.into_iter().zip(prepared) {
+                    results.insert(
+                        index,
+                        remember(states.get_mut(&index).unwrap(), version, result),
+                    );
+                }
+            }
+            Err(error) => {
+                let error = Arc::new(error);
+                for index in pending {
+                    results.insert(index, Err(crate::diagnostics::shared_error(error.clone())));
+                }
+            }
+        }
+    }
+    Ok(results.into_values().collect())
+}
+
+/// Observe completed failures without waiting on an acquisition in progress.
+pub(crate) fn check_cached_failure(identity: &str, version: &str) -> Result<()> {
+    let entry = PREPARATIONS.entries.lock().unwrap().get(identity).cloned();
+    let Some(entry) = entry else {
+        return check_running();
+    };
+    match entry.try_lock() {
+        Ok(state) => check_failure(&state, version),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            check_failure(&error.into_inner(), version)
+        }
+        Err(std::sync::TryLockError::WouldBlock) => check_running(),
+    }
 }
 
 /// Serialize a destination whose preparation owns its own resource admission.
@@ -128,7 +202,7 @@ pub(crate) fn serialized<T>(identity: &str, prepare: impl FnOnce() -> Result<T>)
     serialized_versioned(identity, "", prepare)
 }
 
-fn serialized_versioned<T>(
+pub(crate) fn serialized_versioned<T>(
     identity: &str,
     version: &str,
     prepare: impl FnOnce() -> Result<T>,
@@ -138,17 +212,30 @@ fn serialized_versioned<T>(
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(failure) = &*state
+    check_failure(&state, version)?;
+    remember(&mut state, version, prepare())
+}
+
+fn check_failure(state: &Option<Failure>, version: &str) -> Result<()> {
+    if let Some(failure) = state
         && failure.version == version
         && failure.at.elapsed() < FAILURE_COOLDOWN
     {
         return Err(crate::diagnostics::shared_error(failure.error.clone()));
     }
+    check_running()
+}
+
+pub(crate) fn check_running() -> Result<()> {
     ensure!(
         !STOPPED.load(std::sync::atomic::Ordering::Acquire),
         crate::diagnostics::Cancelled
     );
-    match prepare() {
+    Ok(())
+}
+
+fn remember<T>(state: &mut Option<Failure>, version: &str, result: Result<T>) -> Result<T> {
+    match result {
         Ok(value) => {
             *state = None;
             Ok(value)
@@ -223,10 +310,31 @@ fn extract_transfer(
     integrity: Option<&str>,
     retain: impl Fn(&Path) -> bool,
 ) -> Result<(Vec<String>, u64)> {
+    receive(
+        |writer| transfer_verified(response, writer, integrity),
+        |reader| extract(reader.as_fd(), destination, retain),
+    )
+}
+
+pub(crate) fn stream<T>(
+    response: reqwest::blocking::Response,
+    consume: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
+    receive(
+        |writer| transfer_verified(response, writer, None),
+        |reader| consume(reader),
+    )
+    .map(|(value, _)| value)
+}
+
+fn receive<T>(
+    download: impl FnOnce(&mut std::io::PipeWriter) -> Result<u64> + Send,
+    consume: impl FnOnce(&mut std::io::PipeReader) -> Result<T>,
+) -> Result<(T, u64)> {
     let (mut reader, mut writer) = std::io::pipe()?;
     std::thread::scope(|scope| {
-        let download = scope.spawn(move || transfer_verified(response, &mut writer, integrity));
-        let extracted = extract(reader.as_fd(), destination, retain);
+        let download = scope.spawn(move || download(&mut writer));
+        let extracted = consume(&mut reader);
         // Tar readers may stop before the compressed stream ends. Drain the
         // bounded pipe so every downloaded byte participates in verification.
         let drained = if extracted.is_ok() {
@@ -239,9 +347,24 @@ fn extract_transfer(
         let downloaded = download
             .join()
             .map_err(|_| anyhow::anyhow!("Archive download worker panicked"))?;
-        let inventory = extracted?;
-        drained?;
-        Ok((inventory, downloaded?))
+        // A decoder rejection closes the pipe. Other transfer failures must
+        // preserve their original cause, especially typed cancellation.
+        match (extracted, downloaded) {
+            (Err(error), _) if crate::diagnostics::cancelled(&error) => Err(error),
+            (Err(extracted), Err(downloaded))
+                if downloaded
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe) =>
+            {
+                Err(extracted)
+            }
+            (_, Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+            (Ok(inventory), Ok(bytes)) => {
+                drained?;
+                Ok((inventory, bytes))
+            }
+        }
     })
 }
 
@@ -380,6 +503,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_preparation_keeps_order_and_independent_cooldowns() {
+        let root = tempfile::tempdir().unwrap();
+        let keys: Vec<_> = ["last", "first", "middle"]
+            .map(|name| root.path().join(name).display().to_string())
+            .into();
+        let first = shared_many_versioned(&keys, "one", |indices| {
+            assert_eq!(indices, &[0, 1, 2]);
+            assert!(check_cached_failure(&keys[0], "one").is_ok());
+            vec![Ok(0), Err(anyhow::anyhow!("bad member")), Ok(2)]
+        })
+        .unwrap();
+        assert!(first[0].is_ok());
+        assert!(first[1].is_err());
+        assert!(first[2].is_ok());
+        assert!(check_cached_failure(&keys[1], "one").is_err());
+        let retried = shared_many_versioned(&keys, "one", |indices| {
+            assert_eq!(indices, &[0, 2]);
+            indices.iter().map(|&index| Ok(index)).collect()
+        })
+        .unwrap();
+        assert_eq!(*retried[0].as_ref().unwrap(), 0);
+        assert!(retried[1].is_err());
+        assert_eq!(*retried[2].as_ref().unwrap(), 2);
+        let blocked =
+            shared_many_versioned::<()>(&keys[1..2], "one", |_| panic!("Cached failure retried"))
+                .unwrap();
+        assert!(blocked[0].is_err());
+        assert!(
+            shared_many_versioned::<()>(&[keys[0].clone(), keys[0].clone()], "one", |_| panic!(
+                "Duplicate keys admitted"
+            ))
+            .is_err()
+        );
+        let changed = shared_many_versioned(&keys, "two", |indices| {
+            indices.iter().map(|_| Ok(())).collect()
+        })
+        .unwrap();
+        assert!(changed.iter().all(Result::is_ok));
+    }
+
+    #[test]
     fn preparation_registry_preserves_waiters_and_bounds_failure_bursts() {
         let registry = Preparations {
             entries: Mutex::new(HashMap::new()),
@@ -441,7 +605,18 @@ mod tests {
     fn cancelled_or_panicking_acquisitions_allow_an_immediate_retry() {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().to_str().unwrap();
-        let cancelled = serialized::<()>(key, || Err(crate::diagnostics::Cancelled.into()));
+        let cancelled = serialized(key, || {
+            receive(
+                |writer| {
+                    writer.write_all(b"x")?;
+                    Err(crate::diagnostics::Cancelled.into())
+                },
+                |reader| {
+                    reader.read_exact(&mut [0; 2])?;
+                    Ok(())
+                },
+            )
+        });
         assert!(crate::diagnostics::cancelled(&cancelled.unwrap_err()));
         serialized(key, || Ok(())).unwrap();
         assert!(
@@ -449,6 +624,45 @@ mod tests {
         );
         serialized(key, || Ok(())).unwrap();
         assert!(!PREPARATIONS.entries.lock().unwrap().contains_key(key));
+    }
+
+    #[test]
+    fn streamed_failures_keep_transport_and_consumer_causes() {
+        let disconnected = receive(
+            |writer| {
+                writer.write_all(b"x")?;
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into())
+            },
+            |reader| {
+                reader.read_exact(&mut [0; 2])?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            disconnected
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+
+        let rejected = receive(
+            |writer| {
+                writer.write_all(&[0; 128 * 1024])?;
+                Ok(0)
+            },
+            |_| Err::<(), _>(crate::diagnostics::DependencyUnavailable("invalid archive").into()),
+        )
+        .unwrap_err();
+        assert!(rejected.is::<crate::diagnostics::DependencyUnavailable>());
+
+        let cancelled = receive(
+            |_| Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()),
+            |_| Err::<(), _>(crate::diagnostics::Cancelled.into()),
+        )
+        .unwrap_err();
+        assert!(crate::diagnostics::cancelled(&cancelled));
     }
 
     fn archive(bytes: &[u8]) -> File {

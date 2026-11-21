@@ -335,7 +335,7 @@ pub(super) fn files(root: &Path) -> Result<Vec<PathBuf>> {
 pub(super) fn artifacts(input: &Path) -> Result<Vec<Artifact>> {
     files(input)?
         .into_iter()
-        .filter(|p| p.to_string_lossy().ends_with(".tar.bin"))
+        .filter(|p| p.to_string_lossy().ends_with(".sigla.bin"))
         .map(|p| binary::decode(payload(&read(&p)?)?))
         .collect()
 }

@@ -13,18 +13,62 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
 
+pub(super) const MAGIC: &[u8] = b"version https://git-lfs.github.com/spec/";
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Metrics {
     pub reused_bytes: u64,
     pub checksum_bytes: u64,
     pub linked_files: u64,
+}
+
+/// The hydration worker needs no Git inventory or prior path-to-object maps.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct Hydration {
+    repository: String,
+    allow_private: bool,
+    transport: Option<String>,
+    staging: PathBuf,
+    remaining: Option<u64>,
+    paths: Vec<String>,
+}
+
+impl Hydration {
+    pub fn new(request: &Request, prepared: &Prepared, paths: Vec<String>) -> Self {
+        Self {
+            repository: request.repository.clone(),
+            allow_private: request.allow_private,
+            transport: prepared.transport.clone(),
+            staging: request.staging.clone(),
+            remaining: request.remaining(prepared.transfer_bytes),
+            paths,
+        }
+    }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct Changes {
+    pub transfer_bytes: u64,
+    pub omitted: BTreeMap<String, String>,
+    pub unavailable: BTreeSet<String>,
+}
+
+impl Changes {
+    pub fn apply(self, prepared: &mut Prepared) {
+        prepared.transfer_bytes += self.transfer_bytes;
+        for (path, reason) in self.omitted {
+            prepared.selected.remove(&path);
+            prepared.omitted.insert(path, reason);
+        }
+        prepared.unavailable.extend(self.unavailable);
+    }
 }
 
 struct Counted<'a, R> {
@@ -41,6 +85,7 @@ impl<R: Read> Read for Counted<'_, R> {
 }
 
 /// Inputs whose Git contents cannot yet be used for source navigation.
+#[cfg(test)]
 pub(super) fn pending(staging: &Path, prepared: &Prepared) -> Result<Vec<String>> {
     let mut paths = Vec::new();
     for path in prepared.selected.keys() {
@@ -296,7 +341,7 @@ fn batch(
         "LFS batch request failed ({})",
         response.status()
     );
-    let batch: Batch = serde_json::from_reader(response.take(1024 * 1024))
+    let batch: Batch = serde_json::from_reader(BufReader::new(response.take(1024 * 1024)))
         .context("Invalid LFS batch response")?;
     let mut objects = BTreeMap::new();
     for object in batch.objects {
@@ -327,14 +372,14 @@ impl Pending {
     fn unavailable(
         &self,
         error: &anyhow::Error,
-        request: &Request,
-        prepared: &mut Prepared,
+        request: &Hydration,
+        changes: &mut Changes,
     ) -> Result<()> {
         for path in &self.paths {
             // Never log remote response bodies, URLs or credentials.
             tracing::warn!(path, reason = %error, "Skipping unavailable LFS input");
             fs::remove_file(request.staging.join(path))?;
-            prepared.unavailable.insert(path.clone());
+            changes.unavailable.insert(path.clone());
         }
         Ok(())
     }
@@ -431,9 +476,43 @@ fn store_download(
     Ok(())
 }
 
-pub(super) fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Result<Metrics> {
-    if prepared.selected.is_empty() {
-        return Ok(Metrics::default());
+fn claim(objects: &Path, pointer: &Pointer, deadline: Instant) -> Result<File> {
+    let claims = objects.join(".claims");
+    fs::create_dir_all(&claims)?;
+    let claim = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(claims.join(&pointer.oid))?;
+    loop {
+        match claim.try_lock() {
+            Ok(()) => return Ok(claim),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "LFS preparation time budget exhausted; retrying on the next preparation"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) -> Result<Metrics> {
+    let paths = prepared.selected.keys().cloned().collect::<Vec<_>>();
+    let (changes, metrics) = hydrate_selected(&Hydration::new(request, prepared, paths), cache)?;
+    changes.apply(prepared);
+    Ok(metrics)
+}
+
+pub(super) fn hydrate_selected(request: &Hydration, cache: &Path) -> Result<(Changes, Metrics)> {
+    if request.paths.is_empty() {
+        return Ok((Changes::default(), Metrics::default()));
     }
     let repository = Repository::parse(&request.repository)?.context("Missing repository")?;
     let client = std::sync::LazyLock::new(|| {
@@ -443,12 +522,14 @@ pub(super) fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) 
             .timeout(Duration::from_secs(20))
             .build()
     });
-    let transport = prepared.transport.clone();
+    let transport = request.transport.clone();
     let mut authentication = None;
-    hydrate_with(
+    let mut changes = Changes::default();
+    let metrics = hydrate_paths(
         request,
-        prepared,
+        &mut changes,
         cache,
+        Instant::now() + Duration::from_secs(90),
         |pointers| {
             let authentication = authentication
                 .get_or_insert_with(|| {
@@ -477,13 +558,38 @@ pub(super) fn hydrate(request: &Request, prepared: &mut Prepared, cache: &Path) 
                 transferred,
             )
         },
-    )
+    )?;
+    Ok((changes, metrics))
 }
 
+#[cfg(test)]
 fn hydrate_with(
     request: &Request,
     prepared: &mut Prepared,
     cache: &Path,
+    acquire: impl FnMut(&[&Pointer]) -> Result<BTreeMap<String, Object>>,
+    download: impl Fn(&Action, &Pointer, &Path, &crate::cache::blobs::Store, &mut u64) -> Result<()>
+    + Sync,
+) -> Result<Metrics> {
+    let paths = prepared.selected.keys().cloned().collect::<Vec<_>>();
+    let mut changes = Changes::default();
+    let result = hydrate_paths(
+        &Hydration::new(request, prepared, paths),
+        &mut changes,
+        cache,
+        Instant::now() + Duration::from_secs(90),
+        acquire,
+        download,
+    );
+    changes.apply(prepared);
+    result
+}
+
+fn hydrate_paths(
+    request: &Hydration,
+    changes: &mut Changes,
+    cache: &Path,
+    deadline: Instant,
     mut acquire: impl FnMut(&[&Pointer]) -> Result<BTreeMap<String, Object>>,
     download: impl Fn(&Action, &Pointer, &Path, &crate::cache::blobs::Store, &mut u64) -> Result<()>
     + Sync,
@@ -493,9 +599,8 @@ fn hydrate_with(
     let mut directories = BTreeSet::new();
     // Leave time for Git preparation and publication under the worker deadline.
     // Later preparations retry unavailable inputs and reuse verified objects.
-    let started = Instant::now();
     let mut pending: BTreeMap<String, Pending> = BTreeMap::new();
-    for path in prepared.selected.keys() {
+    for path in &request.paths {
         let target = request.staging.join(path);
         if !target.is_file() {
             continue;
@@ -520,7 +625,7 @@ fn hydrate_with(
                 && crate::documents::language(Path::new(path)).is_none()
                 && crate::native::language(Path::new(path)).is_none()
             {
-                prepared.omitted.insert(
+                changes.omitted.insert(
                     path.clone(),
                     "LFS payload format was not selected for analysis".into(),
                 );
@@ -528,7 +633,7 @@ fn hydrate_with(
                 return Ok(());
             }
             if asset && pointer.size > super::selection::ASSET_LIMIT {
-                prepared.omitted.insert(
+                changes.omitted.insert(
                     path.clone(),
                     format!("LFS asset exceeds size limit ({} bytes)", pointer.size),
                 );
@@ -553,12 +658,9 @@ fn hydrate_with(
             // Log only our context, never remote response bodies, URLs or credentials.
             tracing::warn!(path, reason = %error, "Skipping unavailable LFS input");
             fs::remove_file(&target)?;
-            prepared.unavailable.insert(path.clone());
+            changes.unavailable.insert(path.clone());
         }
     }
-    prepared
-        .selected
-        .retain(|path, _| !prepared.omitted.contains_key(path));
     if pending.is_empty() {
         sync_directories(&directories)?;
         return Ok(metrics);
@@ -570,38 +672,58 @@ fn hydrate_with(
     let jobs: Vec<_> = pending.into_values().collect();
     // Each batch reserves its full declared size before concurrent transfers start.
     // Failures charge only bytes actually read, just as successful transfers do.
-    for group in jobs.chunks(4) {
-        let mut missing = Vec::new();
-        for job in group {
-            match cached(&job.pointer, &objects, &files, &mut metrics) {
-                Ok(true) => {
-                    let result = job.publish(&objects.join(&job.pointer.oid), &request.staging);
-                    if let Err(error) = result {
-                        job.unavailable(&error, request, prepared)?;
-                    } else {
-                        metrics.linked_files += job.paths.len() as u64;
+    let mut groups: Vec<Vec<_>> = jobs.chunks(4).map(|group| group.iter().collect()).collect();
+    let mut next = 0;
+    while next < groups.len() {
+        let first = next;
+        let mut total = 0u64;
+        // Share one action lookup across several transfer groups. Stop at the
+        // affordable prefix so a later group cannot prevent earlier progress.
+        while next < groups.len() && next - first < 8 {
+            // Other selectors can publish objects while earlier batches transfer.
+            // Resolve those hits before charging the next batch's budget.
+            let mut missing = Vec::new();
+            for job in std::mem::take(&mut groups[next]) {
+                match cached(&job.pointer, &objects, &files, &mut metrics) {
+                    Ok(true) => {
+                        if let Err(error) =
+                            job.publish(&objects.join(&job.pointer.oid), &request.staging)
+                        {
+                            job.unavailable(&error, request, changes)?;
+                        } else {
+                            metrics.linked_files += job.paths.len() as u64;
+                        }
                     }
+                    Ok(false) => missing.push(job),
+                    Err(error) => job.unavailable(&error, request, changes)?,
                 }
-                Ok(false) => missing.push(job),
-                Err(error) => job.unavailable(&error, request, prepared)?,
             }
+            groups[next] = missing;
+            let cost = groups[next]
+                .iter()
+                .try_fold(total, |bytes, job| bytes.checked_add(job.pointer.size))
+                .context("LFS batch size overflow")?;
+            if request
+                .remaining
+                .map(|remaining| remaining.saturating_sub(changes.transfer_bytes))
+                .is_some_and(|n| cost > n)
+            {
+                ensure!(
+                    next > first,
+                    "Repository transfer limit exceeded by LFS objects"
+                );
+                break;
+            }
+            total = cost;
+            next += 1;
         }
+        let missing: Vec<_> = groups[first..next].iter().flatten().copied().collect();
         if missing.is_empty() {
             continue;
         }
-        let total = missing
-            .iter()
-            .try_fold(0u64, |total, job| total.checked_add(job.pointer.size))
-            .context("LFS batch size overflow")?;
-        ensure!(
-            request
-                .remaining(prepared.transfer_bytes)
-                .is_none_or(|n| total <= n),
-            "Repository transfer limit exceeded by LFS objects"
-        );
         let batch = (|| -> Result<_> {
             ensure!(
-                started.elapsed() < Duration::from_secs(90),
+                Instant::now() < deadline,
                 "LFS preparation time budget exhausted; retrying on the next preparation"
             );
             acquire(&missing.iter().map(|job| &job.pointer).collect::<Vec<_>>())
@@ -610,7 +732,7 @@ fn hydrate_with(
             Ok(batch) => batch,
             Err(error) => {
                 for job in missing {
-                    job.unavailable(&error, request, prepared)?;
+                    job.unavailable(&error, request, changes)?;
                 }
                 continue;
             }
@@ -626,44 +748,60 @@ fn hydrate_with(
                 None => job.unavailable(
                     &anyhow::anyhow!("LFS object is unavailable"),
                     request,
-                    prepared,
+                    changes,
                 )?,
             }
         }
-        let results = std::thread::scope(|scope| -> Result<Vec<_>> {
-            let handles: Vec<_> = downloads
-                .iter()
-                .map(|(job, action)| {
-                    let download = &download;
-                    let objects = &objects;
-                    let files = &files;
-                    scope.spawn(move || {
-                        let mut transferred = 0;
-                        let result =
-                            download(action, &job.pointer, objects, files, &mut transferred)
-                                .and_then(|_| {
-                                    job.publish(&objects.join(&job.pointer.oid), &request.staging)
-                                });
-                        (*job, transferred, result)
+        for downloads in downloads.chunks(4) {
+            let results = std::thread::scope(|scope| -> Result<Vec<_>> {
+                let handles: Vec<_> = downloads
+                    .iter()
+                    .map(|(job, action)| {
+                        let download = &download;
+                        let objects = &objects;
+                        let files = &files;
+                        scope.spawn(move || {
+                            let mut transferred = 0;
+                            let mut metrics = Metrics::default();
+                            let result = (|| -> Result<()> {
+                                // Each active worker owns at most one claim. The blob
+                                // lease prevents collection from unlinking its lock.
+                                let _claim = claim(objects, &job.pointer, deadline)?;
+                                if !cached(&job.pointer, objects, files, &mut metrics)? {
+                                    ensure!(Instant::now() < deadline,
+                                        "LFS preparation time budget exhausted; retrying on the next preparation");
+                                    download(
+                                        action,
+                                        &job.pointer,
+                                        objects,
+                                        files,
+                                        &mut transferred,
+                                    )?;
+                                }
+                                job.publish(&objects.join(&job.pointer.oid), &request.staging)
+                            })();
+                            (*job, transferred, metrics, result)
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("LFS download worker panicked"))
-                })
-                .collect()
-        })?;
-        for (job, transferred, result) in results {
-            prepared.transfer_bytes += transferred;
-            metrics.checksum_bytes += transferred;
-            if let Err(error) = result {
-                job.unavailable(&error, request, prepared)?;
-            } else {
-                metrics.linked_files += job.paths.len() as u64;
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("LFS download worker panicked"))
+                    })
+                    .collect()
+            })?;
+            for (job, transferred, reused, result) in results {
+                changes.transfer_bytes += transferred;
+                metrics.checksum_bytes += transferred + reused.checksum_bytes;
+                metrics.reused_bytes += reused.reused_bytes;
+                if let Err(error) = result {
+                    job.unavailable(&error, request, changes)?;
+                } else {
+                    metrics.linked_files += job.paths.len() as u64;
+                }
             }
         }
     }
@@ -894,6 +1032,163 @@ mod tests {
     }
 
     #[test]
+    fn selectors_share_downloads_and_retry_failed_owners() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for fail_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let bytes = b"class Shared {}";
+            let requests = ["first", "second"]
+                .map(|name| preparation(&root.path().join(name), &[("shared.cs", bytes)]));
+            let lookup = Barrier::new(2);
+            let downloads = AtomicUsize::new(0);
+            let results = std::thread::scope(|scope| {
+                requests
+                    .into_iter()
+                    .map(|(request, mut prepared)| {
+                        let lookup = &lookup;
+                        let downloads = &downloads;
+                        let cache = root.path();
+                        scope.spawn(move || {
+                            let metrics = hydrate_with(
+                                &request,
+                                &mut prepared,
+                                cache,
+                                |pointers| {
+                                    lookup.wait();
+                                    actions(pointers)
+                                },
+                                |_, pointer, cache, files, transferred| {
+                                    let attempt = downloads.fetch_add(1, Ordering::Relaxed);
+                                    if fail_first && attempt == 0 {
+                                        *transferred += 1;
+                                        anyhow::bail!("Interrupted owner");
+                                    }
+                                    store_download(
+                                        bytes.as_slice(),
+                                        pointer,
+                                        cache,
+                                        files,
+                                        transferred,
+                                    )
+                                },
+                            )
+                            .unwrap();
+                            if prepared.unavailable.is_empty() {
+                                assert_eq!(
+                                    fs::read(request.staging.join("shared.cs")).unwrap(),
+                                    bytes
+                                );
+                            }
+                            (prepared, metrics)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                downloads.load(Ordering::Relaxed),
+                1 + usize::from(fail_first)
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|(prepared, _)| prepared.transfer_bytes)
+                    .sum::<u64>(),
+                bytes.len() as u64 + u64::from(fail_first)
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|(prepared, _)| !prepared.unavailable.is_empty())
+                    .count(),
+                usize::from(fail_first)
+            );
+            if !fail_first {
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|(_, metrics)| metrics.reused_bytes)
+                        .sum::<u64>(),
+                    bytes.len() as u64
+                );
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    fs::metadata(root.path().join("first/source/shared.cs"))
+                        .unwrap()
+                        .ino(),
+                    fs::metadata(root.path().join("second/source/shared.cs"))
+                        .unwrap()
+                        .ino()
+                );
+            }
+            let claims = root.path().join("lfs/.claims");
+            let files = crate::cache::blobs::Store::open(root.path()).unwrap();
+            let lease = files.lease().unwrap();
+            files.collect_with_pressure(true).unwrap();
+            assert!(fs::read_dir(&claims).unwrap().next().is_some());
+            drop(lease);
+            files.collect_with_pressure(true).unwrap();
+            assert!(fs::read_dir(claims).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn action_lookups_cover_multiple_bounded_transfer_groups() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let sources: Vec<_> = (0..13)
+            .map(|index| (format!("{index}.cs"), format!("class C{index} {{}}")))
+            .collect();
+        let inputs: Vec<_> = sources
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_bytes()))
+            .collect();
+        let (request, mut prepared) = preparation(root.path(), &inputs);
+        let contents: BTreeMap<_, _> = inputs
+            .iter()
+            .map(|(_, bytes)| (format!("{:x}", Sha256::digest(bytes)), *bytes))
+            .collect();
+        let lookups = AtomicUsize::new(0);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        hydrate_with(
+            &request,
+            &mut prepared,
+            root.path(),
+            |pointers| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                actions(pointers)
+            },
+            |_, pointer, cache, files, transferred| {
+                peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let result =
+                    store_download(contents[&pointer.oid], pointer, cache, files, transferred);
+                active.fetch_sub(1, Ordering::SeqCst);
+                result
+            },
+        )
+        .unwrap();
+        assert!(lookups.load(Ordering::Relaxed) < inputs.len().div_ceil(4));
+        assert!(peak.load(Ordering::Relaxed) <= 4);
+        assert!(prepared.unavailable.is_empty());
+        assert_eq!(
+            prepared.transfer_bytes,
+            contents
+                .values()
+                .map(|bytes| bytes.len() as u64)
+                .sum::<u64>()
+        );
+        for (path, bytes) in inputs {
+            assert_eq!(fs::read(request.staging.join(path)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn failed_download_cannot_publish_or_replace_verified_bytes() {
         let root = tempfile::tempdir().unwrap();
         let objects = root.path().join("lfs");
@@ -952,6 +1247,99 @@ mod tests {
             .is_err()
         );
         assert_eq!(prepared.transfer_bytes, before);
+    }
+
+    #[test]
+    fn later_batches_reuse_concurrent_publications_before_checking_transfer_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let inputs: &[(&str, &[u8])] = &[
+            ("a.cs", b"aaa"),
+            ("b.cs", b"bbb"),
+            ("c.cs", b"ccc"),
+            ("d.cs", b"ddd"),
+            ("e.cs", b"eee"),
+        ];
+        let (request, mut prepared) = preparation(root.path(), inputs);
+        let contents: BTreeMap<_, _> = inputs
+            .iter()
+            .map(|(_, bytes)| (format!("{:x}", Sha256::digest(bytes)), *bytes))
+            .collect();
+        let allowance = inputs[..4]
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        prepared.transfer_bytes = request.remaining(0).unwrap() - allowance;
+        let before = prepared.transfer_bytes;
+        hydrate_with(
+            &request,
+            &mut prepared,
+            root.path(),
+            |pointers| {
+                let (oid, bytes) = contents
+                    .iter()
+                    .find(|(oid, _)| !pointers.iter().any(|p| &p.oid == *oid))
+                    .unwrap();
+                let pointer = Pointer {
+                    oid: oid.clone(),
+                    size: bytes.len() as u64,
+                };
+                let files = crate::cache::blobs::Store::open(root.path())?;
+                store_download(*bytes, &pointer, &root.path().join("lfs"), &files, &mut 0)?;
+                actions(pointers)
+            },
+            |_, pointer, objects, files, transferred| {
+                store_download(contents[&pointer.oid], pointer, objects, files, transferred)
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.transfer_bytes, before + allowance);
+        assert!(prepared.unavailable.is_empty());
+        for (path, bytes) in inputs {
+            assert_eq!(fs::read(request.staging.join(path)).unwrap(), *bytes);
+        }
+    }
+
+    #[test]
+    fn expired_actions_reuse_completed_objects_without_starting_more_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let inputs: &[(&str, &[u8])] = &[("a.cs", b"aaa"), ("b.cs", b"bbb")];
+        let (request, prepared) = preparation(root.path(), inputs);
+        let contents: BTreeMap<_, _> = inputs
+            .iter()
+            .map(|(_, bytes)| (format!("{:x}", Sha256::digest(bytes)), *bytes))
+            .collect();
+        let request = Hydration::new(
+            &request,
+            &prepared,
+            prepared.selected.keys().cloned().collect(),
+        );
+        let mut changes = Changes::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let metrics = hydrate_paths(
+            &request,
+            &mut changes,
+            root.path(),
+            deadline,
+            |pointers| {
+                let files = crate::cache::blobs::Store::open(root.path())?;
+                store_download(
+                    contents[&pointers[0].oid],
+                    pointers[0],
+                    &root.path().join("lfs"),
+                    &files,
+                    &mut 0,
+                )?;
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                actions(pointers)
+            },
+            |_, _, _, _, _| panic!("Expired work must not start a transfer"),
+        )
+        .unwrap();
+        assert_eq!(metrics.linked_files, 1);
+        assert_eq!(changes.unavailable.len(), 1);
+        assert_eq!(changes.transfer_bytes, 0);
     }
 
     #[test]

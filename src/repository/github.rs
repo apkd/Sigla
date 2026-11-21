@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::Read,
+    io::{BufReader, Read},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -69,9 +69,9 @@ pub fn sizes(
                     details.push(format!("{name}={value}"));
                 }
             }
-            if let Ok(error) =
-                serde_json::from_reader::<_, serde_json::Value>(response.take(16 * 1024))
-                && let Some(message) = error["message"].as_str()
+            if let Ok(error) = serde_json::from_reader::<_, serde_json::Value>(BufReader::new(
+                response.take(16 * 1024),
+            )) && let Some(message) = error["message"].as_str()
             {
                 details.push(message.to_owned());
             }
@@ -80,7 +80,7 @@ pub fn sizes(
                 details.join("; ")
             );
         }
-        serde_json::from_reader(response.take(16 * 1024 * 1024))
+        serde_json::from_reader(BufReader::new(response.take(16 * 1024 * 1024)))
             .context("Invalid GitHub file inventory")
     };
     let sizes = inventory(revision, fetch)?;

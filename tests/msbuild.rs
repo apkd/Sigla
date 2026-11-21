@@ -23,6 +23,128 @@ fn installed_sdk_policy() -> String {
 }
 
 #[test]
+fn automatic_response_files_supply_offline_restore_sources() {
+    let producer = tempfile::tempdir().unwrap();
+    let feed = tempfile::tempdir().unwrap();
+    write(producer.path(), "global.json", &installed_sdk_policy());
+    let offline = "<configuration><packageSources><clear /></packageSources></configuration>";
+    write(producer.path(), "NuGet.Config", offline);
+    write(
+        producer.path(),
+        "FeedSource.cs",
+        "public class FromOfflineFeed {}",
+    );
+    write(
+        producer.path(),
+        "Fixture.csproj",
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <TargetFramework>net10.0</TargetFramework>
+            <PackageId>Sigla.AutoResponse.Fixture</PackageId>
+            <IncludeBuildOutput>false</IncludeBuildOutput>
+          </PropertyGroup>
+          <ItemGroup><Content Include="FeedSource.cs" Pack="true"
+            PackagePath="contentFiles/cs/any" BuildAction="Compile" /></ItemGroup>
+        </Project>"#,
+    );
+    let packed = std::process::Command::new("dotnet")
+        .current_dir(producer.path())
+        .args(["pack", "Fixture.csproj", "-p:NoBuild=true", "--output"])
+        .arg(feed.path())
+        .output()
+        .unwrap();
+    assert!(
+        packed.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&packed.stdout),
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    for response in ["Directory.Build.rsp", "app/MSBuild.rsp"] {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write(root.path(), "global.json", &installed_sdk_policy());
+        write(root.path(), "NuGet.Config", offline);
+        write(
+            root.path(),
+            response,
+            &format!(
+                "-p:RestoreSources=\"{}\"\n-p:ResponseChoice=FirstChoice\n",
+                feed.path().display()
+            ),
+        );
+        write(
+            root.path(),
+            "app/App.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><PackageReference Include="Sigla.AutoResponse.Fixture" Version="1.0.0" /></ItemGroup>
+              <ItemGroup><Compile Include="$(MSBuildProjectExtensionsPath)/ResponseChoice.cs" /></ItemGroup>
+              <Target Name="RecordResponseChoice" AfterTargets="Restore">
+                <WriteLinesToFile File="$(MSBuildProjectExtensionsPath)/ResponseChoice.cs"
+                  Lines="public class $(ResponseChoice) {}" Overwrite="true" />
+              </Target>
+            </Project>"#,
+        );
+        // A neighboring root without a response file still uses grouped restore.
+        write(
+            root.path(),
+            "neighbor/Neighbor.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#,
+        );
+        write(
+            root.path(),
+            "neighbor/Neighbor.cs",
+            "public class Neighbor {}",
+        );
+        let policy = Policy::new(vec![root.path().into(), cache.path().into()]).unwrap();
+        let found = discover_cached(root.path(), &policy, cache.path()).unwrap();
+        assert!(
+            found
+                .sources
+                .iter()
+                .any(|file| file.path.ends_with("FeedSource.cs")),
+            "{response}: {:?}",
+            found.diagnostics
+        );
+        assert!(found.projects.iter().any(|project| {
+            project.origin.as_ref() == Some(&root.path().join("neighbor/Neighbor.csproj"))
+        }));
+        assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
+        let generated = found
+            .sources
+            .iter()
+            .find(|file| file.path.ends_with("ResponseChoice.cs"))
+            .expect("Restore target did not supply its generated source")
+            .path
+            .clone();
+        assert!(
+            std::fs::read_to_string(&generated)
+                .unwrap()
+                .contains("FirstChoice")
+        );
+        write(
+            root.path(),
+            response,
+            &format!(
+                "-p:RestoreSources=\"{}\"\n-p:ResponseChoice=SecondChoice\n",
+                feed.path().display()
+            ),
+        );
+        let refreshed = discover_cached(root.path(), &policy, cache.path()).unwrap();
+        assert!(
+            refreshed.diagnostics.is_empty(),
+            "{:?}",
+            refreshed.diagnostics
+        );
+        assert!(
+            std::fs::read_to_string(generated)
+                .unwrap()
+                .contains("SecondChoice")
+        );
+    }
+}
+
+#[test]
 fn sdk_policy_failure_recovers_and_nested_scopes_remain_independent() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -72,6 +72,7 @@ pub enum Contents {
     All,
     Sources,
     Inventory,
+    Reference,
     Only(BTreeSet<String>),
 }
 
@@ -162,6 +163,19 @@ pub(super) struct Metrics {
     pub extracted_bytes: u64,
     pub reused_files: u64,
     pub reused_bytes: u64,
+    pub staged: Vec<StagedFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct StagedFile {
+    pub path: String,
+    pub extracted: bool,
+    pub lfs: bool,
+}
+
+pub(super) struct Acquired {
+    pub prepared: Prepared,
+    pub staged: Vec<StagedFile>,
 }
 
 pub(super) fn git(store: &Path) -> Command {
@@ -603,6 +617,10 @@ fn prepare_fresh(
     let store_exists = request.store.join("HEAD").is_file();
     let mut session = connect(&repository)?;
     let resolved = super::revision::resolve(&mut session, &request.target, |session, prefix| {
+        ensure!(
+            !matches!(request.contents, Contents::Reference),
+            "Commit prefix requires object acquisition"
+        );
         super::revision::init(&request.store, session.object_format()?)?;
         super::revision::Prefix {
             repository: &repository,
@@ -617,9 +635,16 @@ fn prepare_fresh(
     let resolved_target = resolved
         .pinned
         .then(|| Target::Commit(revision.to_string()));
-    if matches!(request.target, Target::DefaultBranch) {
-        let name = branch.context("Repository does not advertise a default branch")?;
-        super::validate_branch(&name)?;
+    if matches!(request.target, Target::DefaultBranch)
+        || matches!(request.contents, Contents::Reference)
+    {
+        if matches!(request.target, Target::DefaultBranch) {
+            super::validate_branch(
+                branch
+                    .as_deref()
+                    .context("Repository does not advertise a default branch")?,
+            )?;
+        }
         return Ok(Prepared {
             deferred_assets: BTreeSet::new(),
             omitted: BTreeMap::new(),
@@ -627,7 +652,7 @@ fn prepare_fresh(
             unavailable: BTreeSet::new(),
             transport: session.endpoint.clone(),
             resolved_target: None,
-            branch: Some(name),
+            branch,
             revision: revision.to_string(),
             selected: BTreeMap::new(),
             tracked: BTreeMap::new(),
@@ -729,7 +754,6 @@ fn materialize_inventory(
     connect: impl Fn(&Repository) -> Result<Session>,
     metrics: &mut Metrics,
 ) -> Result<Prepared> {
-    use std::io::{Seek, SeekFrom};
     let Prepared {
         mut transfer_bytes,
         transport,
@@ -830,42 +854,7 @@ fn materialize_inventory(
             !defer
         });
     }
-    let sizes = if !matches!(request.contents, Contents::Sources)
-        && selected.keys().any(|path| {
-            super::selection::asset(Path::new(path))
-                || super::selection::visual_graph(Path::new(path))
-        }) {
-        super::github::sizes(repository, &revision, &request.store, request.allow_private)?
-    } else {
-        None
-    };
-    if let Some(sizes) = &sizes {
-        ensure!(
-            selected.keys().all(|p| sizes.contains_key(p)),
-            "GitHub inventory does not cover selected Git files"
-        );
-    }
     let mut omitted = BTreeMap::new();
-    selected.retain(|path, _| {
-        if (super::selection::asset(Path::new(path))
-            || super::selection::visual_graph(Path::new(path)))
-            && sizes
-                .as_ref()
-                .and_then(|s| s.get(path))
-                .is_some_and(|s| *s > super::selection::ASSET_LIMIT)
-        {
-            omitted.insert(
-                path.clone(),
-                format!(
-                    "Exceeds remote asset size limit ({} bytes)",
-                    sizes.as_ref().unwrap()[path]
-                ),
-            );
-            false
-        } else {
-            true
-        }
-    });
     let mut changed: BTreeMap<_, _> = selected
         .iter()
         .filter(|(path, id)| request.previous.get(*path) != Some(*id))
@@ -873,7 +862,8 @@ fn materialize_inventory(
         .collect();
     super::files::reuse(request, cache, &mut changed, &mut omitted, metrics)?;
     let ids: BTreeSet<_> = changed.values().cloned().collect();
-    let mut transfer_session = None;
+    let mut blob_sizes = BTreeMap::new();
+    let mut missing_objects = Vec::new();
     for chunk in ids.iter().collect::<Vec<_>>().chunks(2048) {
         let input = chunk
             .iter()
@@ -883,7 +873,7 @@ fn materialize_inventory(
         let status = crate::process::capture(
             git(&request.store)
                 .arg("cat-file")
-                .arg("--batch-check=%(objectname) %(objecttype)"),
+                .arg("--batch-check=%(objectname) %(objecttype) %(objectsize)"),
             Duration::from_secs(120),
             Some(input),
             None,
@@ -892,32 +882,75 @@ fn materialize_inventory(
             status.status.success(),
             "Cannot inspect selected Git objects"
         );
-        let missing = String::from_utf8(status.stdout)?
-            .lines()
-            .filter_map(|line| line.strip_suffix(" missing"))
-            .map(parse_id)
-            .collect::<Result<Vec<_>>>()?;
-        if !missing.is_empty() {
-            if transfer_session.is_none() {
-                transfer_session = Some(connect(repository)?);
+        let mut missing = Vec::new();
+        for line in std::str::from_utf8(&status.stdout)?.lines() {
+            if let Some(id) = line.strip_suffix(" missing") {
+                missing.push(parse_id(id)?);
+            } else {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                ensure!(
+                    fields.len() == 3 && fields[1] == "blob",
+                    "Selected Git object is not a blob"
+                );
+                blob_sizes.insert(fields[0].to_owned(), fields[2].parse::<u64>()?);
             }
-            let session = transfer_session.as_mut().unwrap();
-            transfer_bytes += receive(
-                session,
-                &request.store,
-                missing,
-                false,
-                request.remaining(transfer_bytes),
-            )?;
-            if !session.can_fetch_again() {
-                transfer_session = None;
+        }
+        missing_objects.extend(missing);
+    }
+    // Canonical aliases and local Git objects already prove their size. Only
+    // unresolved asset payloads need a remote inventory before their transfer.
+    let unresolved_assets: Vec<_> = changed
+        .iter()
+        .filter(|(path, id)| {
+            !blob_sizes.contains_key(*id)
+                && (super::selection::asset(Path::new(path))
+                    || super::selection::visual_graph(Path::new(path)))
+        })
+        .collect();
+    if !matches!(request.contents, Contents::Sources)
+        && !unresolved_assets.is_empty()
+        && let Some(sizes) =
+            super::github::sizes(repository, &revision, &request.store, request.allow_private)?
+    {
+        for (path, _) in unresolved_assets {
+            let size = sizes
+                .get(path)
+                .context("GitHub inventory does not cover selected Git files")?;
+            if *size > super::selection::ASSET_LIMIT {
+                omitted.insert(
+                    path.clone(),
+                    format!("Exceeds remote asset size limit ({size} bytes)"),
+                );
             }
+        }
+    }
+    changed.retain(|path, _| !omitted.contains_key(path));
+    let ids: BTreeSet<_> = changed.values().cloned().collect();
+    missing_objects.retain(|id| ids.contains(&id.to_string()));
+    let mut transfer_session = None;
+    for missing in missing_objects.chunks(2048) {
+        if transfer_session.is_none() {
+            transfer_session = Some(connect(repository)?);
+        }
+        let session = transfer_session.as_mut().unwrap();
+        transfer_bytes += receive(
+            session,
+            &request.store,
+            missing.to_vec(),
+            false,
+            request.remaining(transfer_bytes),
+        )?;
+        if !session.can_fetch_again() {
+            transfer_session = None;
         }
     }
     drop(transfer_session);
     // Inspect decompressed lengths before extracting payloads into staging files.
-    let mut blob_sizes = BTreeMap::new();
-    for chunk in ids.iter().collect::<Vec<_>>().chunks(2048) {
+    let unknown: Vec<_> = ids
+        .iter()
+        .filter(|id| !blob_sizes.contains_key(*id))
+        .collect();
+    for chunk in unknown.chunks(2048) {
         let input = chunk
             .iter()
             .map(|id| format!("{id}\n"))
@@ -959,56 +992,94 @@ fn materialize_inventory(
         }
     });
     fs::create_dir_all(&request.staging)?;
-    for chunk in changed.iter().collect::<Vec<_>>().chunks(2048) {
-        let contents = tempfile::tempfile()?;
+    let mut unique = BTreeMap::<&String, Vec<&String>>::new();
+    for (path, id) in &changed {
+        unique.entry(id).or_default().push(path);
+    }
+    for chunk in unique.iter().collect::<Vec<_>>().chunks(2048) {
+        let (reader, writer) = std::io::pipe()?;
         let input = chunk
             .iter()
-            .map(|(_, id)| format!("{id}\n"))
+            .map(|(id, _)| format!("{id}\n"))
             .collect::<String>()
             .into_bytes();
-        let result = crate::process::capture(
-            git(&request.store).args(["cat-file", "--batch"]),
-            Duration::from_secs(120),
-            Some(input),
-            Some(contents.try_clone()?),
-        )?;
-        ensure!(result.status.success(), "Cannot read selected Git contents");
-        let mut contents = contents;
-        contents.seek(SeekFrom::Start(0))?;
-        let mut contents = BufReader::new(contents);
-        for (path, id) in chunk {
-            let mut header = String::new();
-            contents.read_line(&mut header)?;
-            let fields: Vec<_> = header.split_whitespace().collect();
-            ensure!(
-                fields.len() == 3 && fields[0] == id.as_str() && fields[1] == "blob",
-                "Selected Git object is unavailable"
-            );
-            let size: u64 = fields[2].parse()?;
-            if super::selection::asset(Path::new(path)) && size > super::selection::ASSET_LIMIT {
-                std::io::copy(&mut contents.by_ref().take(size + 1), &mut std::io::sink())?;
-                omitted.insert(
-                    path.to_string(),
-                    format!("Exceeds remote asset size limit ({size} bytes)"),
+        std::thread::scope(|scope| -> Result<()> {
+            let worker = scope.spawn(|| {
+                crate::process::capture(
+                    git(&request.store).args(["cat-file", "--batch"]),
+                    Duration::from_secs(120),
+                    Some(input),
+                    Some(File::from(std::os::fd::OwnedFd::from(writer))),
+                )
+            });
+            let mut contents = BufReader::new(reader);
+            let parsed = (|| -> Result<()> {
+                for (id, paths) in chunk {
+                    let path = paths[0];
+                    let mut header = String::new();
+                    contents.read_line(&mut header)?;
+                    let fields: Vec<_> = header.split_whitespace().collect();
+                    ensure!(
+                        fields.len() == 3 && fields[0] == id.as_str() && fields[1] == "blob",
+                        "Selected Git object is unavailable"
+                    );
+                    let size: u64 = fields[2].parse()?;
+                    ensure!(
+                        blob_sizes.get(**id) == Some(&size),
+                        "Git blob size changed before extraction"
+                    );
+                    let target = request.staging.join(path);
+                    fs::create_dir_all(target.parent().unwrap())?;
+                    let mut file = fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&target)?;
+                    let mut prefix = vec![0; size.min(super::lfs::MAGIC.len() as u64) as usize];
+                    contents.read_exact(&mut prefix)?;
+                    file.write_all(&prefix)?;
+                    ensure!(
+                        std::io::copy(
+                            &mut contents.by_ref().take(size - prefix.len() as u64),
+                            &mut file
+                        )? + prefix.len() as u64
+                            == size,
+                        "Truncated Git blob"
+                    );
+                    let mut delimiter = [0];
+                    contents.read_exact(&mut delimiter)?;
+                    ensure!(delimiter == *b"\n", "Invalid Git blob delimiter");
+                    drop(file);
+                    for path in *paths {
+                        let destination = request.staging.join(path);
+                        if destination != target {
+                            fs::create_dir_all(destination.parent().unwrap())?;
+                            fs::copy(&target, destination)?;
+                        }
+                        metrics.staged.push(StagedFile {
+                            path: (*path).clone(),
+                            extracted: true,
+                            lfs: prefix == super::lfs::MAGIC,
+                        });
+                        metrics.extracted_files += 1;
+                        metrics.extracted_bytes += size;
+                    }
+                }
+                ensure!(
+                    contents.read(&mut [0])? == 0,
+                    "Unexpected trailing Git contents"
                 );
-                continue;
-            }
-            let target = request.staging.join(path);
-            fs::create_dir_all(target.parent().unwrap())?;
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&target)?;
-            ensure!(
-                std::io::copy(&mut contents.by_ref().take(size), &mut file)? == size,
-                "Truncated Git blob"
-            );
-            let mut delimiter = [0];
-            contents.read_exact(&mut delimiter)?;
-            ensure!(delimiter == *b"\n", "Invalid Git blob delimiter");
-            metrics.extracted_files += 1;
-            metrics.extracted_bytes += size;
-        }
+                Ok(())
+            })();
+            // Closing on a parse error lets the producer exit instead of blocking
+            // on a full pipe. Always join the bounded child before returning.
+            drop(contents);
+            let result = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("Git content worker panicked"))??;
+            parsed?;
+            ensure!(result.status.success(), "Cannot read selected Git contents");
+            Ok(())
+        })?;
     }
     selected.retain(|p, _| !omitted.contains_key(p));
     Ok(Prepared {
@@ -1381,6 +1452,82 @@ mod tests {
     }
 
     #[test]
+    fn staged_candidates_preserve_short_and_malformed_pointers_after_alias_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream_path = root.path().join("upstream");
+        upstream(&upstream_path, true);
+        let mut oversized = super::super::lfs::MAGIC.to_vec();
+        oversized.extend(vec![b'x'; 9000]);
+        for (path, bytes) in [
+            ("short.cs", b"x".as_slice()),
+            (
+                "invalid.cs",
+                b"version https://git-lfs.github.com/spec/v9\n".as_slice(),
+            ),
+            (
+                "copy.cs",
+                b"version https://git-lfs.github.com/spec/v9\n".as_slice(),
+            ),
+            ("large.cs", oversized.as_slice()),
+        ] {
+            fs::write(upstream_path.join(path), bytes).unwrap();
+        }
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&upstream_path)
+            .args(["add", "."]))
+        .unwrap();
+        run(Command::new("git").arg("-C").arg(&upstream_path).args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+                "Add pointer fixtures\n\nCover short files, duplicate objects and malformed large pointers during acquisition.",
+        ]))
+        .unwrap();
+        let mut request = request(root.path());
+        let expected: BTreeSet<_> = ["invalid.cs", "copy.cs", "large.cs"]
+            .map(String::from)
+            .into();
+        for reuse in [false, true] {
+            let mut metrics = Metrics::default();
+            let prepared = prepare_inventory(
+                &request,
+                None,
+                root.path(),
+                |_| Session::local(&upstream_path),
+                &mut metrics,
+            )
+            .unwrap();
+            assert_eq!(
+                metrics
+                    .staged
+                    .iter()
+                    .filter(|file| file.lfs)
+                    .map(|file| file.path.clone())
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            assert!(metrics.staged.iter().all(|file| file.extracted != reuse));
+            assert_eq!(
+                fs::read(request.staging.join("invalid.cs")).unwrap(),
+                fs::read(request.staging.join("copy.cs")).unwrap()
+            );
+            crate::cache::blobs::Store::open(root.path())
+                .unwrap()
+                .import_owned_tree(&request.staging)
+                .unwrap();
+            super::super::files::record(root.path(), root.path(), &prepared, &request.staging)
+                .unwrap();
+            request.staging = root.path().join("reused");
+            request.store = root.path().join("fresh-git");
+        }
+    }
+
+    #[test]
     fn immutable_files_are_reused_across_selectors_and_renamed_paths() {
         use std::os::unix::fs::MetadataExt;
         for format in ["sha1", "sha256"] {
@@ -1645,6 +1792,12 @@ mod tests {
         {
             let mut request = request(&root.path().join(index.to_string()));
             request.target = Target::selector(selector).unwrap();
+            request.contents = Contents::Reference;
+            let reference = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
+            assert_eq!(reference.revision, revision);
+            assert!(reference.tracked.is_empty() && reference.selected.is_empty());
+            assert!(!request.store.exists() && !request.staging.exists());
+            request.contents = Contents::All;
             let prepared = prepare_with(&request, |_| Session::local(&upstream_path)).unwrap();
             assert_eq!(prepared.revision, revision);
             assert_eq!(
@@ -1652,6 +1805,17 @@ mod tests {
                 expected
             );
         }
+        execute(&["tag", "-f", "-a", "annotated", "-m", "moved release"]);
+        let mut moved = request(&root.path().join("moved-tag"));
+        moved.target = Target::Tag("annotated".into());
+        moved.contents = Contents::Reference;
+        assert_eq!(
+            prepare_with(&moved, |_| Session::local(&upstream_path))
+                .unwrap()
+                .revision,
+            current
+        );
+        assert!(!moved.store.exists() && !moved.staging.exists());
         let tree = String::from_utf8(execute(&["rev-parse", "HEAD^{tree}"])).unwrap();
         execute(&["tag", "tree", tree.trim()]);
         for selector in ["missing", "tree"] {

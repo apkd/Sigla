@@ -12,6 +12,7 @@ if (args[0] == "--seal-packages") return PackageSnapshot.Run(args[1], args[2], a
 // Request structured import events, including conditional and missing imports.
 Environment.SetEnvironmentVariable("MSBUILDLOGIMPORTS", "1");
 MSBuildLocator.RegisterMSBuildPath(args[0]);
+if (args.Length == 4 && args[3] == "--restore") return Discovery.Restore(args[1], args[2]);
 return Discovery.Run(args[1], args[2]);
 
 static class Sdk
@@ -40,6 +41,48 @@ static class Sdk
 
 static class Discovery
 {
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static int Restore(string requestFile, string resultFile)
+    {
+        try {
+            var request = JsonSerializer.Deserialize<RestoreRequest>(File.ReadAllText(requestFile))!;
+            using var collection = new Microsoft.Build.Evaluation.ProjectCollection();
+            var properties = new Dictionary<string, string>();
+            if (request.ArtifactsPath is { } artifacts) {
+                properties["UseArtifactsOutput"] = "true";
+                properties["IncludeProjectNameInArtifactsPaths"] = "true";
+                properties["ArtifactsPath"] = artifacts;
+            }
+            var failures = new List<object>();
+            var errors = new List<string>();
+            using var manager = new Microsoft.Build.Execution.BuildManager();
+            manager.BeginBuild(new Microsoft.Build.Execution.BuildParameters(collection) {
+                EnableNodeReuse = false, MaxNodeCount = 1, Loggers = [new Errors(errors)]
+            });
+            try {
+                // Preserve each root's normal Restore invocation, including
+                // solution mappings and all target frameworks. Share evaluated
+                // projects and completed targets within this SDK scope.
+                foreach (var entry in request.Entries) {
+                    errors.Clear();
+                    try {
+                        var result = manager.BuildRequest(new Microsoft.Build.Execution.BuildRequestData(
+                            entry, properties, null, ["Restore"], null));
+                        if (result.OverallResult != Microsoft.Build.Execution.BuildResultCode.Success)
+                            failures.Add(new { Entry = entry, Detail = string.Join("\n", errors) });
+                    } catch (Exception error) {
+                        failures.Add(new { Entry = entry, Detail = error.Message });
+                    }
+                }
+            } finally { manager.EndBuild(); }
+            File.WriteAllText(resultFile, JsonSerializer.Serialize(failures));
+            return 0;
+        } catch (Exception error) {
+            Console.Error.WriteLine($"Dependency restore failed: {error}");
+            return 1;
+        }
+    }
+
     static readonly string[] Targets = [
         "PrepareForBuild", "AddImplicitDefineConstants", "FindReferenceAssembliesForReferences",
         "GenerateGlobalUsings", "GenerateAssemblyInfo", "GenerateTargetFrameworkMonikerAttribute"
@@ -180,6 +223,7 @@ static class Discovery
                 }
                 var identity = Identity(project);
                 var fingerprint = JsonSerializer.Serialize(new {
+                    request.RestorePolicy,
                     Properties = project.Properties.Where(p => p.Name.StartsWith("Restore", StringComparison.OrdinalIgnoreCase)
                         || p.Name is "TargetFramework" or "TargetFrameworks" or "RuntimeIdentifier" or "RuntimeIdentifiers" or "NuGetPackageRoot")
                         .OrderBy(p => p.Name).Select(p => new { p.Name, p.EvaluatedValue }).ToArray(),
@@ -281,7 +325,8 @@ static class Discovery
         return JsonSerializer.Serialize(new { Path = project.FullPath, Properties = properties.OrderBy(p => p.Key).ToArray() });
     }
 
-    sealed record Request(string[] Entries, Dictionary<string, string> DependencyState, bool Restored, string[]? Tracked, string? ArtifactsPath);
+    sealed record RestoreRequest(string[] Entries, string? ArtifactsPath);
+    sealed record Request(string[] Entries, Dictionary<string, string> DependencyState, bool Restored, string[]? Tracked, string? ArtifactsPath, string RestorePolicy);
     sealed class Imports : Microsoft.Build.Framework.ILogger
     {
         public List<Microsoft.Build.Framework.ProjectImportedEventArgs> Events { get; } = [];

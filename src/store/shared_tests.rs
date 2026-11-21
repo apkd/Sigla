@@ -604,9 +604,7 @@ fn publication_retires_replaced_and_empty_groups_but_preserves_other_policies() 
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     let root = Path::new("/same-workspace");
-    let open = |id| crate::store::Store {
-        scope: db.workspace([id; 32], root, None).unwrap(),
-    };
+    let open = |id| crate::store::Store::from_scope(db.workspace([id; 32], root, None).unwrap());
     let manifest = crate::workspace::Manifest {
         root: root.into(),
         ..Default::default()
@@ -646,31 +644,32 @@ fn publication_retires_replaced_and_empty_groups_but_preserves_other_policies() 
 }
 
 #[test]
-fn dependency_scan_skips_group_payloads_even_during_refresh() {
+fn dependency_scan_skips_secondary_payloads_even_during_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
-    let store = crate::store::Store {
-        scope: scope(&db, 1),
-    };
-    let bytes = postcard::to_allocvec(&crate::store::ManifestRecord {
-        group: Some(crate::native::Group::Native),
-        policy: [0; 32],
-        data: b"opaque group payload",
-    })
-    .unwrap();
-    store
-        .scope
-        .finish_refresh(&bytes, &BTreeSet::new(), 100)
+    let store = crate::store::Store::from_scope(scope(&db, 1));
+    for group in [None, Some(crate::native::Group::Native)] {
+        let bytes = postcard::to_allocvec(&crate::store::ManifestRecord {
+            group,
+            secondary: true,
+            policy: [0; 32],
+            data: b"opaque group payload",
+        })
         .unwrap();
-    assert!(matches!(
-        store.dependency_inventory().unwrap(),
-        crate::store::DependencyInventory::SourceGroup
-    ));
-    store.begin_refresh().unwrap();
-    assert!(matches!(
-        store.dependency_inventory().unwrap(),
-        crate::store::DependencyInventory::SourceGroup
-    ));
+        store
+            .scope
+            .finish_refresh(&bytes, &BTreeSet::new(), 100)
+            .unwrap();
+        assert!(matches!(
+            store.dependency_inventory().unwrap(),
+            crate::store::DependencyInventory::Secondary
+        ));
+        store.begin_refresh().unwrap();
+        assert!(matches!(
+            store.dependency_inventory().unwrap(),
+            crate::store::DependencyInventory::Secondary
+        ));
+    }
 }
 
 #[test]
@@ -678,11 +677,10 @@ fn replacement_uses_manifest_header_without_decoding_payload() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
     let root = Path::new("/workspace");
-    let old = crate::store::Store {
-        scope: db.workspace([1; 32], root, None).unwrap(),
-    };
+    let old = crate::store::Store::from_scope(db.workspace([1; 32], root, None).unwrap());
     let bytes = postcard::to_allocvec(&crate::store::ManifestRecord {
         group: None,
+        secondary: false,
         policy: [0; 32],
         data: b"opaque manifest",
     })
@@ -691,9 +689,7 @@ fn replacement_uses_manifest_header_without_decoding_payload() {
         .finish_refresh(&bytes, &BTreeSet::new(), 100)
         .unwrap();
     assert!(old.get_manifest::<crate::workspace::Manifest>().is_err());
-    let replacement = crate::store::Store {
-        scope: db.workspace([2; 32], root, None).unwrap(),
-    };
+    let replacement = crate::store::Store::from_scope(db.workspace([2; 32], root, None).unwrap());
     replacement
         .save_manifest(&crate::workspace::Manifest::default())
         .unwrap();
@@ -791,6 +787,79 @@ fn preparing_and_attaching_shared_objects_does_not_duplicate_work_or_postings() 
         b.candidates(&tx, "Shared", false, true, |_| false).unwrap(),
         BTreeSet::from(["two".into(), "copy".into()])
     );
+}
+
+#[test]
+fn postings_preserve_membership_across_partitions_and_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let workspace = scope(&db, 1);
+    let files: Vec<_> = (0..PARTITION * 2 + 3)
+        .map(|index| format!("file-{index}"))
+        .collect();
+    let pending: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            workspace
+                .prepare_install(
+                    file,
+                    vec![1],
+                    *blake3::hash(&(index as u64).to_be_bytes()).as_bytes(),
+                    100,
+                    || {
+                        Ok(object(
+                            if index % 3 == 0 { "Shared" } else { "Other" },
+                            b"body",
+                        ))
+                    },
+                )
+                .unwrap()
+        })
+        .collect();
+    workspace.install_batch(&pending, |_| Ok(())).unwrap();
+    drop(pending);
+    for retain_all in [true, false] {
+        let selected: BTreeSet<_> = files
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| retain_all || index % 2 != 0)
+            .map(|(_, file)| file.clone())
+            .collect();
+        workspace
+            .finish_refresh(&postcard::to_allocvec(&selected).unwrap(), &selected, 100)
+            .unwrap();
+        db.collect_unused(100, true).unwrap();
+        let expected: BTreeSet<_> = files
+            .iter()
+            .step_by(3)
+            .filter(|file| selected.contains(*file))
+            .cloned()
+            .collect();
+        let tx = workspace.query_read().unwrap();
+        assert_eq!(
+            workspace
+                .candidates(&tx, "Shared", false, true, |_| false)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            workspace
+                .candidates(&tx, "Sha*", false, false, |name| name.starts_with("Sha"))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            workspace
+                .candidates(&tx, "Use", true, true, |_| false)
+                .unwrap(),
+            selected
+        );
+        assert_eq!(
+            workspace.global_files(&tx).unwrap(),
+            selected.into_iter().collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]

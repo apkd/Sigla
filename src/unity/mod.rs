@@ -4,7 +4,7 @@ pub(crate) mod catalog;
 mod graph;
 mod package_acquire;
 mod packages;
-mod settings;
+pub(crate) mod settings;
 pub(crate) mod symbols;
 mod version;
 pub(crate) use graph::discover;

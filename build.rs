@@ -1,5 +1,7 @@
 #[path = "scripts/cargo_licenses.rs"]
 mod cargo_licenses;
+#[path = "scripts/fingerprints.rs"]
+mod fingerprints;
 #[path = "scripts/licenses.rs"]
 mod licenses;
 
@@ -465,46 +467,7 @@ fn main() {
                 .join("\n")
                 .into_bytes();
         }
-        let facts = name.starts_with("Cargo.")
-            || name.starts_with("src/binary/")
-            || name.starts_with("vendor/tree-sitter-c-sharp/")
-            || name.starts_with("src/extract/")
-            || name.starts_with("src/native/") && !name.ends_with("jobs.rs")
-            || matches!(
-                name.as_ref(),
-                "src/binary.rs"
-                    | "src/model.rs"
-                    | "src/metadata.rs"
-                    | "src/query.rs"
-                    | "src/minify.rs"
-                    | "src/csharp/syntax.rs"
-                    | "src/csharp/lower.rs"
-                    | "src/csharp/types.rs"
-                    | "src/store/data.rs"
-                    | "src/store/format.rs"
-                    | "src/store/payload.rs"
-            );
-        let graph = facts
-            || name.starts_with("src/discovery")
-            || name.starts_with("src/unity/") && !name.starts_with("src/unity/assets/")
-            || name.starts_with("src/metadata_archive")
-            || matches!(
-                name.as_ref(),
-                "src/workspace.rs"
-                    | "src/msbuild.rs"
-                    | "src/selection.rs"
-                    | "src/documents.rs"
-                    | "src/cache/packages.rs"
-                    | "src/repository/selection.rs"
-            );
-        let objects = facts || name.starts_with("src/csharp/") || name.starts_with("src/unity/");
-        let records = name.starts_with("Cargo.")
-            || matches!(
-                name.as_ref(),
-                "src/unity/assets/parse.rs"
-                    | "src/unity/assets/yaml.rs"
-                    | "src/unity/assets/records.rs"
-            );
+        let [facts, graph, objects, records, layout] = fingerprints::domains(&name);
         for (hash, include) in [
             (&mut analysis, facts),
             (&mut workspace, graph),
@@ -517,15 +480,7 @@ fn main() {
                 hash.update(&bytes);
             }
         }
-        if name.starts_with("src/cache")
-            || name.starts_with("src/repository")
-            || name == "src/store.rs"
-            || name.starts_with("src/store/")
-            || matches!(
-                name.as_ref(),
-                "src/config.rs" | "src/msbuild.rs" | "src/service/inspection.rs"
-            )
-        {
+        if layout {
             cache_layout.update(name.as_bytes());
             cache_layout.update([0]);
             cache_layout.update(&bytes);
@@ -563,6 +518,7 @@ fn main() {
         "scripts/native-libraries.json",
         "scripts/licenses.rs",
         "scripts/cargo_licenses.rs",
+        "scripts/fingerprints.rs",
     ] {
         println!("cargo:rerun-if-changed={input}");
     }

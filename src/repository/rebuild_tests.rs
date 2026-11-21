@@ -48,12 +48,26 @@ impl Fixture {
         fs::write(work.join("src/lib.rs"), "pub fn before() {}\n").unwrap();
         fs::write(work.join("excluded.bin"), b"excluded bytes").unwrap();
         command(&work, &["add", "."]);
-        command(&work, &["commit", "-qm", "first"]);
+        command(
+            &work,
+            &[
+                "commit",
+                "-qm",
+                "Create initial fixture\n\nRecord the first snapshot for repository rebuild tests.",
+            ],
+        );
         let first = text(&work, &["rev-parse", "HEAD"]);
         let before = text(&work, &["rev-parse", "HEAD:src/lib.rs"]);
         fs::write(work.join("src/lib.rs"), "pub fn middle() {}\n").unwrap();
         command(&work, &["add", "."]);
-        command(&work, &["commit", "-qm", "middle"]);
+        command(
+            &work,
+            &[
+                "commit",
+                "-qm",
+                "Update fixture sources\n\nRecord the intermediate snapshot for repository rebuild tests.",
+            ],
+        );
         let middle = text(&work, &["rev-parse", "HEAD"]);
         fs::write(work.join("src/lib.rs"), "pub fn after() {}\n").unwrap();
         command(&work, &["add", "."]);
@@ -67,7 +81,14 @@ impl Fixture {
                 &format!("160000,{gitlink},submodule"),
             ],
         );
-        command(&work, &["commit", "-qm", "last"]);
+        command(
+            &work,
+            &[
+                "commit",
+                "-qm",
+                "Complete fixture history\n\nRecord the final snapshot for repository rebuild tests.",
+            ],
+        );
         let last = text(&work, &["rev-parse", "HEAD"]);
         let after = text(&work, &["rev-parse", "HEAD:src/lib.rs"]);
         let excluded = text(&work, &["rev-parse", "HEAD:excluded.bin"]);

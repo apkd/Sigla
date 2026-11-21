@@ -73,7 +73,9 @@ pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discove
         remote.require_analysis_tree(&root.join("Assets"))?;
     }
     let editor = match &policy.remote {
-        Some(remote) => super::acquire::editor(root, &remote.shared, &result.leases)?,
+        Some(remote) => {
+            super::acquire::editor(root, &remote.shared, policy.unity_platform, &result.leases)?
+        }
         None => Editor::local(root, policy.unity_editors.as_deref(), &result.leases)?,
     };
     discover_with_editor(root, policy, cache, result, &editor)
@@ -88,16 +90,15 @@ pub(crate) fn discover_with_editor(
 ) -> Result<()> {
     result.leases.retain(&editor.data)?;
     let settings = Settings::read(&root.join("ProjectSettings/ProjectSettings.asset"))?;
-    let references = super::catalog::References::read(
-        &editor.data,
-        editor.selected,
-        policy.unity_platform,
-        settings.backend,
-    )?;
+    let references =
+        super::catalog::References::read_editor(editor, policy.unity_platform, settings.backend)?;
     result.metadata.extend(references.watched.iter().cloned());
     result
         .diagnostics
         .extend(references.diagnostics.iter().cloned());
+    if references.incomplete {
+        result.dependency_retry = Some(crate::discovery::DependencyRetry::new());
+    }
     let packages = Packages::local(root, policy, editor, cache, &result.leases)?;
     result.dependency_retry = packages.dependency_retry.or(result.dependency_retry);
     result.metadata.extend(packages.watched);
@@ -990,6 +991,69 @@ fn response_file(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn missing_selected_player_references_keep_sources_but_require_dependency_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let editor_root = tempfile::tempdir().unwrap();
+        let write = |base: &Path, path: &str, text: &str| {
+            let path = base.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(root.path(), "Assets/Code.cs", "public class Available {}");
+        write(
+            root.path(),
+            "ProjectSettings/ProjectSettings.asset",
+            "PlayerSettings: {}",
+        );
+        write(
+            root.path(),
+            "Packages/manifest.json",
+            r#"{"dependencies":{}}"#,
+        );
+        write(
+            root.path(),
+            "Packages/packages-lock.json",
+            r#"{"dependencies":{}}"#,
+        );
+        write(
+            editor_root.path(),
+            "Resources/modules.asset",
+            "PlatformModuleSetup:\n  modules:\n  - name: Core\n    controlledByBuiltinPackage: 0\n",
+        );
+        let version = "6000.3.0f1".parse().unwrap();
+        let editor = Editor {
+            declared: version,
+            selected: version,
+            data: editor_root.path().into(),
+            archive: BTreeMap::from([("player-mono".into(), None)]),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let mut policy = Policy::new(vec![root.path().into()]).unwrap();
+        policy.unity_platform = Platform::StandaloneLinux;
+        let mut discovery = Discovery {
+            leases: crate::cache::views::LeaseSet::new(cache.path()).unwrap(),
+            root: root.path().into(),
+            projects: vec![],
+            sources: vec![],
+            metadata: BTreeSet::new(),
+            dependencies: BTreeSet::new(),
+            diagnostics: vec![],
+            dependency_retry: None,
+        };
+        discover_with_editor(root.path(), &policy, cache.path(), &mut discovery, &editor).unwrap();
+        assert!(discovery.dependency_retry.is_some());
+        assert!(!discovery.diagnostics.is_empty());
+        assert!(
+            discovery
+                .sources
+                .iter()
+                .any(|source| source.path.ends_with("Assets/Code.cs"))
+        );
+    }
+
+    #[test]
     fn response_references_use_only_the_selected_unity_profile_after_project_files() {
         let project = tempfile::tempdir().unwrap();
         let install = tempfile::tempdir().unwrap();
@@ -1008,6 +1072,7 @@ mod tests {
         }
         let version = "6000.3.10f1".parse().unwrap();
         let editor = Editor {
+            archive: Default::default(),
             declared: version,
             selected: version,
             data: install.path().into(),
@@ -1167,6 +1232,7 @@ mod tests {
         );
         let version = "6000.3.0f1".parse().unwrap();
         let editor = Editor {
+            archive: Default::default(),
             declared: version,
             selected: version,
             data: editor_root.path().into(),
@@ -1400,6 +1466,7 @@ PluginImporter:
                 };
                 let selected = snapshot["version"].as_str().unwrap().parse().unwrap();
                 let editor = Editor {
+                    archive: Default::default(),
                     declared: selected,
                     selected,
                     data: editor_root.path().into(),

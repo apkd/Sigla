@@ -1,4 +1,6 @@
-//! Opt-in binding replay using an existing source tree and editor metadata archive.
+//! Opt-in binding replay: set SIGLA_BINDING_ROOT, SIGLA_BINDING_CACHE and
+//! SIGLA_BINDING_QUERY. The production selector acquires matching editor sections
+//! in that cache. Set SIGLA_BINDING_ACQUIRE to also acquire remote packages.
 use super::*;
 
 #[test]
@@ -10,23 +12,6 @@ fn replay_unity_bindings() -> Result<()> {
         .try_init();
     let root = PathBuf::from(std::env::var("SIGLA_BINDING_ROOT")?).canonicalize()?;
     let cache = PathBuf::from(std::env::var("SIGLA_BINDING_CACHE")?);
-    let data = PathBuf::from(std::env::var("SIGLA_BINDING_EDITOR")?).canonicalize()?;
-    let manifest = crate::metadata_archive::manifest(&data.join("manifest.bin"))?;
-    anyhow::ensure!(manifest.origin.kind == "editor", "Expected editor metadata");
-    let version = std::fs::read_to_string(root.join("ProjectSettings/ProjectVersion.txt"))?;
-    let declared = version
-        .lines()
-        .find_map(|line| line.strip_prefix("m_EditorVersion:"))
-        .context("Missing editor version")?
-        .trim()
-        .parse()?;
-    let editor = crate::unity::catalog::Editor {
-        declared,
-        selected: manifest.origin.version.parse()?,
-        data,
-        declared_revision: None,
-        selected_revision: None,
-    };
     let mut policy = Policy::new(vec![root.clone()])?;
     if std::env::var_os("SIGLA_BINDING_ACQUIRE").is_some() {
         policy.remote = Some(discovery::RemoteContext {
@@ -47,6 +32,8 @@ fn replay_unity_bindings() -> Result<()> {
         Default::default(),
     )?;
     let started = std::time::Instant::now();
+    let editor =
+        crate::metadata_archive::editor(&root, &cache, policy.unity_platform, &workspace.leases)?;
     let mut discovery = discovery::Discovery {
         leases: workspace.leases.clone(),
         root: root.clone(),

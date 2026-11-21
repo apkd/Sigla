@@ -1,7 +1,9 @@
 //! Portable records shared by the store and metadata archive.
 mod bounded;
+mod bytes;
 mod stream;
 use anyhow::{Result, ensure};
+pub(crate) use bytes::{byte_map, byte_vec};
 use serde::{Deserialize, Serialize};
 pub(crate) use stream::decode_reader;
 

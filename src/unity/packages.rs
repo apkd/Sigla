@@ -55,6 +55,48 @@ pub struct Packages {
     pub dependency_retry: Option<crate::discovery::DependencyRetry>,
 }
 
+struct Planned {
+    manifest: PackageManifest,
+    location: Location,
+}
+enum Location {
+    Local {
+        root: PathBuf,
+        identity: String,
+        testable: bool,
+    },
+    Archive(crate::metadata_archive::PackagePlan),
+}
+
+fn reachable<'a>(
+    roots: &BTreeSet<String>,
+    packages: impl Iterator<Item = &'a PackageManifest>,
+) -> BTreeSet<String> {
+    let by_name: BTreeMap<_, _> = packages.map(|p| (p.name.as_str(), p)).collect();
+    let mut reachable = BTreeSet::new();
+    let mut pending: VecDeque<_> = roots.iter().cloned().collect();
+    while let Some(name) = pending.pop_front() {
+        if reachable.insert(name.clone())
+            && let Some(package) = by_name.get(name.as_str())
+        {
+            pending.extend(package.dependencies.keys().cloned());
+        }
+    }
+    reachable
+}
+impl From<Package> for Planned {
+    fn from(package: Package) -> Self {
+        Self {
+            manifest: package.manifest,
+            location: Location::Local {
+                root: package.root,
+                identity: package.identity,
+                testable: package.testable,
+            },
+        }
+    }
+}
+
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     super::settings::json(path)
         .with_context(|| format!("Malformed package input {}", path.display()))
@@ -101,8 +143,17 @@ impl Packages {
             editor,
             cache,
             leases,
-            |cache, name, requested, editor| {
-                crate::metadata_archive::package(cache, name, requested, editor, leases)
+            |_, name, requested, editor| {
+                let plan = crate::metadata_archive::plan_package(name, requested, editor)?;
+                let manifest = PackageManifest {
+                    name: plan.info.name.clone(),
+                    version: plan.info.version.clone(),
+                    dependencies: plan.info.dependencies.clone(),
+                };
+                Ok(Planned {
+                    manifest,
+                    location: Location::Archive(plan),
+                })
             },
         )
     }
@@ -113,7 +164,7 @@ impl Packages {
         editor: &Editor,
         cache: &Path,
         leases: &crate::cache::views::LeaseSet,
-        acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<(PathBuf, String)>,
+        acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<Planned>,
     ) -> Result<Self> {
         let cache = policy
             .remote
@@ -276,7 +327,7 @@ impl Packages {
             if let Some(package) = embedded.remove(&package_name) {
                 pending.extend(package.manifest.dependencies.keys().cloned());
                 watched.insert(package.root.join("package.json"));
-                selected.push(package);
+                selected.push(Planned::from(package));
                 continue;
             }
             let derived = requirements.get(&package_name).map(|version| Locked {
@@ -315,25 +366,24 @@ impl Packages {
             ))?;
             let testable = manifest.testables.contains(&package_name);
             let official = policy.remote.is_some()
-                && matches!(node.source.as_str(), "registry" | "builtin")
-                && registry.trim_end_matches('/') == "https://packages.unity.com";
+                && (node.source == "builtin"
+                    || node.source == "registry"
+                        && registry.trim_end_matches('/') == "https://packages.unity.com");
             if official {
-                selected.retain(|p: &Package| p.manifest.name != package_name);
+                selected.retain(|p: &Planned| p.manifest.name != package_name);
             } else {
                 pending.extend(node.dependencies.keys().cloned());
             }
-            let available = (|| -> Result<Package> {
+            let available = (|| -> Result<Planned> {
                 if official {
                     let requested = requirements
                         .get(&package_name)
                         .map_or(node.version.as_str(), String::as_str);
-                    let (path, identity) =
-                        acquire(cache, &package_name, requested, editor.selected).context(
-                            crate::diagnostics::DependencyUnavailable(
-                                "Unity package metadata is unavailable",
-                            ),
-                        )?;
-                    return package(path, &package_name, None, identity, testable);
+                    return acquire(cache, &package_name, requested, editor.selected).context(
+                        crate::diagnostics::DependencyUnavailable(
+                            "Unity package metadata is unavailable",
+                        ),
+                    );
                 }
                 match node.source.as_str() {
                     "builtin" => package(
@@ -389,7 +439,8 @@ impl Packages {
                                 (node.source == "registry").then_some(node.version.as_str()),
                                 identity.clone(),
                                 testable,
-                            );
+                            )
+                            .map(Planned::from);
                         }
                         if node.source == "registry"
                             && let Some((_, path)) = candidates.iter().find(|(info, _)| {
@@ -402,7 +453,8 @@ impl Packages {
                                 Some(&node.version),
                                 identity.clone(),
                                 testable,
-                            );
+                            )
+                            .map(Planned::from);
                         }
                         if node.source == "registry" && policy.remote.is_some() {
                             let path = super::package_acquire::registry(
@@ -419,12 +471,14 @@ impl Packages {
                                 Some(&node.version),
                                 identity.clone(),
                                 testable,
-                            );
+                            )
+                            .map(Planned::from);
                         }
                         bail!("No matching offline package contents are available")
                     }
                     _ => unreachable!(),
                 }
+                .map(Planned::from)
             })();
             let available = available.or_else(|error| {
                 if official || error.chain().any(|cause| cause.is::<crate::diagnostics::Cancelled>()) { return Err(error); }
@@ -432,7 +486,7 @@ impl Packages {
                 matching.sort_by(|a, b| a.1.cmp(&b.1));
                 if let Some((info, path)) = matching.first() {
                     diagnostics.push(format!("Package {package_name} selection failed: {error:#}. Using available version {}.", info.version));
-                    package(policy.canonical(path)?, &package_name, None, identity.clone(), testable)
+                    package(policy.canonical(path)?, &package_name, None, identity.clone(), testable).map(Planned::from)
                 } else { Err(error) }
             });
             match available {
@@ -486,7 +540,9 @@ impl Packages {
                             }
                         }
                     }
-                    watched.insert(package.root.join("package.json"));
+                    if let Location::Local { root, .. } = &package.location {
+                        watched.insert(root.join("package.json"));
+                    }
                     selected.push(package);
                 }
                 Err(error) => {
@@ -507,23 +563,76 @@ impl Packages {
             }
         }
         if policy.remote.is_some() {
-            let by_name: BTreeMap<_, _> = selected
-                .iter()
-                .map(|p| (p.manifest.name.as_str(), p))
-                .collect();
-            let mut reachable = BTreeSet::new();
-            let mut pending: VecDeque<_> = roots.into_iter().collect();
-            while let Some(name) = pending.pop_front() {
-                if reachable.insert(name.clone())
-                    && let Some(package) = by_name.get(name.as_str())
-                {
-                    pending.extend(package.manifest.dependencies.keys().cloned());
-                }
-            }
+            let reachable = reachable(&roots, selected.iter().map(|p| &p.manifest));
             selected.retain(|p| reachable.contains(&p.manifest.name));
         }
+        let plans: Vec<_> = selected
+            .iter()
+            .filter_map(|package| match &package.location {
+                Location::Archive(plan) => Some(plan),
+                _ => None,
+            })
+            .collect();
+        let mut acquired = crate::metadata_archive::materialize_packages(cache, &plans, leases);
+        let mut available = Vec::new();
+        for selected in selected {
+            match selected.location {
+                Location::Local {
+                    root,
+                    identity,
+                    testable,
+                } => available.push(Package {
+                    manifest: selected.manifest,
+                    root,
+                    identity,
+                    testable,
+                }),
+                Location::Archive(_) => {
+                    let name = &selected.manifest.name;
+                    let result = acquired
+                        .remove(name)
+                        .context("Missing package acquisition result")?
+                        .and_then(|(path, identity)| {
+                            let package = package(
+                                path,
+                                name,
+                                None,
+                                identity,
+                                manifest.testables.contains(name),
+                            )?;
+                            ensure!(
+                                package.manifest.version == selected.manifest.version
+                                    && package.manifest.dependencies
+                                        == selected.manifest.dependencies,
+                                "Archived package disagrees with its discovery inventory"
+                            );
+                            Ok(package)
+                        });
+                    match result {
+                        Ok(package) => {
+                            watched.insert(package.root.join("package.json"));
+                            available.push(package);
+                        }
+                        Err(error) => {
+                            if error
+                                .chain()
+                                .any(|cause| cause.is::<crate::diagnostics::Cancelled>())
+                            {
+                                return Err(error);
+                            }
+                            dependency_retry = Some(crate::discovery::DependencyRetry::new());
+                            diagnostics.push(format!("Excluded package {name}: {error:#}. References to this package remain unresolved."));
+                        }
+                    }
+                }
+            }
+        }
+        if policy.remote.is_some() {
+            let reachable = reachable(&roots, available.iter().map(|p| &p.manifest));
+            available.retain(|p| reachable.contains(&p.manifest.name));
+        }
         Ok(Self {
-            selected,
+            selected: available,
             diagnostics,
             watched,
             dependency_retry,
@@ -534,6 +643,244 @@ impl Packages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_registries_do_not_hide_archived_builtin_packages() -> Result<()> {
+        use crate::metadata_archive::{Catalog, PackagePlan, tests::cached_builtin_artifact};
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(root.join("Packages"))?;
+        let name = "com.unity.modules.physics";
+        let version = "6000.3.0f1";
+        std::fs::write(
+            root.join("Packages/manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "dependencies": {name: "1.0.0"}, "scopedRegistries": [{"url": "https://registry.invalid", "scopes": ["com.unity"]}]
+            }))?,
+        )?;
+        std::fs::write(
+            root.join("Packages/packages-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "dependencies": {name: {"version": "1.0.0", "source": "builtin", "depth": 0, "dependencies": {}}}
+            }))?,
+        )?;
+        let mut policy = Policy::new(vec![temp.path().into()])?;
+        policy.remote = Some(crate::discovery::RemoteContext {
+            workspace: root.clone(),
+            writable: temp.path().join("write"),
+            shared: cache.clone(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: Default::default(),
+        });
+        let editor = Editor {
+            declared: version.parse()?,
+            selected: version.parse()?,
+            data: temp.path().join("configuration/Editor/Data"),
+            archive: Default::default(),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let catalog = std::sync::Arc::new(Catalog {
+            artifacts: vec![cached_builtin_artifact(&cache, name, version)],
+            ..Default::default()
+        });
+        let leases = crate::cache::views::LeaseSet::new(&cache)?;
+        let packages = Packages::resolve(
+            &root,
+            &policy,
+            &editor,
+            &cache,
+            &leases,
+            |_, name, requested, editor| {
+                let plan = PackagePlan::select(catalog.clone(), name, requested, editor)?;
+                Ok(Planned {
+                    manifest: PackageManifest {
+                        name: plan.info.name.clone(),
+                        version: plan.info.version.clone(),
+                        dependencies: plan.info.dependencies.clone(),
+                    },
+                    location: Location::Archive(plan),
+                })
+            },
+        )?;
+        assert!(
+            packages.diagnostics.is_empty(),
+            "{:?}",
+            packages.diagnostics
+        );
+        assert!(packages.dependency_retry.is_none());
+        assert_eq!(packages.selected.len(), 1);
+        assert!(packages.selected[0].root.join("Code.cs").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_archived_parent_does_not_keep_orphan_dependencies() -> Result<()> {
+        use crate::metadata_archive::{Catalog, PackagePlan, tests::cached_package_artifact};
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(root.join("Packages"))?;
+        std::fs::write(
+            root.join("Packages/packages-lock.json"),
+            r#"{"dependencies":{"a":{"version":"1.0.0","source":"registry","depth":0,"dependencies":{"b":"1.0.0"}},"b":{"version":"1.0.0","source":"registry","depth":1,"dependencies":{}}}}"#,
+        )?;
+        let mut policy = Policy::new(vec![temp.path().into()])?;
+        policy.remote = Some(crate::discovery::RemoteContext {
+            workspace: root.clone(),
+            writable: temp.path().join("write"),
+            shared: cache.clone(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: Default::default(),
+        });
+        let editor = Editor {
+            declared: "6000.3.0f1".parse()?,
+            selected: "6000.3.0f1".parse()?,
+            data: temp.path().join("Editor"),
+            archive: Default::default(),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        let parent = cached_package_artifact(&cache, "a", "1.0.0", &[("b", "1.0.0")]);
+        let child = cached_package_artifact(&cache, "b", "1.0.0", &[]);
+        std::fs::write(
+            cache
+                .join("unity-metadata")
+                .join(blake3::Hash::from_bytes(parent.hash).to_hex().as_str())
+                .join("source.sigla"),
+            b"broken archive",
+        )?;
+        let catalog = std::sync::Arc::new(Catalog {
+            artifacts: vec![parent, child],
+            ..Default::default()
+        });
+        let leases = crate::cache::views::LeaseSet::new(&cache)?;
+        for independent in [false, true] {
+            let mut dependencies = serde_json::json!({"a":"1.0.0"});
+            if independent {
+                dependencies["b"] = "1.0.0".into();
+            }
+            std::fs::write(
+                root.join("Packages/manifest.json"),
+                serde_json::to_vec(&serde_json::json!({"dependencies": dependencies}))?,
+            )?;
+            let packages = Packages::resolve(
+                &root,
+                &policy,
+                &editor,
+                &cache,
+                &leases,
+                |_, name, requested, editor| {
+                    let plan = PackagePlan::select(catalog.clone(), name, requested, editor)?;
+                    Ok(Planned {
+                        manifest: PackageManifest {
+                            name: plan.info.name.clone(),
+                            version: plan.info.version.clone(),
+                            dependencies: plan.info.dependencies.clone(),
+                        },
+                        location: Location::Archive(plan),
+                    })
+                },
+            )?;
+            assert!(packages.dependency_retry.is_some());
+            assert!(!packages.diagnostics.is_empty());
+            let names: Vec<_> = packages
+                .selected
+                .iter()
+                .map(|p| p.manifest.name.as_str())
+                .collect();
+            assert_eq!(names, if independent { vec!["b"] } else { vec![] });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn package_closure_is_final_before_metadata_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(root.join("Packages")).unwrap();
+        std::fs::write(
+            root.join("Packages/manifest.json"),
+            r#"{"dependencies":{"a":"1.0.0","b":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("Packages/packages-lock.json"), r#"{"dependencies":{"a":{"version":"1.0.0","source":"registry","depth":0,"dependencies":{}},"b":{"version":"1.0.0","source":"registry","depth":0,"dependencies":{}}}}"#).unwrap();
+        let mut policy = Policy::new(vec![temp.path().into()]).unwrap();
+        policy.remote = Some(crate::discovery::RemoteContext {
+            workspace: root.clone(),
+            writable: temp.path().join("write"),
+            shared: cache.clone(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: Default::default(),
+        });
+        let editor = Editor {
+            declared: "6000.3.0f1".parse().unwrap(),
+            selected: "6000.3.0f1".parse().unwrap(),
+            data: temp.path().join("Editor"),
+            archive: Default::default(),
+            declared_revision: None,
+            selected_revision: None,
+        };
+        use crate::metadata_archive::{Catalog, PackagePlan, tests::cached_package_artifact};
+        let old = cached_package_artifact(&cache, "a", "1.0.0", &[("obsolete", "1.0.0")]);
+        let obsolete = cached_package_artifact(&cache, "obsolete", "1.0.0", &[]);
+        let current = cached_package_artifact(&cache, "a", "2.0.0", &[]);
+        let parent = cached_package_artifact(&cache, "b", "1.0.0", &[("a", "2.0.0")]);
+        let catalog = std::sync::Arc::new(Catalog {
+            artifacts: vec![old.clone(), obsolete.clone(), current, parent],
+            ..Default::default()
+        });
+        let leases = crate::cache::views::LeaseSet::new(&cache).unwrap();
+        let packages = Packages::resolve(
+            &root,
+            &policy,
+            &editor,
+            &cache,
+            &leases,
+            |_, name, requested, editor| {
+                let plan = PackagePlan::select(catalog.clone(), name, requested, editor)?;
+                Ok(Planned {
+                    manifest: PackageManifest {
+                        name: plan.info.name.clone(),
+                        version: plan.info.version.clone(),
+                        dependencies: plan.info.dependencies.clone(),
+                    },
+                    location: Location::Archive(plan),
+                })
+            },
+        )
+        .unwrap();
+        assert!(
+            packages.diagnostics.is_empty(),
+            "{:?}",
+            packages.diagnostics
+        );
+        assert_eq!(packages.selected.len(), 2);
+        assert_eq!(
+            packages
+                .selected
+                .iter()
+                .find(|package| package.manifest.name == "a")
+                .unwrap()
+                .manifest
+                .version,
+            "2.0.0"
+        );
+        for skipped in [old, obsolete] {
+            assert!(
+                !cache
+                    .join("unity-metadata")
+                    .join(blake3::Hash::from_bytes(skipped.hash).to_hex().as_str())
+                    .join("sections")
+                    .exists()
+            );
+        }
+    }
 
     #[test]
     fn archived_upgrades_follow_selected_dependencies_and_stop_at_cycles() {
@@ -559,6 +906,7 @@ mod tests {
             declared: "6000.3.0f1".parse().unwrap(),
             selected: "6000.3.0f1".parse().unwrap(),
             data: temp.path().join("Editor"),
+            archive: Default::default(),
             declared_revision: None,
             selected_revision: None,
         };
@@ -588,7 +936,7 @@ mod tests {
                         &serde_json::json!({"name":name,"version":"2.0.0","dependencies":deps}),
                     )?,
                 )?;
-                Ok((path, format!("archive:{name}@2.0.0")))
+                package(path, name, None, format!("archive:{name}@2.0.0"), false).map(Planned::from)
             },
         )
         .unwrap();
@@ -653,6 +1001,7 @@ mod tests {
             declared: "6000.3.0f1".parse().unwrap(),
             selected: "6000.3.0f1".parse().unwrap(),
             data: fixture.path().join("Editor"),
+            archive: Default::default(),
             declared_revision: None,
             selected_revision: None,
         };
@@ -699,6 +1048,7 @@ mod tests {
             declared: "6000.3.0f1".parse().unwrap(),
             selected: "6000.3.0f1".parse().unwrap(),
             data: root.path().join("Editor"),
+            archive: Default::default(),
             declared_revision: None,
             selected_revision: None,
         };

@@ -5,13 +5,89 @@ mod packing;
 mod producer;
 mod registry;
 mod release;
+mod sections;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use client::configured;
 pub(crate) use client::editor;
+pub(crate) use client::{PackagePlan, materialize_packages, plan_package};
 pub use client::{package, prefetch};
 pub use producer::Command;
+
+pub(crate) fn section_entries(root: &Path) -> Result<Vec<Entry>> {
+    let frame: sections::Frame = binary::decode(payload(&read(&root.join("section.bin"))?)?)?;
+    Ok(frame.entries)
+}
+
+/// Resolve each selected section once; raw sources retain a local parsing fallback.
+pub(crate) struct Indexes {
+    cache: PathBuf,
+    sections: BTreeMap<PathBuf, Option<(PathBuf, std::sync::Arc<crate::store::segment::Segment>)>>,
+}
+impl Indexes {
+    pub fn new(cache: &Path) -> Self {
+        Self {
+            cache: cache.into(),
+            sections: BTreeMap::new(),
+        }
+    }
+    pub fn file(
+        &mut self,
+        path: &Path,
+        profile: impl FnOnce() -> Result<ObjectId>,
+    ) -> Result<Option<(PathBuf, u32)>> {
+        let Ok(relative) = path.strip_prefix(self.cache.join("unity-metadata")) else {
+            return Ok(None);
+        };
+        let mut parts = relative.components();
+        let Some(artifact) = parts.next() else {
+            return Ok(None);
+        };
+        if parts
+            .next()
+            .is_none_or(|part| part.as_os_str() != "sections")
+        {
+            return Ok(None);
+        }
+        let Some(section) = parts.next() else {
+            return Ok(None);
+        };
+        let root = self
+            .cache
+            .join("unity-metadata")
+            .join(artifact)
+            .join("sections")
+            .join(section);
+        if !self.sections.contains_key(&root) {
+            let frame: sections::Frame =
+                binary::decode(payload(&read(&root.join("section.bin"))?)?)?;
+            let name = sections::index_path(&frame.role);
+            let index = if frame.entries.iter().any(|entry| entry.path == name) {
+                let path = root.join(name);
+                Some((
+                    path.clone(),
+                    crate::store::segment::Segment::open(&path, Some(&self.cache))?,
+                ))
+            } else {
+                None
+            };
+            self.sections.insert(root.clone(), index);
+        }
+        let Some((index, segment)) = &self.sections[&root] else {
+            return Ok(None);
+        };
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("Invalid indexed source path")?;
+        match segment.file(relative, profile) {
+            Ok(ordinal) => Ok(ordinal.map(|ordinal| (index.clone(), ordinal))),
+            Err(error) if error.is::<crate::extract::preprocess::InvalidDirectives>() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 use crate::{
     binary,
@@ -69,6 +145,18 @@ pub struct Artifact {
     pub size: u64,
     pub release: String,
     pub manifest: Manifest,
+    pub sections: Vec<Section>,
+    pub header_size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Section {
+    pub role: String,
+    /// Compressed range, relative to the end of the container header.
+    pub offset: u64,
+    pub size: u64,
+    pub hash: [u8; 32],
+    pub manifest_hash: [u8; 32],
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pack {
@@ -87,7 +175,7 @@ pub struct Catalog {
 
 impl Catalog {
     fn encode(&self) -> Result<Vec<u8>> {
-        let mut bytes = b"SIGLACAT2".to_vec();
+        let mut bytes = b"SIGLACAT3".to_vec();
         bytes.extend(binary::encode(self)?);
         Ok(bytes)
     }
@@ -95,7 +183,7 @@ impl Catalog {
     fn decode(bytes: &[u8]) -> Result<Self> {
         binary::decode(
             bytes
-                .strip_prefix(b"SIGLACAT2")
+                .strip_prefix(b"SIGLACAT3")
                 .context("Unsupported metadata catalog format")?,
         )
     }
@@ -104,6 +192,28 @@ impl Catalog {
 pub struct Analysis {
     pub id: ObjectId,
     pub encoded: Encoded,
+}
+
+struct IndexReference {
+    id: ObjectId,
+}
+
+impl IndexReference {
+    const SIZE: usize = 40;
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = b"SIGLAREF".to_vec();
+        bytes.extend(self.id);
+        bytes
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() == Self::SIZE && bytes.starts_with(b"SIGLAREF"),
+            "Invalid immutable assembly reference"
+        );
+        Ok(Self {
+            id: bytes[8..].try_into()?,
+        })
+    }
 }
 
 fn envelope(payload: &[u8]) -> Vec<u8> {
@@ -195,6 +305,10 @@ pub(crate) fn logical_filename(path: &Path) -> String {
 }
 pub(crate) fn load_analysis(path: &Path) -> Result<Analysis> {
     let bytes = read(path)?;
+    ensure!(
+        !bytes.starts_with(b"SIGLAREF"),
+        "Assembly requires its verified metadata section index"
+    );
     binary::decode(payload(&bytes)?)
 }
 pub(crate) fn manifest(path: &Path) -> Result<Manifest> {

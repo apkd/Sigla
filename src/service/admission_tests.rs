@@ -579,7 +579,7 @@ async fn cancelled_running_history_keeps_its_permits_until_work_exits() {
     app.shutdown().await;
 }
 
-async fn remote_preparation_fixture() -> (
+pub(super) async fn remote_preparation_fixture() -> (
     tempfile::TempDir,
     Arc<App>,
     Arc<crate::repository::manager::Branch>,

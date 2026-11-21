@@ -1,8 +1,10 @@
 use super::*;
+mod materialization;
 use crate::{
     acquisition,
     unity::{ReleaseBranch, UnityVersion},
 };
+pub(super) use materialization::many as materialize_sections;
 use std::{
     io::Read,
     sync::{Arc, Condvar, LazyLock, Mutex},
@@ -145,6 +147,7 @@ fn validate_catalog(catalog: &Catalog) -> Result<()> {
             artifact.manifest.entries.is_empty(),
             "Catalog contains bundle file inventories"
         );
+        sections::validate(&artifact.sections, artifact.header_size, artifact.size)?;
     }
     let mut packed = std::collections::BTreeSet::new();
     for pack in &catalog.packs {
@@ -175,6 +178,17 @@ fn current(refresh: bool) -> Result<Arc<Catalog>> {
     CATALOG.current(refresh, Instant::now, || catalog(REPOSITORY))
 }
 pub(super) fn download(repo: &str, release: &str, name: &str, output: &Path) -> Result<()> {
+    download_with(repo, release, name, |response| {
+        acquisition::transfer(response, &mut fs::File::create(output)?, None)
+    })
+}
+
+fn download_with<T>(
+    repo: &str,
+    release: &str,
+    name: &str,
+    consume: impl FnOnce(reqwest::blocking::Response) -> Result<T>,
+) -> Result<T> {
     crate::telemetry::record("metadata_download", Some(repo), Some(name), || {
         let started = Instant::now();
         let url = format!("https://github.com/{repo}/releases/download/{release}/{name}");
@@ -182,9 +196,9 @@ pub(super) fn download(repo: &str, release: &str, name: &str, output: &Path) -> 
             .get(acquisition::https(&url)?)
             .send()?
             .error_for_status()?;
-        acquisition::transfer(response, &mut fs::File::create(output)?, None)?;
+        let result = consume(response)?;
         tracing::debug!(artifact = %name, elapsed_ms = started.elapsed().as_millis(), "Metadata asset downloaded");
-        Ok(())
+        Ok(result)
     })
 }
 
@@ -226,6 +240,7 @@ pub(super) fn packed_source(
     Ok(source)
 }
 
+#[cfg(test)]
 pub(super) fn materialize(
     cache: &Path,
     artifact: &Artifact,
@@ -256,38 +271,116 @@ pub(super) fn materialize(
             let stage = tempfile::Builder::new()
                 .prefix("stage-")
                 .tempdir_in(&root)?;
-            let archive = if let Some(path) = packed {
-                path
-            } else {
-                let path = stage.path().join("bundle.tar.zst");
-                download(REPOSITORY, &artifact.release, &artifact.name, &path)?;
-                path
-            };
             let output = stage.path().join("contents");
+            let blobs = crate::cache::blobs::Store::open(cache)?;
+            let mut import = blobs.owned_tree(&output)?;
             let started = Instant::now();
             let manifest =
                 crate::telemetry::record("metadata_unpack", None, Some(&artifact.name), || {
-                    bundle::unpack(&archive, &output, Some(artifact))
+                    if let Some(path) = packed {
+                        bundle::unpack_stream(fs::File::open(path)?, &output, artifact, &mut import)
+                    } else {
+                        download_with(REPOSITORY, &artifact.release, &artifact.name, |response| {
+                            acquisition::stream(response, |reader| {
+                                bundle::unpack_stream(reader, &output, artifact, &mut import)
+                            })
+                        })
+                    }
                 })?;
             tracing::debug!(artifact = %artifact.name, elapsed_ms = started.elapsed().as_millis(), "Metadata bundle unpacked");
             if manifest.origin.kind == "editor" {
-                save(
+                import.alias(
+                    &output.join("manifest.bin"),
                     &output.join("Editor/Data/manifest.bin"),
-                    &binary::encode(&manifest)?,
                 )?;
             }
             let started = Instant::now();
             let stats =
                 crate::telemetry::record("metadata_import", None, Some(&artifact.name), || {
-                    crate::cache::blobs::Store::open(cache)?.import_owned_tree(&output)
+                    import.publish()
                 })?;
             tracing::debug!(artifact = %artifact.name, elapsed_ms = started.elapsed().as_millis(), files = stats.files, bytes = stats.hashed_bytes, adopted = stats.adopted, reused = stats.reused, "Metadata bundle imported");
             fs::rename(output, &contents)?;
+            fs::File::open(&root)?.sync_all()?;
             Ok(contents)
         })
     })?;
     leases.record_metadata_use(&root);
     Ok(contents)
+}
+
+fn materialize_section(
+    cache: &Path,
+    artifact: &Artifact,
+    catalog: &Catalog,
+    section: &Section,
+    leases: &crate::cache::views::LeaseSet,
+) -> Result<PathBuf> {
+    materialize_section_with(cache, artifact, catalog, section, leases, |start, end| {
+        fetch_range(&acquisition::client()?, artifact, start, end)
+    })
+}
+
+fn lazy_ranges() -> impl Fn(&Artifact, u64, u64) -> Result<reqwest::blocking::Response> {
+    let client = std::cell::LazyCell::new(|| acquisition::client().map_err(Arc::new));
+    move |artifact, start, end| {
+        let client = client
+            .as_ref()
+            .map_err(|error| crate::diagnostics::shared_error(error.clone()))?;
+        fetch_range(client, artifact, start, end)
+    }
+}
+
+fn fetch_range(
+    client: &reqwest::blocking::Client,
+    artifact: &Artifact,
+    start: u64,
+    end: u64,
+) -> Result<reqwest::blocking::Response> {
+    let url = format!(
+        "https://github.com/{REPOSITORY}/releases/download/{}/{}",
+        artifact.release, artifact.name
+    );
+    Ok(client
+        .get(acquisition::https(&url)?)
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .send()?
+        .error_for_status()?)
+}
+
+fn section_complete(destination: &Path, section: &Section) -> bool {
+    (|| -> Result<bool> {
+        let bytes = read(&destination.join("section.bin"))?;
+        ensure!(
+            blake3::hash(&bytes).as_bytes() == &section.manifest_hash,
+            "Cached section inventory mismatch"
+        );
+        let frame: sections::Frame = binary::decode(payload(&bytes)?)?;
+        ensure!(frame.role == section.role, "Cached section role mismatch");
+        for entry in frame.entries.iter().filter(|entry| entry.group == "index") {
+            if !crate::store::segment::Segment::compatible(
+                &destination.join(&entry.path),
+                entry.size,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })()
+    .unwrap_or(false)
+}
+
+pub(super) fn materialize_section_with(
+    cache: &Path,
+    artifact: &Artifact,
+    catalog: &Catalog,
+    section: &Section,
+    leases: &crate::cache::views::LeaseSet,
+    fetch: impl Fn(u64, u64) -> Result<reqwest::blocking::Response>,
+) -> Result<PathBuf> {
+    materialize_sections(cache, artifact, catalog, &[section], leases, fetch)
+        .remove(&section.role)
+        .unwrap()
 }
 fn select_editor(catalog: &Catalog, declared: UnityVersion) -> Result<&Artifact> {
     catalog
@@ -310,8 +403,10 @@ fn select_editor(catalog: &Catalog, declared: UnityVersion) -> Result<&Artifact>
 fn acquire_editor(
     cache: &Path,
     declared: UnityVersion,
+    roles: &std::collections::BTreeSet<String>,
     leases: &crate::cache::views::LeaseSet,
-) -> Result<(PathBuf, Origin)> {
+) -> Result<(PathBuf, Origin, BTreeMap<String, Option<PathBuf>>)> {
+    let fetch = lazy_ranges();
     for refresh in [false, true] {
         let catalog = current(refresh)?;
         let artifact = match select_editor(&catalog, declared) {
@@ -319,13 +414,33 @@ fn acquire_editor(
             Err(_) if !refresh => continue,
             Err(error) => return Err(error),
         };
-        match materialize(cache, artifact, &catalog, leases) {
-            Ok(contents) => {
-                return Ok((
-                    contents.join("Editor/Data"),
-                    artifact.manifest.origin.clone(),
-                ));
+        let acquire = || -> Result<_> {
+            let mut roots = BTreeMap::new();
+            let selected: Vec<_> = artifact
+                .sections
+                .iter()
+                .filter(|section| roles.contains(&section.role))
+                .collect();
+            let mut acquired = materialize_sections(
+                cache,
+                artifact,
+                &catalog,
+                &selected,
+                leases,
+                |start, end| fetch(artifact, start, end),
+            );
+            for role in roles {
+                roots.insert(role.clone(), acquired.remove(role).transpose()?);
             }
+            let data = roots
+                .get("configuration")
+                .and_then(Option::as_ref)
+                .context("Archived editor has no configuration section")?
+                .join("Editor/Data");
+            Ok((data, artifact.manifest.origin.clone(), roots))
+        };
+        match acquire() {
+            Ok(editor) => return Ok(editor),
             Err(error) if !refresh && missing_asset(&error) => continue,
             Err(error) => return Err(error),
         }
@@ -340,7 +455,10 @@ fn missing_asset(error: &anyhow::Error) -> bool {
 }
 pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
     let leases = crate::cache::views::LeaseSet::new(cache)?;
-    Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?, &leases)?.0)
+    let roles = ["configuration", "editor", "standard", "framework"]
+        .map(String::from)
+        .into();
+    Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?, &roles, &leases)?.0)
 }
 pub(crate) fn configured(path: &Path, branches: &[ReleaseBranch]) -> bool {
     if branches.is_empty() {
@@ -368,6 +486,7 @@ pub(crate) fn configured(path: &Path, branches: &[ReleaseBranch]) -> bool {
 pub(crate) fn editor(
     project: &Path,
     cache: &Path,
+    platform: crate::unity::Platform,
     leases: &crate::cache::views::LeaseSet,
 ) -> Result<crate::unity::catalog::Editor> {
     let text = fs::read_to_string(project.join("ProjectSettings/ProjectVersion.txt"))?;
@@ -377,13 +496,47 @@ pub(crate) fn editor(
         .context("Unity project has no editor version")?
         .trim()
         .parse()?;
-    let (data, selected) = acquire_editor(cache, declared, leases).context(
+    let settings = crate::unity::settings::Settings::read(
+        &project.join("ProjectSettings/ProjectSettings.asset"),
+    )?;
+    let mut roles: std::collections::BTreeSet<String> = [
+        "configuration".into(),
+        if platform == crate::unity::Platform::EditorLinux {
+            "editor"
+        } else if settings.backend == 0 {
+            "player-mono"
+        } else {
+            "player-il2cpp"
+        }
+        .into(),
+    ]
+    .into();
+    roles.insert(
+        if settings.compilation_api(false) == 6 {
+            "standard"
+        } else {
+            "framework"
+        }
+        .into(),
+    );
+    if platform == crate::unity::Platform::EditorLinux {
+        roles.insert(
+            if settings.compilation_api(true) == 6 {
+                "standard"
+            } else {
+                "framework"
+            }
+            .into(),
+        );
+    }
+    let (data, selected, archive) = acquire_editor(cache, declared, &roles, leases).context(
         crate::diagnostics::DependencyUnavailable("Unity editor metadata is unavailable"),
     )?;
     Ok(crate::unity::catalog::Editor {
         declared,
         selected: selected.version.parse()?,
         data,
+        archive,
         declared_revision: text
             .lines()
             .find_map(|l| l.strip_prefix("m_EditorVersionWithRevision:"))
@@ -425,6 +578,157 @@ fn select_package<'a>(
             )
         })
 }
+
+pub(crate) struct PackagePlan {
+    catalog: Arc<Catalog>,
+    artifact: usize,
+    pub info: Package,
+}
+
+impl PackagePlan {
+    pub(crate) fn select(
+        catalog: Arc<Catalog>,
+        name: &str,
+        requested: &str,
+        editor: UnityVersion,
+    ) -> Result<Self> {
+        let (artifact, info) = select_package(&catalog, name, requested, editor)?;
+        let artifact = catalog
+            .artifacts
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, artifact))
+            .unwrap();
+        let info = info.clone();
+        Ok(Self {
+            catalog,
+            artifact,
+            info,
+        })
+    }
+}
+
+pub(crate) fn plan_package(
+    name: &str,
+    requested: &str,
+    editor: UnityVersion,
+) -> Result<PackagePlan> {
+    for refresh in [false, true] {
+        let catalog = current(refresh)?;
+        match PackagePlan::select(catalog, name, requested, editor) {
+            Ok(plan) => return Ok(plan),
+            Err(_) if !refresh => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) fn materialize_packages(
+    cache: &Path,
+    plans: &[&PackagePlan],
+    leases: &crate::cache::views::LeaseSet,
+) -> BTreeMap<String, Result<(PathBuf, String)>> {
+    let fetch = lazy_ranges();
+    let mut groups = BTreeMap::<[u8; 32], Vec<&PackagePlan>>::new();
+    for plan in plans {
+        groups
+            .entry(plan.catalog.artifacts[plan.artifact].hash)
+            .or_default()
+            .push(plan);
+    }
+    let mut result = BTreeMap::new();
+    for plans in groups.values() {
+        let plan = plans[0];
+        let artifact = &plan.catalog.artifacts[plan.artifact];
+        let selected: Vec<_> = artifact
+            .sections
+            .iter()
+            .filter(|section| {
+                plans
+                    .iter()
+                    .any(|plan| section.role == format!("package/{}", plan.info.name))
+            })
+            .collect();
+        let acquired = (|| -> Result<_> {
+            let mut acquired = materialize_sections(
+                cache,
+                artifact,
+                &plan.catalog,
+                &selected,
+                leases,
+                |start, end| fetch(artifact, start, end),
+            );
+            if acquired
+                .values()
+                .any(|result| result.as_ref().is_err_and(missing_asset))
+                && let Ok(updated) = current(true)
+                && let Some(relocated) = updated
+                    .artifacts
+                    .iter()
+                    .find(|candidate| candidate.hash == artifact.hash)
+            {
+                // A changed locator can repair acquisition without changing the
+                // already resolved package graph. Different contents need rediscovery.
+                ensure!(
+                    relocated.manifest == artifact.manifest
+                        && relocated.sections == artifact.sections,
+                    "Relocated metadata changed its discovery inventory"
+                );
+                let retry: Vec<_> = relocated
+                    .sections
+                    .iter()
+                    .filter(|section| acquired.get(&section.role).is_some_and(Result::is_err))
+                    .collect();
+                acquired.extend(materialize_sections(
+                    cache,
+                    relocated,
+                    &updated,
+                    &retry,
+                    leases,
+                    |start, end| fetch(relocated, start, end),
+                ));
+            }
+            Ok(acquired)
+        })();
+        let mut acquired = match acquired {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                let error = Arc::new(error);
+                for plan in plans {
+                    result.insert(
+                        plan.info.name.clone(),
+                        Err(crate::diagnostics::shared_error(error.clone())),
+                    );
+                }
+                continue;
+            }
+        };
+        for plan in plans {
+            let package = acquired
+                .remove(&format!("package/{}", plan.info.name))
+                .context("Archived package has no metadata section")
+                .and_then(|value| value)
+                .map(|root| {
+                    let prefix = if artifact.manifest.origin.kind == "editor" {
+                        "Editor/Data/Resources/PackageManager/BuiltInPackages"
+                    } else {
+                        "packages"
+                    };
+                    (
+                        root.join(prefix).join(&plan.info.name),
+                        format!(
+                            "archive:{}:{}@{}",
+                            hex(&artifact.hash),
+                            plan.info.name,
+                            plan.info.version
+                        ),
+                    )
+                });
+            result.insert(plan.info.name.clone(), package);
+        }
+    }
+    result
+}
 pub fn package(
     cache: &Path,
     name: &str,
@@ -439,7 +743,12 @@ pub fn package(
             Err(_) if !refresh => continue,
             Err(error) => return Err(error),
         };
-        match materialize(cache, artifact, &catalog, leases) {
+        let section = artifact
+            .sections
+            .iter()
+            .find(|section| section.role == format!("package/{name}"))
+            .context("Archived package has no metadata section")?;
+        match materialize_section(cache, artifact, &catalog, section, leases) {
             Ok(contents) => {
                 let prefix = if artifact.manifest.origin.kind == "editor" {
                     "Editor/Data/Resources/PackageManager/BuiltInPackages"
@@ -606,6 +915,8 @@ mod tests {
             };
             catalog.artifacts.push(Artifact {
                 name: version.into(),
+                sections: Vec::new(),
+                header_size: 0,
                 hash: [0; 32],
                 size: 0,
                 release: TAG.into(),

@@ -932,9 +932,9 @@ impl App {
                 if let Some(scope) = database.existing(key)? {
                     let revision = self.owners.lock().unwrap().dependency_revision();
                     observe();
-                    let store = crate::store::Store { scope };
+                    let store = crate::store::Store::from_scope(scope);
                     match store.dependency_inventory()? {
-                        crate::store::DependencyInventory::SourceGroup => continue,
+                        crate::store::DependencyInventory::Secondary => continue,
                         crate::store::DependencyInventory::Primary(manifest) => {
                             let mut owners = self.owners.lock().unwrap();
                             if owners.dependency_revision() != revision {
@@ -1822,6 +1822,13 @@ mod tests {
             },
         );
         for (key, manifest) in [
+            (
+                [3; 32],
+                Manifest {
+                    secondary: true,
+                    ..Default::default()
+                },
+            ),
             ([0; 32], primary),
             (
                 [1; 32],
@@ -1837,12 +1844,27 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                [4; 32],
+                Manifest {
+                    secondary: true,
+                    ..Default::default()
+                },
+            ),
         ] {
             Store::open_workspace(&cache.path().join("analysis"), key, root.path(), None)
                 .unwrap()
                 .save_manifest(&manifest)
                 .unwrap();
         }
+        assert!(app.seed_owners().unwrap());
+        app.collect_views(true).unwrap();
+        assert!(managed.is_file());
+        assert!(native.is_file());
+        Store::open_workspace(&cache.path().join("analysis"), [4; 32], root.path(), None)
+            .unwrap()
+            .begin_refresh()
+            .unwrap();
         assert!(app.seed_owners().unwrap());
         app.collect_views(true).unwrap();
         assert!(managed.is_file());

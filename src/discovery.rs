@@ -1,4 +1,5 @@
 mod cargo;
+pub(crate) mod rust;
 
 use crate::model::{Language, MetadataReference, Project, ProjectReference, SourceInput};
 use anyhow::{Context, Result, bail, ensure};
@@ -14,6 +15,7 @@ pub struct Policy {
     pub unity_editors: Option<PathBuf>,
     pub remote: Option<RemoteContext>,
     materialization: Option<(PathBuf, [u8; 32])>,
+    pub(crate) rust_only: bool,
 }
 
 #[derive(Clone)]
@@ -147,6 +149,9 @@ impl Policy {
         &self,
         mut metadata: impl Iterator<Item = &'a PathBuf>,
     ) -> Option<&Path> {
+        if self.rust_only {
+            return None;
+        }
         let (root, _) = self.materialization.as_ref()?;
         // MSBuild expressions can inspect arbitrary files, including optional assets.
         // Its directory stamps must remain part of discovery validation.
@@ -189,6 +194,9 @@ impl Policy {
             hash.update(&serde_json::to_vec(editors)?);
         }
         hash.update(&crate::msbuild::environment_identity()?);
+        if self.rust_only {
+            hash.update(b"rust-readiness-v1");
+        }
         Ok(*hash.finalize().as_bytes())
     }
     pub fn new(roots: Vec<PathBuf>) -> Result<Self> {
@@ -197,6 +205,7 @@ impl Policy {
             unity_editors: None,
             remote: None,
             materialization: None,
+            rust_only: false,
             roots: roots
                 .into_iter()
                 .map(|p| {
@@ -230,6 +239,7 @@ impl Policy {
     }
 }
 
+#[derive(Clone)]
 pub struct Discovery {
     pub(crate) leases: crate::cache::views::LeaseSet,
     pub root: PathBuf,
@@ -307,6 +317,18 @@ pub(crate) fn discover_with_budget(
     policy: &Policy,
     cache: &Path,
     budget: crate::msbuild::Budget,
+) -> Result<Discovery> {
+    discover_staged(entry, policy, cache, budget, None)
+}
+
+pub(crate) type RustStage<'a> = dyn FnMut(&Discovery, &[PathBuf]) + 'a;
+
+pub(crate) fn discover_staged(
+    entry: &Path,
+    policy: &Policy,
+    cache: &Path,
+    budget: crate::msbuild::Budget,
+    stage: Option<&mut RustStage<'_>>,
 ) -> Result<Discovery> {
     let entry = policy.canonical(entry)?;
     let root = if entry.is_dir() {
@@ -390,6 +412,9 @@ pub(crate) fn discover_with_budget(
         }
     }
     if !managed.is_empty() {
+        if let Some(stage) = stage {
+            stage(&result, &managed);
+        }
         let mut session = crate::msbuild::Session::with_budget(budget);
         let mut groups = BTreeMap::<_, Vec<PathBuf>>::new();
         let mut fallback = FallbackScan::default();
@@ -470,6 +495,13 @@ pub(crate) fn discover_with_budget(
             }
         }
     }
+    normalize_projects(&mut result)?;
+    discover_documents(policy, &mut result);
+    sort_sources(&mut result);
+    Ok(result)
+}
+
+fn normalize_projects(result: &mut Discovery) -> Result<()> {
     let mut identities = std::collections::HashMap::new();
     let mut contexts: Vec<Project> = Vec::new();
     let mut remap = Vec::new();
@@ -505,6 +537,11 @@ pub(crate) fn discover_with_budget(
     let projects_by_name: std::collections::HashMap<_, _> = result
         .projects
         .iter()
+        .filter(|p| {
+            p.origin
+                .as_ref()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == "Cargo.toml"))
+        })
         .map(|p| (p.name.clone(), p.identity.clone()))
         .collect();
     for project in &mut result.projects {
@@ -541,14 +578,29 @@ pub(crate) fn discover_with_budget(
             }
         }
     }
-    discover_documents(policy, &mut result);
+    Ok(())
+}
+
+fn sort_sources(result: &mut Discovery) {
     result
         .sources
         .sort_by(|a, b| (&a.path, a.project, &a.module).cmp(&(&b.path, b.project, &b.module)));
     result
         .sources
         .dedup_by(|a, b| a.path == b.path && a.project == b.project && a.module == b.module);
-    Ok(result)
+}
+
+impl Discovery {
+    /// Keep the original project identities and memberships of all Rust inputs.
+    pub(crate) fn rust_projection(&self) -> Result<Self> {
+        let mut result = self.clone();
+        normalize_projects(&mut result)?;
+        result
+            .sources
+            .retain(|source| source.language == Language::Rust);
+        sort_sources(&mut result);
+        Ok(result)
+    }
 }
 
 /// Documents have a repository context plus memberships in enclosing build
@@ -1810,7 +1862,7 @@ pub(crate) mod tests {
             "commit".as_ref(),
             "--allow-empty".as_ref(),
             "-m".as_ref(),
-            "fixture".as_ref(),
+            "Create worktree fixture\n\nProvide an initial commit for linked worktree discovery tests.".as_ref(),
         ]);
         git(&[
             "worktree".as_ref(),

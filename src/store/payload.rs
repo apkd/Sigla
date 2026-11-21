@@ -86,14 +86,15 @@ pub fn source_id(
     defines: &[String],
     edition: &str,
 ) -> Result<ObjectId> {
+    let raw = blake3::hash(source.as_bytes());
     let profile = match language {
         Language::CSharp => {
             let active = if source.contains('#') {
-                std::borrow::Cow::Owned(crate::extract::preprocess::active_source(source, defines)?)
+                blake3::hash(crate::extract::preprocess::active_source(source, defines)?.as_bytes())
             } else {
-                std::borrow::Cow::Borrowed(source)
+                raw
             };
-            Profile::CSharp(*blake3::hash(active.as_bytes()).as_bytes())
+            Profile::CSharp(*active.as_bytes())
         }
         Language::Rust => Profile::Rust(edition),
         Language::Markdown | Language::Text => Profile::Document,
@@ -104,7 +105,7 @@ pub fn source_id(
         ANALYSIS_VERSION,
         language,
         profile,
-        blake3::hash(source.as_bytes()).as_bytes(),
+        raw.as_bytes(),
     ))?)
     .as_bytes())
 }

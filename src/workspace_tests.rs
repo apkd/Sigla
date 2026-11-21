@@ -1,5 +1,17 @@
 use super::*;
 
+impl Workspace {
+    pub(crate) fn benchmark_discovery(&mut self, discovery: discovery::Discovery) -> Result<()> {
+        self.apply(Preparation {
+            discovery,
+            fence: 0,
+            started: std::time::Instant::now(),
+            validation: Default::default(),
+            discovery_time: Default::default(),
+        })
+    }
+}
+
 fn write(root: &Path, path: &str, text: &str) {
     let path = root.join(path);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -39,6 +51,169 @@ fn has_symbol(workspace: &Workspace, symbol: &str) -> bool {
         .candidates(&workspace.store.read().unwrap(), symbol, false, false)
         .unwrap()
         .is_empty()
+}
+
+#[test]
+fn scheduling_keeps_cold_work_parallel_and_bounds_warm_attachment_partitions() {
+    let project = Project {
+        identity: "fixture".into(),
+        origin: None,
+        name: "fixture".into(),
+        defines: vec![],
+        references: vec![],
+        assemblies: vec![],
+        edition: "2021".into(),
+        compiler_options: Default::default(),
+        source_roots: vec![],
+    };
+    let files: BTreeMap<_, _> = (0..128)
+        .map(|index| {
+            let path = format!("{index}.rs");
+            (
+                path.clone(),
+                FileEntry {
+                    path: path.clone().into(),
+                    display: path,
+                    stamp: Stamp {
+                        size: 1024 * 1024,
+                        revision: Revision::Immutable([index; 32]),
+                    },
+                    language: Language::Rust,
+                    memberships: vec![Membership {
+                        project: 0,
+                        module: String::new(),
+                    }],
+                    modules: vec![],
+                    metadata: false,
+                },
+            )
+        })
+        .collect();
+    let inputs: Vec<_> = files
+        .values()
+        .map(|file| SourceInput {
+            path: file.path.clone(),
+            project: 0,
+            module: String::new(),
+            language: file.language,
+            metadata: false,
+        })
+        .collect();
+    let jobs: Vec<_> = files
+        .iter()
+        .zip(&inputs)
+        .map(|((key, file), input)| (key.clone(), (file.stamp.clone(), input, &project)))
+        .collect();
+    let workers = index_workers();
+    let batches = source_job_batches(&jobs, workers);
+    // Large inputs must keep every available worker busy even below the count
+    // limit. The same scheduling bounds cache-hit commits by worker count.
+    assert_eq!(batches.len(), workers);
+    assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), jobs.len());
+    let native = native_batches(&files);
+    assert_eq!(native.len(), workers);
+    assert_eq!(native.iter().map(|b| b.len()).sum::<usize>(), files.len());
+    assert!(batches.iter().all(|batch| batch.len() <= INDEX_BATCH_FILES));
+}
+
+#[test]
+fn mounted_dependencies_survive_workspace_restart_and_missing_profiles_fall_back() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write(root.path(), "source/Local.cs", "class Local {}");
+    let conditional = "#if EDITOR\nclass Generated { string text = @\"\n#if GENERATED\nclass Output {}\n\"; }\n#endif\n";
+    let files = [
+        ("Dependency.cs", "class Dependency {}"),
+        ("Conditional.cs", conditional),
+    ];
+    let archived = crate::metadata_archive::tests::cached_sources(
+        cache.path(),
+        &files,
+        vec![vec!["EDITOR".into()]],
+    );
+    let policy = policy(root.path(), cache.path());
+    let mut workspace = open(root.path(), cache.path(), policy.clone());
+    let prepare = || Preparation {
+        discovery: discovery::Discovery {
+            leases: crate::cache::views::LeaseSet::new(cache.path()).unwrap(),
+            root: root.path().join("source"),
+            projects: vec![Project {
+                identity: "fixture".into(),
+                origin: None,
+                name: "fixture".into(),
+                defines: vec![],
+                references: vec![],
+                assemblies: vec![],
+                edition: String::new(),
+                compiler_options: Default::default(),
+                source_roots: vec![],
+            }],
+            sources: [
+                root.path().join("source/Local.cs"),
+                archived.join("Dependency.cs"),
+                archived.join("Conditional.cs"),
+            ]
+            .into_iter()
+            .map(|path| SourceInput {
+                path,
+                project: 0,
+                module: String::new(),
+                language: Language::CSharp,
+                metadata: false,
+            })
+            .collect(),
+            metadata: BTreeSet::new(),
+            dependencies: BTreeSet::from([archived.clone()]),
+            diagnostics: vec![],
+            dependency_retry: None,
+        },
+        fence: 0,
+        started: std::time::Instant::now(),
+        validation: Default::default(),
+        discovery_time: Default::default(),
+    };
+    workspace.apply(prepare()).unwrap();
+    assert!(has_symbol(&workspace, "Local") && has_symbol(&workspace, "Dependency"));
+    assert_eq!(workspace.manifest.mounts.len(), 1);
+    assert_eq!(workspace.manifest.mounts[0].files.len(), 1);
+    assert!(
+        workspace
+            .manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("Conditional.cs"))
+    );
+    let index = workspace.manifest.mounts[0].path.clone();
+    let snapshot = workspace.store.snapshot().unwrap();
+    drop(workspace);
+    let mut restored = open(root.path(), cache.path(), policy.clone());
+    assert!(has_symbol(&restored, "Dependency"));
+    write(root.path(), "source/Local.cs", "class Changed {}");
+    restored.apply(prepare()).unwrap();
+    assert!(has_symbol(&restored, "Changed") && has_symbol(&restored, "Dependency"));
+    drop(restored);
+    std::fs::remove_file(&index).unwrap();
+    let missing = open(root.path(), cache.path(), policy.clone());
+    assert!(missing.manifest.files.is_empty());
+    assert!(!missing.store.manifest_current().unwrap());
+    assert!(
+        !snapshot
+            .candidates(&snapshot.query_read().unwrap(), "Dependency", false, false)
+            .unwrap()
+            .is_empty()
+    );
+    drop(missing);
+    assert_eq!(
+        crate::metadata_archive::tests::cached_sources(
+            cache.path(),
+            &files,
+            vec![vec!["EDITOR".into()]]
+        ),
+        archived
+    );
+    let mut repaired = open(root.path(), cache.path(), policy);
+    repaired.apply(prepare()).unwrap();
+    assert!(has_symbol(&repaired, "Dependency"));
 }
 
 #[test]

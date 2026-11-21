@@ -3477,6 +3477,7 @@ dependencies = [
  "lru",
  "md-5",
  "memchr",
+ "memmap2",
  "postcard",
  "quick-xml 0.39.4",
  "ra_ap_syntax",

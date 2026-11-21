@@ -65,13 +65,13 @@ impl<'a, D> Decoder<'a, D> {
         }
     }
 }
-struct Checked<'a, V> {
+struct Checked<'a, V, const BYTE_COST: usize = 1> {
     inner: V,
     budget: &'a mut Budget,
     depth: usize,
 }
 macro_rules! deserialize {
-    ($($method:ident($($arg:ident: $ty:ty),*);)*) => {$ (
+    ($byte_cost:expr; $($method:ident($($arg:ident: $ty:ty),*);)*) => {$ (
         fn $method<V: Visitor<'de>>(self, $($arg: $ty,)* visitor: V) -> Result<V::Value, Self::Error> {
             // Source lowering allows 66 type nodes. A generic node includes several
             // Serde containers (variant, fields, parts and arguments).
@@ -79,18 +79,18 @@ macro_rules! deserialize {
                 self.budget.failure = Some("Binary record nesting limit exceeded");
                 return Err(de::Error::custom("Binary record nesting limit exceeded"));
             }
-            self.inner.$method($($arg,)* Checked { inner: visitor, budget: self.budget, depth: self.depth + 1 })
+            self.inner.$method($($arg,)* Checked::<_, $byte_cost> { inner: visitor, budget: self.budget, depth: self.depth + 1 })
         }
     )*};
 }
 impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Decoder<'_, D> {
     type Error = D::Error;
-    deserialize! {
+    deserialize! { 1;
         deserialize_any(); deserialize_bool(); deserialize_i8(); deserialize_i16();
         deserialize_i32(); deserialize_i64(); deserialize_i128(); deserialize_u8();
         deserialize_u16(); deserialize_u32(); deserialize_u64(); deserialize_u128();
         deserialize_f32(); deserialize_f64(); deserialize_char(); deserialize_str();
-        deserialize_string(); deserialize_bytes(); deserialize_byte_buf(); deserialize_option();
+        deserialize_string(); deserialize_bytes(); deserialize_option();
         deserialize_unit(); deserialize_unit_struct(name: &'static str);
         deserialize_newtype_struct(name: &'static str); deserialize_seq();
         deserialize_tuple(len: usize); deserialize_tuple_struct(name: &'static str, len: usize);
@@ -98,6 +98,9 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Decoder<'_, D> {
         deserialize_enum(name: &'static str, variants: &'static [&'static str]);
         deserialize_identifier(); deserialize_ignored_any();
     }
+    // An owned buffer retains the same conservative allowance as Vec<u8>:
+    // two bytes per byte, including growth/copy overhead.
+    deserialize! { 2; deserialize_byte_buf(); }
     fn is_human_readable(&self) -> bool {
         self.inner.is_human_readable()
     }
@@ -107,7 +110,7 @@ macro_rules! scalar {
         fn $method<E: de::Error>(self, value: $ty) -> Result<Self::Value, E> { self.inner.$method(value) }
     )*};
 }
-impl<'de, V: Visitor<'de>> Visitor<'de> for Checked<'_, V> {
+impl<'de, V: Visitor<'de>, const BYTE_COST: usize> Visitor<'de> for Checked<'_, V, BYTE_COST> {
     type Value = V::Value;
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         self.inner.expecting(formatter)
@@ -126,12 +129,19 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Checked<'_, V> {
         self.inner.visit_borrowed_str(value)
     }
     fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
-        self.budget.charge::<E>(value.len())?;
+        self.budget
+            .charge::<E>(value.len().saturating_mul(BYTE_COST))?;
         self.inner.visit_bytes(value)
     }
     fn visit_borrowed_bytes<E: de::Error>(self, value: &'de [u8]) -> Result<Self::Value, E> {
-        self.budget.charge::<E>(value.len())?;
+        self.budget
+            .charge::<E>(value.len().saturating_mul(BYTE_COST))?;
         self.inner.visit_borrowed_bytes(value)
+    }
+    fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+        self.budget
+            .charge::<E>(value.len().saturating_mul(BYTE_COST))?;
+        self.inner.visit_byte_buf(value)
     }
     fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
         self.inner.visit_none()
@@ -274,7 +284,7 @@ impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Checked<'_, A> {
     fn tuple_variant<V: Visitor<'de>>(self, len: usize, inner: V) -> Result<V::Value, Self::Error> {
         self.inner.tuple_variant(
             len,
-            Checked {
+            Checked::<_, 1> {
                 inner,
                 budget: self.budget,
                 depth: self.depth,
@@ -288,7 +298,7 @@ impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Checked<'_, A> {
     ) -> Result<V::Value, Self::Error> {
         self.inner.struct_variant(
             fields,
-            Checked {
+            Checked::<_, 1> {
                 inner,
                 budget: self.budget,
                 depth: self.depth,

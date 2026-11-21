@@ -8,6 +8,9 @@ mod diagnostics;
 pub mod discovery;
 mod documents;
 pub mod extract;
+#[cfg(test)]
+#[path = "../scripts/fingerprints.rs"]
+mod fingerprints;
 mod history;
 mod memory;
 pub mod metadata;

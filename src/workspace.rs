@@ -143,11 +143,14 @@ pub struct Manifest {
     #[serde(skip)]
     pub derived: Derived,
     pub source_group: Option<crate::native::Group>,
+    /// A partial scope cannot replace the owner's complete dependency inventory.
+    pub secondary: bool,
     pub discovery_policy: [u8; 32],
     pub environment: [u8; 32],
     pub root: PathBuf,
     pub projects: Vec<Project>,
     pub files: BTreeMap<String, FileEntry>,
+    pub mounts: Vec<crate::store::segment::Mount>,
     /// Selected sources whose facts are published by the native/shader workers.
     pub deferred: BTreeMap<String, FileEntry>,
     pub metadata: BTreeMap<PathBuf, Stamp>,
@@ -294,15 +297,32 @@ impl Workspace {
         owner: Option<&Path>,
         monitor: Arc<crate::watch::Monitor>,
     ) -> Result<Self> {
-        let key = *blake3::hash(&postcard::to_allocvec(&(
+        let mut key = *blake3::hash(&postcard::to_allocvec(&(
             env!("SIGLA_WORKSPACE_FINGERPRINT"),
             &entry,
             policy.unity_platform,
             policy.remote.is_some(),
         ))?)
         .as_bytes();
+        if policy.rust_only {
+            key = blake3::derive_key("sigla rust readiness workspace v1", &key);
+        }
         let store = Store::open_workspace(analysis, key, &entry, owner)?;
-        let manifest: Manifest = store.get_manifest()?.unwrap_or_default();
+        let (mut manifest, mut manifest_bytes): (Manifest, _) =
+            store.get_manifest_sized()?.unwrap_or_default();
+        let store = match store.with_mounts(
+            &manifest.mounts,
+            analysis.parent().context("Analysis has no cache root")?,
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(%error, "Discarding workspace with unavailable dependency index");
+                store.begin_refresh()?;
+                manifest = Manifest::default();
+                manifest_bytes = 0;
+                store
+            }
+        };
         let leases = crate::cache::views::LeaseSet::new(
             analysis.parent().context("Analysis has no cache root")?,
         )?;
@@ -316,7 +336,9 @@ impl Workspace {
         {
             leases.retain(path)?;
         }
-        let retained_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3);
+        let retained_bytes = manifest_bytes
+            .saturating_mul(3)
+            .saturating_add(store.retained_bytes());
         Ok(Self {
             leases,
             pending_leases: None,
@@ -355,27 +377,56 @@ impl Workspace {
         self.prepare_at(budget, crate::cache::now())
     }
 
+    pub(crate) fn prepare_staged(
+        &mut self,
+        budget: crate::msbuild::Budget,
+        stage: Option<&mut discovery::RustStage<'_>>,
+    ) -> Result<Option<Preparation>> {
+        self.prepare_at_staged(budget, crate::cache::now(), stage)
+    }
+
+    pub(crate) fn plan_discovery(&mut self, discovery: discovery::Discovery) -> Result<IndexPlan> {
+        self.plan(Preparation {
+            discovery,
+            fence: self.fence,
+            started: std::time::Instant::now(),
+            validation: std::time::Duration::ZERO,
+            discovery_time: std::time::Duration::ZERO,
+        })
+    }
+
     fn prepare_at(
         &mut self,
         budget: crate::msbuild::Budget,
         now: u64,
     ) -> Result<Option<Preparation>> {
+        self.prepare_at_staged(budget, now, None)
+    }
+
+    fn prepare_at_staged(
+        &mut self,
+        budget: crate::msbuild::Budget,
+        now: u64,
+        stage: Option<&mut discovery::RustStage<'_>>,
+    ) -> Result<Option<Preparation>> {
         let start = std::time::Instant::now();
         let managed = self.policy.managed_root(self.manifest.metadata.keys());
         if !self.initialized {
-            for p in self
+            for dir in self
                 .manifest
                 .files
                 .values()
                 .chain(self.manifest.deferred.values())
-                .map(|f| &f.path)
-                .chain(self.manifest.metadata.keys())
+                .filter_map(|file| file.path.parent())
+                .chain(self.manifest.metadata.keys().filter_map(|p| {
+                    if p.is_dir() {
+                        Some(p.as_path())
+                    } else {
+                        p.parent()
+                    }
+                }))
             {
-                if let Some(dir) = if p.is_dir() {
-                    Some(p.as_path())
-                } else {
-                    p.parent()
-                } && !managed.is_some_and(|root| dir.starts_with(root))
+                if !managed.is_some_and(|root| dir.starts_with(root))
                     && self.directories.insert(dir.into())
                 {
                     self.monitor.register(dir);
@@ -430,7 +481,7 @@ impl Workspace {
         let discovery_started = std::time::Instant::now();
         tracing::debug!(workspace = %self.entry.display(), cache_current, policy_current, ?changed_metadata, ?changed_source, "workspace refresh required");
         let discovery = if metadata_changed {
-            discovery::discover_with_budget(&self.entry, &self.policy, &self.cache, budget)?
+            discovery::discover_staged(&self.entry, &self.policy, &self.cache, budget, stage)?
         } else {
             discovery::Discovery {
                 leases: self.leases.clone(),
@@ -473,11 +524,13 @@ impl Workspace {
         let mut manifest = Manifest {
             derived: Default::default(),
             source_group: None,
+            secondary: self.policy.rust_only,
             discovery_policy: self.policy.discovery_identity(discovery.metadata.iter())?,
             environment: [0; 32],
             root: discovery.root,
             projects: discovery.projects,
             files: BTreeMap::new(),
+            mounts: Vec::new(),
             deferred: BTreeMap::new(),
             metadata: BTreeMap::new(),
             inputs: discovery.sources.clone(),
@@ -486,16 +539,22 @@ impl Workspace {
             dependency_retry: discovery.dependency_retry,
         };
         for p in discovery.metadata {
-            if p.is_dir() && managed.is_some_and(|root| p.starts_with(root)) {
+            let directory = p.is_dir();
+            if directory && managed.is_some_and(|root| p.starts_with(root)) {
                 continue;
             }
-            if let Some(dir) = if p.is_dir() {
+            if let Some(dir) = if directory {
                 Some(p.as_path())
             } else {
                 p.parent()
             } && !managed.is_some_and(|root| dir.starts_with(root))
             {
-                if p.file_name().is_some_and(|name| name == "global.json") && !p.is_dir() {
+                if !directory
+                    && matches!(
+                        p.file_name().and_then(|name| name.to_str()),
+                        Some("global.json" | "MSBuild.rsp" | "Directory.Build.rsp")
+                    )
+                {
                     policy_watches.insert(dir.to_owned());
                 } else {
                     directories.insert(dir.to_owned());
@@ -528,37 +587,33 @@ impl Workspace {
                 (input, owns_directory, None::<std::rc::Rc<RustAncestor>>)
             })
             .collect();
+        let mut references = BTreeMap::new();
         for (project, p) in manifest.projects.iter().enumerate() {
             for assembly in &p.assemblies {
-                if !assembly.path.is_file() {
-                    manifest.diagnostics.push(format!("Reference is unavailable: {}. References to this assembly remain unresolved.", assembly.path.display()));
-                }
-                if assembly.path.is_file() {
-                    let path = if manifest.dependencies.contains(&assembly.path) {
-                        assembly.path.clone()
+                let resolved = references.entry(&assembly.path).or_insert_with(|| {
+                    if !assembly.path.is_file() {
+                        Err(format!("Reference is unavailable: {}. References to this assembly remain unresolved.", assembly.path.display()))
+                    } else if manifest.dependencies.contains(&assembly.path) {
+                        Ok(assembly.path.clone())
                     } else {
-                        match self.policy.canonical(&assembly.path) {
-                            Ok(path) => path,
-                            Err(error) => {
-                                manifest.diagnostics.push(format!(
-                                    "Excluded reference {}: {error:#}",
-                                    assembly.path.display()
-                                ));
-                                continue;
-                            }
-                        }
-                    };
-                    queue.push_back((
-                        SourceInput {
-                            path,
-                            project,
-                            module: String::new(),
-                            language: Language::CSharp,
-                            metadata: true,
-                        },
-                        false,
-                        None,
-                    ));
+                        self.policy.canonical(&assembly.path).map_err(|error| format!("Excluded reference {}: {error:#}", assembly.path.display()))
+                    }
+                });
+                match resolved {
+                    Err(diagnostic) => manifest.diagnostics.push(diagnostic.clone()),
+                    Ok(path) => {
+                        queue.push_back((
+                            SourceInput {
+                                path: path.clone(),
+                                project,
+                                module: String::new(),
+                                language: Language::CSharp,
+                                metadata: true,
+                            },
+                            false,
+                            None,
+                        ));
+                    }
                 }
             }
         }
@@ -759,7 +814,7 @@ impl Workspace {
                 manifest.metadata.insert(directory.clone(), stamp);
             }
         }
-        // Ancestor SDK policies need notifications without making unrelated
+        // Ancestor SDK/restore policies need notifications without making unrelated
         // sibling changes discovery inputs. Source directories still carry stamps.
         directories.extend(policy_watches);
         Ok(IndexPlan {
@@ -809,14 +864,11 @@ impl Workspace {
     pub(crate) fn apply_plan(&mut self, plan: IndexPlan) -> Result<()> {
         // Interrupted publications must probe the persisted bindings again.
         let reuse_current = self.initialized && self.store.manifest_current()?;
-        self.initialized = false;
         let indexing_started = std::time::Instant::now();
-        self.store.begin_refresh()?;
-        let begin_refresh_time = indexing_started.elapsed();
         let IndexPlan {
             leases,
             manifest,
-            directories,
+            mut directories,
             fence,
             started: start,
             validation,
@@ -824,51 +876,148 @@ impl Workspace {
             ..
         } = plan;
         let mut manifest = Arc::unwrap_or_clone(manifest);
+        let mount_started = std::time::Instant::now();
+        let mut indexes = crate::metadata_archive::Indexes::new(self._files.cache());
+        let mut mounts = BTreeMap::<PathBuf, BTreeMap<String, u32>>::new();
+        let previous: BTreeMap<_, _> = self
+            .manifest
+            .mounts
+            .iter()
+            .flat_map(|mount| {
+                mount
+                    .files
+                    .iter()
+                    .map(move |(key, ordinal)| (key.as_str(), (&mount.path, *ordinal)))
+            })
+            .collect();
+        for (key, file) in &manifest.files {
+            let project = &manifest.projects[file.memberships[0].project];
+            let unchanged = file.stamp.immutable().is_some()
+                && self
+                    .manifest
+                    .files
+                    .get(key)
+                    .is_some_and(|old| old.path == file.path && old.stamp == file.stamp);
+            let previous = unchanged
+                .then(|| previous.get(key.as_str()))
+                .flatten()
+                .map(|(path, ordinal)| ((*path).clone(), *ordinal));
+            let selected = match previous {
+                Some(value) => Some(value),
+                None => indexes.file(&file.path, || {
+                    let _admission = crate::memory::admit_file(file.stamp.size, false, &())?;
+                    let source = read_stable(&file.path, file.language)?;
+                    crate::store::source_id(
+                        &source,
+                        file.language,
+                        &project.defines,
+                        &project.edition,
+                    )
+                })?,
+            };
+            if let Some((index, ordinal)) = selected {
+                if !manifest.metadata.contains_key(&index) {
+                    leases.retain(&index)?;
+                    manifest
+                        .metadata
+                        .insert(index.clone(), Stamp::read(&index)?);
+                }
+                let parent = index.parent().context("Index has no parent directory")?;
+                directories.insert(parent.into());
+                if self.directories.insert(parent.into()) {
+                    self.monitor.register(parent);
+                }
+                mounts
+                    .entry(index)
+                    .or_default()
+                    .insert(key.clone(), ordinal);
+            }
+        }
+        manifest.mounts = mounts
+            .into_iter()
+            .map(|(path, files)| crate::store::segment::Mount { path, files })
+            .collect();
+        let store = self
+            .store
+            .with_mounts(&manifest.mounts, self._files.cache())?;
+        let mount_resolution = mount_started.elapsed();
+        let mounted_assemblies = manifest
+            .files
+            .iter()
+            .filter(|(key, file)| file.metadata && store.mounted(key))
+            .count();
+        let mounted_sources = manifest
+            .mounts
+            .iter()
+            .map(|mount| mount.files.len())
+            .sum::<usize>()
+            - mounted_assemblies;
+        let mounted_index_bytes = manifest
+            .mounts
+            .iter()
+            .map(|mount| manifest.metadata[&mount.path].size)
+            .sum::<u64>();
+        self.initialized = false;
+        let begin_refresh_started = std::time::Instant::now();
+        self.store.begin_refresh()?;
+        let begin_refresh_time = begin_refresh_started.elapsed();
         let mut parsed = 0;
         let mut objects_reused = 0;
         let mut new_object_bytes = 0u64;
         let mut reused_object_bytes = 0u64;
         let mut extraction_time = std::time::Duration::ZERO;
         let mut storage_time = std::time::Duration::ZERO;
-        let inputs: VecDeque<_> = manifest
+        let inputs: Vec<_> = manifest
             .files
-            .values()
-            .map(|file| SourceInput {
-                path: file.path.clone(),
-                project: file.memberships[0].project,
-                module: file.memberships[0].module.clone(),
-                language: file.language,
-                metadata: file.metadata,
+            .iter()
+            .map(|(key, file)| {
+                (
+                    key.clone(),
+                    file.stamp.clone(),
+                    SourceInput {
+                        path: file.path.clone(),
+                        project: file.memberships[0].project,
+                        module: file.memberships[0].module.clone(),
+                        language: file.language,
+                        metadata: file.metadata,
+                    },
+                )
             })
             .collect();
-        let changed = inputs
+        let changed: Vec<_> = inputs
             .iter()
-            .zip(manifest.files.iter())
-            .filter(|(_, (key, file))| {
+            .filter(|(key, _, _)| !store.mounted(key))
+            .filter(|(key, stamp, _)| {
                 !reuse_current
+                    || self.store.mounted(key)
                     || self
                         .manifest
                         .files
-                        .get(*key)
-                        .is_none_or(|old| old.stamp != file.stamp)
+                        .get(key)
+                        .is_none_or(|old| old.stamp != *stamp)
             })
-            .map(|(input, _)| input.clone())
+            .map(|(key, stamp, input)| {
+                (
+                    key.clone(),
+                    (stamp.clone(), input, &manifest.projects[input.project]),
+                )
+            })
             .collect();
-        let mut indexed = index_sources(&self.store, &changed, &manifest.projects)?;
-        for input in inputs {
+        let mut indexed = index_source_jobs(&store, changed)?;
+        for (key, stamp, input) in inputs {
             let project = &manifest.projects[input.project];
-            let stamp = Stamp::read(&input.path)?;
-            let key = input_key(&input, project, &stamp);
             ensure!(
-                manifest.files.get(&key).is_some_and(|f| f.stamp == stamp),
+                Stamp::read(&input.path)? == stamp,
                 "File changed during indexing; retry query"
             );
-            if reuse_current
-                && self
-                    .manifest
-                    .files
-                    .get(&key)
-                    .is_some_and(|file| file.stamp == stamp)
+            if store.mounted(&key)
+                || reuse_current
+                    && !self.store.mounted(&key)
+                    && self
+                        .manifest
+                        .files
+                        .get(&key)
+                        .is_some_and(|file| file.stamp == stamp)
             {
                 continue;
             }
@@ -876,7 +1025,7 @@ impl Workspace {
                 .remove(&key)
                 .filter(|(before, _)| before == &stamp)
                 .map_or_else(
-                    || index_input(&self.store, &key, &input, project, &stamp),
+                    || index_input(&store, &key, &input, project, &stamp),
                     |(_, result)| result,
                 );
             let Indexed {
@@ -912,14 +1061,14 @@ impl Workspace {
         let mut environment = blake3::Hasher::new();
         environment.update(&postcard::to_allocvec(&manifest.projects)?);
         {
-            let tx = self.store.read()?;
+            let tx = store.read()?;
             for key in manifest.files.keys() {
                 environment.update(key.as_bytes());
-                environment.update(&self.store.declaration_revision_in(&tx, key)?);
+                environment.update(&store.declaration_revision_in(&tx, key)?);
             }
         }
         manifest.environment = *environment.finalize().as_bytes();
-        self.store.save_manifest(&manifest)?;
+        let manifest_bytes = store.save_manifest(&manifest)?;
         for obsolete in self.directories.difference(&directories) {
             self.monitor.unregister(obsolete);
         }
@@ -929,7 +1078,10 @@ impl Workspace {
                 tracing::warn!("{diagnostic}");
             }
         }
-        self.retained_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3);
+        self.retained_bytes = manifest_bytes
+            .saturating_mul(3)
+            .saturating_add(store.retained_bytes());
+        self.store = store;
         self.manifest = Arc::new(manifest);
         self.leases = leases;
         self.pending_leases = None;
@@ -945,6 +1097,10 @@ impl Workspace {
             projects = self.manifest.projects.len(),
             parsed,
             objects_reused,
+            mounted_assemblies,
+            mounted_sources,
+            mounted_index_bytes,
+            mount_resolution_ms = mount_resolution.as_millis(),
             new_object_bytes,
             reused_object_bytes,
             validation_ms = validation.as_millis(),
@@ -1169,6 +1325,19 @@ type IndexedSources = BTreeMap<String, (Stamp, Result<Indexed>)>;
 const INDEX_BATCH_FILES: usize = 1024;
 const INDEX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
+fn index_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4)
+}
+
+// Split large cold workloads across workers without reverting cache hits to
+// one transaction per byte-limited parser chunk. Byte cuts create large worker
+// partitions; only actual misses use the tighter parser limit.
+fn scheduling_bytes(total: u64, workers: usize) -> u64 {
+    total.div_ceil(workers as u64).max(INDEX_BATCH_BYTES)
+}
+
 type SourceJob<'a> = (String, (Stamp, &'a SourceInput, &'a Project));
 
 fn prepare_input(
@@ -1231,38 +1400,19 @@ fn index_source_batch_cancellable(
     cancel: &dyn crate::cancellation::Cancellation,
     operation: &crate::telemetry::Operation,
 ) -> IndexedSources {
-    let mut results = BTreeMap::new();
-    while results.len() < jobs.len() {
-        results.extend(index_source_chunk(
-            store,
-            &jobs[results.len()..],
-            cancel,
-            operation,
-        ));
-    }
-    results
-}
-
-fn index_source_chunk(
-    store: &Store,
-    jobs: &[SourceJob<'_>],
-    cancel: &dyn crate::cancellation::Cancellation,
-    operation: &crate::telemetry::Operation,
-) -> IndexedSources {
-    use crate::store::shared::Reuse;
-    let mut results = BTreeMap::new();
-    let mut retry = Vec::new();
-    {
-        // Resolve current bindings and immutable aliases without occupying a
-        // parser or worker slot. Each probe uses one short read transaction.
-        let probes: Vec<_> = jobs
-            .iter()
-            .map(|(key, (stamp, input, project))| {
+    // Keep unresolved probes across encoding chunks. A large object must not
+    // cause every remaining cache lookup to run again.
+    let mut probes: VecDeque<_> = {
+        let tx = store.read();
+        jobs.iter()
+            .map(|job @ (key, (stamp, input, project))| {
                 let started = std::time::Instant::now();
                 let probe = (|| -> Result<_> {
-                    store.prepare_reuse(key, stamp, input_identity(input, project, stamp)?)
+                    let tx = tx.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                    store.prepare_reuse_in(tx, key, stamp, input_identity(input, project, stamp)?)
                 })();
                 (
+                    job,
                     probe,
                     Indexed {
                         storage: started.elapsed(),
@@ -1270,21 +1420,45 @@ fn index_source_chunk(
                     },
                 )
             })
-            .collect();
-        let metadata = jobs[0].1.1.metadata;
+            .collect()
+    };
+    let mut results = BTreeMap::new();
+    while !probes.is_empty() {
+        results.extend(index_source_chunk(store, &mut probes, cancel, operation));
+    }
+    results
+}
+
+fn index_source_chunk(
+    store: &Store,
+    probes: &mut VecDeque<(&SourceJob<'_>, Result<crate::store::shared::Reuse>, Indexed)>,
+    cancel: &dyn crate::cancellation::Cancellation,
+    operation: &crate::telemetry::Operation,
+) -> IndexedSources {
+    use crate::store::shared::Reuse;
+    let mut results = BTreeMap::new();
+    let mut retry = Vec::new();
+    {
+        let metadata = probes[0].0.1.1.metadata;
         debug_assert!(
-            jobs.iter()
-                .all(|(_, (_, input, _))| input.metadata == metadata)
+            probes
+                .iter()
+                .all(|((_, (_, input, _)), _, _)| input.metadata == metadata)
         );
         let mut total = 0u64;
         let mut largest = 0;
         let mut needs_admission = false;
-        for ((_, (stamp, _, _)), (probe, _)) in jobs.iter().zip(&probes) {
+        let mut count = 0;
+        for ((_, (stamp, _, _)), probe, _) in probes.iter() {
             if matches!(probe, Ok(Reuse::Missing)) {
+                if needs_admission && total.saturating_add(stamp.size) > INDEX_BATCH_BYTES {
+                    break;
+                }
                 needs_admission = true;
                 total = total.saturating_add(stamp.size);
                 largest = largest.max(stamp.size);
             }
+            count += 1;
         }
         // Reserve unresolved work once, never while holding another parsing
         // reservation. Cache-only batches need neither admission nor a worker.
@@ -1298,9 +1472,9 @@ fn index_source_chunk(
             Ok(admission) => admission,
             Err(error) => {
                 let error = std::sync::Arc::new(error);
-                return jobs
-                    .iter()
-                    .map(|(key, (stamp, _, _))| {
+                return probes
+                    .drain(..count)
+                    .map(|((key, (stamp, _, _)), _, _)| {
                         (
                             key.clone(),
                             (
@@ -1315,7 +1489,8 @@ fn index_source_chunk(
         let mut pending = Vec::new();
         let mut prepared = Vec::new();
         let mut encoded_bytes = 0u64;
-        for ((key, (stamp, input, project)), (probe, mut timing)) in jobs.iter().zip(probes) {
+        for _ in 0..count {
+            let ((key, (stamp, input, project)), probe, mut timing) = probes.pop_front().unwrap();
             let stage = match probe {
                 Err(error) => Err(error),
                 Ok(Reuse::Current) => (|| -> Result<_> {
@@ -1429,17 +1604,23 @@ fn index_source_chunk(
 pub(crate) fn native_batches(
     files: &BTreeMap<String, FileEntry>,
 ) -> Vec<BTreeMap<String, FileEntry>> {
+    let limit = scheduling_bytes(
+        files
+            .values()
+            .fold(0u64, |sum, f| sum.saturating_add(f.stamp.size)),
+        index_workers(),
+    );
     let mut batches = Vec::new();
     let mut batch = BTreeMap::new();
-    let mut bytes = 0;
+    let mut bytes = 0u64;
     for (key, file) in files {
         if !batch.is_empty()
-            && (batch.len() >= INDEX_BATCH_FILES || bytes + file.stamp.size > INDEX_BATCH_BYTES)
+            && (batch.len() >= INDEX_BATCH_FILES || bytes.saturating_add(file.stamp.size) > limit)
         {
             batches.push(std::mem::take(&mut batch));
             bytes = 0;
         }
-        bytes += file.stamp.size;
+        bytes = bytes.saturating_add(file.stamp.size);
         batch.insert(key.clone(), file.clone());
     }
     if !batch.is_empty() {
@@ -1488,12 +1669,12 @@ pub(crate) fn index_native_batch(
 
 /// Extract independent source and metadata inputs concurrently, then assemble
 /// the manifest in discovery order.
+#[cfg(test)]
 fn index_sources(
     store: &Store,
     inputs: &VecDeque<SourceInput>,
     projects: &[Project],
 ) -> Result<IndexedSources> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let mut jobs = BTreeMap::new();
     for input in inputs.iter().take(1_000_000) {
         let Ok(stamp) = Stamp::read(&input.path) else {
@@ -1506,32 +1687,48 @@ fn index_sources(
         let key = input_key(input, project, &stamp);
         jobs.entry(key).or_insert((stamp, input, project));
     }
-    let mut jobs: Vec<_> = jobs.into_iter().collect();
-    // Keep each admission class together so hash order cannot fragment batches.
-    jobs.sort_by_key(|(_, (_, input, _))| input.metadata);
-    // Bound retained encodings and amortize durable commits across small files.
+    index_source_jobs(store, jobs.into_iter().collect())
+}
+
+fn source_job_batches<'a, 'b>(
+    jobs: &'a [SourceJob<'b>],
+    workers: usize,
+) -> Vec<&'a [SourceJob<'b>]> {
+    let totals = jobs
+        .iter()
+        .fold([0u64; 2], |mut totals, (_, (stamp, input, _))| {
+            totals[input.metadata as usize] =
+                totals[input.metadata as usize].saturating_add(stamp.size);
+            totals
+        });
+    let limits = totals.map(|total| scheduling_bytes(total, workers));
     let mut batches = Vec::new();
     let mut start = 0;
-    let mut bytes = 0;
+    let mut bytes = 0u64;
     for (index, (_, (stamp, input, _))) in jobs.iter().enumerate() {
         if index > start
             && (index - start >= INDEX_BATCH_FILES
-                || bytes + stamp.size > INDEX_BATCH_BYTES
-                || input.metadata != jobs[start].1.1.metadata)
+                || input.metadata != jobs[start].1.1.metadata
+                || bytes.saturating_add(stamp.size) > limits[input.metadata as usize])
         {
             batches.push(&jobs[start..index]);
             start = index;
             bytes = 0;
         }
-        bytes += stamp.size;
+        bytes = bytes.saturating_add(stamp.size);
     }
     if start < jobs.len() {
         batches.push(&jobs[start..]);
     }
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(4)
-        .min(batches.len());
+    batches
+}
+
+fn index_source_jobs(store: &Store, mut jobs: Vec<SourceJob<'_>>) -> Result<IndexedSources> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Keep each admission class together so hash order cannot fragment batches.
+    jobs.sort_by_key(|(_, (_, input, _))| input.metadata);
+    let batches = source_job_batches(&jobs, index_workers());
+    let workers = index_workers().min(batches.len());
     if workers <= 1 {
         return Ok(batches
             .iter()

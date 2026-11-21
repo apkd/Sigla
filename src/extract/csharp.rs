@@ -91,6 +91,9 @@ impl DeclarationScopes {
 }
 
 pub fn extract(source: &str, defines: &[String]) -> Result<Facts> {
+    if !source.contains('#') {
+        return extract_analysis(source);
+    }
     let analysis = super::preprocess::active_source(source, defines)?;
     extract_analysis(&analysis)
 }

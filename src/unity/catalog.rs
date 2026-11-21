@@ -35,17 +35,38 @@ pub struct References {
     modules: BTreeMap<String, bool>,
     pub watched: BTreeSet<PathBuf>,
     pub diagnostics: Vec<String>,
+    pub incomplete: bool,
 }
 
 impl References {
+    pub fn read_editor(editor: &Editor, platform: Platform, backend: u32) -> Result<Self> {
+        Self::read_paths(
+            &editor.data,
+            editor.selected,
+            platform,
+            backend,
+            (!editor.archive.is_empty()).then_some(&editor.archive),
+        )
+    }
+
     pub fn read(
         data: &Path,
         version: UnityVersion,
         platform: Platform,
         backend: u32,
     ) -> Result<Self> {
+        Self::read_paths(data, version, platform, backend, None)
+    }
+
+    fn read_paths(
+        data: &Path,
+        version: UnityVersion,
+        platform: Platform,
+        backend: u32,
+        archived: Option<&BTreeMap<String, Option<PathBuf>>>,
+    ) -> Result<Self> {
         ensure!(
-            supported(version) || data.join("manifest.bin").is_file(),
+            supported(version) || archived.is_some() || data.join("manifest.bin").is_file(),
             "Unsupported Unity editor reference layout {version}"
         );
         let module_path = data.join("Resources/modules.asset");
@@ -89,9 +110,38 @@ impl References {
             "Unity module catalog lacks Core"
         );
         let mut watched = BTreeSet::from([module_path]);
-        if data.join("manifest.bin").is_file() {
-            watched.insert(data.join("manifest.bin"));
-            let manifest = crate::metadata_archive::manifest(&data.join("manifest.bin"))?;
+        if archived.is_some() || data.join("manifest.bin").is_file() {
+            let mut entries = Vec::new();
+            let mut incomplete = false;
+            if let Some(archived) = archived {
+                for (role, root) in archived {
+                    if let Some(root) = root {
+                        watched.insert(root.join("section.bin"));
+                        entries.extend(
+                            crate::metadata_archive::section_entries(root)?
+                                .into_iter()
+                                .map(|entry| {
+                                    let path = root.join(&entry.path);
+                                    (entry, path)
+                                }),
+                        );
+                    } else {
+                        incomplete = true;
+                        diagnostics.push(format!("Archived editor has no {role} references"));
+                    }
+                }
+            } else {
+                watched.insert(data.join("manifest.bin"));
+                entries.extend(
+                    crate::metadata_archive::manifest(&data.join("manifest.bin"))?
+                        .entries
+                        .into_iter()
+                        .filter_map(|entry| {
+                            let path = data.join(entry.path.strip_prefix("Editor/Data/")?);
+                            Some((entry, path))
+                        }),
+                );
+            }
             let group = if platform == Platform::EditorLinux {
                 "editor"
             } else if backend == 0 {
@@ -100,11 +150,10 @@ impl References {
                 "player-il2cpp"
             };
             let paths = |group: &str| -> Vec<PathBuf> {
-                manifest
-                    .entries
+                entries
                     .iter()
-                    .filter(|e| e.group == group && e.path.ends_with(".sigla"))
-                    .filter_map(|e| e.path.strip_prefix("Editor/Data/").map(|p| data.join(p)))
+                    .filter(|(e, _)| e.group == group && e.path.ends_with(".sigla"))
+                    .map(|(_, path)| path.clone())
                     .collect()
             };
             let engine: Vec<_> = paths(group)
@@ -112,6 +161,11 @@ impl References {
                 .filter(|p| {
                     platform != Platform::EditorLinux
                         || p.starts_with(data.join("Managed/UnityEngine"))
+                        || archived.is_some_and(|roots| {
+                            roots.values().flatten().any(|root| {
+                                p.starts_with(root.join("Editor/Data/Managed/UnityEngine"))
+                            })
+                        })
                 })
                 .collect();
             let standard = paths("standard")
@@ -133,6 +187,7 @@ impl References {
                 })
                 .collect();
             if engine.is_empty() {
+                incomplete = true;
                 diagnostics.push(format!("Archived editor has no {group} references"));
             }
             return Ok(Self {
@@ -142,6 +197,7 @@ impl References {
                 modules,
                 watched,
                 diagnostics,
+                incomplete,
             });
         }
         let mut directory = |relative: &str| -> Result<Vec<PathBuf>> {
@@ -205,6 +261,7 @@ impl References {
             modules,
             watched,
             diagnostics,
+            incomplete: false,
         })
     }
 }
@@ -231,6 +288,9 @@ pub struct Editor {
     pub declared: UnityVersion,
     pub selected: UnityVersion,
     pub data: PathBuf,
+    /// Selected immutable sections. None means the catalog publishes no such group.
+    /// An empty map identifies an installed local editor.
+    pub archive: BTreeMap<String, Option<PathBuf>>,
     pub declared_revision: Option<String>,
     pub selected_revision: Option<String>,
 }
@@ -249,6 +309,17 @@ pub struct AssemblyContext {
 }
 
 impl Editor {
+    fn reference_path(&self, group: &str, relative: &Path) -> Option<PathBuf> {
+        if self.archive.is_empty() {
+            Some(self.data.join(relative))
+        } else {
+            self.archive
+                .get(group)?
+                .as_ref()
+                .map(|root| root.join("Editor/Data").join(relative))
+        }
+    }
+
     /// Resolve a simple assembly name in the same API profile used for compilation.
     pub(super) fn profile_reference(&self, name: &str, api: u32) -> Option<PathBuf> {
         if Path::new(name).file_name()?.to_str()? != name || name.contains('\\') {
@@ -261,8 +332,10 @@ impl Editor {
             &[FRAMEWORK_DIR, FACADES_DIR]
         };
         directories.iter().find_map(|directory| {
-            let path =
-                crate::metadata_archive::reference(self.data.join(directory).join(&filename));
+            let path = crate::metadata_archive::reference(self.reference_path(
+                if api == 6 { "standard" } else { "framework" },
+                &Path::new(directory).join(&filename),
+            )?);
             path.is_file().then_some(path)
         })
     }
@@ -337,6 +410,7 @@ impl Editor {
             declared,
             selected,
             data: data.canonicalize()?,
+            archive: BTreeMap::new(),
             selected_revision: (declared == selected).then(|| revision.clone()).flatten(),
             declared_revision: revision,
         })
@@ -457,7 +531,8 @@ impl Editor {
                 references.extend(
                     EDITOR_PRECOMPILED
                         .iter()
-                        .map(|p| crate::metadata_archive::reference(self.data.join(p))),
+                        .filter_map(|p| self.reference_path("editor", Path::new(p)))
+                        .map(crate::metadata_archive::reference),
                 );
             }
         }

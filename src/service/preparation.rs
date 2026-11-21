@@ -109,6 +109,7 @@ enum Progress {
 #[derive(Clone)]
 pub(super) struct Ticket {
     progress: watch::Receiver<Progress>,
+    pub(super) rust: super::rust::Ticket,
     id: u64,
     telemetry_id: Option<String>,
 }
@@ -176,6 +177,7 @@ impl Ticket {
         matches!(*self.progress.borrow(), Progress::Failed(_, Some(_)))
     }
     pub fn retained_heap_bytes(&self, workspace_manifest: Option<&Arc<Manifest>>) -> (u64, u64) {
+        let (rust_bytes, rust_pinned) = self.rust.heap_bytes();
         let progress = self.progress.borrow();
         let inventory = match &*progress {
             Progress::Failed(_, Some(inventory))
@@ -183,7 +185,7 @@ impl Ticket {
             | Progress::RetryFailed(inventory, _, _)
             | Progress::Files(inventory)
             | Progress::Ready(inventory, _) => inventory,
-            _ => return (0, 0),
+            _ => return (rust_bytes, rust_pinned),
         };
         let bytes = if workspace_manifest
             .is_some_and(|manifest| Arc::ptr_eq(manifest, &inventory.manifest))
@@ -197,7 +199,7 @@ impl Ticket {
         } else {
             0
         };
-        (bytes, pinned)
+        (bytes + rust_bytes, pinned + rust_pinned)
     }
     pub async fn inventory(&mut self) -> Result<Arc<Inventory>> {
         loop {
@@ -591,6 +593,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     } = request;
     let retrying = retry.is_some();
     let retry_base = retry.clone();
+    let (rust_send, rust_receive) = super::rust::channel();
+    if retrying {
+        rust_send.disable();
+    }
     let (send, receive) = watch::channel(retry.map_or(
         Progress::Pending("preparation"),
         |(inventory, generation)| Progress::Refreshing(inventory, generation),
@@ -610,6 +616,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     tokio::spawn(async move {
         tracing::info!(shared_job = job, workspace = %entry.display(), reason, "Workspace preparation started");
         let mut lifecycle = None;
+        let mut rust_job: Option<tokio::task::JoinHandle<()>> = None;
         let outcome = async {
             if let Some(branch) = &preparing_branch {
                 publish_progress(&send, Progress::Pending("acquisition"));
@@ -641,6 +648,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             let mut policy = policy;
             let mut discovery_budget = None;
             let (state, branch_state) = loop {
+                if let Some(job) = rust_job.take() {
+                    let _ = job.await;
+                    rust_send.disable();
+                }
                 operation.stage("discovery_admission");
                 let (mut permit, mut state, mut branch_state) = preparing_app
                     .admit_work(
@@ -725,13 +736,21 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 let cache = cache.clone();
                 let current_policy = policy.clone();
                 let owner = preparing_branch.as_ref().map(|branch| branch.root.clone());
+                let rust_eligible = !retrying && branch_state.as_ref().and_then(|s| s.as_ref()).is_some_and(|s|
+                    s.prepared.unavailable.is_empty() && s.prepared.omitted.is_empty()
+                        && s.prepared.deferred_assets.is_empty());
+                if !rust_eligible { rust_send.disable(); }
+                let (stage_send, mut stage_receive) = tokio::sync::oneshot::channel();
+                let generation = preparing_branch.as_ref().map(|branch|
+                    branch.generation.load(std::sync::atomic::Ordering::Acquire));
+                let rust_policy = policy.clone();
                 #[cfg(test)]
                 let _discovery_pause = {
                     preparing_app.discovery_started.notify_one();
                     preparing_app.discovery_pause.clone().acquire_owned().await?
                 };
                 operation.stage("discovery");
-                let (next, result) = tokio::task::spawn_blocking(move || -> Result<_> {
+                let mut discovering = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _permit = permit;
                     if state.is_none() {
                         *state = Some(Workspace::open(
@@ -743,17 +762,55 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             app.monitor.clone(),
                         )?);
                     }
-                    state.as_mut().unwrap().update_policy(current_policy);
+                    state.as_mut().unwrap().update_policy(current_policy.clone());
                     let code = state.as_mut().unwrap();
+                    let mut stage_send = Some(stage_send);
+                    let mut stage = |discovery: &crate::discovery::Discovery, managed: &[PathBuf]| {
+                        if rust_eligible && let Some(send) = stage_send.take() {
+                            let staged = crate::discovery::rust::stage(discovery, managed, &current_policy, app.monitor.clone());
+                            match staged {
+                                Ok(Some(staged)) => {
+                                    let _ = send.send(staged);
+                                    #[cfg(test)]
+                                    {
+                                        app.rust_staged.notify_one();
+                                        let _pause = tokio::runtime::Handle::current().block_on(app.managed_pause.acquire());
+                                    }
+                                }
+                                Ok(None) => (),
+                                Err(error) => tracing::debug!(%error, "Rust completeness proof unavailable"),
+                            }
+                        }
+                    };
                     let result = rediscovered.map_or_else(
-                        || code.prepare_with_budget(budget),
+                        || code.prepare_staged(budget, Some(&mut stage)),
                         |prepared| prepared.map(Some),
                     )
                         .and_then(|p| p.map(|p| code.plan(p)).transpose());
                     crate::memory::reclaim();
                     Ok((state, result))
-                })
-                .await??;
+                });
+                let discovered = tokio::select! {
+                    result = &mut discovering => result,
+                    staged = &mut stage_receive => {
+                        if let Ok(staged) = staged {
+                            let send = rust_send.clone();
+                            let app = preparing_app.clone();
+                            let entry = entry.clone();
+                            let branch = preparing_branch.as_ref().unwrap().clone();
+                            let operation = operation.clone();
+                            rust_job = Some(tokio::spawn(async move {
+                                send.index(app, super::rust::IndexRequest {
+                                    stage: staged, entry, policy: rust_policy, branch,
+                                    generation: generation.unwrap(), operation,
+                                }).await;
+                            }));
+                        } else { rust_send.disable(); }
+                        discovering.await
+                    }
+                };
+                if rust_job.is_none() { rust_send.disable(); }
+                let (next, result) = discovered??;
                 #[cfg(test)]
                 drop(_discovery_pause);
                 state = next;
@@ -779,6 +836,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                             .clone();
                         drop(branch_state);
                         drop(state);
+                        // A queued publisher may precede the child's next analysis
+                        // read. Release our pin before joining that child.
+                        if let Some(job) = rust_job.take() { let _ = job.await; }
+                        rust_send.disable();
                         publish_progress(&send, Progress::Pending("acquisition"));
                         operation.stage("required_input_acquisition");
                         preparing_app
@@ -903,6 +964,11 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             Ok::<_, anyhow::Error>((inventory, generation))
         }
         .await;
+        // The lifecycle permit and cache ownership cover every blocking child.
+        if let Some(job) = rust_job {
+            let _ = job.await;
+        }
+        rust_send.disable();
         let progress = match outcome {
             Ok((inventory, generation)) => {
                 operation.finish("success");
@@ -945,6 +1011,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
     });
     Ticket {
         progress: receive,
+        rust: rust_receive,
         id: job,
         telemetry_id,
     }
@@ -1001,6 +1068,12 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), app.discovery_started.notified())
             .await
             .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ticket.rust.ready())
+                .await
+                .unwrap()
+                .is_none()
+        );
         let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 app.search(path, "type:Ready"),
@@ -1122,6 +1195,7 @@ mod tests {
         ));
         let ticket = Ticket {
             progress,
+            rust: super::super::rust::channel().1,
             id: 1,
             telemetry_id: None,
         };

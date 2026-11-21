@@ -70,13 +70,39 @@ async fn unchanged_files_need_no_import_or_hydration_job() {
     let completed = complete(
         &request,
         cache.path(),
-        prepared.clone(),
+        super::super::materialize::Acquired {
+            prepared: prepared.clone(),
+            staged: Vec::new(),
+        },
         &pin(&pool),
         &staging,
         &telemetry,
     )
     .unwrap();
-    assert_eq!(completed.selected, prepared.selected);
+    assert_eq!(completed.prepared.selected, prepared.selected);
+    // A newly staged ordinary source must also bypass the LFS subprocess.
+    fs::write(request.staging.join("Code.cs"), b"class Ready {}").unwrap();
+    let completed = complete(
+        &request,
+        cache.path(),
+        super::super::materialize::Acquired {
+            prepared: prepared.clone(),
+            staged: vec![super::super::materialize::StagedFile {
+                path: "Code.cs".into(),
+                extracted: true,
+                lfs: false,
+            }],
+        },
+        &pin(&pool),
+        &staging,
+        &telemetry,
+    )
+    .unwrap();
+    assert_eq!(completed.prepared.selected, prepared.selected);
+    assert_eq!(
+        fs::read(request.staging.join("Code.cs")).unwrap(),
+        b"class Ready {}"
+    );
 }
 
 fn publish_selector(cache: &Path, pool: &Pool, root: &Root) {

@@ -7,10 +7,7 @@ use crate::{
     model::Language,
     store::{FileData, payload as records},
 };
-use std::{
-    collections::BTreeSet,
-    io::{Read, Write},
-};
+use std::{collections::BTreeSet, io::Read};
 
 pub(super) struct Builder {
     work: tempfile::TempDir,
@@ -36,9 +33,9 @@ impl Builder {
             },
         })
     }
-    fn object(&mut self, path: String, bytes: &[u8], group: &str) -> Result<()> {
+    pub(super) fn object(&mut self, path: String, bytes: &[u8], group: &str) -> Result<()> {
         safe(&path)?;
-        let hash = *blake3::hash(bytes).as_bytes();
+        let hash = sections::object_hash(bytes);
         if let Some((previous, previous_group)) = self.paths.get(&path) {
             ensure!(
                 previous == &hash && previous_group == group,
@@ -83,8 +80,7 @@ impl Builder {
                 encoded: records::encode(data)?,
             };
             let encoded = envelope(&binary::encode(&analysis)?);
-            self.assemblies
-                .insert(id, *blake3::hash(&encoded).as_bytes());
+            self.assemblies.insert(id, sections::object_hash(&encoded));
             return self.object(target, &encoded, group);
         }
         let language = if file.extension().is_some_and(|e| e == "cs") {
@@ -148,48 +144,7 @@ impl Builder {
             );
         }
         self.manifest.packages.dedup();
-        let bytes = envelope(&binary::encode(&self.manifest)?);
-        let name = format!(
-            "{}-{}.tar.zst",
-            self.manifest.origin.kind,
-            blake3::hash(&bytes).to_hex()
-        );
-        let path = output.join(&name);
-        let mut temporary = tempfile::NamedTempFile::new_in(output)?;
-        {
-            let mut compressed = zstd::stream::write::Encoder::new(temporary.as_file_mut(), 22)?;
-            compressed.window_log(27)?;
-            compressed.long_distance_matching(true)?;
-            let mut tar = tar::Builder::new(compressed);
-            fn append<W: Write>(tar: &mut tar::Builder<W>, path: &str, bytes: &[u8]) -> Result<()> {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(bytes.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                tar.append_data(&mut header, path, bytes)?;
-                Ok(())
-            }
-            append(&mut tar, "manifest.bin", &bytes)?;
-            let unique: BTreeSet<_> = self.manifest.entries.iter().map(|e| e.hash).collect();
-            for hash in unique {
-                let bytes = read(&self.work.path().join(hex(&hash)))?;
-                append(&mut tar, &format!("objects/{}", hex(&hash)), &bytes)?;
-            }
-            tar.into_inner()?.finish()?;
-        }
-        temporary.as_file().sync_all()?;
-        temporary.persist(&path)?;
-        self.manifest.entries.clear();
-        let artifact = Artifact {
-            name,
-            hash: digest(&path)?,
-            size: fs::metadata(&path)?.len(),
-            release: TAG.into(),
-            manifest: self.manifest,
-        };
-        verify(&path, Some(&artifact))?;
-        save(&path.with_extension("bin"), &binary::encode(&artifact)?)?;
-        Ok(artifact)
+        sections::write(self.manifest, self.work.path(), output)
     }
 }
 
@@ -217,6 +172,7 @@ pub(super) fn license(path: &Path) -> bool {
         || name.contains("third party")
 }
 
+#[cfg(test)]
 pub(super) fn unpack(
     path: &Path,
     destination: &Path,
@@ -233,14 +189,48 @@ fn inspect(
     if let Some(expected) = expected {
         verify_digest(path, expected)?;
     }
-    let mut reader = zstd::stream::read::Decoder::new(fs::File::open(path)?)?;
+    sections::inspect(fs::File::open(path)?, destination, expected, None)
+}
+
+/// Decode into a private tree while verifying the compressed transport. No
+/// immutable links are published until this function has validated the EOF.
+#[cfg(test)]
+pub(super) fn unpack_stream(
+    reader: impl Read,
+    destination: &Path,
+    expected: &Artifact,
+    import: &mut crate::cache::blobs::OwnedTree<'_>,
+) -> Result<Manifest> {
+    sections::authenticated(reader, expected.size, &expected.hash, |reader| {
+        sections::inspect(reader, Some(destination), Some(expected), Some(import))
+    })
+}
+
+pub(super) fn inspect_section(
+    input: impl Read,
+    destination: Option<&Path>,
+    expected: &Section,
+    import: Option<&mut crate::cache::blobs::OwnedTree<'_>>,
+) -> Result<sections::Frame> {
+    inspect_section_with(input, destination, expected, import, |_, _| Ok(()))
+}
+
+pub(super) fn inspect_section_with(
+    input: impl Read,
+    destination: Option<&Path>,
+    expected: &Section,
+    mut import: Option<&mut crate::cache::blobs::OwnedTree<'_>>,
+    begin: impl FnOnce(&sections::Frame, u64) -> Result<()>,
+) -> Result<sections::Frame> {
+    let mut reader = zstd::stream::read::Decoder::new(input)?;
     reader.window_log_max(27)?;
     let mut archive = tar::Archive::new(reader);
-    let mut entries = archive.entries()?;
+    // Extensions can allocate unbounded payloads before our size/type checks.
+    // The bundle format uses only short, regular entries.
+    let mut entries = archive.entries()?.raw(true);
     let mut first = entries.next().context("Empty metadata bundle")??;
     ensure!(
-        first.path()?.as_ref() == Path::new("manifest.bin")
-            && first.header().entry_type().is_file(),
+        first.path()?.as_ref() == Path::new("section.bin") && first.header().entry_type().is_file(),
         "Bundle must start with its manifest"
     );
     ensure!(
@@ -249,18 +239,51 @@ fn inspect(
     );
     let mut bytes = Vec::new();
     first.read_to_end(&mut bytes)?;
-    let mut manifest: Manifest = binary::decode(payload(&bytes)?)?;
+    ensure!(
+        blake3::hash(&bytes).as_bytes() == &expected.manifest_hash,
+        "Section manifest digest mismatch"
+    );
+    let manifest: sections::Frame = binary::decode(payload(&bytes)?)?;
+    let manifest_size = bytes.len() as u64;
     drop(bytes);
-    if let Some(expected) = expected {
-        let entries = std::mem::take(&mut manifest.entries);
-        let agrees = manifest == expected.manifest;
-        manifest.entries = entries;
-        ensure!(agrees, "Catalog and bundle disagree");
-    }
+    ensure!(manifest.role == expected.role, "Section role mismatch");
+    let index_path = sections::index_path(&manifest.role);
+    let has_index = manifest
+        .entries
+        .iter()
+        .any(|entry| entry.path == index_path);
+    let verification = if has_index && destination.is_none() {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let mut references = Vec::new();
+    let mut index_disk = None;
+    let mut sources = BTreeMap::new();
+    let groups: BTreeMap<_, _> = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.group.as_str()))
+        .collect();
+    let mut package_verified = manifest.package.is_none();
     let mut pending: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
     let mut paths = BTreeSet::new();
     for entry in &manifest.entries {
         safe(&entry.path)?;
+        ensure!(
+            if entry.group == "index" {
+                entry.path == index_path
+            } else {
+                sections::role(entry, &groups)? == manifest.role
+            },
+            "File belongs to another metadata section"
+        );
+        ensure!(
+            !has_index
+                || !entry.path.ends_with(".sigla")
+                || entry.size == IndexReference::SIZE as u64,
+            "Invalid assembly reference size"
+        );
         ensure!(
             entry.size <= MAX_RECORD && paths.insert(entry.path.as_str()),
             "Invalid bundle inventory"
@@ -279,6 +302,7 @@ fn inspect(
             "Bundle file is also used as a directory"
         );
     }
+    begin(&manifest, manifest_size)?;
     if let Some(destination) = destination {
         fs::create_dir_all(destination)?;
     }
@@ -296,8 +320,50 @@ fn inspect(
             targets.iter().all(|e| e.size == item.size()),
             "Object size mismatch"
         );
+        if destination.is_none() && targets.iter().any(|entry| entry.path == index_path) {
+            let path = verification.as_ref().unwrap().path().join(&index_path);
+            fs::create_dir_all(path.parent().unwrap())?;
+            let mut file = fs::File::create(&path)?;
+            std::io::copy(&mut item, &mut file)?;
+            let mut hash = crate::cache::file_id::hasher(sections::OBJECT_MODE);
+            hash.update_reader(fs::File::open(&path)?)?;
+            ensure!(
+                hash.finalize().as_bytes() == &targets[0].hash,
+                "Index digest mismatch"
+            );
+            index_disk = Some(path);
+            continue;
+        }
         if let Some(destination) = destination {
             let first = destination.join(&targets[0].path);
+            if let Some(import) = import.as_deref_mut() {
+                ensure!(
+                    import.write_identified(
+                        &first,
+                        0o666,
+                        &mut item,
+                        (sections::OBJECT_MODE, targets[0].hash)
+                    )? == targets[0].size,
+                    "Truncated bundle object"
+                );
+                if has_index {
+                    for target in &targets {
+                        if target.path == index_path {
+                            index_disk = Some(first.clone());
+                        }
+                        if target.path.ends_with(".sigla") {
+                            references.push((
+                                target.path.clone(),
+                                IndexReference::decode(&read(&first)?)?,
+                            ));
+                        }
+                    }
+                }
+                for target in &targets[1..] {
+                    import.alias(&first, &destination.join(&target.path))?;
+                }
+                continue;
+            }
             fs::create_dir_all(first.parent().unwrap())?;
             let mut output = fs::OpenOptions::new()
                 .write(true)
@@ -308,9 +374,21 @@ fn inspect(
                 "Truncated bundle object"
             );
             drop(output);
-            if expected.is_none() {
-                ensure!(digest(&first)? == targets[0].hash, "Object digest mismatch");
+            if has_index {
+                for target in &targets {
+                    if target.path == index_path {
+                        index_disk = Some(first.clone());
+                    }
+                    if target.path.ends_with(".sigla") {
+                        references
+                            .push((target.path.clone(), IndexReference::decode(&read(&first)?)?));
+                    }
+                }
             }
+            ensure!(
+                sections::object_hash(&read(&first)?) == targets[0].hash,
+                "Object digest mismatch"
+            );
             for target in &targets[1..] {
                 let path = destination.join(&target.path);
                 fs::create_dir_all(path.parent().unwrap())?;
@@ -326,12 +404,40 @@ fn inspect(
         let mut bytes = Vec::new();
         item.read_to_end(&mut bytes)?;
         ensure!(
-            blake3::hash(&bytes).as_bytes() == &targets[0].hash,
+            sections::object_hash(&bytes) == targets[0].hash,
             "Object digest mismatch"
         );
         for target in targets {
+            if let Some(package) = &manifest.package
+                && [
+                    "packages",
+                    "Editor/Data/Resources/PackageManager/BuiltInPackages",
+                ]
+                .iter()
+                .any(|prefix| target.path == format!("{prefix}/{}/package.json", package.name))
+            {
+                ensure!(
+                    &registry::package(&serde_json::from_slice(&bytes)?)? == package,
+                    "Package contents disagree with discovery inventory"
+                );
+                package_verified = true;
+            }
+            if target.path.ends_with(".cs") && has_index {
+                let source = crate::model::decode(&bytes, Language::CSharp)?;
+                sources.insert(
+                    target.path.clone(),
+                    (
+                        *blake3::hash(source.as_bytes()).as_bytes(),
+                        source.contains('#'),
+                    ),
+                );
+            }
             if target.path.ends_with(".sigla") {
-                validate_analysis(&binary::decode::<Analysis>(payload(&bytes)?)?)?;
+                if has_index {
+                    references.push((target.path.clone(), IndexReference::decode(&bytes)?));
+                } else {
+                    validate_analysis(&binary::decode::<Analysis>(payload(&bytes)?)?)?;
+                }
             } else if target.path.ends_with(".analysis") {
                 for (id, encoded) in binary::decode::<Vec<(ObjectId, &[u8])>>(payload(&bytes)?)? {
                     validate_analysis(&Analysis {
@@ -343,12 +449,58 @@ fn inspect(
         }
     }
     ensure!(pending.is_empty(), "Bundle is missing objects");
-    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
-    if let Some(destination) = destination {
-        save(
-            &destination.join("manifest.bin"),
-            &binary::encode(&manifest)?,
-        )?;
+    ensure!(
+        destination.is_some() || package_verified,
+        "Package section is missing its package manifest"
+    );
+    // The iterator consumes the first zero block. Only the writer's second
+    // block may follow; never expand an unchecked tail before authentication.
+    let mut reader = archive.into_inner();
+    let mut padding = [0; 512];
+    reader.read_exact(&mut padding)?;
+    ensure!(padding == [0; 512], "Invalid bundle padding");
+    ensure!(reader.read(&mut [0])? == 0, "Unexpected data after bundle");
+    if has_index {
+        // Extraction has stopped. The private output remains owned here until
+        // this map drops, before publication or removal of the staging tree.
+        let segment = unsafe {
+            crate::store::segment::Segment::staged(
+                index_disk.as_deref().context("Missing section index")?,
+            )?
+        };
+        segment.validate(destination.is_none())?;
+        segment.files(|path, invariant, ordinal| {
+            ensure!(
+                paths.contains(path),
+                "Indexed file is absent from its section"
+            );
+            if destination.is_none() && path.ends_with(".cs") {
+                let (hash, directives) = sources.get(path).context("Indexed source is missing")?;
+                let source = segment.source(ordinal)?;
+                ensure!(
+                    blake3::hash(source.as_bytes()).as_bytes() == hash,
+                    "Source profile belongs to a different file"
+                );
+                if invariant {
+                    ensure!(
+                        !directives
+                            && segment.object(ordinal)?
+                                == crate::store::source_id(source, Language::CSharp, &[], "")?,
+                        "Conditional source marked as invariant"
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        for (path, reference) in references {
+            let ordinal = segment
+                .file(&path, || Ok(reference.id))?
+                .context("Assembly has no immutable profile")?;
+            ensure!(
+                segment.object(ordinal)? == reference.id,
+                "Assembly reference identity mismatch"
+            );
+        }
     }
     Ok(manifest)
 }

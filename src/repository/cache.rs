@@ -13,7 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -68,6 +68,27 @@ struct Pool {
     capacity: Arc<Capacity>,
     pending: Mutex<Vec<Weak<Root>>>,
     readers: Mutex<Vec<Weak<HistoryRoot>>>,
+}
+
+struct PoolHold {
+    repository: Identity,
+    owner: &'static str,
+    started: Instant,
+}
+impl PoolHold {
+    fn new(repository: &Identity, owner: &'static str) -> Self {
+        Self {
+            repository: repository.clone(),
+            owner,
+            started: Instant::now(),
+        }
+    }
+}
+impl Drop for PoolHold {
+    fn drop(&mut self) {
+        tracing::info!(repository = %self.repository, owner = self.owner,
+            hold_ms = self.started.elapsed().as_millis(), "Git pool operation released");
+    }
 }
 
 /// Hold this until parent-side publication completes or is abandoned.
@@ -405,7 +426,7 @@ pub(crate) fn acquire(request: &Request, cache: &Path) -> Result<(Prepared, Pin,
     let (prepared, pin) = acquisition.git(request, cache, None, &telemetry)?;
     drop(acquisition);
     Ok((
-        complete(request, cache, prepared, &pin, &staging, &telemetry)?,
+        complete(request, cache, prepared, &pin, &staging, &telemetry)?.prepared,
         pin,
         staging,
     ))
@@ -417,6 +438,7 @@ pub(super) struct Acquisition {
     pool: Arc<Pool>,
     operation: OwnedMutexGuard<u64>,
     pub staging: Arc<Staging>,
+    _held: PoolHold,
 }
 
 impl Acquisition {
@@ -430,11 +452,13 @@ impl Acquisition {
             let _wait = telemetry.wait("repository_pool_admission");
             pool.operation.clone().lock_owned().await
         };
+        let held = PoolHold::new(identity, "acquisition");
         let staging = pool.capacity.staging(telemetry).await?;
         Ok(Self {
             pool,
             operation,
             staging,
+            _held: held,
         })
     }
 
@@ -444,7 +468,7 @@ impl Acquisition {
         cache: &Path,
         reuse: Option<super::materialize::Reuse>,
         telemetry: &crate::telemetry::Operation,
-    ) -> Result<(Prepared, Pin)> {
+    ) -> Result<(super::materialize::Acquired, Pin)> {
         ensure!(
             !matches!(request.target, super::materialize::Target::DefaultBranch),
             "Default-branch discovery must keep using the metadata-only job"
@@ -463,14 +487,11 @@ impl Acquisition {
         let mut request = request.clone();
         request.store = pool.root.join("current");
         // execute() is synchronous and does not return until its bounded child is stopped.
-        let prepared = match reuse {
-            Some(reuse) => super::job::materialize(&request, cache, reuse)?,
-            None => super::job::execute(&request, cache)?,
-        };
+        let prepared = super::job::acquire(&request, cache, reuse)?;
         state.used = now();
         state.retained = None;
         pool.persist(&state)?;
-        let pin = pool.pin(&prepared)?; // Still under operation lock: no unprotected handoff.
+        let pin = pool.pin(&prepared.prepared)?; // Still under operation lock: no unprotected handoff.
         Ok((prepared, pin))
     }
 }
@@ -478,43 +499,47 @@ impl Acquisition {
 pub(super) fn complete(
     request: &Request,
     cache: &Path,
-    prepared: Prepared,
+    mut acquired: super::materialize::Acquired,
     pin: &Pin,
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
-) -> Result<Prepared> {
+) -> Result<super::materialize::Acquired> {
     if matches!(request.contents, super::materialize::Contents::Inventory)
-        || fs::read_dir(&request.staging)?
-            .next()
-            .transpose()?
-            .is_none()
+        || acquired.staged.is_empty()
     {
-        return Ok(prepared);
+        return Ok(acquired);
     }
     // Record raw Git identities before hydration replaces pointer files.
     import_stage(
         request,
         cache,
-        &prepared,
+        &acquired.prepared,
+        &acquired.staged,
         staging,
         telemetry,
         &pin._pool.root,
     )?;
     // Hydration only uses staged pointers and the LFS cache. It must not hold
     // the Git pool gate while downloading large objects.
-    if prepared.selected.is_empty() {
-        Ok(prepared)
-    } else {
+    let pointers: Vec<_> = acquired
+        .staged
+        .iter()
+        .filter(|file| file.lfs)
+        .map(|file| file.path.clone())
+        .collect();
+    if !pointers.is_empty() {
         let _permit = futures_executor::block_on(staging.capacity.transfer(telemetry))?;
         // Hydration publishes canonical files and syncs only affected directories.
-        super::job::hydrate(request, cache, prepared)
+        acquired.prepared = super::job::hydrate(request, cache, acquired.prepared, pointers)?;
     }
+    Ok(acquired)
 }
 
 fn import_stage(
     request: &Request,
     cache: &Path,
     prepared: &Prepared,
+    staged: &[super::materialize::StagedFile],
     staging: &Staging,
     telemetry: &crate::telemetry::Operation,
     raw_owner: &Path,
@@ -523,7 +548,16 @@ fn import_stage(
         let _permit = futures_executor::block_on(staging.capacity.import(telemetry))?;
         let started = std::time::Instant::now();
         let stats = crate::cache::blobs::Store::open(cache)?.import_owned_tree(&request.staging)?;
-        if let Err(error) = super::files::record(raw_owner, cache, prepared, &request.staging) {
+        if let Err(error) = super::files::record_selected(
+            raw_owner,
+            cache,
+            prepared,
+            &request.staging,
+            staged
+                .iter()
+                .filter(|file| file.extracted)
+                .map(|file| file.path.as_str()),
+        ) {
             tracing::warn!(%error, "Could not cache Git file aliases");
         }
         tracing::info!(
@@ -578,6 +612,7 @@ fn maintain_pool(
         Ok(guard) => guard,
         Err(_) => return Ok(()),
     };
+    let _held = PoolHold::new(identity, "maintenance");
     private_dir(&pool.root)?; // A preceding idle-maintenance operation may have removed it.
     pool.recover()?;
     let mut state = pool.state()?;
@@ -838,6 +873,7 @@ pub(super) fn object_lease_monitored(
         let _wait = telemetry.wait("history_pool_admission");
         super::history::wait(cancel, pool.operation.lock())?
     };
+    let _held = PoolHold::new(identity, "history_reader_setup");
     let _setup = telemetry.wait("history_reader_setup");
     private_dir(&pool.root)?;
     pool.recover()?;
@@ -912,6 +948,7 @@ impl ObjectLease {
             let _wait = telemetry.wait("history_pool_admission");
             super::history::wait(cancel, self.pool.operation.lock())?
         };
+        let _held = PoolHold::new(&self.pool.identity, "history_acquisition");
         self.pool.recover()?;
         let bytes = {
             let _permit = super::history::wait(cancel, self.pool.capacity.transfer(telemetry))??;
@@ -937,6 +974,7 @@ impl ObjectLease {
             complete,
             boundaries,
             &std::sync::atomic::AtomicBool::new(false),
+            &crate::telemetry::Operation::default(),
         )
     }
 
@@ -945,8 +983,13 @@ impl ObjectLease {
         complete: &BTreeSet<String>,
         boundaries: &BTreeSet<String>,
         cancel: &std::sync::atomic::AtomicBool,
+        telemetry: &crate::telemetry::Operation,
     ) -> Result<()> {
-        let _operation = super::history::wait(cancel, self.pool.operation.lock())?;
+        let _operation = {
+            let _wait = telemetry.wait("history_publication_admission");
+            super::history::wait(cancel, self.pool.operation.lock())?
+        };
+        let _held = PoolHold::new(&self.pool.identity, "history_publication");
         let current = self.pool.root.join("current");
         // A replacement includes every object pinned before root capture. Readers
         // can also keep older objects: link these back before extending coverage.

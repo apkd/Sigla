@@ -175,6 +175,13 @@ impl Summary {
             list(&projects),
             format!("{tracked} tracked · {} indexed", files.len()),
         ];
+        if manifest.secondary {
+            columns[2] = "Rust projects";
+            columns[3] = "Rust files";
+            values[3] = format!("{} indexed", files.len());
+            columns.push("Scope");
+            values.push("Rust; other languages are still preparing".into());
+        }
         if !stack.is_empty() {
             columns.push("Stack");
             values.push(cell(&stack.into_iter().collect::<Vec<_>>().join(" · ")));
@@ -191,7 +198,11 @@ impl Summary {
             ));
         }
         Self {
-            key: format!("{}#{branch}", identity.storage_key()),
+            key: format!(
+                "{}#{branch}{}",
+                identity.storage_key(),
+                if manifest.secondary { ":rust" } else { "" }
+            ),
             table: format!(
                 "| {} |\n| {} |\n| {} |",
                 columns.join(" | "),

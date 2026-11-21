@@ -476,7 +476,12 @@ impl Store {
     }
     pub fn finish(&self) -> Result<()> {
         if let Some(lease) = &self.lease {
-            lease.publish_cancellable(&self.complete, &self.boundaries, &self.cancel)?;
+            lease.publish_cancellable(
+                &self.complete,
+                &self.boundaries,
+                &self.cancel,
+                &self.operation,
+            )?;
         }
         if let Some(remote) = &self.remote {
             tracing::debug!(

@@ -2,6 +2,7 @@
 mod data;
 pub(crate) mod format;
 pub(crate) mod payload;
+pub mod segment;
 pub mod shared;
 
 use crate::{
@@ -25,6 +26,7 @@ pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ManifestRecord<'a> {
     group: Option<crate::native::Group>,
+    secondary: bool,
     policy: [u8; 32],
     data: &'a [u8],
 }
@@ -39,10 +41,11 @@ pub use data::FileData;
 
 pub struct Store {
     pub scope: shared::Scope,
+    mounted: Arc<segment::Mounted>,
 }
 
 pub(crate) enum DependencyInventory {
-    SourceGroup,
+    Secondary,
     Primary(Box<crate::workspace::Manifest>),
     Unavailable,
 }
@@ -55,8 +58,8 @@ pub(crate) fn inspect_dependencies(
         return Ok(DependencyInventory::Unavailable);
     };
     let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
-    if record.group.is_some() {
-        Ok(DependencyInventory::SourceGroup)
+    if record.secondary {
+        Ok(DependencyInventory::Secondary)
     } else if phase == shared::Phase::Clean {
         Ok(DependencyInventory::Primary(Box::new(
             postcard::from_bytes(record.data)?,
@@ -119,6 +122,38 @@ fn now() -> u64 {
         .unwrap_or(u64::MAX)
 }
 impl Store {
+    pub(crate) fn from_scope(scope: shared::Scope) -> Self {
+        Self {
+            scope,
+            mounted: Arc::default(),
+        }
+    }
+    pub(crate) fn with_mounts(&self, mounts: &[segment::Mount], cache: &Path) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            scope: self.scope.clone(),
+            mounted: Arc::new(segment::Mounted::open(mounts, cache)?),
+        }))
+    }
+    pub(crate) fn mounted(&self, file: &str) -> bool {
+        self.mounted.files.contains_key(file)
+    }
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.mounted.retained_bytes()
+    }
+    fn record<'a>(&'a self, tx: &'a RoTxn<'_>, file: &str, key: &[u8]) -> Result<Option<&'a [u8]>> {
+        if self.mounted(file) {
+            self.mounted.record(file, key)
+        } else {
+            self.scope.record(tx, file, key)
+        }
+    }
+    fn object(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<ObjectId>> {
+        if self.mounted(file) {
+            self.mounted.object(file)
+        } else {
+            Ok(self.scope.binding(tx, file)?.map(|binding| binding.object))
+        }
+    }
     pub fn open_workspace(
         analysis: &Path,
         fingerprint: [u8; 32],
@@ -126,9 +161,11 @@ impl Store {
         owner: Option<&Path>,
     ) -> Result<Arc<Self>> {
         let database = Database::open(analysis)?;
-        Ok(Arc::new(Self {
-            scope: database.workspace(fingerprint, entry, owner)?,
-        }))
+        Ok(Arc::new(Self::from_scope(database.workspace(
+            fingerprint,
+            entry,
+            owner,
+        )?)))
     }
     pub fn read(&self) -> Result<RoTxn<'_, heed::WithTls>> {
         self.scope.read()
@@ -136,6 +173,7 @@ impl Store {
     pub(crate) fn snapshot(&self) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             scope: self.scope.snapshot()?,
+            mounted: self.mounted.clone(),
         }))
     }
     pub fn query_read(&self) -> Result<RoTxn<'_, heed::WithTls>> {
@@ -151,22 +189,38 @@ impl Store {
         self.scope.clean()
     }
     pub fn get_manifest<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
-        let bytes = self.scope.manifest()?;
-        let Some(bytes) = bytes else {
-            return Ok(None);
-        };
-        let record: ManifestRecord<'_> = postcard::from_bytes(&bytes)?;
-        Ok(Some(postcard::from_bytes(record.data)?))
+        Ok(self.get_manifest_sized()?.map(|(manifest, _)| manifest))
+    }
+    pub(crate) fn get_manifest_sized<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<(T, usize)>> {
+        self.scope.inspect_manifest(|phase, bytes| {
+            let Some(bytes) = bytes.filter(|_| phase == shared::Phase::Clean) else {
+                return Ok(None);
+            };
+            let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
+            Ok(Some((
+                postcard::from_bytes(record.data)?,
+                record.data.len(),
+            )))
+        })
     }
     pub(crate) fn dependency_inventory(&self) -> Result<DependencyInventory> {
         self.scope.inspect_manifest(inspect_dependencies)
     }
     /// Reconcile against persisted bindings, not only the previous in-memory manifest.
-    pub fn save_manifest(&self, manifest: &crate::workspace::Manifest) -> Result<()> {
-        let keep = manifest.files.keys().cloned().collect();
+    pub fn save_manifest(&self, manifest: &crate::workspace::Manifest) -> Result<usize> {
+        let keep = manifest
+            .files
+            .keys()
+            .filter(|file| !self.mounted(file))
+            .cloned()
+            .collect();
         let data = postcard::to_allocvec(manifest)?;
+        let secondary = manifest.secondary || manifest.source_group.is_some();
         let bytes = postcard::to_allocvec(&ManifestRecord {
             group: manifest.source_group,
+            secondary,
             policy: manifest.discovery_policy,
             data: &data,
         })?;
@@ -180,10 +234,14 @@ impl Store {
         self.scope.retire_matching(|id, bytes| {
             let record: ManifestRecord<'_> = postcard::from_bytes(bytes)?;
             Ok(record.policy == manifest.discovery_policy
-                && (id < self.scope.id && record.group == manifest.source_group
-                    || manifest.source_group.is_none()
+                && (id < self.scope.id
+                    && record.group == manifest.source_group
+                    && record.secondary == secondary
+                    || !secondary
+                        && manifest.source_group.is_none()
                         && record.group.is_some_and(|group| !groups.contains(&group))))
-        })
+        })?;
+        Ok(data.len())
     }
     pub fn remove(&self, file: &str) -> Result<()> {
         self.scope.detach(file, now())
@@ -251,20 +309,20 @@ impl Store {
         self.scope
             .prepare_install(file, postcard::to_allocvec(revision)?, id, now(), build)
     }
-    pub(crate) fn prepare_reuse<R: Serialize>(
+    pub(crate) fn prepare_reuse_in<R: Serialize>(
         &self,
+        tx: &RoTxn<'_>,
         file: &str,
         revision: &R,
         input: Option<ObjectId>,
     ) -> Result<shared::Reuse> {
         self.scope
-            .prepare_reuse(file, postcard::to_allocvec(revision)?, input, now())
+            .prepare_reuse_in(tx, file, postcard::to_allocvec(revision)?, input, now())
     }
     pub fn modules(&self, file: &str) -> Result<Vec<ModuleFile>> {
         let tx = self.read()?;
         crate::binary::decode(
-            self.scope
-                .record(&tx, file, payload::MODULES)?
+            self.record(&tx, file, payload::MODULES)?
                 .context("Missing module record")?,
         )
     }
@@ -276,20 +334,18 @@ impl Store {
             .map(crate::binary::decode)
             .transpose()
     }
-    pub(crate) fn source<'t>(&self, tx: &'t RoTxn<'_>, file: &str) -> Result<Option<&'t str>> {
-        self.scope
-            .record(tx, file, payload::DATA)?
+    pub(crate) fn source<'t>(&'t self, tx: &'t RoTxn<'_>, file: &str) -> Result<Option<&'t str>> {
+        self.record(tx, file, payload::DATA)?
             .map(payload::source)
             .transpose()
     }
     pub(crate) fn assembly_signature<'t>(
-        &self,
+        &'t self,
         tx: &'t RoTxn<'_>,
         file: &str,
         header: std::ops::Range<usize>,
     ) -> Result<&'t str> {
         let data = self
-            .scope
             .record(tx, file, payload::DATA)?
             .context("Missing assembly source")?;
         let bytes = payload::source_bytes(data)?
@@ -298,14 +354,12 @@ impl Store {
         Ok(std::str::from_utf8(bytes)?.trim())
     }
     pub fn load(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<FileData>> {
-        self.scope
-            .record(tx, file, payload::DATA)?
+        self.record(tx, file, payload::DATA)?
             .map(|bytes| {
                 let (mut data, _) = payload::decode::<FileData>(bytes, 32)?;
                 data.facts.declarations = self.declarations_in(tx, file)?;
                 data.facts.modules = crate::binary::decode(
-                    self.scope
-                        .record(tx, file, payload::MODULES)?
+                    self.record(tx, file, payload::MODULES)?
                         .context("Missing module record")?,
                 )?;
                 data.assembly = self.assembly_name_in(tx, file)?;
@@ -323,7 +377,7 @@ impl Store {
         tx: &RoTxn<'_>,
         file: &str,
     ) -> Result<Vec<crate::model::Declaration>> {
-        format::Reader::new(|key| self.scope.record(tx, file, key))?.declarations()
+        format::Reader::new(|key| self.record(tx, file, key))?.declarations()
     }
     pub(crate) fn named_assembly_declarations(
         &self,
@@ -337,7 +391,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        format::Reader::new(|key| self.scope.record(tx, file, key))?.declarations_at(ids)
+        format::Reader::new(|key| self.record(tx, file, key))?.declarations_at(ids)
     }
     fn headers_record(
         &self,
@@ -345,18 +399,17 @@ impl Store {
         file: &str,
         key: &[u8],
     ) -> Result<Option<Arc<DeclarationFile>>> {
-        let Some(binding) = self.scope.binding(tx, file)? else {
+        let Some(object) = self.object(tx, file)? else {
             return Ok(None);
         };
         let mut hash = blake3::Hasher::new();
-        hash.update(&binding.object);
+        hash.update(&object);
         hash.update(key);
         let cache_key = *hash.finalize().as_bytes();
         if let Some(Decoded::Headers(value)) = DECODED.lock().unwrap().get(&cache_key) {
             return Ok(Some(value));
         }
-        let mut reader =
-            format::Reader::for_analysis(|key| self.scope.record(tx, file, key), binding.object)?;
+        let mut reader = format::Reader::for_analysis(|key| self.record(tx, file, key), object)?;
         if !reader.directory.csharp {
             return Ok(None);
         }
@@ -399,10 +452,7 @@ impl Store {
         name: &str,
         kind: DeclarationLookup,
     ) -> Result<Vec<u32>> {
-        let Some(bytes) = self
-            .scope
-            .record(tx, file, &payload::lookup_key(kind, name))?
-        else {
+        let Some(bytes) = self.record(tx, file, &payload::lookup_key(kind, name))? else {
             return Ok(Vec::new());
         };
         Ok(payload::decode(bytes, 16)?.0)
@@ -413,7 +463,6 @@ impl Store {
         file: &str,
     ) -> Result<Vec<crate::csharp::syntax::Import>> {
         let bytes = self
-            .scope
             .record(tx, file, payload::IMPORTS)?
             .context("Missing C# imports")?;
         Ok(payload::decode(bytes, 16)?.0)
@@ -432,7 +481,7 @@ impl Store {
         file: &str,
         position: usize,
     ) -> Result<Option<Arc<BodyFile>>> {
-        let Some(bytes) = self.scope.record(tx, file, payload::BODY_INDEX)? else {
+        let Some(bytes) = self.record(tx, file, payload::BODY_INDEX)? else {
             return Ok(None);
         };
         let index = crate::binary::decode::<Vec<(std::ops::Range<usize>, u32)>>(bytes)?;
@@ -444,7 +493,6 @@ impl Store {
             return Ok(None);
         };
         let bytes = self
-            .scope
             .record(tx, file, &payload::body_key(entry.1))?
             .context("Missing body group")?;
         let key = *blake3::hash(bytes).as_bytes();
@@ -463,8 +511,9 @@ impl Store {
         &self,
         tx: &RoTxn<'_>,
     ) -> Result<Vec<(String, Vec<crate::csharp::syntax::Import>)>> {
-        self.scope
-            .global_files(tx)?
+        let mut files: BTreeSet<_> = self.scope.global_files(tx)?.into_iter().collect();
+        self.mounted.globals(&mut files)?;
+        files
             .into_iter()
             .map(|file| {
                 let imports = self
@@ -482,7 +531,6 @@ impl Store {
     }
     pub fn declaration_revision_in(&self, tx: &RoTxn<'_>, file: &str) -> Result<[u8; 32]> {
         Ok(self
-            .scope
             .record(tx, file, payload::ENVIRONMENT)?
             .context("Missing declaration fingerprint")?
             .try_into()?)
@@ -492,14 +540,12 @@ impl Store {
         self.assembly_name_in(&tx, file)
     }
     pub fn assembly_name_in(&self, tx: &RoTxn<'_>, file: &str) -> Result<Option<String>> {
-        self.scope
-            .record(tx, file, payload::ASSEMBLY)?
+        self.record(tx, file, payload::ASSEMBLY)?
             .map(|b| Ok(std::str::from_utf8(b)?.to_owned()))
             .transpose()
     }
     pub fn assembly_forwarders(&self, tx: &RoTxn<'_>, file: &str) -> Result<Vec<(String, String)>> {
-        self.scope
-            .record(tx, file, payload::FORWARDERS)?
+        self.record(tx, file, payload::FORWARDERS)?
             .map(crate::binary::decode)
             .transpose()
             .map(|v| v.unwrap_or_default())
@@ -511,12 +557,15 @@ impl Store {
         loose: bool,
         occurrences: bool,
     ) -> Result<BTreeSet<String>> {
-        self.scope.candidates(
+        let mut result = self.scope.candidates(
             tx,
             name,
             occurrences,
             !loose && !name.contains('*'),
             |candidate| crate::query::name_rank(name, candidate, loose).is_some(),
-        )
+        )?;
+        self.mounted
+            .candidates(name, loose, occurrences, &mut result)?;
+        Ok(result)
     }
 }

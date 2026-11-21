@@ -129,7 +129,7 @@ impl Analysis {
                     owners.observe(&info.entry, info.owner.as_deref(), &manifest, None);
                 }
                 crate::store::DependencyInventory::Unavailable => unknown.push(info.entry.clone()),
-                crate::store::DependencyInventory::SourceGroup => (),
+                crate::store::DependencyInventory::Secondary => (),
             }
             Ok(())
         })?;

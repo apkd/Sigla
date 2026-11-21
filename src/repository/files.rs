@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
+    io::Read,
     os::unix::fs::OpenOptionsExt,
     path::Path,
 };
@@ -135,6 +136,17 @@ pub(super) fn reuse(
                 reused.push(path.clone());
             }
             Linked::File(size) => {
+                let mut prefix = Vec::new();
+                if size >= super::lfs::MAGIC.len() as u64 {
+                    File::open(request.staging.join(path))?
+                        .take(super::lfs::MAGIC.len() as u64)
+                        .read_to_end(&mut prefix)?;
+                }
+                metrics.staged.push(super::materialize::StagedFile {
+                    path: path.clone(),
+                    extracted: false,
+                    lfs: prefix == super::lfs::MAGIC,
+                });
                 metrics.reused_files += 1;
                 metrics.reused_bytes += size;
                 reused.push(path.clone());
@@ -148,10 +160,30 @@ pub(super) fn reuse(
 }
 
 /// Call after importing raw Git files and before replacing any LFS pointers.
+#[cfg(test)]
 pub(super) fn record(root: &Path, cache: &Path, prepared: &Prepared, staging: &Path) -> Result<()> {
+    record_selected(
+        root,
+        cache,
+        prepared,
+        staging,
+        prepared.selected.keys().map(String::as_str),
+    )
+}
+
+pub(super) fn record_selected<'a>(
+    root: &Path,
+    cache: &Path,
+    prepared: &Prepared,
+    staging: &Path,
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<()> {
     let files = Store::open(cache)?;
     let mut additions = BTreeMap::new();
-    for (path, oid) in &prepared.selected {
+    for path in paths {
+        let Some(oid) = prepared.selected.get(path) else {
+            continue;
+        };
         if let Some((id, mode)) = files.file_identity(&staging.join(path))? {
             additions.insert(
                 key(oid, mode),

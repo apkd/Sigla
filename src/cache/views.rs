@@ -58,6 +58,11 @@ pub(crate) fn metadata_complete(root: &Path) -> bool {
         .is_some_and(|parent| parent.ends_with("unity-metadata"))
     {
         root.join("contents/manifest.bin").is_file()
+            || fs::read_dir(root.join("sections"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry.is_ok_and(|entry| entry.path().join("section.bin").is_file()))
     } else {
         root.join("contents").is_dir()
     }

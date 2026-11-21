@@ -217,7 +217,7 @@ impl View {
             },
         )?;
         File::open(&self.root)?.sync_all()?;
-        exchange(&contents, &self.path())?;
+        super::exchange(&contents, &self.path())?;
         File::open(stage.path())?.sync_all()?;
         File::open(&self.root)?.sync_all()?;
         // The journal owns both sides until cleanup completes, including after a crash.
@@ -253,26 +253,6 @@ fn validate_upper(path: &Path) -> Result<bool> {
         }
     }
     Ok(changed)
-}
-
-fn exchange(a: &Path, b: &Path) -> Result<()> {
-    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
-    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
-    ensure!(
-        unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                a.as_ptr(),
-                libc::AT_FDCWD,
-                b.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        } == 0,
-        "Cannot publish package view: {}",
-        std::io::Error::last_os_error()
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -318,7 +298,7 @@ mod tests {
             };
             super::super::records::write(&journal, &publication).unwrap();
             if installed {
-                exchange(&stage.join("contents"), &view.path()).unwrap();
+                crate::cache::exchange(&stage.join("contents"), &view.path()).unwrap();
             }
             drop(view);
             let recovered = View::open(cache.path(), &root, &leases).unwrap();
