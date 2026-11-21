@@ -16,6 +16,8 @@ pub struct Policy {
     pub remote: Option<RemoteContext>,
     materialization: Option<(PathBuf, [u8; 32])>,
     pub(crate) rust_only: bool,
+    /// Roots whose dependency caches were warmed by this preparation attempt.
+    pub(crate) unity_prefetched: Option<BTreeSet<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -41,6 +43,19 @@ impl std::fmt::Display for RequiredInputs {
 }
 impl std::error::Error for RequiredInputs {}
 
+#[derive(Debug)]
+pub(crate) struct UnityDependencies(pub PathBuf);
+impl std::fmt::Display for UnityDependencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Unity dependencies require preparation: {}",
+            self.0.display()
+        )
+    }
+}
+impl std::error::Error for UnityDependencies {}
+
 impl RemoteContext {
     fn tracked_file(&self, path: &Path) -> Result<Option<&str>> {
         let Ok(relative) = path.strip_prefix(&self.workspace) else {
@@ -64,6 +79,10 @@ impl RemoteContext {
     }
 
     pub fn require(&self, paths: impl IntoIterator<Item = PathBuf>) -> Result<()> {
+        Self::require_missing(self.missing(paths)?)
+    }
+
+    fn missing(&self, paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<String>> {
         let mut missing = BTreeSet::new();
         for path in paths {
             if !path.is_file()
@@ -72,8 +91,12 @@ impl RemoteContext {
                 missing.insert(relative.to_owned());
             }
         }
+        Ok(missing.into_iter().collect())
+    }
+
+    fn require_missing(missing: Vec<String>) -> Result<()> {
         if !missing.is_empty() {
-            return Err(RequiredInputs(missing.into_iter().collect()).into());
+            return Err(RequiredInputs(missing).into());
         }
         Ok(())
     }
@@ -86,11 +109,18 @@ impl RemoteContext {
         &'a self,
         directories: impl IntoIterator<Item = &'a Path>,
     ) -> Result<()> {
+        Self::require_missing(self.missing_analysis_inputs(directories)?)
+    }
+
+    pub(crate) fn missing_analysis_inputs<'a>(
+        &'a self,
+        directories: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Vec<String>> {
         let inputs = directories
             .into_iter()
             .map(|directory| self.analysis_inputs(directory))
             .collect::<Result<Vec<_>>>()?;
-        self.require(inputs.into_iter().flatten())
+        self.missing(inputs.into_iter().flatten())
     }
 
     fn tracked_files_in<'a>(
@@ -130,6 +160,10 @@ impl RemoteContext {
 }
 
 impl Policy {
+    pub(crate) fn leases(&self, cache: &Path) -> Result<crate::cache::views::LeaseSet> {
+        crate::cache::views::LeaseSet::new(self.remote.as_ref().map_or(cache, |r| &r.shared))
+    }
+
     /// Compare compiler input alternatives before sparse files are materialized.
     pub(crate) fn has_file(&self, path: &Path) -> Result<bool> {
         if path.is_file() {
@@ -206,6 +240,7 @@ impl Policy {
             remote: None,
             materialization: None,
             rust_only: false,
+            unity_prefetched: None,
             roots: roots
                 .into_iter()
                 .map(|p| {
@@ -337,12 +372,7 @@ pub(crate) fn discover_staged(
         entry.parent().unwrap().to_owned()
     };
     let mut result = Discovery {
-        leases: crate::cache::views::LeaseSet::new(
-            policy
-                .remote
-                .as_ref()
-                .map_or(cache, |remote| &remote.shared),
-        )?,
+        leases: policy.leases(cache)?,
         root,
         projects: Vec::new(),
         sources: Vec::new(),
@@ -393,6 +423,7 @@ pub(crate) fn discover_staged(
         };
         if let Err(error) = loaded {
             if error.downcast_ref::<RequiredInputs>().is_some()
+                || error.is::<UnityDependencies>()
                 || error
                     .chain()
                     .any(|cause| cause.is::<crate::diagnostics::Cancelled>())
@@ -1563,6 +1594,70 @@ pub(crate) mod tests {
             existing_error,
             allowed.canonical(&missing).unwrap_err().to_string()
         );
+    }
+
+    #[test]
+    fn remote_dependency_leases_use_shared_storage_instead_of_workspace_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let view = cache.path().join("unity-packages/retained");
+        std::fs::create_dir_all(&view).unwrap();
+        let mut policy = Policy::new(vec![root.path().into()]).unwrap();
+        policy.remote = Some(RemoteContext {
+            workspace: root.path().into(),
+            writable: private.path().into(),
+            shared: cache.path().into(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: Default::default(),
+        });
+        let leases = policy.leases(private.path()).unwrap();
+        leases.retain(&view).unwrap();
+        let registry = crate::cache::views::Registry::open(cache.path()).unwrap();
+        assert!(registry.try_retire(&view, || false).unwrap().is_none());
+        drop(leases);
+        assert!(registry.try_retire(&view, || false).unwrap().is_some());
+    }
+
+    #[test]
+    fn remote_unity_discovery_yields_before_missing_assets_or_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "ProjectSettings/ProjectVersion.txt",
+            "m_EditorVersion: 6000.3.0f1",
+        );
+        std::fs::create_dir(root.path().join("Assets")).unwrap();
+        let mut policy = Policy::new(vec![root.path().into()]).unwrap();
+        policy.remote = Some(RemoteContext {
+            workspace: root.path().into(),
+            writable: root.path().into(),
+            shared: cache.path().into(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new(["Assets/Plugin.dll".to_owned()].into()),
+        });
+        let identity = policy.identity().unwrap();
+        policy.unity_prefetched = Some(Default::default());
+        assert_eq!(identity, policy.identity().unwrap());
+        let error = discover_cached(root.path(), &policy, cache.path())
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<UnityDependencies>().unwrap().0,
+            root.path()
+        );
+        policy
+            .unity_prefetched
+            .as_mut()
+            .unwrap()
+            .insert(root.path().into());
+        let error = discover_cached(root.path(), &policy, cache.path())
+            .err()
+            .unwrap();
+        assert!(error.is::<RequiredInputs>());
     }
 
     #[test]

@@ -69,6 +69,14 @@ struct Assembly {
 }
 
 pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discovery) -> Result<()> {
+    if policy.remote.is_some()
+        && policy
+            .unity_prefetched
+            .as_ref()
+            .is_some_and(|roots| !roots.contains(root))
+    {
+        return Err(crate::discovery::UnityDependencies(root.to_owned()).into());
+    }
     if let Some(remote) = &policy.remote {
         remote.require_analysis_tree(&root.join("Assets"))?;
     }
@@ -79,6 +87,20 @@ pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discove
         None => Editor::local(root, policy.unity_editors.as_deref(), &result.leases)?,
     };
     discover_with_editor(root, policy, cache, result, &editor)
+}
+
+/// Warm immutable dependencies only. Discovery must reread the current inputs
+/// after repository publication, rather than adopt a graph from this preflight.
+pub(crate) fn prefetch_dependencies(
+    root: &Path,
+    policy: &Policy,
+    leases: &crate::cache::views::LeaseSet,
+    selected: impl FnOnce(Vec<PathBuf>),
+) -> Result<()> {
+    let remote = policy.remote.as_ref().expect("Remote dependency preflight");
+    let editor = super::acquire::editor(root, &remote.shared, policy.unity_platform, leases)?;
+    Packages::local_staged(root, policy, &editor, &remote.shared, leases, selected)?;
+    Ok(())
 }
 
 pub(crate) fn discover_with_editor(

@@ -4,6 +4,8 @@ use crate::workspace::Manifest;
 use anyhow::Context;
 use tokio::sync::watch;
 
+mod dependencies;
+
 type RepositoryContext = (crate::repository::Identity, String, String, usize);
 
 fn materialized_policy(
@@ -974,6 +976,10 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
             #[cfg(test)]
             preparing_app.preparation_started.notify_one();
             let mut policy = policy;
+            if preparing_branch.is_some() {
+                policy.unity_prefetched = Some(Default::default());
+            }
+            let dependency_leases = policy.leases(&cache)?;
             let mut discovery_budget = None;
             let (state, branch_state) = loop {
                 if let Some(job) = rust_job.take() {
@@ -1148,12 +1154,13 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 match result {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        let Some(required) =
-                            error.downcast_ref::<crate::discovery::RequiredInputs>()
-                        else {
+                        let required = error.downcast_ref::<crate::discovery::RequiredInputs>()
+                            .map(|required| required.0.clone());
+                        let unity = error.downcast_ref::<crate::discovery::UnityDependencies>()
+                            .map(|request| request.0.clone());
+                        if required.is_none() && unity.is_none() {
                             return Err(error);
-                        };
-                        let paths = required.0.clone();
+                        }
                         let branch = preparing_branch
                             .as_ref()
                             .ok_or(error.context("No repository materializer is available"))?;
@@ -1174,12 +1181,23 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                         publish_progress(&send, Progress::Pending("acquisition"));
                         operation.stage("required_input_acquisition");
                         work.check()?;
-                        preparing_app
-                            .remote
-                            .as_ref()
-                            .unwrap()
-                            .require_inputs_cancellable(branch, &revision, paths, &operation, work.clone())
-                            .await?;
+                        dependencies::wait(&preparing_app, &mut lifecycle, &work, &operation, async {
+                            if let Some(root) = &unity {
+                                dependencies::prefetch(&preparing_app, branch, &revision,
+                                    dependencies::Prefetch {
+                                        root: root.clone(), policy: policy.clone(),
+                                        leases: dependency_leases.clone(),
+                                    }, work.clone(), &operation,
+                                ).await
+                            } else {
+                                preparing_app.remote.as_ref().unwrap()
+                                    .require_inputs_cancellable(branch, &revision, required.unwrap(), &operation, work.clone())
+                                    .await
+                            }
+                        }).await?;
+                        if let Some(root) = unity {
+                            policy.unity_prefetched.as_mut().unwrap().insert(root);
+                        }
                         publish_progress(&send, Progress::Pending("preparation"));
                         continue;
                     }

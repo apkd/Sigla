@@ -137,7 +137,18 @@ impl Packages {
         cache: &Path,
         leases: &crate::cache::views::LeaseSet,
     ) -> Result<Self> {
-        Self::resolve(
+        Self::local_staged(root, policy, editor, cache, leases, |_| {})
+    }
+
+    pub(crate) fn local_staged(
+        root: &Path,
+        policy: &Policy,
+        editor: &Editor,
+        cache: &Path,
+        leases: &crate::cache::views::LeaseSet,
+        selected: impl FnOnce(Vec<PathBuf>),
+    ) -> Result<Self> {
+        Self::resolve_staged(
             root,
             policy,
             editor,
@@ -155,9 +166,11 @@ impl Packages {
                     location: Location::Archive(plan),
                 })
             },
+            selected,
         )
     }
 
+    #[cfg(test)]
     fn resolve(
         root: &Path,
         policy: &Policy,
@@ -165,6 +178,18 @@ impl Packages {
         cache: &Path,
         leases: &crate::cache::views::LeaseSet,
         acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<Planned>,
+    ) -> Result<Self> {
+        Self::resolve_staged(root, policy, editor, cache, leases, acquire, |_| {})
+    }
+
+    fn resolve_staged(
+        root: &Path,
+        policy: &Policy,
+        editor: &Editor,
+        cache: &Path,
+        leases: &crate::cache::views::LeaseSet,
+        acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<Planned>,
+        stage: impl FnOnce(Vec<PathBuf>),
     ) -> Result<Self> {
         let cache = policy
             .remote
@@ -566,6 +591,15 @@ impl Packages {
             let reachable = reachable(&roots, selected.iter().map(|p| &p.manifest));
             selected.retain(|p| reachable.contains(&p.manifest.name));
         }
+        stage(
+            selected
+                .iter()
+                .filter_map(|package| match &package.location {
+                    Location::Local { root, .. } => Some(root.clone()),
+                    Location::Archive(_) => None,
+                })
+                .collect(),
+        );
         let plans: Vec<_> = selected
             .iter()
             .filter_map(|package| match &package.location {
@@ -687,8 +721,23 @@ mod tests {
             artifacts: vec![cached_builtin_artifact(&cache, name, version)],
             ..Default::default()
         });
+        let embedded = root.join("Packages/embedded");
+        std::fs::create_dir(&embedded)?;
+        std::fs::write(
+            embedded.join("package.json"),
+            r#"{"name":"embedded","version":"1.0.0"}"#,
+        )?;
+        let sections = cache
+            .join("unity-metadata")
+            .join(
+                blake3::Hash::from_bytes(catalog.artifacts[0].hash)
+                    .to_hex()
+                    .as_str(),
+            )
+            .join("sections");
+        let staged = std::cell::Cell::new(false);
         let leases = crate::cache::views::LeaseSet::new(&cache)?;
-        let packages = Packages::resolve(
+        let packages = Packages::resolve_staged(
             &root,
             &policy,
             &editor,
@@ -705,15 +754,30 @@ mod tests {
                     location: Location::Archive(plan),
                 })
             },
+            |roots| {
+                assert_eq!(roots, vec![embedded]);
+                assert!(
+                    !sections.exists(),
+                    "Publish local scopes before archive materialization"
+                );
+                staged.set(true);
+            },
         )?;
+        assert!(staged.get());
+        assert!(sections.exists());
         assert!(
             packages.diagnostics.is_empty(),
             "{:?}",
             packages.diagnostics
         );
         assert!(packages.dependency_retry.is_none());
-        assert_eq!(packages.selected.len(), 1);
-        assert!(packages.selected[0].root.join("Code.cs").is_file());
+        assert_eq!(packages.selected.len(), 2);
+        assert!(
+            packages
+                .selected
+                .iter()
+                .any(|p| p.root.join("Code.cs").is_file())
+        );
         Ok(())
     }
 
