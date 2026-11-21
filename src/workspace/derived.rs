@@ -26,7 +26,7 @@ pub struct Derived {
     navigation: Mutex<Vec<CachedNavigation>>,
     search: OnceLock<Paths>,
     rendering: OnceLock<crate::render::Inventory>,
-    query: Mutex<Option<QueryManifest>>,
+    query: Mutex<Vec<QueryManifest>>,
     pub(crate) asset_generation: OnceLock<Result<[u8; 32], String>>,
     pub(crate) source_generations: [OnceLock<Result<[u8; 32], String>>; 2],
 }
@@ -38,21 +38,25 @@ impl Clone for Derived {
 }
 
 impl Derived {
-    /// Retain only the latest ready-source combination within the workspace heap budget.
+    /// Two source groups have three nonempty combinations. Retain their derived
+    /// paths and rendering inventories within the workspace heap budget.
     pub(crate) fn query(base: &Arc<Manifest>, sources: &[Arc<Manifest>]) -> Arc<Manifest> {
         if sources.is_empty() {
             return base.clone();
         }
         let mut cached = base.derived.query.lock().unwrap();
-        if let Some(saved) = cached.as_ref()
-            && saved.sources.len() == sources.len()
-            && saved
-                .sources
-                .iter()
-                .zip(sources)
-                .all(|(left, right)| left.ptr_eq(&Arc::downgrade(right)))
-        {
-            return saved.manifest.clone();
+        if let Some(index) = cached.iter().position(|saved| {
+            saved.sources.len() == sources.len()
+                && saved
+                    .sources
+                    .iter()
+                    .zip(sources)
+                    .all(|(left, right)| left.ptr_eq(&Arc::downgrade(right)))
+        }) {
+            let saved = cached.remove(index);
+            let manifest = saved.manifest.clone();
+            cached.push(saved);
+            return manifest;
         }
         let mut manifest = (**base).clone();
         for source in sources {
@@ -60,7 +64,11 @@ impl Derived {
         }
         let heap_bytes = crate::memory::encoded_size(&manifest).saturating_mul(3) as u64;
         let manifest = Arc::new(manifest);
-        *cached = Some(QueryManifest {
+        cached.retain(|saved| saved.sources.iter().all(|source| source.strong_count() > 0));
+        if cached.len() == 3 {
+            cached.remove(0);
+        }
+        cached.push(QueryManifest {
             sources: sources.iter().map(Arc::downgrade).collect(),
             manifest: manifest.clone(),
             heap_bytes,
@@ -108,7 +116,14 @@ impl Derived {
             crate::render::Inventory::new(
                 manifest
                     .files
-                    .values()
+                    .iter()
+                    .chain(
+                        manifest
+                            .deferred
+                            .iter()
+                            .filter(|(key, _)| !manifest.files.contains_key(*key)),
+                    )
+                    .map(|(_, file)| file)
                     .filter(|file| !file.metadata)
                     .flat_map(|file| {
                         file.memberships
@@ -127,9 +142,13 @@ impl Derived {
             .iter()
             .map(|cached| cached.heap_bytes)
             .sum();
-        let query = self.query.lock().unwrap().as_ref().map_or(0, |query| {
-            query.heap_bytes + query.manifest.derived.heap_bytes()
-        });
+        let query: u64 = self
+            .query
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|query| query.heap_bytes + query.manifest.derived.heap_bytes())
+            .sum();
         navigation
             + query
             + self.search.get().map_or(0, |paths| paths.heap_bytes)
@@ -265,6 +284,85 @@ pub(crate) fn candidate_files<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternating_groups_retain_rendering_and_account_for_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let make = |path: &str| {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "source").unwrap();
+            let mut manifest = Manifest::default();
+            manifest.projects.push(crate::model::Project {
+                identity: "project".into(),
+                origin: None,
+                name: "project".into(),
+                defines: vec![],
+                references: vec![],
+                assemblies: vec![],
+                edition: String::new(),
+                compiler_options: BTreeMap::new(),
+                source_roots: vec![],
+            });
+            manifest.files.insert(
+                path.into(),
+                super::super::FileEntry {
+                    path: file.clone(),
+                    display: path.into(),
+                    stamp: super::super::Stamp::read(&file).unwrap(),
+                    language: crate::model::Language::Rust,
+                    memberships: vec![super::super::Membership {
+                        project: 0,
+                        module: String::new(),
+                    }],
+                    modules: vec![],
+                    metadata: false,
+                },
+            );
+            Arc::new(manifest)
+        };
+        let base = make("code/shared.rs");
+        let native = make("native/shared.rs");
+        let shaders = make("shaders/shared.rs");
+        let groups = [
+            vec![native.clone()],
+            vec![shaders.clone()],
+            vec![native, shaders],
+        ];
+        let combinations: Vec<_> = groups
+            .iter()
+            .map(|sources| Derived::query(&base, sources))
+            .collect();
+        let before = base.derived.heap_bytes();
+        for manifest in &combinations {
+            manifest.derived.rendering(manifest);
+        }
+        assert!(base.derived.heap_bytes() > before);
+        for manifest in &combinations {
+            let mut paths = crate::render::Paths::new(manifest.derived.rendering(manifest));
+            assert_eq!(paths.display("code/shared.rs"), "code/shared.rs");
+            assert_eq!(paths.display("code/shared.rs"), "code/shared.rs");
+        }
+        for _ in 0..2 {
+            for (sources, previous) in groups.iter().zip(&combinations) {
+                let current = Derived::query(&base, sources);
+                assert!(Arc::ptr_eq(previous, &current));
+                assert!(std::ptr::eq(
+                    previous.derived.rendering(previous),
+                    current.derived.rendering(&current)
+                ));
+            }
+        }
+        let changed = make("replacement/new.rs");
+        let replacement = Derived::query(&base, &[changed]);
+        assert!(replacement.files.contains_key("replacement/new.rs"));
+        assert!(!replacement.files.contains_key("native/shared.rs"));
+        assert!(combinations[0].files.contains_key("native/shared.rs"));
+        assert!(!Arc::ptr_eq(
+            &combinations[0],
+            &Derived::query(&base, &groups[0])
+        ));
+    }
 
     #[test]
     fn query_manifest_reuses_only_the_same_immutable_sources() {
