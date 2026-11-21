@@ -13,6 +13,173 @@ fn fixture(workers: usize) -> (tempfile::TempDir, tempfile::TempDir, App) {
     (root, cache, app)
 }
 
+#[tokio::test]
+async fn setup_deadline_covers_workspace_and_query_admission() {
+    use std::time::Duration;
+
+    let (root, _cache, mut app) = fixture(1);
+    let source = root.path().join("code.rs");
+    std::fs::write(&source, "pub struct Available;").unwrap();
+    app.index_wait = Duration::from_millis(30);
+    let app = Arc::new(app);
+    let path = source.to_str().unwrap();
+    app.search(path, "type:Available wait:complete")
+        .await
+        .unwrap();
+    let workspace = app.workspaces.lock().unwrap()[&source].state.clone();
+    for lock_workspace in [true, false] {
+        let guard = if lock_workspace {
+            Some(workspace.lock().await)
+        } else {
+            None
+        };
+        let permit = if lock_workspace {
+            None
+        } else {
+            Some(app.workers.acquire().await.unwrap())
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.dispatch(path, Request::Search("type:Available".into())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.structured_content.unwrap()["complete"], false);
+
+        let mut waiting = Box::pin(app.search(path, "type:Available wait:complete"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        drop(permit);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("Available")
+        );
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn setup_deadline_covers_maintenance_admission() {
+    use std::time::Duration;
+    let (root, _cache, mut app) = fixture(1);
+    std::fs::write(root.path().join("code.rs"), "pub struct Available;").unwrap();
+    app.index_wait = Duration::from_millis(30);
+    let app = Arc::new(app);
+    let maintenance = app.activity.write().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        app.dispatch(
+            root.path().to_str().unwrap(),
+            Request::Search("type:Available".into()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.structured_content.unwrap()["complete"], false);
+    let mut waiting = Box::pin(app.search(
+        root.path().to_str().unwrap(),
+        "type:Available wait:complete",
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut waiting)
+            .await
+            .is_err()
+    );
+    drop(maintenance);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .contains("Available")
+    );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn setup_deadline_covers_early_navigation_admission() {
+    use std::time::Duration;
+    let (root, _cache, mut app) = fixture(1);
+    std::fs::write(root.path().join("code.rs"), "pub struct Available;").unwrap();
+    app.index_wait = Duration::from_millis(30);
+    let app = Arc::new(app);
+    let project = root.path().to_str().unwrap();
+    app.search(project, "type:Available wait:complete")
+        .await
+        .unwrap();
+    let navigation = app
+        .navigation_workers
+        .clone()
+        .acquire_many_owned(app.navigation_workers.available_permits() as u32)
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        app.dispatch(project, Request::Search("file:*.rs".into())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.structured_content.unwrap()["complete"], false);
+    drop(navigation);
+    assert!(
+        app.search(project, "file:*.rs")
+            .await
+            .unwrap()
+            .contains("code.rs")
+    );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_asset_filename_does_not_wait_for_code_or_asset_indexing() {
+    use std::time::Duration;
+    let (root, _cache, app) = fixture(1);
+    let source = root.path().join("code.rs");
+    std::fs::write(&source, "pub struct Available;").unwrap();
+    std::fs::create_dir(root.path().join("Assets")).unwrap();
+    std::fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+    std::fs::write(
+        root.path().join("ProjectSettings/ProjectVersion.txt"),
+        "version",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("Assets/Known.asset"), "unparsed asset").unwrap();
+    let app = Arc::new(app);
+    let indexing = app.indexing_pause.acquire().await.unwrap();
+    let assets = app.assets.pause().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.dispatch(
+            source.to_str().unwrap(),
+            Request::Search("file:Assets/Known.asset -lang:cs".into()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        result
+            .structured_content
+            .as_ref()
+            .is_none_or(|v| v["complete"] != false)
+    );
+    assert!(result_text(result).unwrap().contains("Assets/Known.asset"));
+    assert_eq!(app.assets.stats().entries, 0);
+    drop(indexing);
+    drop(assets);
+    app.shutdown().await;
+}
+
 #[test]
 fn ownership_lock_rejects_symlinks_and_non_regular_files() {
     use std::os::unix::ffi::OsStrExt;
@@ -501,6 +668,54 @@ async fn remote_preparation_fixture() -> (
         .await
         .unwrap();
     (cache, app, branch, source)
+}
+
+#[tokio::test]
+async fn exact_remote_asset_filename_uses_deferred_inventory_before_discovery() {
+    use std::time::Duration;
+    let (_cache, app, branch, source) = remote_preparation_fixture().await;
+    {
+        let mut publication = branch.publish().await;
+        let mut state = (**publication.as_ref().unwrap()).clone();
+        for path in ["Assets/Known.prefab", "ProjectSettings/ProjectVersion.txt"] {
+            state.prepared.tracked.insert(path.into(), "object".into());
+        }
+        state
+            .prepared
+            .deferred_assets
+            .insert("Assets/Known.prefab".into());
+        state.prepared.directories.insert("Assets".into());
+        *publication = Some(Arc::new(state));
+    }
+    assert!(!source.join("Assets/Known.prefab").exists());
+    let discovery = app.discovery_pause.clone().acquire_owned().await.unwrap();
+    let indexing = app.indexing_pause.clone().acquire_owned().await.unwrap();
+    let assets = app.assets.pause().await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.dispatch(
+            "https://github.com/fixture/repo#refs/heads/main",
+            Request::Search("file:Assets/Known.prefab".into()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        response
+            .structured_content
+            .as_ref()
+            .is_none_or(|value| value["complete"] != false)
+    );
+    assert!(
+        result_text(response)
+            .unwrap()
+            .contains("Assets/Known.prefab")
+    );
+    assert!(app.workspaces.lock().unwrap().is_empty());
+    assert_eq!(app.assets.stats().entries, 0);
+    drop((discovery, indexing, assets));
+    app.shutdown().await;
 }
 
 #[tokio::test]

@@ -112,6 +112,8 @@ pub(super) struct Retirement {
 pub(super) struct StartupMaintenance {
     scopes: Option<VecDeque<([u8; 32], crate::store::shared::WorkspaceInfo)>>,
     cleaned: bool,
+    retired: Option<crate::cache::cleanup::Removal>,
+    reset_cleaned: bool,
     pub(super) progress: Option<crate::telemetry::Progress>,
 }
 
@@ -505,6 +507,14 @@ impl App {
             let Ok(_activity) = self.activity.clone().try_read_owned() else {
                 return Ok(false);
             };
+            if !state.reset_cleaned {
+                state.reset_cleaned =
+                    crate::cache::reset::cleanup_step(&self.cache, &mut state.retired)?;
+                if !state.reset_cleaned {
+                    state.progress = Some(crate::telemetry::Progress::Advanced);
+                    return Ok(false);
+                }
+            }
             let cleanup = if state.cleaned {
                 Ok(())
             } else {

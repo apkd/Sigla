@@ -399,6 +399,13 @@ pub(crate) fn build(
     let (metadata, workspaces) = workspaces
         .into_iter()
         .partition(|entry| super::views::is_metadata_root(cache, &entry.entry));
+    let pending_retirement_bytes = super::blobs::allocated(&cache.join("retired-views"))?
+        + footprint
+            .categories
+            .iter()
+            .filter(|(name, _)| name.starts_with(super::reset::RETIRED))
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>();
     Ok(Report {
         cache: cache.into(),
         live_service,
@@ -411,7 +418,7 @@ pub(crate) fn build(
         metadata,
         dependencies: dependencies.into_values().collect(),
         active_view_leases,
-        pending_retirement_bytes: super::blobs::allocated(&cache.join("retired-views"))?,
+        pending_retirement_bytes,
         resources: live_service.then(crate::memory::resources),
         preview: Preview {
             reclaim_target_bytes,

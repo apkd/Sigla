@@ -114,6 +114,55 @@ pub(crate) struct Sources<'a> {
     pub assets: Option<&'a crate::unity::assets::Index>,
     pub cancel: &'a tokio_util::sync::CancellationToken,
 }
+
+pub(crate) fn source_paths(
+    manifest: &Manifest,
+    root: &std::path::Path,
+) -> std::sync::Arc<BTreeMap<String, String>> {
+    manifest.derived.navigation(root, || {
+        manifest
+            .files
+            .iter()
+            .chain(manifest.deferred.iter())
+            .filter(|(_, file)| !file.metadata)
+            .flat_map(|(key, file)| {
+                file.memberships.iter().filter_map(move |m| {
+                    if let Ok(path) = file.path.strip_prefix(root) {
+                        Some((path.to_string_lossy().into_owned(), key.clone()))
+                    } else {
+                        let display = manifest.display(file, m);
+                        (!std::path::Path::new(display.as_ref()).is_absolute())
+                            .then(|| (display.into_owned(), key.clone()))
+                    }
+                })
+            })
+            .collect()
+    })
+}
+
+pub(crate) fn file_path_filters(q: &Query) -> Result<impl Fn(&str) -> bool + '_> {
+    let paths = q
+        .filters
+        .iter()
+        .filter(|f| f.key == "path")
+        .map(|f| {
+            Ok((
+                f,
+                globset::Glob::new(f.value.trim_end_matches('/'))?.compile_matcher(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(move |path: &str| {
+        paths.iter().all(|(f, pattern)| {
+            (pattern.is_match(path)
+                || path
+                    .strip_prefix(f.value.trim_end_matches('/'))
+                    .is_some_and(|suffix| suffix.starts_with('/')))
+                != f.negate
+        })
+    })
+}
+
 impl Sources<'_> {
     fn check(&self) -> Result<()> {
         ensure!(!self.cancel.is_cancelled(), "Query cancelled");
@@ -188,25 +237,7 @@ impl Sources<'_> {
         None
     }
     fn source_paths(&self, root: &std::path::Path) -> std::sync::Arc<BTreeMap<String, String>> {
-        let mut paths = self.manifest.derived.navigation(root, || {
-            self.manifest
-                .files
-                .iter()
-                .chain(self.manifest.deferred.iter())
-                .filter(|(_, file)| !file.metadata)
-                .flat_map(|(key, file)| {
-                    file.memberships.iter().filter_map(move |m| {
-                        if let Ok(path) = file.path.strip_prefix(root) {
-                            Some((path.to_string_lossy().into_owned(), key.clone()))
-                        } else {
-                            let display = self.manifest.display(file, m);
-                            (!std::path::Path::new(display.as_ref()).is_absolute())
-                                .then(|| (display.into_owned(), key.clone()))
-                        }
-                    })
-                })
-                .collect()
-        });
+        let mut paths = source_paths(self.manifest, root);
         if let Some(assets) = self.assets {
             let paths = std::sync::Arc::make_mut(&mut paths);
             for asset in assets.assets.values() {
@@ -221,17 +252,7 @@ impl Sources<'_> {
             .literal_separator(true)
             .build()?
             .compile_matcher();
-        let paths = q
-            .filters
-            .iter()
-            .filter(|f| f.key == "path")
-            .map(|f| {
-                Ok((
-                    f,
-                    globset::Glob::new(f.value.trim_end_matches('/'))?.compile_matcher(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let paths = file_path_filters(q)?;
         let mut found = Vec::new();
         let mut total = 0;
         let filter_languages = q.filters.iter().any(|f| f.key == "lang");
@@ -244,15 +265,7 @@ impl Sources<'_> {
             } else {
                 path.rsplit('/').next().unwrap()
             };
-            if !pattern.is_match(target)
-                || !paths.iter().all(|(f, p)| {
-                    (p.is_match(path)
-                        || path
-                            .strip_prefix(f.value.trim_end_matches('/'))
-                            .is_some_and(|suffix| suffix.starts_with('/')))
-                        != f.negate
-                })
-            {
+            if !pattern.is_match(target) || !paths(path) {
                 continue;
             }
             let file = self

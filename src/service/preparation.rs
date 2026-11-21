@@ -274,6 +274,38 @@ fn context(
 }
 
 impl App {
+    pub(super) async fn exact_asset_filename(
+        self: &Arc<Self>,
+        inventory: Arc<Inventory>,
+        query: Query,
+        entry: PathBuf,
+        activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Option<CallToolResult>> {
+        let permit = self.navigation_workers.clone().acquire_owned().await?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
+        let app = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _activity = activity;
+            let _permit = permit;
+            Ok(crate::unity::assets::selection::exact_file(
+                &inventory.manifest,
+                None,
+                &query,
+                &cancel,
+            )?
+            .then(|| {
+                app.record_usage(&entry, None, &inventory.manifest);
+                CallToolResult::success(vec![ContentBlock::text(crate::navigation::quote(
+                    &query.target.name,
+                ))])
+            }))
+        })
+        .await?;
+        guard.disarm();
+        result
+    }
+
     pub(super) async fn view_asset_file(
         self: &Arc<Self>,
         inventory: Arc<Inventory>,
@@ -449,7 +481,13 @@ impl App {
                 super::Request::History(_) => unreachable!("history bypasses snapshot preparation"),
                 super::Request::Browse(path) => (path, None),
                 super::Request::View(path, mode) => (path, Some(mode)),
-                super::Request::Search(_) => unreachable!(),
+                super::Request::Search(query) => {
+                    let query = Query::parse(&query)?;
+                    let manifest = Manifest { root, ..Default::default() };
+                    let found = crate::unity::assets::selection::exact_file(&manifest, Some(prepared), &query, &cancel)?;
+                    if found { branch.record_use(); }
+                    return Ok(found.then(|| CallToolResult::success(vec![ContentBlock::text(crate::navigation::quote(&query.target.name))])));
+                }
             };
             let Some(text) = crate::navigation::sources::repository(
                 &root, contents, prepared, &path, mode, &cancel,
@@ -479,16 +517,9 @@ impl App {
         query: Option<Query>,
         usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
-        operation: crate::telemetry::Operation,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CallToolResult> {
-        tracing::Span::current().record("stage", "query_admission");
-        operation.stage("query_admission");
-        let permit = {
-            let _wait = operation.wait("query_admission");
-            self.navigation_workers.clone().acquire_owned().await?
-        };
         tracing::Span::current().record("stage", "evaluation");
-        operation.stage("evaluation");
         let app = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let guard = cancel.clone().drop_guard();

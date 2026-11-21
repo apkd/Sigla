@@ -366,17 +366,26 @@ impl App {
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
         startup.0.stage("cache_initialization");
         crate::cache::reset::prepare(&cache)?;
-        crate::repository::state_store::recover(&cache)?;
-        startup.0.stage("compaction_recovery");
-        crate::cache::compaction::recover(&cache)?;
-        startup.0.stage("store_initialization");
+        let (blobs, asset_records, owners) =
+            crate::cache::reset::with_space_recovery(&cache, || {
+                startup.0.stage("repository_recovery");
+                crate::repository::state_store::recover(&cache)?;
+                startup.0.stage("compaction_recovery");
+                crate::cache::compaction::recover(&cache)?;
+                startup.0.stage("store_initialization");
+                Ok((
+                    crate::cache::blobs::Store::open(&cache)?,
+                    crate::cache::artifacts::Store::open(&cache)?,
+                    crate::cache::owners::Catalog::open(&cache)?,
+                ))
+            })?;
         crate::memory::start_reclaimer()?;
         let app = Self {
             activity: Arc::new(tokio::sync::RwLock::new(())),
-            blobs: crate::cache::blobs::Store::open(&cache)?,
-            asset_records: Arc::new(crate::cache::artifacts::Store::open(&cache)?),
+            blobs,
+            asset_records: Arc::new(asset_records),
             cache_limits: Default::default(),
-            owners: Mutex::new(crate::cache::owners::Catalog::open(&cache)?),
+            owners: Mutex::new(owners),
             _ownership: Ownership(ownership),
             policy,
             cache,
@@ -422,8 +431,8 @@ impl App {
             #[cfg(test)]
             history_pause: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        // Recovery above is mandatory. Retirement and space reclamation are
-        // scheduled by start_setup, never part of synchronous construction.
+        // Recovery above is mandatory. Normal space reclamation is scheduled by
+        // start_setup; a full filesystem can require exceptional startup cleanup.
         startup.ready();
         Ok(app)
     }
@@ -991,19 +1000,6 @@ impl App {
         if let Request::History(query) = &request {
             return self.history_request(path, query, operation).await;
         }
-        tracing::Span::current().record("stage", "maintenance");
-        operation.stage("maintenance_admission");
-        let activity = {
-            let _wait = operation.wait("maintenance_admission");
-            Arc::new(
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    self.activity.clone().read_owned(),
-                )
-                .await
-                .map_err(|_| crate::diagnostics::MaintenanceBusy)?,
-            )
-        };
         let query = match &request {
             Request::Search(query) => {
                 operation.stage("query_parse");
@@ -1016,6 +1012,26 @@ impl App {
         };
         let wait =
             indexes::Wait((!query.as_ref().is_some_and(|q| q.wait_complete)).then_some(deadline));
+        tracing::Span::current().record("stage", "maintenance");
+        operation.stage("maintenance_admission");
+        let activity = {
+            let _wait = operation.wait("maintenance_admission");
+            let Some(activity) = wait
+                .until(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        self.activity.clone().read_owned(),
+                    )
+                    .await
+                    .map(Arc::new)
+                    .map_err(|_| crate::diagnostics::MaintenanceBusy.into())
+                })
+                .await?
+            else {
+                return Ok(indexes::pending("Maintenance admission"));
+            };
+            activity
+        };
         self.start_setup();
         let repository = crate::repository::Repository::project(path, self.remote.is_some())?;
         if let Some(repository) = &repository {
@@ -1038,7 +1054,11 @@ impl App {
                 let _wait = operation.wait("repository_acquisition");
                 let branch = wait
                     .until(async {
-                        if matches!(request, Request::Browse(_) | Request::View(..)) {
+                        if matches!(request, Request::Browse(_) | Request::View(..))
+                            || query
+                                .as_ref()
+                                .is_some_and(crate::unity::assets::selection::exact_request)
+                        {
                             remote
                                 .resolve_inventory_monitored(repository, &operation)
                                 .await
@@ -1054,6 +1074,28 @@ impl App {
             }
             None => None,
         };
+        if let Some(branch) = &branch
+            && query
+                .as_ref()
+                .is_some_and(crate::unity::assets::selection::exact_request)
+        {
+            let Some(result) = wait
+                .until(self.navigate_repository(branch.clone(), request.clone(), activity.clone()))
+                .await?
+            else {
+                return Ok(indexes::pending("Repository file inventory"));
+            };
+            if let Some(result) = result {
+                return Ok(result);
+            }
+            if wait
+                .until(self.remote.as_ref().unwrap().sources_ready(branch))
+                .await?
+                .is_none()
+            {
+                return Ok(indexes::pending("Repository source preparation"));
+            }
+        }
         let (entry, policy, cache) = if let Some(branch) = &branch {
             let source = branch.source().canonicalize()?;
             let mut policy = Policy::new(vec![source.clone()])?;
@@ -1231,6 +1273,26 @@ impl App {
                 return Ok(indexes::pending("Workspace preparation"));
             }
         };
+        if branch.is_none()
+            && let Some(query) = query
+                .as_ref()
+                .filter(|q| crate::unity::assets::selection::exact_request(q))
+        {
+            let Some(result) = wait
+                .until(self.exact_asset_filename(
+                    inventory.clone(),
+                    query.clone(),
+                    usage_entry.clone(),
+                    activity.clone(),
+                ))
+                .await?
+            else {
+                return Ok(indexes::pending("Asset file inventory"));
+            };
+            if let Some(result) = result {
+                return Ok(result);
+            }
+        }
         if let Request::View(path, mode) = &request
             && crate::unity::assets::view::requested(path)
         {
@@ -1259,7 +1321,18 @@ impl App {
                 || preparation.retained_inventory()
                 || indexes::source_only(&request, query.as_ref()))
         {
-            operation.stage("navigation");
+            operation.stage("query_admission");
+            let permit = {
+                let _wait = operation.wait("query_admission");
+                let Some(permit) = wait
+                    .until(async { Ok(self.navigation_workers.clone().acquire_owned().await?) })
+                    .await?
+                else {
+                    return Ok(indexes::pending("Navigation admission"));
+                };
+                permit
+            };
+            operation.stage("evaluation");
             return self
                 .navigate_early(
                     inventory,
@@ -1267,7 +1340,7 @@ impl App {
                     query,
                     (usage_entry, usage_branch),
                     activity,
-                    operation.clone(),
+                    permit,
                 )
                 .await;
         }
@@ -1295,7 +1368,15 @@ impl App {
         }) {
             let manifest = inventory.manifest.clone();
             let snapshot = match &branch {
-                Some(branch) => branch.state.read().await.clone(),
+                Some(branch) => {
+                    let Some(snapshot) = wait
+                        .until(async { Ok(branch.state.read().await.clone()) })
+                        .await?
+                    else {
+                        return Ok(indexes::pending("Repository state"));
+                    };
+                    snapshot
+                }
                 None => None,
             };
             let query = query.clone();
@@ -1334,16 +1415,24 @@ impl App {
             true
         };
         let asset_workspace = workspace.clone();
-        let state = {
-            let _wait = operation.wait("workspace_lock");
-            workspace.lock_owned().await
-        };
-        let branch_state = match &branch {
-            Some(branch) => {
-                let _wait = operation.wait("branch_analysis");
-                Some(branch.analyze().await)
-            }
-            None => None,
+        let Some((state, branch_state)) = wait
+            .until(async {
+                let state = {
+                    let _wait = operation.wait("workspace_lock");
+                    workspace.lock_owned().await
+                };
+                let branch_state = match &branch {
+                    Some(branch) => {
+                        let _wait = operation.wait("branch_analysis");
+                        Some(branch.analyze().await)
+                    }
+                    None => None,
+                };
+                Ok((state, branch_state))
+            })
+            .await?
+        else {
+            return Ok(indexes::pending("Workspace access"));
         };
         let context = branch.as_ref().map(|branch| {
             let prepared = &branch_state.as_ref().unwrap().as_ref().unwrap().prepared;
@@ -1482,9 +1571,12 @@ impl App {
         }
         tracing::Span::current().record("stage", "query_admission");
         operation.stage("query_admission");
-        let (permit, mut state, branch_state) = self
-            .admit_query(asset_workspace, branch.as_ref(), &operation)
-            .await?;
+        let Some((permit, mut state, branch_state)) = wait
+            .until(self.admit_query(asset_workspace, branch.as_ref(), &operation))
+            .await?
+        else {
+            return Ok(indexes::pending("Query admission"));
+        };
         let current = state.as_ref().ok_or(crate::diagnostics::RefreshRequired(
             "Workspace was retired during admission",
         ))?;

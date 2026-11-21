@@ -194,7 +194,11 @@ impl Reader<'_> {
 }
 
 /// Follow the same directory boundaries as inventory without walking siblings.
-fn exact(scope: &Path, relative: &str, cancel: &dyn Cancellation) -> Result<Option<PathBuf>> {
+pub(super) fn exact(
+    scope: &Path,
+    relative: &str,
+    cancel: &dyn Cancellation,
+) -> Result<Option<PathBuf>> {
     let mut path = scope.to_owned();
     let mut components = Path::new(relative).components().peekable();
     while let Some(component) = components.next() {
@@ -327,6 +331,15 @@ mod tests {
         };
         for file in ["Assets/Selected.prefab", "Packages/example/Selected.prefab"] {
             assert_eq!(reader.view(file, Mode::Raw).unwrap().unwrap(), source);
+            assert!(
+                super::selection::exact_file(
+                    &manifest,
+                    None,
+                    &crate::query::Query::parse(&format!("file:{file}")).unwrap(),
+                    &cancel
+                )
+                .unwrap()
+            );
         }
         assert!(reader.view("Selected.prefab", Mode::Raw).is_err());
         cancel.cancel();
