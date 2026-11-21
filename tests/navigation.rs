@@ -63,6 +63,36 @@ async fn cached_path_filters_preserve_globs_boundaries_and_refreshes() {
 }
 
 #[tokio::test]
+async fn narrow_document_views_still_reject_binary_outside_the_range() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let text = format!("visible\n{}\0", "ordinary text\n".repeat(4096));
+    write(root.path(), "data.txt", &text);
+    let app = Arc::new(
+        App::new(
+            Policy::new(vec![root.path().into()]).unwrap(),
+            cache.path().into(),
+            1,
+        )
+        .unwrap(),
+    );
+    for mode in ["raw", "exact", "minified"] {
+        let result = app
+            .view(root.path().to_str().unwrap(), "data.txt:1", mode)
+            .await;
+        if mode == "raw" {
+            assert!(result.is_err());
+        } else if let Ok(output) = result {
+            assert!(
+                !output.contains("visible"),
+                "Binary input must not expose a readable prefix: {output}"
+            );
+        }
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn documents_are_searchable_preserved_and_refreshed_without_build_projects() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

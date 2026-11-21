@@ -14,11 +14,12 @@ struct Token {
 
 pub fn render(source: &str, language: Language, range: Range<usize>) -> String {
     let (tokens, mut edits) = match language {
-        Language::Rust => rust(source),
+        Language::Rust => rust(source, &range),
         Language::CSharp => csharp(source, &range),
         _ => return source[range].into(),
     };
-    edits.extend(spacing(source, &tokens));
+    let tokens = token_window(&tokens, &range);
+    edits.extend(spacing(source, tokens));
     if let Some(first) = tokens.iter().find(|t| t.range.end > range.start)
         && first.range.start >= range.start
         && first.range.start <= range.end
@@ -32,6 +33,15 @@ pub fn render(source: &str, language: Language, range: Range<usize>) -> String {
         });
     }
     apply(source, range, edits)
+}
+
+fn token_window<'a>(tokens: &'a [Token], range: &Range<usize>) -> &'a [Token] {
+    // Keep neighbors for boundary spacing and groups crossing the selection.
+    let start = tokens
+        .partition_point(|t| t.range.end < range.start)
+        .saturating_sub(1);
+    let end = (tokens.partition_point(|t| t.range.start <= range.end) + 1).min(tokens.len());
+    &tokens[start..end]
 }
 
 /// Minification parses C# and Rust input and therefore shares parser admission.
@@ -141,7 +151,34 @@ fn separator(left: &str, right: &str) -> bool {
         || (word(a) && matches!(b, '\'' | '"' | '#' | '@' | '$'))
 }
 
-fn rust(source: &str) -> (Vec<Token>, Vec<Edit>) {
+fn contains(selection: &Range<usize>, range: Range<usize>) -> bool {
+    selection.start <= range.start && range.end <= selection.end
+}
+
+fn rust_nodes(
+    root: ra_ap_syntax::SyntaxNode,
+    selection: &Range<usize>,
+) -> impl Iterator<Item = ra_ap_syntax::SyntaxNode> {
+    let mut walk = root.preorder();
+    std::iter::from_fn(move || {
+        while let Some(event) = walk.next() {
+            if let ra_ap_syntax::WalkEvent::Enter(node) = event {
+                let range: Range<usize> = node.text_range().into();
+                if range.end < selection.start
+                    || range.start > selection.end
+                    || matches!(node.kind(), SyntaxKind::TOKEN_TREE | SyntaxKind::ATTR)
+                {
+                    walk.skip_subtree();
+                } else {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    })
+}
+
+fn rust(source: &str, selection: &Range<usize>) -> (Vec<Token>, Vec<Edit>) {
     let parsed = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2024);
     let root = parsed.syntax_node();
     let mut tokens = Vec::new();
@@ -172,19 +209,24 @@ fn rust(source: &str) -> (Vec<Token>, Vec<Edit>) {
     if !parsed.errors().is_empty() {
         return (tokens, edits);
     }
-    for node in root.descendants() {
-        if node
-            .ancestors()
-            .any(|n| matches!(n.kind(), SyntaxKind::TOKEN_TREE | SyntaxKind::ATTR))
-        {
-            continue;
-        }
+    for node in rust_nodes(root.clone(), selection) {
         if let Some(field) = ast::RecordExprField::cast(node.clone())
             && let (Some(name), Some(expr), Some(_)) =
                 (field.name_ref(), field.expr(), field.colon_token())
         {
             let name = name.syntax().text().to_string();
-            if expr.syntax().text().to_string() == name && !has_rust_comment(&node) {
+            if contains(
+                selection,
+                field
+                    .name_ref()
+                    .unwrap()
+                    .syntax()
+                    .text_range()
+                    .start()
+                    .into()..expr.syntax().text_range().end().into(),
+            ) && expr.syntax().text().to_string() == name
+                && !has_rust_comment(&node)
+            {
                 // Keep field attributes outside the replaced name/expression span.
                 let start = field
                     .name_ref()
@@ -201,6 +243,7 @@ fn rust(source: &str) -> (Vec<Token>, Vec<Edit>) {
         }
         if let Some(tree) = ast::UseTree::cast(node.clone())
             && let Some(list) = tree.use_tree_list()
+            && contains(selection, list.syntax().text_range().into())
         {
             let children: Vec<_> = list.use_trees().collect();
             if children.len() == 1 && !has_rust_comment(&node) {
@@ -225,24 +268,34 @@ fn rust(source: &str) -> (Vec<Token>, Vec<Edit>) {
                 | SyntaxKind::VARIANT_LIST
                 | SyntaxKind::USE_TREE_LIST
         ) {
-            let significant: Vec<_> = node
-                .children_with_tokens()
-                .filter(|n| !matches!(n.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))
-                .collect();
-            if significant.len() >= 2 {
-                let comma = &significant[significant.len() - 2];
-                if comma.kind() == SyntaxKind::COMMA {
-                    edits.push(Edit {
-                        range: comma.text_range().into(),
-                        text: String::new(),
-                    });
-                }
+            let comma = std::iter::successors(node.last_child_or_token(), |child| {
+                child.prev_sibling_or_token()
+            })
+            .filter(|n| !matches!(n.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))
+            .nth(1);
+            if let Some(comma) = comma
+                && comma.kind() == SyntaxKind::COMMA
+                && contains(selection, comma.text_range().into())
+            {
+                edits.push(Edit {
+                    range: comma.text_range().into(),
+                    text: String::new(),
+                });
             }
         }
     }
     // Adjacent plain imports in the same scope can share their prefix. Attributes are retained.
-    for parent in root.descendants() {
+    for parent in rust_nodes(root, selection) {
         let children: Vec<_> = parent.children().collect();
+        // Boundary neighbors keep a group crossing the selection from merging.
+        let start = children
+            .partition_point(|child| usize::from(child.text_range().end()) < selection.start)
+            .saturating_sub(1);
+        let end = (children
+            .partition_point(|child| usize::from(child.text_range().start()) <= selection.end)
+            + 1)
+        .min(children.len());
+        let children = &children[start..end];
         let mut i = 0;
         while i < children.len() {
             let Some(first) = plain_use(&children[i], source, &tokens) else {
@@ -264,7 +317,12 @@ fn rust(source: &str) -> (Vec<Token>, Vec<Edit>) {
                 end = children[j].text_range().end();
                 j += 1;
             }
-            if tails.len() > 1 {
+            if tails.len() > 1
+                && contains(
+                    selection,
+                    usize::from(children[i].text_range().start())..usize::from(end),
+                )
+            {
                 edits.push(Edit {
                     range: usize::from(children[i].text_range().start())..usize::from(end),
                     text: format!("{}use {}::{{{}}};", first.0, first.1, tails.join(",")),
@@ -336,14 +394,15 @@ fn csharp(source: &str, selection: &Range<usize>) -> (Vec<Token>, Vec<Edit>) {
     }
     visit(tree.root_node(), &mut tokens);
     let mut edits = Vec::new();
+    let selected = token_window(&tokens, selection);
     let mut index = 0;
-    while index < tokens.len() {
-        let start = tokens[index].range.start;
-        let text = &source[tokens[index].range.clone()];
+    while index < selected.len() {
+        let start = selected[index].range.start;
+        let text = &source[selected[index].range.clone()];
         if text.starts_with("///") || text.starts_with("/**") {
-            let mut end = tokens[index].range.end;
+            let mut end = selected[index].range.end;
             if text.starts_with("///") {
-                while let Some(next) = tokens.get(index + 1)
+                while let Some(next) = selected.get(index + 1)
                     && source[end..next.range.start]
                         .chars()
                         .all(char::is_whitespace)
@@ -353,7 +412,9 @@ fn csharp(source: &str, selection: &Range<usize>) -> (Vec<Token>, Vec<Edit>) {
                     end = next.range.end;
                 }
             }
-            if let Some(text) = xml_doc(&source[start..end]) {
+            if contains(selection, start..end)
+                && let Some(text) = xml_doc(&source[start..end])
+            {
                 edits.push(Edit {
                     range: start..end,
                     text,
@@ -369,6 +430,9 @@ fn csharp(source: &str, selection: &Range<usize>) -> (Vec<Token>, Vec<Edit>) {
         edits: &mut Vec<Edit>,
         selection: &Range<usize>,
     ) {
+        if node.end_byte() < selection.start || node.start_byte() > selection.end {
+            return;
+        }
         if node.has_error() {
             // Still simplify independent valid siblings.
             if node.is_error() {
@@ -421,9 +485,9 @@ fn simplify_cs(
     let mut previous = None;
     for child in node.named_children(&mut node.walk()) {
         if child.kind() != "attribute_list"
-            || !clean_cs(child)
             || child.start_byte() < selection.start
             || child.end_byte() > selection.end
+            || !clean_cs(child)
         {
             previous = None;
             continue;
@@ -468,6 +532,7 @@ fn simplify_cs(
     match node.kind() {
         "method_declaration" => {
             if let Some(body) = node.child_by_field_name("body")
+                && contains(selection, body.byte_range())
                 && let Some(expr) = returned(body)
             {
                 edits.push(Edit {
@@ -478,6 +543,7 @@ fn simplify_cs(
         }
         "property_declaration" => {
             if let Some(list) = node.child_by_field_name("accessors")
+                && contains(selection, list.byte_range())
                 && list.named_child_count() == 1
                 && clean_cs(list)
             {
@@ -525,14 +591,17 @@ fn simplify_cs(
                 });
             }
         }
-        "variable_declaration" if clean_cs(node) => {
+        "variable_declaration" => {
+            let before = edits.len();
             if let Some(ty) = node.child_by_field_name("type") {
-                for declarator in node
-                    .named_children(&mut node.walk())
-                    .filter(|n| n.kind() == "variable_declarator")
-                {
+                for declarator in node.named_children(&mut node.walk()).filter(|n| {
+                    n.kind() == "variable_declarator"
+                        && n.end_byte() >= selection.start
+                        && n.start_byte() <= selection.end
+                }) {
                     for value in declarator.named_children(&mut declarator.walk()) {
                         if value.kind() == "default_expression"
+                            && contains(selection, value.byte_range())
                             && value
                                 .child_by_field_name("type")
                                 .is_some_and(|t| text(t) == text(ty))
@@ -546,16 +615,16 @@ fn simplify_cs(
                         if value.kind() == "object_creation_expression"
                             && ty.kind() == "predefined_type"
                             && value.child_by_field_name("arguments").is_some()
-                            && value
-                                .child_by_field_name("type")
-                                .is_some_and(|t| text(t) == text(ty))
+                            && let Some(t) = value.child_by_field_name("type")
+                            && contains(selection, value.start_byte()..t.end_byte())
+                            && text(t) == text(ty)
                         {
-                            let t = value.child_by_field_name("type").unwrap();
                             edits.push(Edit {
                                 range: value.start_byte()..t.end_byte(),
                                 text: "new".into(),
                             });
                         } else if value.kind() == "object_creation_expression"
+                            && contains(selection, node.byte_range())
                             && value
                                 .child_by_field_name("type")
                                 .is_some_and(|t| text(t) == text(ty))
@@ -563,8 +632,6 @@ fn simplify_cs(
                                 .parent()
                                 .is_some_and(|p| p.kind() == "local_declaration_statement")
                             && node.named_child_count() == 2
-                            && selection.start <= node.start_byte()
-                            && selection.end >= node.end_byte()
                             && text(ty).len() > 3
                         {
                             // The constructor still spells the exact original type, including nullable types.
@@ -576,8 +643,17 @@ fn simplify_cs(
                     }
                 }
             }
+            // Comments anywhere in the declaration still disallow replacements.
+            // Inspect the full declaration only when a selected edit needs it.
+            if edits.len() != before && !clean_cs(node) {
+                edits.truncate(before);
+            }
         }
-        "block" if clean_cs(node) && node.named_child_count() == 1 => {
+        "block"
+            if contains(selection, node.byte_range())
+                && node.named_child_count() == 1
+                && clean_cs(node) =>
+        {
             let parent = node.parent().unwrap();
             if matches!(
                 parent.kind(),
@@ -930,6 +1006,64 @@ class Sample {
             assert_eq!(render(source, language, range.clone()), source[range]);
         }
     }
+    #[test]
+    fn selected_declarators_keep_whole_declaration_comment_checks() {
+        for (value, compacted) in [("default(int)", "default"), ("new int()", "new()")] {
+            for comment in ["", "// preserve declaration"] {
+                let source = format!(
+                    "class C {{\n int first = {value}, {comment}\n second = {value};\n}}\n"
+                );
+                let (range, _, _) = crate::navigation::lines(&source, Some((3, 3))).unwrap();
+                let expected = if comment.is_empty() { compacted } else { value };
+                assert_eq!(
+                    render(&source, Language::CSharp, range).trim(),
+                    format!("second={expected};")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ranges_keep_comment_import_and_macro_boundaries() {
+        for (language, source, range) in [
+            (
+                Language::Rust,
+                "use a::One;\nuse a::Two;\nuse a::Three;\n",
+                2..=3,
+            ),
+            (
+                Language::CSharp,
+                "/// <summary>\n/// keep   spacing\n/// </summary>\nclass C {}",
+                2..=2,
+            ),
+            (
+                Language::Rust,
+                "custom! {\n  use a::One; use a::Two;\n}",
+                2..=2,
+            ),
+            (
+                Language::CSharp,
+                "class C { /*\n  keep   comment\n*/ }",
+                2..=2,
+            ),
+        ] {
+            let (selected, _, _) =
+                crate::navigation::lines(source, Some((*range.start(), *range.end()))).unwrap();
+            let output = render(source, language, selected.clone());
+            if language == Language::Rust && source.starts_with("use") {
+                assert!(
+                    output.contains("use a::Two;") && output.contains("use a::Three;"),
+                    "{output}"
+                );
+            } else {
+                assert_eq!(output, source[selected]);
+            }
+        }
+        let malformed = "fn f(x: i32) { Point { x: x }; }\nfn broken(";
+        let range = 0..malformed.find('\n').unwrap();
+        assert!(render(malformed, Language::Rust, range).contains("x:x"));
+    }
+
     #[test]
     fn ranges_do_not_apply_half_a_namespace_conversion() {
         let source = "namespace Example\n{\nclass C { int Get() { return 1; } }\n}\n";

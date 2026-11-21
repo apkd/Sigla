@@ -244,9 +244,11 @@ fn validate_document(bytes: &[u8], language: Language) -> anyhow::Result<()> {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         anyhow::ensure!(
             !bytes.starts_with(b"bplist00")
-                && !bytes
-                    .iter()
-                    .any(|&b| b.is_ascii_control() && !matches!(b, b'\t'..=b'\r')),
+                && !bytes.chunks(64).any(|block| {
+                    block.iter().fold(false, |invalid, &b| {
+                        invalid | (b.is_ascii_control() && !matches!(b, b'\t'..=b'\r'))
+                    })
+                }),
             "Binary document contents are unsupported"
         );
     }
