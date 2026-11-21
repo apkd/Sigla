@@ -400,12 +400,19 @@ fn select_editor(catalog: &Catalog, declared: UnityVersion) -> Result<&Artifact>
         .map(|(_, a)| a)
         .context("No equal or newer archived Unity editor is available")
 }
+struct AcquiredEditor {
+    data: PathBuf,
+    selected: Origin,
+    archive: BTreeMap<String, Option<PathBuf>>,
+    references: EditorReferences,
+}
+
 fn acquire_editor(
     cache: &Path,
     declared: UnityVersion,
     roles: &std::collections::BTreeSet<String>,
     leases: &crate::cache::views::LeaseSet,
-) -> Result<(PathBuf, Origin, BTreeMap<String, Option<PathBuf>>)> {
+) -> Result<AcquiredEditor> {
     let fetch = lazy_ranges();
     for refresh in [false, true] {
         let catalog = current(refresh)?;
@@ -437,7 +444,12 @@ fn acquire_editor(
                 .and_then(Option::as_ref)
                 .context("Archived editor has no configuration section")?
                 .join("Editor/Data");
-            Ok((data, artifact.manifest.origin.clone(), roots))
+            Ok(AcquiredEditor {
+                data,
+                selected: artifact.manifest.origin.clone(),
+                archive: roots,
+                references: EditorReferences(catalog.clone()),
+            })
         };
         match acquire() {
             Ok(editor) => return Ok(editor),
@@ -453,12 +465,67 @@ fn missing_asset(error: &anyhow::Error) -> bool {
         .filter_map(|e| e.downcast_ref::<reqwest::Error>())
         .any(|e| e.status().is_some_and(|s| matches!(s.as_u16(), 404 | 410)))
 }
+
+pub(crate) struct EditorReferences(pub(super) Arc<Catalog>);
+
+pub(crate) fn editor_reference(
+    editor: &crate::unity::catalog::Editor,
+    name: &str,
+    api: u32,
+    cache: &Path,
+    leases: &crate::cache::views::LeaseSet,
+) -> Result<Option<PathBuf>> {
+    let catalog = &editor
+        .archive_references
+        .as_ref()
+        .context("Archived editor has no reference catalog")?
+        .0;
+    let paths = crate::unity::references::profile_paths(name, api);
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let artifact = catalog
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.manifest.origin.kind == "editor"
+                && editor
+                    .data
+                    .starts_with(cache.join("unity-metadata").join(hex(&artifact.hash)))
+        })
+        .context("Selected Unity editor is no longer in the metadata catalog")?;
+    let group = if api == 6 { "standard" } else { "framework" };
+    for path in paths {
+        let path = Path::new("Editor/Data").join(path).with_extension("sigla");
+        if let Some(root) = editor.archive.get(group).and_then(Option::as_ref) {
+            let default = root.join(&path);
+            if default.is_file() {
+                return Ok(Some(default));
+            }
+        }
+        let role = sections::assembly_role(group, path.to_str().context("Invalid reference path")?);
+        if let Some(section) = artifact
+            .sections
+            .iter()
+            .find(|section| section.role == role)
+        {
+            let root = materialize_section(cache, artifact, catalog, section, leases)?;
+            let path = root.join(path);
+            ensure!(
+                path.is_file(),
+                "Archived reference is missing from its section"
+            );
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
 pub fn prefetch(cache: &Path, branch: ReleaseBranch) -> Result<PathBuf> {
     let leases = crate::cache::views::LeaseSet::new(cache)?;
     let roles = ["configuration", "editor", "standard", "framework"]
         .map(String::from)
         .into();
-    Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?, &roles, &leases)?.0)
+    Ok(acquire_editor(cache, format!("{branch}.0a0").parse()?, &roles, &leases)?.data)
 }
 pub(crate) fn configured(path: &Path, branches: &[ReleaseBranch]) -> bool {
     if branches.is_empty() {
@@ -529,7 +596,12 @@ pub(crate) fn editor(
             .into(),
         );
     }
-    let (data, selected, archive) = acquire_editor(cache, declared, &roles, leases).context(
+    let AcquiredEditor {
+        data,
+        selected,
+        archive,
+        references,
+    } = acquire_editor(cache, declared, &roles, leases).context(
         crate::diagnostics::DependencyUnavailable("Unity editor metadata is unavailable"),
     )?;
     Ok(crate::unity::catalog::Editor {
@@ -537,6 +609,7 @@ pub(crate) fn editor(
         selected: selected.version.parse()?,
         data,
         archive,
+        archive_references: Some(references),
         declared_revision: text
             .lines()
             .find_map(|l| l.strip_prefix("m_EditorVersionWithRevision:"))

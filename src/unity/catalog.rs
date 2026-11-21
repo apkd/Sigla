@@ -1,3 +1,4 @@
+use super::references::*;
 use super::symbols::symbols;
 use super::{
     Platform, UnityVersion,
@@ -9,15 +10,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
-
-const STANDARD_DIRS: &[&str] = &[
-    "NetStandard/ref/2.1.0",
-    "NetStandard/compat/2.1.0/shims/netfx",
-    "NetStandard/compat/2.1.0/shims/netstandard",
-    "NetStandard/Extensions/2.0.0",
-];
-const FRAMEWORK_DIR: &str = "UnityReferenceAssemblies/unity-4.8-api";
-const FACADES_DIR: &str = "UnityReferenceAssemblies/unity-4.8-api/Facades";
 
 fn supported(version: UnityVersion) -> bool {
     matches!(
@@ -179,12 +171,7 @@ impl References {
                 .collect();
             let framework = paths("framework")
                 .into_iter()
-                .filter(|p| {
-                    p.parent().is_some_and(|p| p.ends_with("Facades"))
-                        || FRAMEWORK
-                            .split_whitespace()
-                            .any(|name| p.file_stem().is_some_and(|n| n == name))
-                })
+                .filter(|p| default_reference("framework", p))
                 .collect();
             if engine.is_empty() {
                 incomplete = true;
@@ -291,6 +278,7 @@ pub struct Editor {
     /// Selected immutable sections. None means the catalog publishes no such group.
     /// An empty map identifies an installed local editor.
     pub archive: BTreeMap<String, Option<PathBuf>>,
+    pub(crate) archive_references: Option<crate::metadata_archive::EditorReferences>,
     pub declared_revision: Option<String>,
     pub selected_revision: Option<String>,
 }
@@ -322,20 +310,10 @@ impl Editor {
 
     /// Resolve a simple assembly name in the same API profile used for compilation.
     pub(super) fn profile_reference(&self, name: &str, api: u32) -> Option<PathBuf> {
-        if Path::new(name).file_name()?.to_str()? != name || name.contains('\\') {
-            return None;
-        }
-        let filename = format!("{}.dll", name.strip_suffix(".dll").unwrap_or(name));
-        let directories = if api == 6 {
-            STANDARD_DIRS
-        } else {
-            &[FRAMEWORK_DIR, FACADES_DIR]
-        };
-        directories.iter().find_map(|directory| {
-            let path = crate::metadata_archive::reference(self.reference_path(
-                if api == 6 { "standard" } else { "framework" },
-                &Path::new(directory).join(&filename),
-            )?);
+        profile_paths(name, api).iter().find_map(|relative| {
+            let path = crate::metadata_archive::reference(
+                self.reference_path(if api == 6 { "standard" } else { "framework" }, relative)?,
+            );
             path.is_file().then_some(path)
         })
     }
@@ -411,6 +389,7 @@ impl Editor {
             selected,
             data: data.canonicalize()?,
             archive: BTreeMap::new(),
+            archive_references: None,
             selected_revision: (declared == selected).then(|| revision.clone()).flatten(),
             declared_revision: revision,
         })
@@ -516,11 +495,7 @@ impl Editor {
                     {
                         continue;
                     }
-                } else if name != "UnityEngine.dll"
-                    && !(platform == Platform::EditorLinux
-                        && (name == "UnityEditor.dll"
-                            || name.starts_with("UnityEditor.") && name.ends_with("Module.dll")))
-                {
+                } else if !engine_reference(&name, platform == Platform::EditorLinux) {
                     continue;
                 }
                 references.insert(path.clone());
@@ -551,23 +526,6 @@ impl Editor {
         })
     }
 }
-
-// Editor-only precompiled references observed in both supported Linux layouts.
-// Unity tests custom-assembly compatibility with response-file defines, but
-// without the compilation's general/version defines (TargetAssembly.editorCompatibility).
-const EDITOR_PRECOMPILED: &[&str] = &[
-    "Managed/UnityEditor.Graphs.dll",
-    "PlaybackEngines/LinuxStandaloneSupport/UnityEditor.LinuxStandalone.Extensions.dll",
-];
-
-// Unity's default .NET Framework references. Other DLLs in this directory
-// remain available to explicit references; they are not automatic imports.
-const FRAMEWORK: &str = "
-Microsoft.CSharp System.ComponentModel.Composition System.Core System.Data.DataSetExtensions
-System.Data System.Drawing System.IO.Compression.FileSystem System.IO.Compression
-System.Net.Http System.Numerics.Vectors System.Numerics System.Runtime.Serialization
-System.Transactions System.Xml.Linq System.Xml System mscorlib
-";
 
 #[cfg(test)]
 mod tests {

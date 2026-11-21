@@ -4,6 +4,7 @@ pub(crate) mod catalog;
 mod graph;
 mod package_acquire;
 mod packages;
+pub(crate) mod references;
 pub(crate) mod settings;
 pub(crate) mod symbols;
 mod version;

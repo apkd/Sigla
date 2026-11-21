@@ -1,4 +1,5 @@
 pub(crate) use crate::metadata_archive::editor;
+pub(crate) use crate::metadata_archive::editor_reference;
 pub use crate::metadata_archive::prefetch;
 
 use anyhow::Result;

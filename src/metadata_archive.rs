@@ -9,8 +9,10 @@ mod sections;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub(crate) use client::EditorReferences;
 pub(crate) use client::configured;
 pub(crate) use client::editor;
+pub(crate) use client::editor_reference;
 pub(crate) use client::{PackagePlan, materialize_packages, plan_package};
 pub use client::{package, prefetch};
 pub use producer::Command;

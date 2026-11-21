@@ -44,6 +44,7 @@ pub fn domains(name: &str) -> [bool; 5] {
             | "src/cache/file_id.rs"
             | "src/metadata_archive.rs" | "src/metadata_archive/sections.rs"
             | "src/metadata_archive/bundle.rs"
+            | "src/unity/references.rs"
         );
     let graph = facts
         || name.starts_with("src/discovery")

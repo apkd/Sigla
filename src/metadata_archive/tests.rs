@@ -808,6 +808,139 @@ fn section_import_handles_identical_assembly_references_before_alias_publication
 }
 
 #[test]
+fn editor_defaults_leave_optional_assemblies_for_explicit_references() -> Result<()> {
+    let output = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let version = "6000.3.0f1";
+    let mut builder = bundle::Builder::new(
+        Origin {
+            kind: "editor".into(),
+            name: "unity-editor".into(),
+            version: version.into(),
+            ..origin()
+        },
+        vec![vec![]],
+    )?;
+    builder.add(
+        "Editor/Data/Resources/modules.asset".into(),
+        b"configuration".to_vec(),
+        "configuration",
+    )?;
+    let source = "class Library {}";
+    let analysis = envelope(&binary::encode(&Analysis {
+        id: [5; 32],
+        encoded: records::encode(FileData {
+            source: source.into(),
+            facts: crate::extract::extract(source, Language::CSharp, &[], "")?,
+            assembly: Some("Library".into()),
+        })?,
+    })?);
+    let default = "Editor/Data/UnityReferenceAssemblies/unity-4.8-api/System.sigla";
+    let optional = "Editor/Data/UnityReferenceAssemblies/unity-4.8-api/System.Configuration.sigla";
+    let facade =
+        "Editor/Data/UnityReferenceAssemblies/unity-4.8-api/Facades/System.Configuration.sigla";
+    let editor_extra = "Editor/Data/Managed/Unused.sigla";
+    for (path, group) in [
+        (default, "framework"),
+        (optional, "framework"),
+        (facade, "framework"),
+        (editor_extra, "editor"),
+    ] {
+        builder.object(path.into(), &analysis, group)?;
+    }
+    let artifact = builder.finish(output.path())?;
+    // One release asset; optional ranges are authenticated by its directory.
+    let archive = output.path().join(&artifact.name);
+    bundle::verify(&archive, Some(&artifact))?;
+    let root = cache
+        .path()
+        .join("unity-metadata")
+        .join(hex(&artifact.hash));
+    fs::create_dir_all(&root)?;
+    fs::copy(&archive, root.join("source.sigla"))?;
+    let leases = crate::cache::views::LeaseSet::new(cache.path())?;
+    let catalog = Catalog {
+        artifacts: vec![artifact.clone()],
+        ..Default::default()
+    };
+    let selected: Vec<_> = artifact
+        .sections
+        .iter()
+        .filter(|section| matches!(section.role.as_str(), "configuration" | "framework"))
+        .collect();
+    let roots = client::materialize_sections(
+        cache.path(),
+        &artifact,
+        &catalog,
+        &selected,
+        &leases,
+        |_, _| panic!("Local archive should need no network"),
+    );
+    let mut acquired = BTreeMap::new();
+    for (role, result) in roots {
+        acquired.insert(role, Some(result?));
+    }
+    assert!(
+        acquired["framework"]
+            .as_ref()
+            .unwrap()
+            .join(default)
+            .is_file()
+    );
+    for path in [optional, editor_extra] {
+        assert!(
+            acquired
+                .values()
+                .flatten()
+                .all(|root| !root.join(path).exists())
+        );
+    }
+    let editor = crate::unity::catalog::Editor {
+        declared: version.parse()?,
+        selected: version.parse()?,
+        data: acquired["configuration"]
+            .as_ref()
+            .unwrap()
+            .join("Editor/Data"),
+        archive: acquired,
+        archive_references: Some(client::EditorReferences(std::sync::Arc::new(catalog))),
+        declared_revision: None,
+        selected_revision: None,
+    };
+    let path = client::editor_reference(&editor, "System.Configuration", 2, cache.path(), &leases)?
+        .unwrap();
+    assert!(path.ends_with(optional));
+    assert!(path.is_file());
+    assert_eq!(
+        client::editor_reference(
+            &editor,
+            "System.Configuration.dll",
+            2,
+            cache.path(),
+            &leases
+        )?,
+        Some(path.clone())
+    );
+    assert!(
+        client::editor_reference(&editor, "System.Configuration", 6, cache.path(), &leases)?
+            .is_none()
+    );
+    let mut indexes = Indexes::new(cache.path());
+    assert!(
+        indexes
+            .file(&path, || panic!("Assembly lookup uses its stored identity"))?
+            .is_some()
+    );
+    let unused = &artifact
+        .sections
+        .iter()
+        .find(|section| section.role.ends_with(editor_extra))
+        .unwrap();
+    assert!(!root.join("sections").join(hex(&unused.hash)).exists());
+    Ok(())
+}
+
+#[test]
 fn range_fallback_downloads_once_and_rejects_malformed_responses() {
     let output = tempfile::tempdir().unwrap();
     let mut builder = bundle::Builder::new(origin(), vec![vec![]]).unwrap();

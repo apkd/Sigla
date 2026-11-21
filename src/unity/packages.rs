@@ -679,6 +679,7 @@ mod tests {
             selected: version.parse()?,
             data: temp.path().join("configuration/Editor/Data"),
             archive: Default::default(),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };
@@ -741,6 +742,7 @@ mod tests {
             selected: "6000.3.0f1".parse()?,
             data: temp.path().join("Editor"),
             archive: Default::default(),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };
@@ -823,6 +825,7 @@ mod tests {
             selected: "6000.3.0f1".parse().unwrap(),
             data: temp.path().join("Editor"),
             archive: Default::default(),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };
@@ -907,6 +910,7 @@ mod tests {
             selected: "6000.3.0f1".parse().unwrap(),
             data: temp.path().join("Editor"),
             archive: Default::default(),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };
@@ -1002,6 +1006,7 @@ mod tests {
             selected: "6000.3.0f1".parse().unwrap(),
             data: fixture.path().join("Editor"),
             archive: Default::default(),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };
@@ -1049,6 +1054,7 @@ mod tests {
             selected: "6000.3.0f1".parse().unwrap(),
             data: root.path().join("Editor"),
             archive: Default::default(),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };

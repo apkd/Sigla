@@ -116,6 +116,12 @@ pub(super) fn role(entry: &Entry, groups: &BTreeMap<&str, &str>) -> Result<Strin
             return Ok(format!("package/{name}"));
         }
     }
+    if entry.path.ends_with(".sigla")
+        && let Some(relative) = entry.path.strip_prefix("Editor/Data/")
+        && !crate::unity::references::default_reference(&entry.group, Path::new(relative))
+    {
+        return Ok(assembly_role(&entry.group, &entry.path));
+    }
     Ok(if entry.group == "analysis" {
         *groups
             .get(
@@ -129,6 +135,10 @@ pub(super) fn role(entry: &Entry, groups: &BTreeMap<&str, &str>) -> Result<Strin
         &entry.group
     }
     .to_owned())
+}
+
+pub(super) fn assembly_role(group: &str, path: &str) -> String {
+    format!("assembly/{group}/{path}")
 }
 
 pub(super) fn validate(sections: &[Section], header_size: u64, size: u64) -> Result<()> {

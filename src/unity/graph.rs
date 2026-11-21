@@ -445,8 +445,22 @@ pub(crate) fn discover_with_editor(
                     root,
                     policy,
                     |name| {
-                        editor
-                            .profile_reference(name, settings.compilation_api(assembly.editor_only))
+                        let api = settings.compilation_api(assembly.editor_only);
+                        match &policy.remote {
+                            Some(remote) => super::acquire::editor_reference(
+                                editor,
+                                name,
+                                api,
+                                &remote.shared,
+                                &result.leases,
+                            )
+                            .context(
+                                crate::diagnostics::DependencyUnavailable(
+                                    "Unity explicit reference metadata is unavailable",
+                                ),
+                            ),
+                            None => Ok(editor.profile_reference(name, api)),
+                        }
                     },
                     &mut response_defines,
                     &mut response_refs,
@@ -454,11 +468,15 @@ pub(crate) fn discover_with_editor(
                     if error
                         .downcast_ref::<crate::discovery::RequiredInputs>()
                         .is_some()
+                        || crate::diagnostics::cancelled(&error)
                     {
                         return Err(error);
                     }
                     response_defines.clear();
                     response_refs.clear();
+                    if error.is::<crate::diagnostics::DependencyUnavailable>() {
+                        result.dependency_retry = Some(crate::discovery::DependencyRetry::new());
+                    }
                     result.diagnostics.push(format!(
                         "Ignored response file {}: {error:#}",
                         response.display()
@@ -611,7 +629,12 @@ pub(crate) fn discover_with_editor(
         let project = match prepared {
             Ok(Some(project)) => project,
             Ok(None) => continue,
-            Err(error) if error.is::<crate::discovery::RequiredInputs>() => return Err(error),
+            Err(error)
+                if error.is::<crate::discovery::RequiredInputs>()
+                    || crate::diagnostics::cancelled(&error) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 result.diagnostics.push(format!(
                     "Excluded assembly {}: {error:#}",
@@ -912,7 +935,7 @@ fn response_file(
     path: &Path,
     root: &Path,
     policy: &Policy,
-    profile_reference: impl Fn(&str) -> Option<PathBuf>,
+    profile_reference: impl Fn(&str) -> Result<Option<PathBuf>>,
     defines: &mut BTreeSet<String>,
     references: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
@@ -974,13 +997,13 @@ fn response_file(
                     }
                 }
             }
-            references.insert(
-                found
-                    .or_else(|| profile_reference(value))
-                    .with_context(|| {
-                        format!("Cannot resolve Unity response-file reference {value}")
-                    })?,
-            );
+            let found = match found {
+                Some(path) => Some(path),
+                None => profile_reference(value)?,
+            };
+            references.insert(found.with_context(|| {
+                format!("Cannot resolve Unity response-file reference {value}")
+            })?);
         } else if token.starts_with('@') {
             bail!("Nested Unity response files are not supported");
         }
@@ -1027,6 +1050,7 @@ mod tests {
             selected: version,
             data: editor_root.path().into(),
             archive: BTreeMap::from([("player-mono".into(), None)]),
+            archive_references: None,
             declared_revision: None,
             selected_revision: None,
         };
@@ -1073,6 +1097,7 @@ mod tests {
         let version = "6000.3.10f1".parse().unwrap();
         let editor = Editor {
             archive: Default::default(),
+            archive_references: None,
             declared: version,
             selected: version,
             data: install.path().into(),
@@ -1094,7 +1119,7 @@ mod tests {
                 &response,
                 root,
                 &policy,
-                |name| editor.profile_reference(name, settings.compilation_api(editor_only)),
+                |name| Ok(editor.profile_reference(name, settings.compilation_api(editor_only))),
                 &mut BTreeSet::new(),
                 &mut references,
             )?;
@@ -1153,7 +1178,7 @@ mod tests {
             &response,
             source,
             &policy,
-            |_| None,
+            |_| Ok(None),
             &mut BTreeSet::new(),
             &mut references,
         )
@@ -1233,6 +1258,7 @@ mod tests {
         let version = "6000.3.0f1".parse().unwrap();
         let editor = Editor {
             archive: Default::default(),
+            archive_references: None,
             declared: version,
             selected: version,
             data: editor_root.path().into(),
@@ -1467,6 +1493,7 @@ PluginImporter:
                 let selected = snapshot["version"].as_str().unwrap().parse().unwrap();
                 let editor = Editor {
                     archive: Default::default(),
+                    archive_references: None,
                     declared: selected,
                     selected,
                     data: editor_root.path().into(),
