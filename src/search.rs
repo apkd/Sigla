@@ -2297,16 +2297,13 @@ impl<'a> Search<'a> {
                 !h.decl.named_type()
                     && !h.decl.callable()
                     && (self.manifest.files[&h.file].language != Language::CSharp
-                        || h.decl.kind == "namespace")
+                        || h.decl.kind == "namespace"
+                        || h.decl.modifiers.iter().any(|m| m == "partial"))
             }) {
                 continue;
             }
             let mut files: BTreeSet<_> = targets.iter().map(|h| h.file.clone()).collect();
-            // Partial members, like partial types, can own bodies in another file.
-            for h in targets
-                .iter()
-                .filter(|h| h.decl.named_type() || h.decl.modifiers.iter().any(|m| m == "partial"))
-            {
+            for h in targets.iter().filter(|h| h.decl.named_type()) {
                 files.extend(self.candidates(&h.decl.name, false, false)?);
                 if self.manifest.files[&h.file].language == Language::Rust {
                     files.extend(self.candidates(&h.decl.name, false, true)?);
@@ -2646,6 +2643,28 @@ mod tests {
             )
             .unwrap();
         assert!(result.contains("Holder.Value.Nested"), "{result}");
+    }
+
+    #[test]
+    fn location_selected_partial_method_does_not_include_other_overloads() {
+        let definition = "partial class Holder { partial void Run(int value); }";
+        let (_root, _cache, workspace) = text_workspace(&[
+            ("Definition.cs", definition),
+            (
+                "Overload.cs",
+                "partial class Holder { void Run(string value) { int needle = 2; void Wrong() {} } }",
+            ),
+        ]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut search = Search::new(&workspace.store, &workspace.manifest, &cancel).unwrap();
+        let scope = format!(
+            "in:@Definition.cs:1:{}",
+            definition.find("Run").unwrap() + 1
+        );
+        let symbols = search
+            .run(&Query::parse(&format!("symbol:* {scope}")).unwrap())
+            .unwrap();
+        assert!(!symbols.contains("Holder.Run.Wrong"), "{symbols}");
     }
 
     #[test]
