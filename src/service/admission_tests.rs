@@ -260,6 +260,70 @@ async fn request_completion_trims_idle_workspace_registry() {
     assert!(app.workspaces.lock().unwrap().len() <= WORKSPACE_CACHE_ENTRIES);
 }
 
+#[tokio::test]
+async fn active_query_pins_workspace_until_cancelled_worker_exits() {
+    use std::time::Duration;
+
+    let (root, _cache, app) = fixture(1);
+    let source = root.path().join("code.rs");
+    std::fs::write(&source, "pub struct Available;").unwrap();
+    let app = Arc::new(app);
+    app.search(source.to_str().unwrap(), "type:Available wait:complete")
+        .await
+        .unwrap();
+    app.query_snapshot_started.notified().await;
+    let pause = app.query_snapshot_pause.lock().await;
+    let query = tokio::spawn({
+        let app = app.clone();
+        let source = source.clone();
+        async move {
+            app.search(source.to_str().unwrap(), "type:Available wait:complete")
+                .await
+        }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        app.query_snapshot_started.notified(),
+    )
+    .await
+    .unwrap();
+    {
+        let mut registry = app.workspaces.lock().unwrap();
+        assert!(registry[&source].state.try_lock().is_ok());
+        for index in 0..WORKSPACE_CACHE_ENTRIES {
+            registry.insert(
+                root.path().join(format!("idle-{index}")),
+                WorkspaceSlot {
+                    state: Arc::new(tokio::sync::Mutex::new(None)),
+                    preparing: None,
+                    used: Instant::now(),
+                },
+            );
+        }
+    }
+    app.trim_idle();
+    assert!(app.workspaces.lock().unwrap().contains_key(&source));
+    query.abort();
+    assert!(query.await.unwrap_err().is_cancelled());
+    assert_eq!(app.workspace_cache_usage().active_entries, 1);
+    drop(pause);
+    let drained = tokio::time::timeout(Duration::from_secs(5), app.activity.write())
+        .await
+        .unwrap();
+    drop(drained);
+    app.workspaces.lock().unwrap().insert(
+        root.path().join("another-idle"),
+        WorkspaceSlot {
+            state: Arc::new(tokio::sync::Mutex::new(None)),
+            preparing: None,
+            used: Instant::now(),
+        },
+    );
+    app.trim_idle();
+    assert!(!app.workspaces.lock().unwrap().contains_key(&source));
+    app.shutdown().await;
+}
+
 #[test]
 fn workspace_cache_usage_reports_active_pins() {
     let (root, _cache, app) = fixture(1);

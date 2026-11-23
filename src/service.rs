@@ -127,6 +127,10 @@ pub struct App {
     #[cfg(test)]
     admission_started: tokio::sync::Notify,
     #[cfg(test)]
+    query_snapshot_started: tokio::sync::Notify,
+    #[cfg(test)]
+    query_snapshot_pause: tokio::sync::Mutex<()>,
+    #[cfg(test)]
     preparation_admission_started: tokio::sync::Notify,
     #[cfg(test)]
     history_started: tokio::sync::Notify,
@@ -479,6 +483,10 @@ impl App {
             indexing_started: tokio::sync::Notify::new(),
             #[cfg(test)]
             admission_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            query_snapshot_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            query_snapshot_pause: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             preparation_admission_started: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -1681,7 +1689,7 @@ impl App {
         tracing::Span::current().record("stage", "query_admission");
         operation.stage("query_admission");
         let Some((permit, mut state, branch_state)) = wait
-            .until(self.admit_query(asset_workspace, branch.as_ref(), &operation))
+            .until(self.admit_query(asset_workspace.clone(), branch.as_ref(), &operation))
             .await?
         else {
             return Ok(indexes::pending("Query admission"));
@@ -1737,6 +1745,8 @@ impl App {
         let result = tokio::task::spawn_blocking(move || {
             let _activity = rendering_activity;
             let _permit = permit;
+            // Immutable snapshots still need their workspace protected from retirement.
+            let _workspace = asset_workspace;
             blocking_operation.stage("evaluation");
             app.trim_idle();
             let result = (|| {
@@ -1824,6 +1834,11 @@ impl App {
                         search.with_assets(assets);
                     }
                     drop(state);
+                    #[cfg(test)]
+                    {
+                        app.query_snapshot_started.notify_one();
+                        let _pause = app.query_snapshot_pause.blocking_lock();
+                    }
                     match request {
                         Request::History(_) => {
                             unreachable!("history bypasses snapshot preparation")
