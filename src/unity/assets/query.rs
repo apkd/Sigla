@@ -310,6 +310,13 @@ impl Index {
                         };
                         if names.iter().any(|name| {
                             qualified_name_rank(&q.target.name, name, q.loose).is_some()
+                                || !q.target.name.contains('.')
+                                    && qualified_name_rank(
+                                        &q.target.name,
+                                        name.rsplit('.').next().unwrap(),
+                                        q.loose,
+                                    )
+                                    .is_some()
                         }) {
                             lines.push(describe(self, key, object, &composition));
                         }

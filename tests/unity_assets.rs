@@ -547,6 +547,38 @@ async fn native_lod_group_instances_round_trip_and_keep_renderer_edges() {
         .unwrap();
     assert_eq!(object_handles(&components).len(), 4, "{components}");
     assert!(components.contains(handles[0]), "{components}");
+    for (short, qualified) in [
+        ("MeshRenderer", "UnityEngine.MeshRenderer"),
+        ("Renderer", "UnityEngine.Renderer"),
+        ("*Renderer", "UnityEngine.*Renderer"),
+        ("Unity*", "UnityEngine.*"),
+    ] {
+        for filter in ["", "type-match:exact"] {
+            let mut results = Vec::new();
+            for name in [short, qualified] {
+                results.push(
+                    app.search(
+                        codebase,
+                        &format!("instance:{name} {filter} path:Assets/Bolt.prefab"),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            assert_eq!(object_handles(&results[0]), object_handles(&results[1]));
+        }
+    }
+    let loose_namespace = app
+        .search(
+            codebase,
+            "instance:UnityEngine match:loose type-match:exact path:Assets/Bolt.prefab",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        object_handles(&loose_namespace),
+        object_handles(&components)
+    );
     let exact_base = app
         .search(
             codebase,

@@ -2293,14 +2293,20 @@ impl<'a> Search<'a> {
     fn containment_files(&self, inside: &[(bool, Vec<Hit>)]) -> Result<Option<BTreeSet<String>>> {
         let mut allowed: Option<BTreeSet<String>> = None;
         for (_, targets) in inside.iter().filter(|(negate, _)| !*negate) {
-            if targets
-                .iter()
-                .any(|h| !h.decl.named_type() && !h.decl.callable())
-            {
+            if targets.iter().any(|h| {
+                !h.decl.named_type()
+                    && !h.decl.callable()
+                    && (self.manifest.files[&h.file].language != Language::CSharp
+                        || h.decl.kind == "namespace")
+            }) {
                 continue;
             }
             let mut files: BTreeSet<_> = targets.iter().map(|h| h.file.clone()).collect();
-            for h in targets.iter().filter(|h| h.decl.named_type()) {
+            // Partial members, like partial types, can own bodies in another file.
+            for h in targets
+                .iter()
+                .filter(|h| h.decl.named_type() || h.decl.modifiers.iter().any(|m| m == "partial"))
+            {
                 files.extend(self.candidates(&h.decl.name, false, false)?);
                 if self.manifest.files[&h.file].language == Language::Rust {
                     files.extend(self.candidates(&h.decl.name, false, true)?);
@@ -2584,6 +2590,62 @@ mod tests {
                 .run(&Query::parse("text:needle limit:10").unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn member_name_collisions_keep_containment_bounded() {
+        let (_root, _cache, workspace) = text_workspace(&[
+            ("Grid.cs", "partial class Grid { void First() {} }"),
+            ("OtherPart.cs", "partial class Grid { void Second() {} }"),
+            (
+                "Holder.cs",
+                "class Holder { int Grid { get { int Nested() => 1; return Nested(); } } }",
+            ),
+            ("Unrelated.cs", "class Unrelated { void Noise() {} }"),
+        ]);
+        let mut manifest = (*workspace.manifest).clone();
+        let unrelated = manifest
+            .files
+            .iter()
+            .find(|(_, file)| file.display == "Unrelated.cs")
+            .unwrap()
+            .0
+            .clone();
+        let file = manifest.files.remove(&unrelated).unwrap();
+        manifest.files.insert("unavailable".into(), file);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut search = Search::new(&workspace.store, &manifest, &cancel).unwrap();
+        let result = search
+            .run(&Query::parse("symbol:* in:Grid").unwrap())
+            .unwrap();
+        for member in ["Grid.First", "Grid.Second", "Holder.Grid.Nested"] {
+            assert!(result.contains(member), "{result}");
+        }
+        assert!(!result.contains("Noise"), "{result}");
+    }
+
+    #[test]
+    fn location_selected_partial_property_includes_implementation_body() {
+        let definition = "partial class Holder { public partial int Value { get; } }";
+        let (_root, _cache, workspace) = text_workspace(&[
+            ("Definition.cs", definition),
+            (
+                "Implementation.cs",
+                "partial class Holder { public partial int Value { get { int Nested() => 1; return Nested(); } } }",
+            ),
+        ]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut search = Search::new(&workspace.store, &workspace.manifest, &cancel).unwrap();
+        let result = search
+            .run(
+                &Query::parse(&format!(
+                    "symbol:* in:@Definition.cs:1:{}",
+                    definition.find("Value").unwrap() + 1
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(result.contains("Holder.Value.Nested"), "{result}");
     }
 
     #[test]
