@@ -80,6 +80,24 @@ class Usage<T> : Base { void Run(Items items, Derived derived) {
 }
 
 #[tokio::test]
+async fn nested_overloaded_arguments_resolve_within_query_budget() {
+    let alternatives: String = (0..48).map(|i| format!("class V{i} {{}}\n")).collect();
+    let overloads: String = (0..48)
+        .map(|i| format!("static V{i} Mul(V{i} a, V{i} b) => a;\n"))
+        .collect();
+    check(
+        &format!(
+            "{alternatives} class MathOps {{ {overloads}
+             static void Accept(V0 result) {{}}
+             static void Run(V0 x) {{ var product = Mul(Mul(Mul(x, x), x), Mul(x, x));
+                                      /*target*/Accept(product); }} }}"
+        ),
+        &[("/*target*/", "MathOps.Accept")],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn repeated_scalar_inference_stays_bounded_across_overloads() {
     let alternatives: String = (0..24)
         .map(|index| format!("class Other{index} {{}}\n"))

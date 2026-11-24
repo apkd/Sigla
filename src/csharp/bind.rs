@@ -1116,7 +1116,13 @@ impl Binder {
         depth: usize,
     ) -> Result<Bound> {
         let result = self.expression_inner(view, context, body, id, expected, locals, depth)?;
-        self.observed.push((id, result.clone()));
+        let expr = &body.expressions[id as usize];
+        // Only navigation and the inferred type of an out variable read observations.
+        if expr.span.contains(&self.occurrence_position)
+            || matches!(expr.kind, ExpressionKind::OutVariable { .. })
+        {
+            self.observed.push((id, result.clone()));
+        }
         Ok(result)
     }
 
@@ -2282,6 +2288,10 @@ impl Binder {
         if depth > 48 {
             return Ok(vec![]);
         }
+        // All overloads bind these arguments in the same caller and lambda scope.
+        // Out variables can read an earlier argument's candidate-specific observation.
+        let reuse = candidates.len() > 1 && !body.locals.iter().any(|l| l.out_argument.is_some());
+        let mut shared = Vec::<Option<Bound>>::new();
         let mut result = Vec::new();
         for (candidate, expanded) in candidates
             .iter()
@@ -2393,18 +2403,40 @@ impl Binder {
                 }
             }
             let mut values = Vec::new();
-            for (argument, ty) in &mapped {
-                let expected =
-                    substitute(ty, &substitutions, &mut 4096).unwrap_or(Type::Unsupported);
-                let value = self.expression(
-                    view,
-                    context,
-                    body,
-                    argument.value,
-                    Some(&expected),
-                    locals,
-                    depth + 1,
-                )?;
+            for (index, (argument, ty)) in mapped.iter().enumerate() {
+                let value = if let Some(Some(cached)) = shared.get(index) {
+                    cached.clone()
+                } else {
+                    let expected =
+                        substitute(ty, &substitutions, &mut 4096).unwrap_or(Type::Unsupported);
+                    let before = self.observed.len();
+                    let value = self.expression(
+                        view,
+                        context,
+                        body,
+                        argument.value,
+                        Some(&expected),
+                        locals,
+                        depth + 1,
+                    )?;
+                    // These expressions choose their own type. Rebind if navigation
+                    // needs observations from the winning candidate.
+                    if reuse
+                        && before == self.observed.len()
+                        && matches!(
+                            body.expressions[argument.value as usize].kind,
+                            ExpressionKind::Call { .. }
+                                | ExpressionKind::Member { .. }
+                                | ExpressionKind::Name { .. }
+                        )
+                    {
+                        if shared.is_empty() {
+                            shared.resize_with(arguments.len(), || None);
+                        }
+                        shared[index] = Some(value.clone());
+                    }
+                    value
+                };
                 if explicit.is_empty()
                     && let Some(actual) = &value.ty
                 {
@@ -2520,14 +2552,19 @@ impl Binder {
                             self.fix_inference(view, &inference, &mut substitutions)?;
                         }
                         lambda_types.insert(argument.value, (ty.clone(), output));
-                        self.observed.push((
-                            argument.value,
-                            Bound {
-                                symbols: vec![symbol],
-                                ty: Some(ty),
-                                ..Default::default()
-                            },
-                        ));
+                        if body.expressions[argument.value as usize]
+                            .span
+                            .contains(&self.occurrence_position)
+                        {
+                            self.observed.push((
+                                argument.value,
+                                Bound {
+                                    symbols: vec![symbol],
+                                    ty: Some(ty),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
                     }
                 }
             }
