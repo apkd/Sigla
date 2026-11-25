@@ -879,6 +879,8 @@ fn remote_requests_omitted_imports_and_evaluated_sources() {
                 "inputs/membership.data",
                 "Sources/Included.code",
                 "Sources/Excluded.code",
+                "Sources/Nested/AlsoIncluded.code",
+                "SourcesElsewhere/Outside.code",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -909,15 +911,25 @@ fn remote_requests_omitted_imports_and_evaluated_sources() {
             .downcast_ref::<sigla::discovery::RequiredInputs>()
             .unwrap_or_else(|| panic!("{error:#}"))
             .0,
-        ["Sources/Included.code"]
+        ["Sources/Included.code", "Sources/Nested/AlsoIncluded.code"]
     );
     write(root.path(), "Sources/Included.code", "class Included {}");
+    write(
+        root.path(),
+        "Sources/Nested/AlsoIncluded.code",
+        "class AlsoIncluded {}",
+    );
     let result = discover_cached(&entry, &policy, cache.path()).unwrap();
-    let sources: Vec<_> = result
+    let paths: std::collections::BTreeSet<_> = result
         .sources
         .iter()
         .filter(|s| s.language == sigla::model::Language::CSharp)
+        .map(|source| source.path.strip_prefix(root.path()).unwrap())
         .collect();
-    assert_eq!(sources.len(), 1);
-    assert!(sources[0].path.ends_with("Included.code"));
+    assert_eq!(
+        paths,
+        ["Sources/Included.code", "Sources/Nested/AlsoIncluded.code"]
+            .map(Path::new)
+            .into()
+    );
 }

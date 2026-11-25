@@ -97,6 +97,7 @@ static class Discovery
             using var collection = new Microsoft.Build.Evaluation.ProjectCollection();
             var required = new HashSet<string>(StringComparer.Ordinal);
             var tracked = new HashSet<string>(request.Tracked ?? [], StringComparer.Ordinal);
+            var fileSystem = tracked.Count == 0 ? null : new TrackedFileSystem(tracked, required);
             void Require(string path) { if (tracked.Contains(path) && !File.Exists(path)) required.Add(path); }
             int Missing()
             {
@@ -116,7 +117,7 @@ static class Discovery
             var entries = new List<Microsoft.Build.Graph.ProjectGraphEntryPoint>();
             void Probe(string entry, IDictionary<string, string> globals)
             {
-                if (tracked.Count == 0) return;
+                if (fileSystem == null) return;
                 Require(entry);
                 if (required.Count != 0) return;
                 var imports = new Imports();
@@ -129,7 +130,7 @@ static class Discovery
                         LoadSettings = Microsoft.Build.Evaluation.ProjectLoadSettings.IgnoreMissingImports,
                         EvaluationContext = Microsoft.Build.Evaluation.Context.EvaluationContext.Create(
                             Microsoft.Build.Evaluation.Context.EvaluationContext.SharingPolicy.Shared,
-                            new TrackedFileSystem(tracked, required))
+                            fileSystem)
                     });
                     foreach (var kind in new[] { "Compile", "ProjectReference" })
                         foreach (var item in probe.GetItems(kind)) Require(Path.GetFullPath(item.EvaluatedInclude, probe.DirectoryPath));
@@ -280,7 +281,8 @@ static class Discovery
                         final = result.ProjectStateAfterBuild ?? initial;
                     }
                     var evaluated = new Microsoft.Build.Evaluation.Project(initial.FullPath,
-                        initial.GlobalProperties.ToDictionary(p => p.Key, p => p.Value), null, collection);
+                        initial.GlobalProperties.ToDictionary(p => p.Key, p => p.Value), null, collection,
+                        Microsoft.Build.Evaluation.ProjectLoadSettings.RecordEvaluatedItemElements);
                     string Full(string p) => Path.GetFullPath(p, evaluated.DirectoryPath);
                     string[] Items(string name) => final.GetItems(name).Select(i => Full(i.EvaluatedInclude)).Distinct().ToArray();
                     var properties = new[] { "AssemblyName", "DefineConstants", "LangVersion", "Nullable",

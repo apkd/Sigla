@@ -2,7 +2,7 @@
 use super::file_id::hasher as content_hasher;
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::CString,
     fs::{self, File},
     io::{Read, Write},
@@ -538,6 +538,15 @@ impl Store {
 
     /// Import a stopped, private stage. Later changes must replace files atomically.
     pub(crate) fn import_owned_tree(&self, root: &Path) -> Result<ImportStats> {
+        self.import_stage(root, false)
+    }
+
+    /// Import a private snapshot the caller discards in full on failure.
+    pub(crate) fn import_disposable_tree(&self, root: &Path) -> Result<ImportStats> {
+        self.import_stage(root, true)
+    }
+
+    fn import_stage(&self, root: &Path, discard_duplicates: bool) -> Result<ImportStats> {
         let started = Instant::now();
         let _lease = self.lease()?;
         let mut files = Vec::new();
@@ -547,8 +556,25 @@ impl Store {
         let (prepared, mut stats) = parallel_import(&files, |path, stats| {
             self.prepare_owned(path, stats, keep_open)
         })?;
-        let prepared: Vec<_> = prepared.into_iter().flatten().collect();
+        let mut prepared: Vec<_> = prepared.into_iter().flatten().collect();
+        let mut aliases = Vec::new();
+        if discard_duplicates {
+            // Unlink duplicate copies before the kernel flushes their data.
+            let mut unique = HashSet::new();
+            for file in prepared.extract_if(.., |file| !unique.insert(file.id)) {
+                fs::remove_file(&file.path)?;
+                aliases.push((file.id, file.path));
+            }
+        }
         self.publish_tree(root, &prepared, &mut stats)?;
+        if !aliases.is_empty() {
+            let linking = Instant::now();
+            for (id, path) in aliases {
+                fs::hard_link(self.path(&id), path)?;
+                stats.reused += 1;
+            }
+            stats.publication += linking.elapsed();
+        }
         let syncing = Instant::now();
         for directory in directories {
             File::open(directory)?.sync_all()?;
@@ -1974,6 +2000,15 @@ mod tests {
 
     #[test]
     fn owned_tree_adopts_files_and_reuses_existing_content_by_mode() {
+        check_tree_reuse(Store::import_owned_tree);
+    }
+
+    #[test]
+    fn disposable_tree_restores_all_paths_with_their_original_modes() {
+        check_tree_reuse(Store::import_disposable_tree);
+    }
+
+    fn check_tree_reuse(import: fn(&Store, &Path) -> Result<ImportStats>) {
         let cache = tempfile::tempdir().unwrap();
         let store = Store::open(cache.path()).unwrap();
         let root = cache.path().join("source");
@@ -1995,7 +2030,7 @@ mod tests {
             fs::metadata(&executable).unwrap().ino(),
             fs::metadata(&special).unwrap().ino(),
         ];
-        let stats = store.import_owned_tree(&root).unwrap();
+        let stats = import(&store, &root).unwrap();
         assert_eq!(stats.files, 4);
         assert_eq!(stats.adopted, 2);
         assert_eq!(stats.reused, 2);
@@ -2016,14 +2051,18 @@ mod tests {
 
         let other = cache.path().join("other");
         fs::create_dir(&other).unwrap();
+        fs::create_dir(other.join("nested")).unwrap();
         fs::write(other.join("copy"), b"same contents").unwrap();
-        let stats = store.import_owned_tree(&other).unwrap();
+        fs::write(other.join("nested/alias"), b"same contents").unwrap();
+        let stats = import(&store, &other).unwrap();
         assert_eq!(stats.adopted, 0);
-        assert_eq!(stats.reused, 1);
-        assert_eq!(
-            fs::metadata(other.join("copy")).unwrap().ino(),
-            fs::metadata(&first).unwrap().ino()
-        );
+        assert_eq!(stats.reused, 2);
+        for name in ["copy", "nested/alias"] {
+            assert_eq!(
+                fs::metadata(other.join(name)).unwrap().ino(),
+                fs::metadata(&first).unwrap().ino()
+            );
+        }
     }
 
     #[test]
@@ -2081,6 +2120,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let staged = root.join("file");
         fs::write(&staged, b"original").unwrap();
+        fs::write(root.join("duplicate"), b"original").unwrap();
         let seed = cache.path().join("seed");
         fs::write(&seed, b"original").unwrap();
         let _lease = store.lease().unwrap();
@@ -2089,6 +2129,7 @@ mod tests {
         fs::create_dir_all(&destination).unwrap();
         assert!(store.import_owned_tree(&root).is_err());
         assert_eq!(fs::read(staged).unwrap(), b"original");
+        assert_eq!(fs::read(root.join("duplicate")).unwrap(), b"original");
         assert!(destination.is_dir());
     }
 

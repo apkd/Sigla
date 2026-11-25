@@ -198,7 +198,7 @@ impl View {
         let snapshotted = Instant::now();
         // The helper has exited. Changed files are private copies; unchanged
         // files already link to the immutable lower view.
-        self.store.import_owned_tree(&contents)?;
+        self.store.import_disposable_tree(&contents)?;
         let imported = Instant::now();
         let generation = stage
             .path()
