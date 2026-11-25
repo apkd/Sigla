@@ -74,6 +74,34 @@ struct OwnedFile {
     path: PathBuf,
     id: Id,
     new: bool,
+    // Keep the descriptor that marked the inode so fsync can report writeback errors.
+    marked: Option<File>,
+}
+
+const SMALL_BATCH: usize = 32;
+
+// All data and xattrs must be durable before a canonical link exposes an inode.
+// Small imports need not wait for unrelated dirty files on the same volume.
+fn flush_new_files<'a>(directory: &File, files: impl Iterator<Item = &'a OwnedFile>) -> Result<()> {
+    let new: Option<Vec<_>> = files
+        .filter(|f| f.new)
+        .take(SMALL_BATCH + 1)
+        .map(|file| file.marked.as_ref())
+        .collect();
+    if let Some(new) = new
+        && new.len() <= SMALL_BATCH
+    {
+        for file in new {
+            file.sync_all()?;
+        }
+        return Ok(());
+    }
+    ensure!(
+        unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(directory)) } == 0,
+        "Cannot flush cache import: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
 }
 
 /// Build a private immutable tree while bytes arrive. Publication is explicit,
@@ -82,6 +110,7 @@ pub(crate) struct OwnedTree<'a> {
     store: &'a Store,
     root: PathBuf,
     files: Vec<OwnedFile>,
+    new_files: usize,
     aliases: Vec<(PathBuf, PathBuf)>,
     directories: BTreeSet<PathBuf>,
     stats: ImportStats,
@@ -169,11 +198,18 @@ impl OwnedTree<'_> {
         let new = !self.store.path(&id).try_exists()?;
         if new {
             mark(&output, &id)?;
+            self.new_files += 1;
+            if self.new_files == SMALL_BATCH + 1 {
+                for file in &mut self.files {
+                    file.marked.take();
+                }
+            }
         }
         self.files.push(OwnedFile {
             path: path.to_owned(),
             id,
             new,
+            marked: (new && self.new_files <= SMALL_BATCH).then_some(output),
         });
         Ok(size)
     }
@@ -212,21 +248,7 @@ impl OwnedTree<'_> {
 
     /// Flush stopped private trees together before publishing canonical links.
     /// Callers retain their stages and activate each destination independently.
-    pub(crate) fn publish_together(trees: Vec<Self>) -> Result<Vec<Result<ImportStats>>> {
-        Self::publish_together_with(trees, |directory| {
-            ensure!(
-                unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(directory)) } == 0,
-                "Cannot flush cache import: {}",
-                std::io::Error::last_os_error()
-            );
-            Ok(())
-        })
-    }
-
-    fn publish_together_with(
-        mut trees: Vec<Self>,
-        flush: impl FnOnce(&File) -> Result<()>,
-    ) -> Result<Vec<Result<ImportStats>>> {
+    pub(crate) fn publish_together(mut trees: Vec<Self>) -> Result<Vec<Result<ImportStats>>> {
         let Some(first) = trees.first() else {
             return Ok(Vec::new());
         };
@@ -238,7 +260,7 @@ impl OwnedTree<'_> {
                 &tree.store.root == root,
                 "Batch spans different blob stores"
             );
-            if tree.files.iter().any(|file| file.new) {
+            if tree.new_files != 0 {
                 let input = File::open(&tree.root)?;
                 ensure!(
                     input.metadata()?.dev() == device,
@@ -249,7 +271,7 @@ impl OwnedTree<'_> {
         }
         if let Some(directory) = directory {
             let started = Instant::now();
-            flush(&directory)?;
+            flush_new_files(&directory, trees.iter().flat_map(|tree| &tree.files))?;
             trees[0].stats.sync += started.elapsed();
         }
         Ok(trees
@@ -351,6 +373,7 @@ impl Store {
             store: self,
             root: root.to_owned(),
             files: Vec::new(),
+            new_files: 0,
             aliases: Vec::new(),
             directories: BTreeSet::from([root.to_owned()]),
             stats: ImportStats::default(),
@@ -520,8 +543,10 @@ impl Store {
         let mut files = Vec::new();
         let mut directories = Vec::new();
         Self::inventory(root, &mut files, &mut directories)?;
-        let (prepared, mut stats) =
-            parallel_import(&files, |path, stats| self.prepare_owned(path, stats, false))?;
+        let keep_open = files.len() <= SMALL_BATCH;
+        let (prepared, mut stats) = parallel_import(&files, |path, stats| {
+            self.prepare_owned(path, stats, keep_open)
+        })?;
         let prepared: Vec<_> = prepared.into_iter().flatten().collect();
         self.publish_tree(root, &prepared, &mut stats)?;
         let syncing = Instant::now();
@@ -549,13 +574,7 @@ impl Store {
                 directory.metadata()?.dev() == fs::metadata(&self.root)?.dev(),
                 "Cache import must stay on one filesystem"
             );
-            // All private writes and xattrs precede this barrier. No canonical
-            // link can expose a new inode before its data is durable.
-            ensure!(
-                unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&directory)) } == 0,
-                "Cannot flush cache import: {}",
-                std::io::Error::last_os_error()
-            );
+            flush_new_files(&directory, files.iter())?;
             stats.sync += started.elapsed();
         }
         self.publish_durable_files(files, stats)
@@ -613,6 +632,11 @@ impl Store {
         shards: &Mutex<BTreeSet<PathBuf>>,
     ) -> Result<()> {
         if let Some(file) = self.prepare_owned(path, stats, true)? {
+            if let Some(input) = &file.marked {
+                let started = Instant::now();
+                input.sync_all()?;
+                stats.sync += started.elapsed();
+            }
             self.publish_owned(&file, stats, shards)?;
         }
         Ok(())
@@ -622,7 +646,7 @@ impl Store {
         &self,
         path: &Path,
         stats: &mut ImportStats,
-        sync: bool,
+        keep_open: bool,
     ) -> Result<Option<OwnedFile>> {
         let mut input = regular(path)?;
         let metadata = input.metadata()?;
@@ -658,16 +682,12 @@ impl Store {
         if new {
             input.set_permissions(fs::Permissions::from_mode(mode))?;
             mark(&input, &id)?;
-            if sync {
-                let started = Instant::now();
-                input.sync_all()?;
-                stats.sync += started.elapsed();
-            }
         }
         Ok(Some(OwnedFile {
             path: path.to_owned(),
             id,
             new,
+            marked: (new && keep_open).then_some(input),
         }))
     }
 
@@ -1366,20 +1386,53 @@ mod tests {
     fn grouped_barrier_failure_exposes_no_canonical_files() {
         let cache = tempfile::tempdir().unwrap();
         let store = Store::open(cache.path()).unwrap();
+        let seed = cache.path().join("seed");
+        let mut cached = store.owned_tree(&seed).unwrap();
+        cached
+            .write(&seed.join("cached"), 0o600, b"cached".as_slice())
+            .unwrap();
+        cached.publish().unwrap();
         let mut trees = Vec::new();
         let mut ids = Vec::new();
         for index in 0..3 {
             let root = cache.path().join(format!("stage-{index}"));
             let mut tree = store.owned_tree(&root).unwrap();
+            if index == 0 {
+                for hit in 0..=SMALL_BATCH {
+                    tree.write(
+                        &root.join(format!("hit-{hit}")),
+                        0o600,
+                        b"cached".as_slice(),
+                    )
+                    .unwrap();
+                }
+            }
             tree.write(&root.join("input"), 0o600, [index as u8].as_slice())
                 .unwrap();
-            ids.push(tree.files[0].id);
+            ids.push(tree.files.last().unwrap().id);
             trees.push(tree);
         }
-        let result =
-            OwnedTree::publish_together_with(trees, |_| anyhow::bail!("injected flush failure"));
+        // fsync fails on a socket. Exercise a real error after flushing earlier files.
+        let socket = std::os::unix::net::UnixStream::pair().unwrap().0;
+        trees.last_mut().unwrap().files[0].marked = Some(std::os::fd::OwnedFd::from(socket).into());
+        let result = OwnedTree::publish_together(trees);
         assert!(result.is_err());
         assert!(ids.iter().all(|id| !store.path(id).exists()));
+    }
+
+    #[test]
+    fn private_tree_can_publish_a_write_only_file() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let root = cache.path().join("stage");
+        let path = root.join("write-only");
+        let mut tree = store.owned_tree(&root).unwrap();
+        tree.write(&path, 0o200, b"bytes".as_slice()).unwrap();
+        let canonical = store.path(&tree.files[0].id);
+        tree.publish().unwrap();
+        let published = fs::metadata(canonical).unwrap();
+        assert_eq!(published.ino(), fs::metadata(path).unwrap().ino());
+        assert_eq!(published.mode() & 0o777, 0o200);
     }
 
     #[test]
