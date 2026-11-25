@@ -3,6 +3,7 @@ use crate::discovery::Policy;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
 };
@@ -137,16 +138,23 @@ impl Packages {
         cache: &Path,
         leases: &crate::cache::views::LeaseSet,
     ) -> Result<Self> {
-        Self::local_staged(root, policy, editor, cache, leases, |_| {})
+        Self::local_staged(
+            root,
+            policy,
+            |_| Ok(Some(editor)),
+            cache,
+            leases,
+            |_| Ok(()),
+        )
     }
 
-    pub(crate) fn local_staged(
+    pub(crate) fn local_staged<E: Borrow<Editor>>(
         root: &Path,
         policy: &Policy,
-        editor: &Editor,
+        editor: impl FnMut(bool) -> Result<Option<E>>,
         cache: &Path,
         leases: &crate::cache::views::LeaseSet,
-        selected: impl FnOnce(Vec<PathBuf>),
+        selected: impl FnMut(Vec<PathBuf>) -> Result<()>,
     ) -> Result<Self> {
         Self::resolve_staged(
             root,
@@ -179,17 +187,25 @@ impl Packages {
         leases: &crate::cache::views::LeaseSet,
         acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<Planned>,
     ) -> Result<Self> {
-        Self::resolve_staged(root, policy, editor, cache, leases, acquire, |_| {})
+        Self::resolve_staged(
+            root,
+            policy,
+            |_| Ok(Some(editor)),
+            cache,
+            leases,
+            acquire,
+            |_| Ok(()),
+        )
     }
 
-    fn resolve_staged(
+    fn resolve_staged<E: Borrow<Editor>>(
         root: &Path,
         policy: &Policy,
-        editor: &Editor,
+        mut poll_editor: impl FnMut(bool) -> Result<Option<E>>,
         cache: &Path,
         leases: &crate::cache::views::LeaseSet,
         acquire: impl Fn(&Path, &str, &str, super::UnityVersion) -> Result<Planned>,
-        stage: impl FnOnce(Vec<PathBuf>),
+        mut stage: impl FnMut(Vec<PathBuf>) -> Result<()>,
     ) -> Result<Self> {
         let cache = policy
             .remote
@@ -273,13 +289,13 @@ impl Packages {
                     let path = policy.canonical(&path)?;
                     let info: PackageManifest = read(&path.join("package.json"))?;
                     ensure!(name(&info.name), "Invalid embedded package name");
-                    package(
-                        path,
-                        &info.name,
-                        None,
-                        format!("embedded:{}", info.name),
-                        true,
-                    )
+                    ensure!(!info.version.is_empty(), "Missing embedded package version");
+                    Ok(Package {
+                        identity: format!("embedded:{}", info.name),
+                        manifest: info,
+                        root: path,
+                        testable: true,
+                    })
                 })();
                 match loaded {
                     Ok(value) => {
@@ -300,6 +316,14 @@ impl Packages {
                 }
             }
         }
+        // Embedded packages are roots regardless of what the editor or lock requests.
+        let embedded_names: BTreeSet<_> = embedded.keys().cloned().collect();
+        stage(
+            std::iter::once(root.join("Assets"))
+                .chain(embedded.values().map(|p| p.root.clone()))
+                .collect(),
+        )?;
+        let mut editor = poll_editor(false)?;
         for (package, request) in &manifest.dependencies {
             if !name(package) || request.is_empty() {
                 diagnostics.push(format!("Invalid direct package request {package}"));
@@ -394,6 +418,17 @@ impl Packages {
                 && (node.source == "builtin"
                     || node.source == "registry"
                         && registry.trim_end_matches('/') == "https://packages.unity.com");
+            if editor.is_none() {
+                // Git, registry and local locks are independent of the editor.
+                // Observe failures between packages; wait only at its first use.
+                editor = poll_editor(official || node.source == "builtin")?;
+            }
+            let selected_editor = || {
+                editor
+                    .as_ref()
+                    .map(Borrow::borrow)
+                    .expect("Waited for editor")
+            };
             if official {
                 selected.retain(|p: &Planned| p.manifest.name != package_name);
             } else {
@@ -404,15 +439,14 @@ impl Packages {
                     let requested = requirements
                         .get(&package_name)
                         .map_or(node.version.as_str(), String::as_str);
-                    return acquire(cache, &package_name, requested, editor.selected).context(
-                        crate::diagnostics::DependencyUnavailable(
+                    return acquire(cache, &package_name, requested, selected_editor().selected)
+                        .context(crate::diagnostics::DependencyUnavailable(
                             "Unity package metadata is unavailable",
-                        ),
-                    );
+                        ));
                 }
                 match node.source.as_str() {
                     "builtin" => package(
-                        editor
+                        selected_editor()
                             .data
                             .join("Resources/PackageManager/BuiltInPackages")
                             .join(&package_name),
@@ -530,7 +564,9 @@ impl Packages {
                             });
                             if increased {
                                 requirements.insert(dependency.clone(), requested.clone());
-                                visited.remove(dependency);
+                                if !embedded_names.contains(dependency) {
+                                    visited.remove(dependency);
+                                }
                             }
                             if !visited.contains(dependency) {
                                 pending.push_back(dependency.clone());
@@ -587,6 +623,9 @@ impl Packages {
                 }
             }
         }
+        if editor.is_none() {
+            poll_editor(true)?.context("Editor acquisition did not finish")?;
+        }
         if policy.remote.is_some() {
             let reachable = reachable(&roots, selected.iter().map(|p| &p.manifest));
             selected.retain(|p| reachable.contains(&p.manifest.name));
@@ -594,12 +633,13 @@ impl Packages {
         stage(
             selected
                 .iter()
+                .filter(|p| !embedded_names.contains(&p.manifest.name))
                 .filter_map(|package| match &package.location {
                     Location::Local { root, .. } => Some(root.clone()),
                     Location::Archive(_) => None,
                 })
                 .collect(),
-        );
+        )?;
         let plans: Vec<_> = selected
             .iter()
             .filter_map(|package| match &package.location {
@@ -690,13 +730,14 @@ mod tests {
         std::fs::write(
             root.join("Packages/manifest.json"),
             serde_json::to_vec(&serde_json::json!({
-                "dependencies": {name: "1.0.0"}, "scopedRegistries": [{"url": "https://registry.invalid", "scopes": ["com.unity"]}]
+                "dependencies": {name: "1.0.0", "a.embedded": "1.0.0", "local": "file:../../local"}, "scopedRegistries": [{"url": "https://registry.invalid", "scopes": ["com.unity"]}]
             }))?,
         )?;
         std::fs::write(
             root.join("Packages/packages-lock.json"),
             serde_json::to_vec(&serde_json::json!({
-                "dependencies": {name: {"version": "1.0.0", "source": "builtin", "depth": 0, "dependencies": {}}}
+                "dependencies": {name: {"version": "1.0.0", "source": "builtin", "depth": 0, "dependencies": {}},
+                    "local": {"version": "file:../../local", "source": "local", "depth": 0}}
             }))?,
         )?;
         let mut policy = Policy::new(vec![temp.path().into()])?;
@@ -718,14 +759,25 @@ mod tests {
             selected_revision: None,
         };
         let catalog = std::sync::Arc::new(Catalog {
-            artifacts: vec![cached_builtin_artifact(&cache, name, version)],
+            artifacts: vec![cached_builtin_artifact(
+                &cache,
+                name,
+                version,
+                &[("a.embedded", "2.0.0")],
+            )],
             ..Default::default()
         });
         let embedded = root.join("Packages/embedded");
         std::fs::create_dir(&embedded)?;
         std::fs::write(
             embedded.join("package.json"),
-            r#"{"name":"embedded","version":"1.0.0"}"#,
+            r#"{"name":"a.embedded","version":"1.0.0"}"#,
+        )?;
+        let local = temp.path().join("local");
+        std::fs::create_dir(&local)?;
+        std::fs::write(
+            local.join("package.json"),
+            r#"{"name":"local","version":"1.0.0"}"#,
         )?;
         let sections = cache
             .join("unity-metadata")
@@ -735,12 +787,16 @@ mod tests {
                     .as_str(),
             )
             .join("sections");
-        let staged = std::cell::Cell::new(false);
+        let opened = std::cell::Cell::new(false);
+        let mut batches = Vec::new();
         let leases = crate::cache::views::LeaseSet::new(&cache)?;
         let packages = Packages::resolve_staged(
             &root,
             &policy,
-            &editor,
+            |wait| {
+                opened.set(true);
+                Ok(wait.then_some(&editor))
+            },
             &cache,
             &leases,
             |_, name, requested, editor| {
@@ -755,15 +811,21 @@ mod tests {
                 })
             },
             |roots| {
-                assert_eq!(roots, vec![embedded]);
                 assert!(
                     !sections.exists(),
                     "Publish local scopes before archive materialization"
                 );
-                staged.set(true);
+                batches.push((opened.get(), roots.into_iter().collect::<BTreeSet<_>>()));
+                Ok(())
             },
         )?;
-        assert!(staged.get());
+        assert_eq!(
+            batches,
+            [
+                (false, [root.join("Assets"), embedded.clone()].into()),
+                (true, [local].into())
+            ]
+        );
         assert!(sections.exists());
         assert!(
             packages.diagnostics.is_empty(),
@@ -771,13 +833,66 @@ mod tests {
             packages.diagnostics
         );
         assert!(packages.dependency_retry.is_none());
-        assert_eq!(packages.selected.len(), 2);
+        assert_eq!(packages.selected.len(), 3);
+        assert!(packages.selected.iter().any(|p| p.root == embedded));
         assert!(
             packages
                 .selected
                 .iter()
                 .any(|p| p.root.join("Code.cs").is_file())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn independent_package_is_acquired_while_editor_is_pending() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        let packages = root.join("Packages");
+        std::fs::create_dir_all(&packages)?;
+        std::fs::write(
+            packages.join("manifest.json"),
+            r#"{"dependencies":{"local":"file:local.tar"}}"#,
+        )?;
+        std::fs::write(
+            packages.join("packages-lock.json"),
+            r#"{"dependencies":{"local":{"version":"file:local.tar","source":"local","depth":0}}}"#,
+        )?;
+        let mut archive = tar::Builder::new(std::fs::File::create(packages.join("local.tar"))?);
+        let manifest = br#"{"name":"local","version":"1.0.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        archive.append_data(&mut header, "package/package.json", manifest.as_slice())?;
+        archive.finish()?;
+        let policy = Policy::new(vec![temp.path().into()])?;
+        let leases = crate::cache::views::LeaseSet::new(&cache)?;
+        let mut started_before_package = false;
+        let result = Packages::resolve_staged::<&Editor>(
+            &root,
+            &policy,
+            |wait| {
+                if !wait {
+                    started_before_package |= !cache.join("unity-packages").exists();
+                    return Ok(None);
+                }
+                assert!(started_before_package);
+                assert!(
+                    cache
+                        .join("unity-packages")
+                        .read_dir()?
+                        .flatten()
+                        .any(|p| p.path().join("contents/package.json").is_file())
+                );
+                Err(crate::diagnostics::Cancelled.into())
+            },
+            &cache,
+            &leases,
+            |_, _, _, _| unreachable!(),
+            |_| Ok(()),
+        );
+        assert!(result.is_err_and(|e| crate::diagnostics::cancelled(&e)));
         Ok(())
     }
 

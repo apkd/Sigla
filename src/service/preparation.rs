@@ -1179,7 +1179,7 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                         if let Some(job) = rust_job.take() { let _ = job.await; }
                         rust_send.disable();
                         publish_progress(&send, Progress::Pending("acquisition"));
-                        operation.stage("required_input_acquisition");
+                        operation.stage(if unity.is_some() { "unity_dependencies" } else { "required_input_acquisition" });
                         work.check()?;
                         dependencies::wait(&preparing_app, &mut lifecycle, &work, &operation, async {
                             if let Some(root) = &unity {

@@ -131,14 +131,19 @@ pub(crate) fn cached_package_artifact(
     cached_package_with_origin(cache, name, version, dependencies, origin)
 }
 
-pub(crate) fn cached_builtin_artifact(cache: &Path, name: &str, editor: &str) -> Artifact {
+pub(crate) fn cached_builtin_artifact(
+    cache: &Path,
+    name: &str,
+    editor: &str,
+    dependencies: &[(&str, &str)],
+) -> Artifact {
     let origin = Origin {
         kind: "editor".into(),
         name: "unity-editor".into(),
         version: editor.into(),
         ..origin()
     };
-    cached_package_with_origin(cache, name, "1.0.0", &[], origin)
+    cached_package_with_origin(cache, name, "1.0.0", dependencies, origin)
 }
 
 fn cached_package_with_origin(

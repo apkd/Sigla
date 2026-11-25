@@ -11,7 +11,7 @@ mod version;
 pub(crate) use graph::discover;
 #[cfg(test)]
 pub(crate) use graph::discover_with_editor;
-pub(crate) use graph::prefetch_dependencies;
+pub(crate) use graph::{missing_inputs, prefetch_dependencies};
 pub use version::{ReleaseBranch, UnityVersion};
 
 fn package_version(value: &str) -> Option<semver::Version> {

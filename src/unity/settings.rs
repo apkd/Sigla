@@ -1,3 +1,4 @@
+use super::Platform;
 use anyhow::{Context, Result, ensure};
 use serde_yaml::Value;
 use std::path::Path;
@@ -23,6 +24,83 @@ pub fn yaml(path: &Path) -> Result<Value> {
 
 pub fn plugin_metadata(path: &Path) -> Result<Value> {
     read_yaml(path, true)
+}
+
+pub(super) fn plugin_platform(importer: &Value, platform: Platform) -> bool {
+    let data = &importer["platformData"];
+    let (any, exclusions, specific) = if let Some(entries) = data.as_sequence() {
+        let any = entries
+            .iter()
+            .find(|e| e["first"].get("Any").is_some())
+            .map(|e| &e["second"]);
+        // Unity can store Any mode and its exclusions in separate records.
+        let anonymous = entries
+            .iter()
+            .find(|e| e["first"][""].as_str() == Some("Any"))
+            .map(|e| &e["second"]);
+        let specific = entries.iter().find(|entry| match platform {
+            Platform::EditorLinux => entry["first"].get("Editor").is_some(),
+            Platform::StandaloneLinux => matches!(
+                entry["first"]["Standalone"].as_str(),
+                Some("Linux64" | "LinuxStandalone64")
+            ),
+        });
+        (any.or(anonymous), anonymous, specific.map(|e| &e["second"]))
+    } else if data.is_mapping() {
+        // Mapped importer settings use the platform name as the key.
+        let name = match platform {
+            Platform::EditorLinux => "Editor",
+            Platform::StandaloneLinux => "Linux64",
+        };
+        let specific = data.get(name);
+        // Missing or conflicting targets don't establish an exclusion.
+        if specific.is_none()
+            || platform == Platform::StandaloneLinux
+                && data
+                    .get("LinuxUniversal")
+                    .is_some_and(|e| e["enabled"].as_i64() != Some(0))
+        {
+            return true;
+        }
+        (data.get("Any"), None, specific)
+    } else {
+        return true;
+    };
+    if any.is_none() && specific.is_none()
+        || [any, specific]
+            .into_iter()
+            .flatten()
+            .any(|entry| !matches!(entry["enabled"].as_i64(), Some(0 | 1)))
+    {
+        return true;
+    }
+    if let Some(any) = any.filter(|entry| entry["enabled"].as_i64() == Some(1)) {
+        let excluded = if platform == Platform::EditorLinux {
+            "Exclude Editor"
+        } else {
+            "Exclude Linux64"
+        };
+        if exclusions
+            .and_then(|entry| entry["settings"][excluded].as_i64())
+            .or_else(|| any["settings"][excluded].as_i64())
+            == Some(1)
+        {
+            return false;
+        }
+    } else if specific.is_none_or(|entry| entry["enabled"].as_i64() == Some(0)) {
+        return false;
+    }
+    if platform == Platform::EditorLinux
+        && let Some(specific) = specific
+    {
+        let options = &specific["settings"];
+        if matches!(options["OS"].as_str(), Some("Windows" | "OSX" | "macOS"))
+            || matches!(options["CPU"].as_str(), Some("x86" | "ARMv7" | "ARM64"))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn read_yaml(path: &Path, plugin: bool) -> Result<Value> {

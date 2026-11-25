@@ -17,6 +17,7 @@ pub(super) async fn wait<T>(
     }
     // The future owns and joins every blocking child, even after cancellation.
     let result = future.await?;
+    operation.stage("preparation_resume");
     if waiting.is_some() {
         let _wait = operation.wait("preparation_resume");
         *lifecycle = Some(
@@ -33,6 +34,16 @@ pub(super) struct Prefetch {
     pub leases: crate::cache::views::LeaseSet,
 }
 
+fn finish_child(operation: crate::telemetry::Operation, result: Result<()>) -> Result<()> {
+    operation.finish(match &result {
+        Ok(()) => "success",
+        Err(error) if error.is::<crate::demand::Paused>() => "paused",
+        Err(error) if crate::diagnostics::cancelled(error) => "cancelled",
+        Err(_) => "failure",
+    });
+    result
+}
+
 pub(super) async fn prefetch(
     app: &App,
     branch: &Arc<crate::repository::manager::Branch>,
@@ -41,38 +52,53 @@ pub(super) async fn prefetch(
     work: Arc<crate::demand::Work>,
     operation: &crate::telemetry::Operation,
 ) -> Result<()> {
-    let remote = request.policy.remote.as_ref().unwrap();
     let manager = app.remote.as_ref().unwrap();
-    let hydrate = |paths| {
-        manager.require_inputs_cancellable(branch, revision, paths, operation, work.clone())
+    let repository = branch.repository.identity.to_string();
+    // Packages and repository inputs run concurrently. Each needs its own
+    // stage clock so the parent's time waiting for packages isn't billed to publication.
+    let child = |kind| {
+        let child = crate::telemetry::operation(kind, Some(&repository), None);
+        child.target(revision);
+        if let Some(id) = child.id() {
+            operation.link(&id);
+        }
+        child
     };
-    let assets = remote.missing_analysis_inputs([request.root.join("Assets").as_path()])?;
-    let (selected, packages) = tokio::sync::oneshot::channel();
+    let hydrate = async |paths| {
+        let child = child("repository_required_inputs");
+        child.stage("required_input_acquisition");
+        let result = manager
+            .require_inputs_cancellable(branch, revision, paths, &child, work.clone())
+            .await;
+        finish_child(child, result)
+    };
+    let (selected, mut batches) = tokio::sync::mpsc::channel(2);
     let child_work = work.clone();
-    let root = request.root.clone();
-    let policy = request.policy.clone();
+    let packages = child("unity_dependency_acquisition");
     let prefetch = tokio::task::spawn_blocking(move || {
-        child_work.check()?;
-        let operation = crate::telemetry::operation(
-            "unity_dependency_acquisition",
-            Some(&root.to_string_lossy()),
-            None,
-        );
-        let result =
-            crate::unity::prefetch_dependencies(&root, &policy, &request.leases, |roots| {
-                let _ = selected.send(roots);
-            });
-        operation.finish(if result.is_ok() { "success" } else { "failure" });
-        child_work.check()?;
-        result
+        let Prefetch {
+            root,
+            policy,
+            leases,
+        } = request;
+        let select = |roots: Vec<PathBuf>| {
+            let paths = crate::unity::missing_inputs(
+                policy.remote.as_ref().unwrap(),
+                roots.iter().map(PathBuf::as_path),
+                policy.unity_platform,
+            );
+            let _ = selected.blocking_send(paths);
+            child_work.check()
+        };
+        let result = child_work.check().and_then(|()| {
+            let result = crate::unity::prefetch_dependencies(&root, &policy, &leases, select);
+            child_work.check().and(result)
+        });
+        finish_child(packages, result)
     });
     let hydration = async {
-        if !assets.is_empty() {
-            hydrate(assets).await?;
-        }
-        // Local scopes are known before official package archives are acquired.
-        if let Ok(roots) = packages.await {
-            let paths = remote.missing_analysis_inputs(roots.iter().map(PathBuf::as_path))?;
+        while let Some(paths) = batches.recv().await {
+            let paths = paths?;
             if !paths.is_empty() {
                 hydrate(paths).await?;
             }

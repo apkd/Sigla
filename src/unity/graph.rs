@@ -1,4 +1,9 @@
-use super::{Platform, catalog::Editor, packages::Packages, settings::Settings};
+use super::{
+    Platform,
+    catalog::Editor,
+    packages::Packages,
+    settings::{Settings, plugin_platform},
+};
 use crate::{
     discovery::{Discovery, Policy},
     model::{Language, MetadataReference, Project, ProjectReference, SourceInput, SourceRoot},
@@ -78,7 +83,11 @@ pub fn discover(root: &Path, policy: &Policy, cache: &Path, result: &mut Discove
         return Err(crate::discovery::UnityDependencies(root.to_owned()).into());
     }
     if let Some(remote) = &policy.remote {
-        remote.require_analysis_tree(&root.join("Assets"))?;
+        crate::discovery::RemoteContext::require_missing(missing_inputs(
+            remote,
+            [root.join("Assets").as_path()],
+            policy.unity_platform,
+        )?)?;
     }
     let editor = match &policy.remote {
         Some(remote) => {
@@ -95,12 +104,58 @@ pub(crate) fn prefetch_dependencies(
     root: &Path,
     policy: &Policy,
     leases: &crate::cache::views::LeaseSet,
-    selected: impl FnOnce(Vec<PathBuf>),
+    selected: impl FnMut(Vec<PathBuf>) -> Result<()>,
 ) -> Result<()> {
     let remote = policy.remote.as_ref().expect("Remote dependency preflight");
-    let editor = super::acquire::editor(root, &remote.shared, policy.unity_platform, leases)?;
-    Packages::local_staged(root, policy, &editor, &remote.shared, leases, selected)?;
-    Ok(())
+    std::thread::scope(|scope| {
+        let mut worker = None;
+        let editor = |wait: bool| {
+            let running = worker.get_or_insert_with(|| {
+                scope.spawn(|| {
+                    super::acquire::editor(root, &remote.shared, policy.unity_platform, leases)
+                })
+            });
+            if !wait && !running.is_finished() {
+                return Ok(None);
+            }
+            worker
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| anyhow::anyhow!("Editor acquisition worker panicked"))?
+                .map(Some)
+        };
+        Packages::local_staged(root, policy, editor, &remote.shared, leases, selected)?;
+        Ok(())
+    })
+}
+
+/// Explicit compiler references use RemoteContext::require independently.
+pub(crate) fn missing_inputs<'a>(
+    remote: &'a crate::discovery::RemoteContext,
+    scopes: impl IntoIterator<Item = &'a Path>,
+    platform: Platform,
+) -> Result<Vec<String>> {
+    let mut paths = remote.missing_analysis_inputs(scopes)?;
+    paths.retain(|p| {
+        if !p.ends_with(".dll") {
+            return true;
+        }
+        let meta = format!("{p}.meta");
+        if !remote.tracked.contains(&meta) {
+            return true;
+        }
+        let meta = remote.workspace.join(meta);
+        // Speculative reads only use ordinary, small importer files. Fall back
+        // to normal acquisition when the settings are absent or unreadable.
+        !meta
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_file() && m.len() <= 64 * 1024)
+            || super::settings::plugin_metadata(&meta).map_or(true, |settings| {
+                plugin_platform(&settings["PluginImporter"], platform)
+            })
+    });
+    Ok(paths)
 }
 
 pub(crate) fn discover_with_editor(
@@ -180,7 +235,17 @@ pub(crate) fn discover_with_editor(
         })
         .collect();
     if let Some(remote) = &policy.remote {
-        remote.require_analysis_trees(scopes.iter().map(|scope| scope.path.as_path()))?;
+        // Assets were checked before acquiring the editor. A canonicalized
+        // alias can name a different tracked subtree and still needs checking.
+        let assets = root.join("Assets");
+        crate::discovery::RemoteContext::require_missing(missing_inputs(
+            remote,
+            scopes
+                .iter()
+                .filter(|s| s.package || s.path != assets)
+                .map(|scope| scope.path.as_path()),
+            policy.unity_platform,
+        )?)?;
     }
     let mut files = Vec::new();
     for (scope, location) in scopes.iter().enumerate() {
@@ -784,6 +849,9 @@ fn scan(
                 continue;
             }
             scan(&path, scope, files, watched, diagnostics);
+        } else if kind.is_file() && path.to_str().is_some_and(|p| p.ends_with(".dll.meta")) {
+            // A change can enable a plugin whose DLL was never downloaded.
+            watched.insert(path);
         } else if kind.is_file()
             && path.extension().is_some_and(|e| {
                 matches!(
@@ -843,56 +911,7 @@ fn plugin_enabled(
                 .context("Invalid plugin define constraint")
         })
         .collect::<Result<_>>()?;
-    if !constraints(&constraints_list, defines)? {
-        return Ok(false);
-    }
-    let Some(entries) = importer["platformData"].as_sequence() else {
-        return Ok(true);
-    };
-    let any = entries
-        .iter()
-        .find(|entry| entry["first"].get("Any").is_some());
-    let specific = entries.iter().find(|entry| {
-        if platform == Platform::EditorLinux {
-            entry["first"].get("Editor").is_some()
-        } else {
-            matches!(
-                entry["first"]["Standalone"].as_str(),
-                Some("Linux64" | "LinuxStandalone64")
-            )
-        }
-    });
-    let all = any.is_some_and(|entry| entry["second"]["enabled"].as_i64() == Some(1));
-    if all {
-        let excluded = if platform == Platform::EditorLinux {
-            "Exclude Editor"
-        } else {
-            "Exclude Linux64"
-        };
-        if any.unwrap()["second"]["settings"][excluded].as_i64() == Some(1) {
-            return Ok(false);
-        }
-    } else if specific.is_none_or(|entry| entry["second"]["enabled"].as_i64() != Some(1)) {
-        return Ok(false);
-    }
-    if platform == Platform::EditorLinux
-        && let Some(specific) = specific
-    {
-        let options = &specific["second"]["settings"];
-        if options["OS"]
-            .as_str()
-            .is_some_and(|os| !matches!(os, "AnyOS" | "Linux"))
-        {
-            return Ok(false);
-        }
-        if options["CPU"]
-            .as_str()
-            .is_some_and(|cpu| !matches!(cpu, "AnyCPU" | "x86_64"))
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(constraints(&constraints_list, defines)? && plugin_platform(importer, platform))
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -1231,6 +1250,51 @@ mod tests {
     }
 
     #[test]
+    fn disabled_plugin_bytes_are_only_requested_for_explicit_references() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Assets");
+        std::fs::create_dir(&dir).unwrap();
+        let dll = "Assets/Plugin.dll";
+        let meta = format!("{dll}.meta");
+        std::fs::write(root.path().join(&meta), "PluginImporter:\n  platformData:\n    Any: {enabled: 0}\n    Editor: {enabled: 0}\n    Linux64: {enabled: 1}\n").unwrap();
+        let mut policy = Policy::new(vec![root.path().into()]).unwrap();
+        let remote = crate::discovery::RemoteContext {
+            workspace: root.path().into(),
+            writable: root.path().into(),
+            shared: root.path().into(),
+            repositories: vec![],
+            selection_identity: String::new(),
+            tracked: std::sync::Arc::new([dll.to_owned(), meta].into()),
+        };
+        let inputs = |platform| missing_inputs(&remote, [dir.as_path()], platform).unwrap();
+        assert!(inputs(Platform::EditorLinux).is_empty());
+        assert_eq!(inputs(Platform::StandaloneLinux), [dll]);
+        std::fs::write(dir.join("Plugin.dll.meta"), "PluginImporter:\n  platformData:\n    Any: {enabled: 0}\n    Editor: {enabled: 1, settings: {OS: Unspecified, CPU: Unknown}}\n").unwrap();
+        assert_eq!(inputs(Platform::EditorLinux), [dll]);
+        std::fs::write(dir.join("Plugin.dll.meta"), "PluginImporter:\n  platformData:\n    Any: {enabled: 0}\n    Editor: {enabled: 1, settings: {OS: Windows}}\n").unwrap();
+        assert!(inputs(Platform::EditorLinux).is_empty());
+        policy.remote = Some(remote);
+        let response = dir.join("csc.rsp");
+        std::fs::write(&response, "-r:Plugin.dll").unwrap();
+        let error = response_file(
+            &response,
+            root.path(),
+            &policy,
+            |_| Ok(None),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::discovery::RequiredInputs>()
+                .unwrap()
+                .0,
+            [dll]
+        );
+    }
+
+    #[test]
     fn missing_embedded_and_local_package_inputs_are_requested_together() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1392,6 +1456,10 @@ PluginImporter:
         assert!(!plugin_enabled(Some(&metadata), Platform::EditorLinux, &BTreeSet::new()).unwrap());
         assert!(plugin_enabled(Some(&metadata), Platform::EditorLinux, &defines).unwrap());
         assert!(!plugin_enabled(Some(&metadata), Platform::StandaloneLinux, &defines).unwrap());
+        std::fs::write(&path, "PluginImporter:\n  platformData:\n  - first:\n      : Any\n    second: {enabled: 0, settings: {Exclude Editor: 1}}\n  - first: {Any: null}\n    second: {enabled: 1, settings: {}}\n").unwrap();
+        let metadata = super::super::settings::plugin_metadata(&path).unwrap();
+        assert!(!plugin_enabled(Some(&metadata), Platform::EditorLinux, &defines).unwrap());
+        assert!(plugin_enabled(Some(&metadata), Platform::StandaloneLinux, &defines).unwrap());
         std::fs::write(&path, "Other:\n  - first:\n      : Any\n").unwrap();
         assert!(super::super::settings::plugin_metadata(&path).is_err());
     }

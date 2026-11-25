@@ -94,7 +94,7 @@ impl RemoteContext {
         Ok(missing.into_iter().collect())
     }
 
-    fn require_missing(missing: Vec<String>) -> Result<()> {
+    pub(crate) fn require_missing(missing: Vec<String>) -> Result<()> {
         if !missing.is_empty() {
             return Err(RequiredInputs(missing).into());
         }
