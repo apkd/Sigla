@@ -76,7 +76,6 @@ pub(super) fn filter(graph: &Graph, tracker: &mut Tracker, trace: &mut Trace) ->
         if merge.parents.len() < 2 || !trace.states.contains_key(id) {
             continue;
         }
-        let bases = graph.bases(&merge.parents);
         let merged = super::single_value(tracker, &trace.states[id])?;
         let parents = merge
             .parents
@@ -108,23 +107,30 @@ pub(super) fn filter(graph: &Graph, tracker: &mut Tracker, trace: &mut Trace) ->
                         })
             })
         };
-        let identity_continues = merge.parents.iter().any(|p| same_identity(p));
-        if !trace.states[id].uncertain
-            && merged.as_ref().is_some_and(|m| {
-                parents
-                    .iter()
-                    .enumerate()
-                    .any(|(i, p)| p.as_ref() == Some(m) && same_identity(&merge.parents[i]))
-            })
-            && let Some(record) = trace.records.get_mut(id)
-        {
-            record.suppressed = true;
+        if let Some(merged) = &merged {
+            let retained = parents
+                .iter()
+                .zip(&merge.parents)
+                .filter(|(value, id)| value.as_ref() == Some(merged) && same_identity(id))
+                .count();
+            if retained > 0
+                && let Some(record) = trace.records.get_mut(id)
+            {
+                record.suppressed = true;
+            }
+            // If every parent agrees on the selected value, path and mode,
+            // the merge rejected nothing. Keep the parents' own edits.
+            if retained == parents.len() {
+                continue;
+            }
         }
-        if bases.len() != 1
-            || merged.is_none()
-            || parents.iter().any(Option::is_none)
-            || trace.states[id].uncertain
-        {
+        let identity_continues = merge.parents.iter().any(|p| same_identity(p));
+        let sides = (merged.is_some()
+            && parents.iter().all(Option::is_some)
+            && !trace.states[id].uncertain)
+            .then(|| graph.merge_sides(&merge.parents))
+            .flatten();
+        let Some((base_id, exclusive)) = sides else {
             if let Some(record) = trace.records.get_mut(id) {
                 record.uncertain = true;
                 record
@@ -132,29 +138,13 @@ pub(super) fn filter(graph: &Graph, tracker: &mut Tracker, trace: &mut Trace) ->
                     .insert("merge attribution unresolved (alternative regions or bases)".into());
             }
             continue;
-        }
-        let base_id = &bases[0];
+        };
         let Some(base_state) = trace.states.get(base_id) else {
             continue;
         };
         let Some(Value::Present(base_text)) = super::single_value(tracker, base_state)? else {
             continue;
         };
-        let exclusive: Vec<_> = merge
-            .parents
-            .iter()
-            .enumerate()
-            .map(|(index, parent)| {
-                let mut commits = graph.ancestors(parent);
-                for (other_index, other) in merge.parents.iter().enumerate() {
-                    if other_index != index {
-                        let shared = graph.ancestors(other);
-                        commits.retain(|id| !shared.contains(id));
-                    }
-                }
-                commits
-            })
-            .collect();
         let mut contribution_tips = merge.parents.clone();
         for (index, parent) in merge.parents.iter().enumerate() {
             if matches!(merged, Some(Value::Present(_)))

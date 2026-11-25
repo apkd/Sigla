@@ -3174,6 +3174,18 @@ async fn same_name_after_deletion_does_not_claim_a_trivial_neighbour() {
 }
 
 #[tokio::test]
+async fn agreeing_merge_parents_keep_both_independent_edits() {
+    let f = Fixture::new();
+    let root = f.commit(&[("lib.rs", "const VALUE: u8 = 1;\n")], &[], "base");
+    let changed = [("lib.rs", "const VALUE: u8 = 2;\n")];
+    let left = f.commit(&changed, &[&root], "left edit");
+    let right = f.commit(&changed, &[&root], "right edit");
+    let merge = f.commit(&changed, &[&left, &right], "merge");
+    let history = f.history(&merge, "log file:lib.rs").await;
+    assert_eq!(ids(&history), [&left, &right, &root]);
+}
+
+#[tokio::test]
 async fn merge_rejection_preserves_completed_edit_and_revert_cycles() {
     let f = Fixture::new();
     let base_text = "const X: i32 = 1;\nconst Y: i32 = 1;\n";

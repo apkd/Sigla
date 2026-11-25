@@ -3,7 +3,7 @@
 use crate::repository::history::{Commit, Store, check};
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::atomic::AtomicBool,
 };
 
@@ -94,37 +94,62 @@ impl Graph {
             }
         }
     }
+    fn parents(&self, id: &str) -> &[String] {
+        if self.boundary.as_deref() == Some(id) {
+            &[]
+        } else {
+            self.commits.get(id).map_or(&[], |c| c.parents.as_slice())
+        }
+    }
     pub fn ancestors(&self, tip: &str) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();
-        let mut pending = vec![tip.to_owned()];
+        let mut pending = vec![tip];
         while let Some(id) = pending.pop() {
-            if !seen.insert(id.clone()) || self.boundary.as_ref() == Some(&id) {
-                continue;
-            }
-            if let Some(commit) = self.commits.get(&id) {
-                pending.extend(commit.parents.iter().cloned());
+            if seen.insert(id.to_owned()) {
+                pending.extend(self.parents(id).iter().map(String::as_str));
             }
         }
         seen
     }
-    pub fn bases(&self, tips: &[String]) -> Vec<String> {
-        let Some(first) = tips.first() else {
-            return Vec::new();
-        };
-        let mut common = self.ancestors(first);
-        for tip in &tips[1..] {
-            let ancestors = self.ancestors(tip);
-            common.retain(|id| ancestors.contains(id));
-        }
-        let mut below = BTreeSet::new();
-        let mut bases = Vec::new();
-        for id in self.order.iter().chain(self.boundary.iter()) {
-            if common.contains(id) && !below.contains(id) {
-                bases.push(id.clone());
-                below.extend(self.ancestors(id));
+    /// A single best common ancestor and the commits unique to each parent.
+    pub fn merge_sides<'a>(
+        &'a self,
+        tips: &'a [String],
+    ) -> Option<(&'a str, Vec<BTreeSet<String>>)> {
+        let mut visits = HashMap::<&str, (usize, usize)>::new();
+        let mut below = HashSet::new();
+        for (index, tip) in tips.iter().enumerate() {
+            let mut pending = vec![tip.as_str()];
+            while let Some(id) = pending.pop() {
+                let (count, last) = visits.entry(id).or_insert((0, tips.len()));
+                if *last == index {
+                    continue;
+                }
+                *last = index;
+                *count += 1;
+                let parents = self.parents(id);
+                if *count == tips.len() {
+                    // Every parent of a common commit is also common, and
+                    // therefore cannot be a best common ancestor.
+                    below.extend(parents.iter().map(String::as_str));
+                }
+                pending.extend(parents.iter().map(String::as_str));
             }
         }
-        bases
+        let mut bases = visits
+            .iter()
+            .filter(|(id, (count, _))| *count == tips.len() && !below.contains(**id));
+        let (&base, _) = bases.next()?;
+        if bases.next().is_some() {
+            return None;
+        }
+        let mut exclusive = vec![BTreeSet::new(); tips.len()];
+        for (id, (count, last)) in visits {
+            if count == 1 {
+                exclusive[last].insert(id.to_owned());
+            }
+        }
+        Some((base, exclusive))
     }
 }
 
@@ -528,7 +553,16 @@ mod tests {
         assert_eq!(graph.order, ["left", "right"]);
         assert_eq!(graph.boundary.as_deref(), Some("base"));
         assert_eq!(graph.commits["base"].parents, ["older"]);
-        assert_eq!(graph.bases(&["left".into(), "right".into()]), ["base"]);
+        let tips = ["left".into(), "right".into()];
+        let (base, sides) = graph.merge_sides(&tips).unwrap();
+        assert_eq!(base, "base");
+        assert_eq!(
+            sides,
+            [
+                BTreeSet::from([tips[0].clone()]),
+                BTreeSet::from([tips[1].clone()])
+            ]
+        );
         assert_eq!(
             graph.ancestors("left"),
             BTreeSet::from(["left".into(), "base".into()])
@@ -621,11 +655,17 @@ mod tests {
         let graph = graph.unwrap();
         assert_eq!(graph.boundary.as_deref(), Some("join"));
         assert_eq!(graph.order, ["left", "right", "shared", "middle"]);
-        assert_eq!(graph.bases(&["left".into(), "right".into()]), ["shared"]);
+        assert_eq!(
+            graph
+                .merge_sides(&["left".into(), "right".into()])
+                .unwrap()
+                .0,
+            "shared"
+        );
     }
 
     #[test]
-    fn all_merge_bases_remain_visible_above_the_cut() {
+    fn alternative_merge_bases_prevent_attribution() {
         let commits = fixture(&[
             ("left", &["a", "b"]),
             ("right", &["b", "a"]),
@@ -637,8 +677,37 @@ mod tests {
         let graph = graph.unwrap();
         assert_eq!(graph.order, ["left", "right", "a", "b"]);
         assert_eq!(graph.boundary.as_deref(), Some("base"));
-        assert_eq!(graph.bases(&["left".into(), "right".into()]), ["a", "b"]);
+        assert!(
+            graph
+                .merge_sides(&["left".into(), "right".into()])
+                .is_none()
+        );
         assert!(!reads.iter().any(|id| id == "older"));
+    }
+
+    #[test]
+    fn octopus_merge_only_attributes_commits_unique_to_one_parent() {
+        let commits = fixture(&[
+            ("first", &["shared"]),
+            ("second", &["second-edit"]),
+            ("second-edit", &["shared", "base"]),
+            ("third", &["base"]),
+            ("shared", &["base"]),
+            ("base", &[]),
+        ]);
+        let tips = ["first".into(), "second".into(), "third".into()];
+        let (graph, _) = discover(&commits, &["first", "second", "third"], true);
+        let graph = graph.unwrap();
+        let (base, sides) = graph.merge_sides(&tips).unwrap();
+        assert_eq!(base, "base");
+        assert_eq!(
+            sides,
+            [
+                BTreeSet::from(["first".into()]),
+                BTreeSet::from(["second".into(), "second-edit".into()]),
+                BTreeSet::from(["third".into()]),
+            ]
+        );
     }
 
     #[test]
