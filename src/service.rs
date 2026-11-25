@@ -1109,11 +1109,16 @@ impl App {
             tracing::Span::current()
                 .record("selector", tracing::field::debug(&repository.selector));
         }
+        let exact_asset = query
+            .as_ref()
+            .filter(|q| crate::unity::assets::selection::exact_request(q));
         let navigation = matches!(&request, Request::Browse(_))
             || matches!(&request, Request::View(path, _) if !path.starts_with("unity@"))
-            || query
-                .as_ref()
-                .is_some_and(crate::unity::assets::selection::exact_request);
+            || exact_asset.is_some()
+            || repository.is_some()
+                && query
+                    .as_ref()
+                    .is_some_and(crate::navigation::sources::repository_glob);
         let branch = match repository {
             Some(repository) => {
                 let remote = self.remote.as_ref().ok_or_else(|| {
@@ -1138,10 +1143,9 @@ impl App {
             }
             None => None,
         };
-        let exact_asset = query
-            .as_ref()
-            .is_some_and(crate::unity::assets::selection::exact_request);
-        if exact_asset && let Some(branch) = &branch {
+        if exact_asset.is_some_and(|q| !q.filters.iter().any(|f| f.key == "lang"))
+            && let Some(branch) = &branch
+        {
             let Some(result) = wait
                 .until(self.navigate_repository(branch.clone(), request.clone(), activity.clone()))
                 .await?
@@ -1193,18 +1197,27 @@ impl App {
             && !ready_workspace
             && navigation
         {
-            let Some(result) = wait
-                .until(self.navigate_repository(branch.clone(), request.clone(), activity.clone()))
-                .await?
-            else {
-                return Ok(indexes::pending("Repository file inventory"));
-            };
-            if let Some(result) = result {
-                return Ok(result);
+            if exact_asset.is_none() {
+                let Some(result) = wait
+                    .until(self.navigate_repository(
+                        branch.clone(),
+                        request.clone(),
+                        activity.clone(),
+                    ))
+                    .await?
+                else {
+                    return Ok(indexes::pending("Repository file inventory"));
+                };
+                if let Some(result) = result {
+                    return Ok(result);
+                }
             }
             let mut result = match &request {
                 Request::View(..) => CallToolResult::error(vec![ContentBlock::text(
                     "No matching file in the repository inventory. Dependency and generated files become available after a semantic search.",
+                )]),
+                Request::Search(_) => CallToolResult::success(vec![ContentBlock::text(
+                    "The repository inventory cannot confirm this file match. Add `wait:complete` to check the workspace, including project language memberships.",
                 )]),
                 _ => CallToolResult::success(vec![ContentBlock::text(
                     "No matches in the repository inventory. Dependency and generated files become available after a semantic search.",
@@ -1383,10 +1396,7 @@ impl App {
                 return Ok(indexes::pending("Workspace preparation"));
             }
         };
-        if let Some(query) = query
-            .as_ref()
-            .filter(|q| crate::unity::assets::selection::exact_request(q))
-        {
+        if let Some(query) = exact_asset {
             let Some(result) = wait
                 .until(self.exact_asset_filename(
                     inventory.clone(),

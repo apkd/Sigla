@@ -18,6 +18,64 @@ pub(crate) fn repository_language(
     }
 }
 
+pub(crate) fn repository_glob(q: &Query) -> bool {
+    q.selector == "file"
+        && q.filters.is_empty()
+        && !q.wait_complete
+        && !q.loose
+        && q.target.name.contains(['*', '?', '[', '{'])
+        && repository_language(std::path::Path::new(&q.target.name), false).is_some()
+}
+
+fn file_target(q: &Query) -> Result<impl Fn(&str) -> bool> {
+    let pattern = globset::GlobBuilder::new(&q.target.name)
+        .case_insensitive(q.loose)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher();
+    let basename = !q.target.name.contains('/');
+    Ok(move |path: &str| {
+        pattern.is_match(if basename {
+            path.rsplit('/').next().unwrap()
+        } else {
+            path
+        })
+    })
+}
+
+pub(crate) fn repository_candidates(
+    prepared: &crate::repository::materialize::Prepared,
+    q: &Query,
+    cancel: &dyn crate::cancellation::Cancellation,
+) -> Result<String> {
+    let matches = file_target(q)?;
+    let mut text = String::from(
+        "> Repository path candidates. Use `wait:complete` to check workspace membership.\n",
+    );
+    let mut count = 0;
+    for path in prepared.selected.keys() {
+        cancel.check()?;
+        if !matches(path)
+            || prepared.omitted.contains_key(path)
+            || prepared.unavailable.contains(path)
+            || repository_language(std::path::Path::new(path), false).is_none()
+        {
+            continue;
+        }
+        text.push('\n');
+        if count == q.limit {
+            text.push_str(&crate::render::omission(None));
+            break;
+        }
+        text.push_str(&crate::navigation::quote(path));
+        count += 1;
+    }
+    if count == 0 {
+        text.push_str("\nNo matching paths in the selected repository inventory.");
+    }
+    Ok(text)
+}
+
 /// Navigate materialized repository inputs while dependency discovery is pending.
 /// Missing file contents are acquired separately; no discovery is started here.
 pub(crate) fn repository(
@@ -245,11 +303,7 @@ impl Sources<'_> {
         paths
     }
     pub fn files(&self, q: &Query, root: &std::path::Path) -> Result<String> {
-        let pattern = globset::GlobBuilder::new(&q.target.name)
-            .case_insensitive(q.loose)
-            .literal_separator(true)
-            .build()?
-            .compile_matcher();
+        let matches = file_target(q)?;
         let paths = file_path_filters(q)?;
         let mut found = Vec::new();
         let mut total = 0;
@@ -258,12 +312,7 @@ impl Sources<'_> {
         let source_paths = self.source_paths(root);
         for (path, key) in source_paths.iter() {
             self.check()?;
-            let target = if q.target.name.contains('/') {
-                path.as_str()
-            } else {
-                path.rsplit('/').next().unwrap()
-            };
-            if !pattern.is_match(target) || !paths(path) {
+            if !matches(path) || !paths(path) {
                 continue;
             }
             let file = self

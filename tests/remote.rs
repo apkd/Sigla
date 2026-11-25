@@ -380,6 +380,7 @@ fn lifecycle() -> Result<()> {
         "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[[bin]]\nname='tool'\npath='src/bin/tool.rs'\n[workspace]\nmembers=['extra']\n",
     )?;
     fs::write(upstream.join("src/lib.rs"), "pub struct Main;\n")?;
+    fs::write(upstream.join("src/unused.rs"), "pub struct Unused;\n")?;
     fs::write(
         upstream.join("src/bin/tool.rs"),
         "mod witness; mod child; fn main() {}",
@@ -457,12 +458,34 @@ fn lifecycle() -> Result<()> {
     let server =
         Server::launch_with_refresh(root.path(), Duration::from_secs(30), false, Some("1h"))?;
     let reading = "ssh://git@fixture.invalid/repo#refs/heads/reading";
+    let glob = "file:src/*.rs";
+    let (error, candidates, complete) =
+        server.call_status("search", json!({"codebase":reading,"query":glob}))?;
+    ensure!(
+        !error
+            && complete == Some(false)
+            && candidates.contains("candidates")
+            && candidates.contains("src/lib.rs")
+            && candidates.contains("src/unused.rs"),
+        "Cold file search did not return repository candidates: {candidates}"
+    );
     let (error, tree) = server.call("browse", json!({"codebase":reading,"path":"src"}))?;
     ensure!(
         !error && tree.contains("lib.rs"),
         "Cold inventory failed: {tree}"
     );
     let inventory_requests = fs::read(root.path().join("requests.log"))?.len();
+    let (error, limited, complete) = server.call_status(
+        "search",
+        json!({"codebase":reading,"query":"file:{lib,unused}.rs limit:1"}),
+    )?;
+    ensure!(
+        !error
+            && complete == Some(false)
+            && limited.contains("src/lib.rs")
+            && !limited.contains("src/unused.rs"),
+        "Expected a bounded, sorted basename preview: {limited}"
+    );
     ensure!(
         !server
             .call("browse", json!({"codebase":reading,"path":"src"}))?
@@ -502,7 +525,11 @@ fn lifecycle() -> Result<()> {
         .join("cache/git")
         .join(identity.storage_key())
         .join("current");
-    for (path, expected) in [("src/lib.rs", true), ("src/bin/tool.rs", false)] {
+    for (path, expected) in [
+        ("src/lib.rs", true),
+        ("src/unused.rs", false),
+        ("src/bin/tool.rs", false),
+    ] {
         let oid = Command::new("git")
             .arg("-C")
             .arg(&upstream)
@@ -554,11 +581,17 @@ fn lifecycle() -> Result<()> {
             "File view acquired an unrelated source"
         );
     }
-    let (error, promoted) = server.query(reading, "type:Main wait:complete")?;
-    ensure!(
-        !error && promoted.contains("Main"),
-        "Inventory promotion failed: {promoted}"
-    );
+    for query in [format!("{glob} wait:complete"), glob.to_owned()] {
+        let (error, files, complete) =
+            server.call_status("search", json!({"codebase":reading,"query":query}))?;
+        ensure!(
+            !error
+                && complete != Some(false)
+                && files.contains("src/lib.rs")
+                && !files.contains("unused.rs"),
+            "Expected only workspace members for {query}: {files}"
+        );
+    }
     fs::write(root.path().join("offline"), "")?;
     let (error, warm) = server.call(
         "view",

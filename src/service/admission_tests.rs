@@ -776,6 +776,21 @@ async fn exact_remote_asset_filename_uses_deferred_inventory_before_discovery() 
             .unwrap()
             .contains("Assets/Known.prefab")
     );
+    let filtered = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.dispatch(
+            "https://github.com/fixture/repo#refs/heads/main",
+            Request::Search("file:Assets/Known.prefab -lang:cs".into()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        filtered.structured_content.as_ref().unwrap()["complete"],
+        false
+    );
+    assert!(result_text(filtered).unwrap().contains("wait:complete"));
     assert!(app.workspaces.lock().unwrap().is_empty());
     assert_eq!(app.assets.stats().entries, 0);
     drop((discovery, indexing, assets));

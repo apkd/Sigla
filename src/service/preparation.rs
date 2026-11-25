@@ -753,6 +753,13 @@ impl App {
                 super::Request::View(path, mode) => (path, Some(mode)),
                 super::Request::Search(query) => {
                     let query = Query::parse(&query)?;
+                    if crate::navigation::sources::repository_glob(&query) {
+                        let text = crate::navigation::sources::repository_candidates(prepared, &query, &cancel)?;
+                        branch.record_use();
+                        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                        result.structured_content = Some(serde_json::json!({"complete": false}));
+                        return Ok(RepositoryNavigation::Found(result));
+                    }
                     let manifest = Manifest { root, ..Default::default() };
                     let found = crate::unity::assets::selection::exact_file(&manifest, Some(prepared), &query, &cancel)?;
                     if found { branch.record_use(); }
