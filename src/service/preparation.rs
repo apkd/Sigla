@@ -7,6 +7,11 @@ use tokio::sync::watch;
 mod dependencies;
 
 type RepositoryContext = (crate::repository::Identity, String, String, usize);
+type ViewUsage = (
+    PathBuf,
+    Option<Arc<crate::repository::manager::Branch>>,
+    Option<String>,
+);
 
 fn materialized_policy(
     policy: &mut Policy,
@@ -52,6 +57,14 @@ struct CachedSummary {
 }
 
 impl Inventory {
+    fn request_context(&self, alias: Option<String>) -> Option<RepositoryContext> {
+        let mut context = self.context.clone()?;
+        if let Some(alias) = alias {
+            context.1 = alias;
+        }
+        Some(context)
+    }
+
     pub(super) fn summary(
         &self,
         context: &RepositoryContext,
@@ -539,7 +552,7 @@ impl App {
         inventory: Arc<Inventory>,
         path: String,
         mode: crate::navigation::Mode,
-        usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
+        usage: ViewUsage,
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
         operation: crate::telemetry::Operation,
     ) -> Result<Option<CallToolResult>> {
@@ -583,7 +596,7 @@ impl App {
         inventory: Arc<Inventory>,
         path: String,
         mode: crate::navigation::Mode,
-        usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
+        usage: ViewUsage,
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
         operation: crate::telemetry::Operation,
     ) -> Result<RepositoryNavigation> {
@@ -656,7 +669,7 @@ impl App {
             app.record_usage(&usage.0, usage.1.as_deref(), manifest);
             let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
             if mode != crate::navigation::Mode::Raw
-                && let Some(context) = &inventory.context
+                && let Some(context) = inventory.request_context(usage.2)
             {
                 let root = usage
                     .1
@@ -664,7 +677,7 @@ impl App {
                     .map(|branch| branch.source())
                     .unwrap_or_else(|| manifest.root.clone());
                 inventory
-                    .summary(context, &root, manifest, manifest, &[])
+                    .summary(&context, &root, manifest, manifest, &[])
                     .attach(&mut result);
             }
             Ok(RepositoryNavigation::Found(result))
@@ -837,7 +850,7 @@ impl App {
         inventory: Arc<Inventory>,
         request: super::Request,
         query: Option<Query>,
-        usage: (PathBuf, Option<Arc<crate::repository::manager::Branch>>),
+        usage: ViewUsage,
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CallToolResult> {
@@ -878,8 +891,8 @@ impl App {
             if assets_pending {
                 result.structured_content = Some(serde_json::json!({"complete": false}));
             }
-            if !raw && let Some(context) = &inventory.context {
-                inventory.summary(context, &root, manifest, manifest, &[])
+            if !raw && let Some(context) = inventory.request_context(usage.2) {
+                inventory.summary(&context, &root, manifest, manifest, &[])
                 .attach(&mut result);
             }
             app.record_usage(&usage.0, usage.1.as_deref(), manifest);

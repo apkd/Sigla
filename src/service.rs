@@ -382,6 +382,15 @@ impl App {
     }
 
     pub fn new(policy: Policy, cache: PathBuf, workers: usize) -> Result<Self> {
+        Self::open(policy, cache, workers, None)
+    }
+
+    fn open(
+        policy: Policy,
+        cache: PathBuf,
+        workers: usize,
+        remote: Option<crate::config::RemoteOptions>,
+    ) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
         let mut startup = crate::telemetry::Startup::new("cache_startup");
         startup.0.stage("cache_ownership");
@@ -416,10 +425,10 @@ impl App {
             .map_err(|_| anyhow::anyhow!("Another Sigla process owns this cache root"))?;
         startup.0.stage("cache_initialization");
         crate::cache::reset::prepare(&cache)?;
-        let (blobs, asset_records, owners) =
+        let (blobs, asset_records, owners, pins) =
             crate::cache::reset::with_space_recovery(&cache, || {
                 startup.0.stage("repository_recovery");
-                crate::repository::state_store::recover(&cache)?;
+                let pins = crate::repository::state_store::recover(&cache)?;
                 startup.0.stage("compaction_recovery");
                 crate::cache::compaction::recover(&cache)?;
                 startup.0.stage("store_initialization");
@@ -427,9 +436,13 @@ impl App {
                     crate::cache::blobs::Store::open(&cache)?,
                     crate::cache::artifacts::Store::open(&cache)?,
                     crate::cache::owners::Catalog::open(&cache)?,
+                    pins,
                 ))
             })?;
         crate::memory::start_reclaimer()?;
+        let remote = remote
+            .map(|opts| crate::repository::manager::Manager::with_pins(cache.clone(), opts, pins))
+            .transpose()?;
         let app = Self {
             activity: Arc::new(tokio::sync::RwLock::new(())),
             blobs,
@@ -457,7 +470,7 @@ impl App {
                 crate::memory::cache_budget() / 4,
             )),
             monitor: Arc::new(crate::watch::Monitor::default()),
-            remote: None,
+            remote,
             upstream: None,
             startup: Mutex::new(None),
             maintenance: Mutex::new(None),
@@ -510,10 +523,7 @@ impl App {
         workers: usize,
         options: crate::config::RemoteOptions,
     ) -> Result<Self> {
-        let mut app = Self::new(policy, cache.clone(), workers)?;
-        let manager = crate::repository::manager::Manager::new(app.cache.clone(), options)?;
-        app.remote = Some(manager);
-        Ok(app)
+        Self::open(policy, cache, workers, Some(options))
     }
 
     pub fn hybrid(
@@ -1119,6 +1129,7 @@ impl App {
                 && query
                     .as_ref()
                     .is_some_and(crate::navigation::sources::repository_glob);
+        let requested_selector = repository.as_ref().and_then(|r| r.selector.clone());
         let branch = match repository {
             Some(repository) => {
                 let remote = self.remote.as_ref().ok_or_else(|| {
@@ -1143,6 +1154,10 @@ impl App {
             }
             None => None,
         };
+        let alias = requested_selector.filter(|s| {
+            s.bytes().all(|b| b.is_ascii_hexdigit())
+                && branch.as_ref().is_some_and(|b| b.name != *s)
+        });
         if exact_asset.is_some_and(|q| !q.filters.iter().any(|f| f.key == "lang"))
             && let Some(branch) = &branch
         {
@@ -1350,7 +1365,7 @@ impl App {
                     return self
                         .search_rust(
                             ready,
-                            branch.clone(),
+                            (branch.clone(), alias.as_deref()),
                             query.clone(),
                             activity.clone(),
                             operation.clone(),
@@ -1427,7 +1442,7 @@ impl App {
                     inventory.clone(),
                     path.clone(),
                     *mode,
-                    (usage_entry.clone(), usage_branch.clone()),
+                    (usage_entry.clone(), usage_branch.clone(), alias.clone()),
                     activity.clone(),
                     operation.clone(),
                 ))
@@ -1465,7 +1480,7 @@ impl App {
                     inventory,
                     request,
                     query,
-                    (usage_entry, usage_branch),
+                    (usage_entry, usage_branch, alias.clone()),
                     activity,
                     permit,
                 )
@@ -1565,7 +1580,7 @@ impl App {
             let prepared = &branch_state.as_ref().unwrap().as_ref().unwrap().prepared;
             (
                 branch.repository.identity.clone(),
-                branch.selector(prepared),
+                alias.unwrap_or_else(|| branch.selector(prepared)),
                 prepared.revision.clone(),
                 prepared.tracked.len(),
             )

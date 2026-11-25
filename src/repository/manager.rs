@@ -982,6 +982,54 @@ mod refresh_tests {
     }
 
     #[tokio::test]
+    async fn full_commit_prefers_an_indexed_view_and_falls_back_after_eviction() {
+        let cache = tempfile::tempdir().unwrap();
+        let repo = Repository::parse("https://github.com/owner/repo")
+            .unwrap()
+            .unwrap();
+        let id = "a".repeat(40);
+        let mut roots = Vec::new();
+        {
+            let manager = Manager::new(cache.path().into(), options()).unwrap();
+            for (prefix, indexed) in [(&id[..8], false), (&id[..11], true)] {
+                let branch = manager
+                    .branch_for(&repo, Target::Named(prefix.into()))
+                    .unwrap();
+                fs::create_dir_all(branch.source()).unwrap();
+                fs::write(branch.source().join("lib.rs"), "").unwrap();
+                let mut saved = state();
+                saved.policy = manager.options.selection.identity.clone();
+                saved.branch = prefix.into();
+                saved.target = branch.target.clone();
+                saved.prepared.revision = id.clone();
+                saved.prepared.resolved_target = Some(Target::Commit(id.clone()));
+                saved.indexed_revision = indexed.then(|| id.clone());
+                branch.persist(&saved).unwrap();
+                roots.push(branch.root.clone());
+            }
+        }
+        let manager = Manager::new(cache.path().into(), options()).unwrap();
+        let op = crate::telemetry::Operation::default();
+        for root in roots.iter().rev() {
+            let owner = manager
+                .pinned_branch(&repo, &id, &op)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&owner.root, root);
+            drop(owner);
+            assert!(manager.evict(root, true, || Ok(()), |()| Ok(())).unwrap());
+        }
+        assert!(
+            manager
+                .pinned_branch(&repo, &id, &op)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn expiry_uses_live_activity_and_loaded_state_before_retirement() {
         let cache = tempfile::tempdir().unwrap();
         let manager = Manager::new(cache.path().into(), options()).unwrap();
@@ -1056,6 +1104,26 @@ pub struct State {
 }
 
 impl State {
+    fn reuse_inventory(&self, policy: &str, target: &Target) -> Option<super::materialize::Reuse> {
+        use super::materialize::{Inventory, Reuse};
+        if self.policy != policy {
+            return None;
+        }
+        let inventory = Inventory {
+            repository: self.repository.clone(),
+            policy: self.policy.clone(),
+            subdirectory: None,
+            prepared: self.prepared.inventory(),
+        };
+        Some(
+            if matches!(target, Target::Commit(id) if id == &self.prepared.revision) {
+                Reuse::Pinned(inventory)
+            } else {
+                Reuse::Previous(inventory)
+            },
+        )
+    }
+
     fn same_inputs(&self, next: &Self) -> bool {
         !self.repair
             && self.policy == next.policy
@@ -1225,17 +1293,53 @@ impl Branch {
             }
             false
         });
-        let mut state = self.state.blocking_write();
+        self.record_state_transfer(
+            &mut self.state.blocking_write(),
+            &prepared.revision,
+            prepared.transfer_bytes,
+        )
+    }
+
+    fn record_state_transfer(
+        &self,
+        state: &mut Option<Arc<State>>,
+        revision: &str,
+        bytes: u64,
+    ) -> Result<()> {
         if let Some(state) = state.as_mut()
-            && state.prepared.revision == prepared.revision
-            && state.prepared.transfer_bytes < prepared.transfer_bytes
+            && state.prepared.revision == revision
+            && state.prepared.transfer_bytes < bytes
         {
             let state = Arc::make_mut(state);
-            state.prepared.transfer_bytes =
-                state.prepared.transfer_bytes.max(prepared.transfer_bytes);
-            self.persist_header(state)?;
+            let previous = std::mem::replace(&mut state.prepared.transfer_bytes, bytes);
+            if let Err(error) = self.persist_header(state) {
+                state.prepared.transfer_bytes = previous;
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    fn pending_state(
+        &self,
+        prepared: Prepared,
+        policy: String,
+        refreshed: u64,
+        before: Option<&State>,
+    ) -> State {
+        State {
+            repository: self.repository.identity.clone(),
+            transport: self.repository.transport.clone(),
+            branch: self.name.clone(),
+            target: self.target.clone(),
+            last_use: self.last_use.load(Ordering::Relaxed),
+            refreshed,
+            policy,
+            prepared,
+            indexed_revision: before.and_then(|s| s.indexed_revision.clone()),
+            repair: true,
+            additional: before.map(|s| s.additional.clone()).unwrap_or_default(),
+        }
     }
     pub(super) fn sources_current(&self, prepared: &Prepared) -> bool {
         self.sources
@@ -1357,6 +1461,16 @@ impl Branch {
             .unwrap_or(&self.target)
     }
 
+    async fn resolved_commit(&self) -> Option<String> {
+        let state = self.state.read().await;
+        let inventory = self.inventory.borrow();
+        let prepared = inventory
+            .as_ref()
+            .map(|i| &i.prepared)
+            .or_else(|| state.as_ref().map(|s| &s.prepared))?;
+        prepared.immutable_commit(&self.target).map(str::to_owned)
+    }
+
     fn refresh_due(
         &self,
         options: &RemoteOptions,
@@ -1447,6 +1561,7 @@ pub struct Manager {
     cache: PathBuf,
     pub options: RemoteOptions,
     branches: Mutex<HashMap<String, Arc<Branch>>>,
+    commit_pins: Mutex<super::commits::Pins>,
     defaults: AsyncMutex<HashMap<String, DefaultBranch>>,
     capacity: Arc<super::admission::Capacity>,
     default_running: Mutex<HashMap<String, DefaultOperation>>,
@@ -1696,6 +1811,7 @@ impl Manager {
         }
         retire(plan)?;
         let retired = crate::cache::views::retire(&self.cache, root)?;
+        self.commit_pins.lock().unwrap().retire(root);
         branches.retain(|_, branch| branch.root != root);
         drop(_gate);
         drop(branches);
@@ -1704,12 +1820,22 @@ impl Manager {
     }
 
     pub fn new(cache: PathBuf, options: RemoteOptions) -> Result<Arc<Self>> {
+        let pins = super::state_store::commit_pins(&cache)?;
+        Self::with_pins(cache, options, pins)
+    }
+
+    pub(crate) fn with_pins(
+        cache: PathBuf,
+        options: RemoteOptions,
+        pins: super::commits::Pins,
+    ) -> Result<Arc<Self>> {
         let capacity = crate::cache::reset::with_space_recovery(&cache, || {
             fs::create_dir_all(cache.join("repositories"))?;
             fs::create_dir_all(cache.join("defaults"))?;
             super::admission::Capacity::open(&cache)
         })?;
         Ok(Arc::new(Self {
+            commit_pins: Mutex::new(pins),
             capacity,
             cache,
             options,
@@ -1942,6 +2068,8 @@ impl Manager {
                     }
                 }
             }
+            // A cancelled prefix request may still be staging its durable inventory.
+            drop(branch.acquiring.lock().await);
         }
         tokio::task::spawn_blocking(move || {
             for branch in branches {
@@ -2090,6 +2218,7 @@ impl Manager {
         }
         retire()?;
         let retired = crate::cache::views::retire(&self.cache, &branch.root)?;
+        self.commit_pins.lock().unwrap().retire(&branch.root);
         branches.retain(|_, value| !Arc::ptr_eq(value, branch));
         drop(branches);
         retired.dispose()?;
@@ -2302,6 +2431,130 @@ impl Manager {
             Some(name) => Target::selector(name)?,
             None => Target::Branch(default.context("Default branch is missing")?),
         };
+        let telemetry = crate::telemetry::Operation::default();
+        let operation = operation.unwrap_or(&telemetry);
+        // A full object ID needs no new name resolution. A hex abbreviation may be a
+        // branch or tag: only Git's resolution for that selector can prove the commit.
+        if let Target::Commit(id) = &target
+            && let Some(owner) = self.pinned_branch(&repository, id, operation).await?
+        {
+            return self.resolve_branch(owner, inventory_only, operation).await;
+        }
+        let eligible = matches!(&target, Target::Commit(_))
+            || matches!(&target, Target::Named(name) if super::revision::is_prefix(name));
+        let probe = matches!(&target, Target::Named(name) if super::revision::is_prefix(name)
+            && self.commit_pins.lock().unwrap().may_share(&repository.identity, name));
+        let branch = self.branch_for(&repository, target)?;
+        let branch = if probe {
+            self.initialize_branch(&branch, operation).await?;
+            if branch.resolved_commit().await.is_some() {
+                branch
+            } else {
+                self.resolve_branch(branch, true, operation).await?
+            }
+        } else {
+            self.resolve_branch(branch, inventory_only, operation)
+                .await?
+        };
+        if eligible
+            && let Some(id) = branch.resolved_commit().await
+            && let Some(owner) = self.pinned_branch(&repository, &id, operation).await?
+            && !Arc::ptr_eq(&owner, &branch)
+            && (!probe
+                || inventory_only
+                || self
+                    .retain_commit_inventory(&branch, &id, operation)
+                    .await?)
+        {
+            branch.record_use();
+            return self.resolve_branch(owner, inventory_only, operation).await;
+        }
+        if probe {
+            self.resolve_branch(branch, inventory_only, operation).await
+        } else {
+            Ok(branch)
+        }
+    }
+
+    /// Persist Git's own inventory before reporting a successful semantic request.
+    /// Its sources remain pending until the selector needs its own workspace.
+    async fn retain_commit_inventory(
+        &self,
+        branch: &Arc<Branch>,
+        id: &str,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<bool> {
+        let gate = branch.acquiring.clone().lock_owned().await;
+        if let Some(saved) = branch.state.read().await.as_ref() {
+            return Ok(saved.prepared.immutable_commit(&saved.target) == Some(id));
+        }
+        let Some(inventory) = branch.inventory.borrow().clone() else {
+            return Ok(false);
+        };
+        if inventory.prepared.immutable_commit(&branch.target) != Some(id) {
+            return Ok(false);
+        }
+        let permit = self.capacity.import(operation).await?;
+        let policy = self.options.selection.identity.clone();
+        let selector = branch.clone();
+        let (_gate, next, staged) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let state = selector.pending_state(
+                inventory.prepared.clone(),
+                policy,
+                inventory.refreshed,
+                None,
+            );
+            let staged = super::state_store::stage(&selector.root, &state)?;
+            Ok::<_, anyhow::Error>((gate, state, staged))
+        })
+        .await??;
+        let mut state = branch.publish().await;
+        branch.publish_inventory(&next, staged)?;
+        *state = Some(Arc::new(next));
+        Ok(true)
+    }
+
+    async fn pinned_branch(
+        &self,
+        repository: &Repository,
+        id: &str,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<Option<Arc<Branch>>> {
+        let Some(candidates) = self
+            .commit_pins
+            .lock()
+            .unwrap()
+            .candidates(&repository.identity, id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        for owner in candidates.iter() {
+            let branch = self.branch_for(repository, owner.target.clone())?;
+            // Retirement may have won the race before we acquired the branch handle.
+            if branch.root == owner.root
+                && self
+                    .commit_pins
+                    .lock()
+                    .unwrap()
+                    .candidates(&repository.identity, id)
+                    .is_some_and(|c| c.contains(owner))
+            {
+                self.initialize_branch(&branch, operation).await?;
+                let state = branch.state.read().await;
+                if state.as_ref().is_some_and(|s| {
+                    s.prepared.immutable_commit(&s.target) == Some(id) && self.usable(&branch, s)
+                }) {
+                    drop(state);
+                    return Ok(Some(branch));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn branch_for(&self, repository: &Repository, target: Target) -> Result<Arc<Branch>> {
         let name = match &target {
             Target::Branch(name) | Target::Named(name) | Target::Commit(name) => name.clone(),
             Target::Tag(name) => format!("refs/tags/{name}"),
@@ -2313,7 +2566,7 @@ impl Manager {
             postcard::to_allocvec(&(&repository.identity, &target))?
         };
         let key = blake3::hash(&identity).to_hex().to_string();
-        let branch = {
+        Ok({
             let mut branches = self.branches.lock().unwrap();
             if let Some(branch) = branches.get(&key) {
                 branch.clone()
@@ -2343,14 +2596,18 @@ impl Manager {
                 branches.insert(key, branch.clone());
                 branch
             }
-        };
+        })
+    }
+
+    async fn resolve_branch(
+        self: &Arc<Self>,
+        branch: Arc<Branch>,
+        inventory_only: bool,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<Arc<Branch>> {
         let _inventory_interest = branch.inventory_demand.interest();
         let _interest = (!inventory_only).then(|| branch.demand.interest());
-        self.initialize_branch(
-            &branch,
-            operation.unwrap_or(&crate::telemetry::Operation::default()),
-        )
-        .await?;
+        self.initialize_branch(&branch, operation).await?;
         let state = branch.state.read().await;
         let usable = state
             .as_ref()
@@ -2384,11 +2641,7 @@ impl Manager {
             return Ok(branch);
         }
         if !inventory_only && !usable {
-            self.ready(
-                &branch,
-                operation.unwrap_or(&crate::telemetry::Operation::default()),
-            )
-            .await?;
+            self.ready(&branch, operation).await?;
         } else if inventory_only && !usable {
             let mut inventory = branch.inventory.subscribe();
             let (mut running, mut job_id) = {
@@ -2418,7 +2671,7 @@ impl Manager {
                     outcome.map_err(crate::diagnostics::shared_error)?;
                     break;
                 }
-                if let (Some(operation), Some(job_id)) = (operation, job_id.take()) {
+                if let Some(job_id) = job_id.take() {
                     operation.link(&job_id);
                 }
                 tokio::select! {
@@ -2922,8 +3175,12 @@ impl Manager {
             .and_then(|state| state.prepared.resolved_target.clone());
         let target =
             Target::clone(branch.acquisition_target(before.as_ref().map(|state| &state.prepared)));
+        let pinned = before.as_ref().filter(
+            |state| matches!(&target, Target::Commit(id) if id == &state.prepared.revision),
+        );
+        let transfer_used = pinned.map_or(0, |state| state.prepared.transfer_bytes);
         let mut request = Request {
-            transfer_used: 0,
+            transfer_used,
             contents: super::materialize::Contents::Sources,
             unlimited_transfer: self
                 .options
@@ -2953,6 +3210,9 @@ impl Manager {
             telemetry.stage("repository_inventory_acquisition");
             let mut inventory_request = request.clone();
             inventory_request.contents = super::materialize::Contents::Inventory;
+            let reuse = pinned.and_then(|state| {
+                state.reuse_inventory(&self.options.selection.identity, &inventory_request.target)
+            });
             let cache = cache.clone();
             let staged = stage.clone();
             let worker_telemetry = telemetry.clone();
@@ -2962,7 +3222,7 @@ impl Manager {
                 let (prepared, pin) = acquisition.git_cancellable(
                     &inventory_request,
                     &cache,
-                    None,
+                    reuse,
                     &worker_telemetry,
                     worker_cancel.as_ref(),
                 )?;
@@ -2979,8 +3239,20 @@ impl Manager {
                 .map(|prior| prior.transfer_bytes)
                 .max()
                 .unwrap_or(0);
-            prepared.prepared.transfer_bytes =
-                prepared.prepared.transfer_bytes.saturating_add(prior_bytes);
+            prepared.prepared.transfer_bytes = prepared
+                .prepared
+                .transfer_bytes
+                .saturating_add(prior_bytes.saturating_sub(transfer_used));
+            if pinned.is_some() {
+                prepared.prepared.resolved_target = resolved_target.clone();
+                if prepared.prepared.transfer_bytes > transfer_used {
+                    branch.record_state_transfer(
+                        &mut *branch.state.write().await,
+                        &prepared.prepared.revision,
+                        prepared.prepared.transfer_bytes,
+                    )?;
+                }
+            }
             fs::create_dir_all(branch.source())?;
             let inventory = Arc::new(Inventory {
                 prepared: prepared.prepared,
@@ -2990,8 +3262,6 @@ impl Manager {
                 heap_bytes: Default::default(),
                 _staging: None,
             });
-            request.target = Target::Commit(inventory.prepared.revision.clone());
-            request.transfer_used = inventory.prepared.transfer_bytes;
             branch.inventory.send_replace(Some(inventory.clone()));
             Some(inventory)
         } else {
@@ -3003,7 +3273,7 @@ impl Manager {
         work.check()?;
         if let Some(inventory) = &inventory {
             request.target = Target::Commit(inventory.prepared.revision.clone());
-            request.transfer_used = inventory.prepared.transfer_bytes;
+            request.transfer_used = transfer_used.max(inventory.prepared.transfer_bytes);
         }
         // No publication lock is held while fetching or extracting objects.
         let mut transferred = request.transfer_used;
@@ -3025,17 +3295,9 @@ impl Manager {
                     })
                 })
                 .or_else(|| {
-                    before
-                        .as_ref()
-                        .filter(|state| state.policy == self.options.selection.identity)
-                        .map(|state| {
-                            super::materialize::Reuse::Previous(super::materialize::Inventory {
-                                repository: state.repository.clone(),
-                                policy: state.policy.clone(),
-                                subdirectory: request.subdirectory.clone(),
-                                prepared: state.prepared.inventory(),
-                            })
-                        })
+                    before.as_ref().and_then(|state| {
+                        state.reuse_inventory(&self.options.selection.identity, &git_request.target)
+                    })
                 });
             let (acquired, pin) = tokio::task::spawn_blocking(move || {
                 let _stage = staged;
@@ -3098,22 +3360,12 @@ impl Manager {
             .prepared;
             transferred = prepared.transfer_bytes;
             telemetry.stage("repository_publication");
-            let mut next = State {
-                repository: branch.repository.identity.clone(),
-                transport: branch.repository.transport.clone(),
-                branch: branch.name.clone(),
-                target: branch.target.clone(),
-                last_use: branch.last_use.load(Ordering::Relaxed),
-                refreshed: now(),
-                policy: self.options.selection.identity.clone(),
+            let mut next = branch.pending_state(
                 prepared,
-                indexed_revision: before.as_ref().and_then(|s| s.indexed_revision.clone()),
-                repair: true,
-                additional: before
-                    .as_ref()
-                    .map(|s| s.additional.clone())
-                    .unwrap_or_default(),
-            };
+                self.options.selection.identity.clone(),
+                now(),
+                before.as_deref(),
+            );
             let source = branch.source();
             let unchanged = before.as_ref().is_some_and(|s| s.same_inputs(&next))
                 && fs::read_dir(stage.path())?.next().transpose()?.is_none()
@@ -3204,6 +3456,14 @@ impl Manager {
                 next.indexed_revision = Some(next.prepared.revision.clone());
             }
             branch.persist_header(&next)?;
+            if let Some(id) = next.prepared.immutable_commit(&next.target) {
+                self.commit_pins.lock().unwrap().register(
+                    &next.repository,
+                    id,
+                    &next.target,
+                    &branch.root,
+                );
+            }
             *state = Some(Arc::new(next));
             branch.generation.fetch_add(1, Ordering::Release);
             branch.inventory.send_replace(None);
@@ -3216,6 +3476,15 @@ impl Manager {
                 inventory
             });
             branch.inventory.send_replace(inventory);
+            if let Some(previous) = pinned
+                && transferred > previous.prepared.transfer_bytes
+            {
+                branch.record_state_transfer(
+                    &mut *branch.state.write().await,
+                    &previous.prepared.revision,
+                    transferred,
+                )?;
+            }
         }
         outcome
     }

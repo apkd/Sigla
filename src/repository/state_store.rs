@@ -41,7 +41,7 @@ pub struct PreparedHeader {
     pub revision: String,
     transfer_bytes: u64,
     transport: Option<String>,
-    resolved_target: Option<Target>,
+    pub(super) resolved_target: Option<Target>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -240,10 +240,19 @@ pub fn record_use(root: &Path, last_use: u64) -> Result<()> {
 }
 
 /// Remove unpublished inventories before requests start, under cache ownership.
-pub(crate) fn recover(cache: &Path) -> Result<()> {
+pub(crate) fn recover(cache: &Path) -> Result<super::commits::Pins> {
+    scan(cache, true)
+}
+
+pub(super) fn commit_pins(cache: &Path) -> Result<super::commits::Pins> {
+    scan(cache, false)
+}
+
+fn scan(cache: &Path, recover: bool) -> Result<super::commits::Pins> {
+    let mut pins = super::commits::Pins::default();
     let repositories = match fs::read_dir(cache.join("repositories")) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(pins),
         Err(error) => return Err(error.into()),
     };
     for repository in repositories {
@@ -252,13 +261,13 @@ pub(crate) fn recover(cache: &Path) -> Result<()> {
             repository.file_type()?.is_dir(),
             "Invalid selector directory"
         );
-        cleanup(&repository.path())?;
+        scan_selector(&repository.path(), recover, &mut pins)?;
     }
-    Ok(())
+    pins.prefer_indexed();
+    Ok(pins)
 }
 
 /// Retain repository inventories while requiring their graphs to be rebuilt.
-/// The caller holds exclusive cache ownership before any repository is opened.
 pub(crate) fn invalidate_indexed(cache: &Path) -> Result<()> {
     let root = cache.join("repositories");
     let metadata = match fs::symlink_metadata(&root) {
@@ -293,9 +302,9 @@ pub(crate) fn invalidate_indexed(cache: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cleanup(root: &Path) -> Result<()> {
-    let current = match records::read::<Header>(&root.join(HEADER), MAX_HEADER) {
-        Ok(header) => Some(header.inventory),
+fn scan_selector(root: &Path, recover: bool, pins: &mut super::commits::Pins) -> Result<()> {
+    let header = match records::read::<Header>(&root.join(HEADER), MAX_HEADER) {
+        Ok(header) => Some(header),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -305,15 +314,20 @@ fn cleanup(root: &Path) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("inventory-") && Some(name) != current.as_deref())
-        {
-            fs::remove_file(entry.path())?;
+    if recover {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| {
+                name.starts_with("inventory-")
+                    && Some(name) != header.as_ref().map(|h| h.inventory.as_str())
+            }) {
+                fs::remove_file(entry.path())?;
+            }
         }
+    }
+    if let Some(header) = header {
+        pins.restore_owner(root, header);
     }
     Ok(())
 }
@@ -471,7 +485,7 @@ mod tests {
         assert_eq!(restored.prepared.revision, current.prepared.revision);
         assert_eq!(restored.prepared.selected, current.prepared.selected);
         assert_eq!(header(root.path()).unwrap().inventory, original);
-        cleanup(root.path()).unwrap();
+        scan_selector(root.path(), true, &mut Default::default()).unwrap();
         assert!(!orphan.exists());
         assert_eq!(
             read(root.path()).unwrap().prepared.selected,

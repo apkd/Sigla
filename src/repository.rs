@@ -5,6 +5,7 @@ use std::fmt;
 use url::Url;
 pub(crate) mod admission;
 pub mod cache;
+mod commits;
 mod credentials;
 mod files;
 mod github;

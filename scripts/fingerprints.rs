@@ -8,6 +8,8 @@ const COMPATIBLE_WRITERS: &[&str] = &[
     "f795f98ce053000a88db10bf395ba01e258a2559f2cac94877708f42295d2085", // Index marker
     "0264b8a95348bba494dee3707697fae41d175722baf356da58ed85f6b1403e79", // Key buffers
     "cf1fafbe06938f4ca2dcce73c20e46ae68549b8337b83635cd9b008171db5dfe", // Page encoder
+    "ae02f87f1e4278276a31a96aa814ddba25fd5d063f5dc1e0ff3872e987621c74", // Immutable selector reuse
+    "9fa87f3a65c2a0985ef79c066f233f0ad8452c2d43ec162f2b9915a2f4bd6810", // Pending commit inventories
 ];
 
 /// Use the released format ID only for an exact, reviewed source digest in its domain.

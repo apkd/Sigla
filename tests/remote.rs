@@ -792,7 +792,76 @@ fn lifecycle() -> Result<()> {
     let abbreviated = format!("ssh://git@fixture.invalid/repo#{}", &original_commit[..8]);
     server.until(tag, "type:Main", "Main")?;
     server.until(&pinned, "type:Main", "Main")?;
-    server.until(&abbreviated, "type:Main", "Main")?;
+    let generic = "ssh://git@fixture.invalid/repo";
+    let identity = sigla::repository::Repository::parse(generic)?
+        .unwrap()
+        .identity;
+    let generic_full = format!("{generic}#{original_commit}");
+    let second_prefix = format!("{generic}#{}", &original_commit[..10]);
+    let immutable_views = |indexed: bool| -> Result<Vec<PathBuf>> {
+        let mut owners = Vec::new();
+        for entry in fs::read_dir(root.path().join("cache/repositories"))? {
+            let path = entry?.path();
+            if path.join("state.bin").is_file() {
+                let state = sigla::repository::state_store::read(&path)?;
+                if state.repository == identity
+                    && state.prepared.revision == original_commit
+                    && (!indexed || state.indexed_revision.as_deref() == Some(&original_commit))
+                    && (matches!(
+                        state.target,
+                        sigla::repository::materialize::Target::Commit(_)
+                    ) || state.prepared.resolved_target.is_some())
+                {
+                    owners.push(path);
+                }
+            }
+        }
+        owners.sort();
+        Ok(owners)
+    };
+    let check_label = |url: &str, label: &str| -> Result<()> {
+        let response = server.until(url, "type:Main wait:complete", "pub struct Main")?;
+        ensure!(
+            response.contains(&format!("{label} @ ")),
+            "Wrong commit label: {response}"
+        );
+        Ok(())
+    };
+    check_label(&abbreviated, &original_commit[..8])?;
+    let prepared = immutable_views(false)?;
+    check_label(&generic_full, &original_commit)?;
+    ensure!(
+        immutable_views(false)? == prepared,
+        "Full SHA materialized another repository view"
+    );
+    let (error, tree, complete) =
+        server.call_status("browse", json!({"codebase":second_prefix, "path":"src"}))?;
+    ensure!(
+        !error && complete != Some(false) && tree.contains("lib.rs"),
+        "A newly resolved abbreviation missed the prepared workspace: {tree}"
+    );
+    ensure!(
+        tree.contains(&format!("{} @ ", &original_commit[..10])),
+        "Wrong browse label: {tree}"
+    );
+    server.until(&second_prefix, "type:Main wait:complete", "pub struct Main")?;
+    let owners = immutable_views(true)?;
+    ensure!(
+        owners.len() == 1,
+        "Commit spellings prepared separate workspaces: {owners:?}"
+    );
+    let all = immutable_views(false)?;
+    let proof = all
+        .iter()
+        .find(|path| !owners.contains(path))
+        .context("Missing durable commit proof")?;
+    let saved = sigla::repository::state_store::read(proof)?;
+    ensure!(
+        saved.repair
+            && saved.prepared.tracked.contains_key("src/lib.rs")
+            && !proof.join("source/src/lib.rs").exists(),
+        "A new abbreviation copied files despite a usable workspace"
+    );
     let (error, tree) = server.call("browse", json!({"codebase":abbreviated}))?;
     ensure!(
         !error && tree.contains("lib.rs"),
@@ -853,6 +922,12 @@ fn lifecycle() -> Result<()> {
         &["commit", "--quiet", "--amend", "-am", "force push"],
     )?;
     git(&upstream, &["branch", "-f", &original_commit[..8]])?;
+    git(&upstream, &["branch", &original_commit[..9]])?;
+    server.until(
+        &format!("{generic}#{}", &original_commit[..9]),
+        "type:Changed",
+        "Changed",
+    )?;
     let started = Instant::now();
     loop {
         let (error, source) = server.call(
@@ -903,6 +978,12 @@ fn lifecycle() -> Result<()> {
     server.until(tag, "type:Changed", "Changed")?;
     server.until(&pinned, "type:Main", "Main")?;
     server.until(&abbreviated, "type:Main", "Main")?;
+    server.until(&second_prefix, "type:Main", "Main")?;
+    server.until(&generic_full, "type:Main", "Main")?;
+    ensure!(
+        immutable_views(true)? == owners,
+        "Offline restart lost the shared commit workspace"
+    );
     let (error, cached) = server.query(main, "type:Changed")?;
     ensure!(
         !error && cached.contains("Changed"),
@@ -934,6 +1015,32 @@ fn lifecycle() -> Result<()> {
     server.until(main, "type:Adaptive", "Adaptive")?;
     server.until(&pinned, "type:Main", "Main")?;
     server.until(&abbreviated, "type:Main", "Main")?;
+    drop(server);
+
+    // Recovering the tree for a browse must charge the saved selector even if
+    // the process exits before anyone asks for sources.
+    git(&upstream, &["branch", "retained-commit", &original_commit])?;
+    fs::rename(&owners[0], root.path().join("evicted-owner"))?;
+    let pool = root
+        .path()
+        .join("cache/git")
+        .join(saved.repository.storage_key());
+    fs::rename(pool.join("current"), root.path().join("lost-pool"))?;
+    let before = sigla::repository::state_store::read(proof)?
+        .prepared
+        .transfer_bytes;
+    let server = Server::start(root.path())?;
+    let (error, tree) = server.call("browse", json!({"codebase":second_prefix,"path":"src"}))?;
+    ensure!(
+        !error && tree.contains("lib.rs"),
+        "Lost-pool browse failed: {tree}"
+    );
+    drop(server);
+    let recovered = sigla::repository::state_store::read(proof)?;
+    ensure!(
+        recovered.repair && recovered.prepared.transfer_bytes > before,
+        "Inventory-only recovery did not persist its transfer cost"
+    );
     Ok(())
 }
 
@@ -1050,15 +1157,17 @@ fn check_required_input_generations(root: &Path) -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let options = RemoteOptions {
-            rules: vec![Rule::parse_private("ssh://git@fixture.invalid/repo")?],
-            refresh_interval: Some(Duration::from_secs(3600)),
-            repo_ttl: Duration::from_secs(86400),
-            branch_ttl: Duration::from_secs(86400),
-            unity_versions: Vec::new(),
-            selection: Selection::new(&[], &[])?,
+        let options = || -> Result<_> {
+            Ok(RemoteOptions {
+                rules: vec![Rule::parse_private("ssh://git@fixture.invalid/repo")?],
+                refresh_interval: Some(Duration::from_secs(3600)),
+                repo_ttl: Duration::from_secs(86400),
+                branch_ttl: Duration::from_secs(86400),
+                unity_versions: Vec::new(),
+                selection: Selection::new(&[], &[])?,
+            })
         };
-        let manager = Manager::new(root.join("cache"), options)?;
+        let manager = Manager::new(root.join("cache"), options()?)?;
         let repository = Repository::parse("ssh://git@fixture.invalid/repo#refs/heads/main")?
             .context("Missing fixture repository")?;
         let branch = manager.resolve(repository.clone()).await?;
@@ -1109,6 +1218,67 @@ fn check_required_input_generations(root: &Path) -> Result<()> {
         ensure!(
             fs::read_to_string(&required)? == "pub struct Required;\n",
             "Warm resolution did not repair a missing source"
+        );
+        let prefix = &revision[..9];
+        let selector = |name: &str| {
+            Repository::parse(&format!("ssh://git@fixture.invalid/repo#{name}"))?
+                .context("Missing fixture selector")
+        };
+        let short = manager.resolve(selector(prefix)?).await?;
+        let full = manager.resolve(selector(&revision)?).await?;
+        ensure!(std::sync::Arc::ptr_eq(&short, &full));
+        let alternate = &revision[..11];
+        let (one, two) = tokio::try_join!(
+            manager.resolve(selector(alternate)?),
+            manager.resolve(selector(alternate)?)
+        )?;
+        ensure!(
+            std::sync::Arc::ptr_eq(&one, &short) && std::sync::Arc::ptr_eq(&two, &short),
+            "Concurrent requests did not join the same commit workspace"
+        );
+        let root_to_evict = short.root.clone();
+        drop((short, full, one, two));
+        ensure!(manager.evict(&root_to_evict, true, || Ok(()), |()| Ok(()))?);
+        manager.flush_usage().await?;
+        drop(manager);
+        let (proof_root, mut proof) = fs::read_dir(root.join("cache/repositories"))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let state = sigla::repository::state_store::read(&path).ok()?;
+                (state.branch == alternate).then_some((path, state))
+            })
+            .next()
+            .context("Abbreviation was not persisted")?;
+        ensure!(proof.repair && !proof_root.join("source/lib.rs").exists());
+        // The fixture's local Git transfer can cost zero bytes. Seed an existing spend
+        // to check that resuming from disk does not grant a fresh allowance.
+        let spent = proof.prepared.transfer_bytes + 12345;
+        proof.prepared.transfer_bytes = spent;
+        sigla::repository::state_store::update(&proof_root, &proof)?;
+        fs::write(root.join("offline"), "")?;
+        let manager = Manager::new(root.join("cache"), options()?)?;
+        let resumed = manager.resolve(selector(alternate)?).await?;
+        ensure!(resumed.root == proof_root && resumed.source().join("lib.rs").is_file());
+        ensure!(
+            sigla::repository::state_store::read(&proof_root)?
+                .prepared
+                .transfer_bytes
+                >= spent,
+            "Materializing a retained commit reset the transfer count"
+        );
+        fs::remove_file(root.join("offline"))?;
+        let upstream = root.join("upstream");
+        git(
+            &upstream,
+            &["commit", "--quiet", "--allow-empty", "-m", "Advance main"],
+        )?;
+        git(&upstream, &["branch", prefix])?;
+        let rebound = manager.resolve(selector(prefix)?).await?;
+        let state = rebound.state.read().await;
+        let prepared = &state.as_ref().context("Missing branch state")?.prepared;
+        ensure!(
+            prepared.branch.as_deref() == Some(prefix) && prepared.revision != revision,
+            "Retired abbreviation hid a newly created upstream branch"
         );
         Ok(())
     })

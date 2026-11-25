@@ -188,12 +188,13 @@ impl App {
     pub(super) async fn search_rust(
         self: &Arc<Self>,
         ready: Arc<Ready>,
-        branch: Arc<crate::repository::manager::Branch>,
+        selection: (Arc<crate::repository::manager::Branch>, Option<&str>),
         query: Query,
         activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
         operation: crate::telemetry::Operation,
         wait: &indexes::Wait,
     ) -> Result<CallToolResult> {
+        let (branch, alias) = selection;
         let Some((permit, state, branch_state)) = wait
             .until(self.admit_query(ready.state.clone(), Some(&branch), &operation))
             .await?
@@ -216,7 +217,7 @@ impl App {
         let prepared = &branch_state.as_ref().unwrap().as_ref().unwrap().prepared;
         let summary = crate::summary::Summary::build(
             &branch.repository.identity,
-            &branch.selector(prepared),
+            alias.unwrap_or(&branch.selector(prepared)),
             &ready.revision,
             prepared.tracked.len(),
             &branch.source(),
@@ -376,7 +377,7 @@ mod tests {
             tokio::spawn(async move {
                 app.search_rust(
                     ready,
-                    branch,
+                    (branch, None),
                     Query::parse("type:Nested lang:rust")?,
                     Arc::new(app.activity.clone().read_owned().await),
                     crate::telemetry::Operation::default(),
@@ -452,7 +453,7 @@ mod tests {
         let error = app
             .search_rust(
                 ready,
-                branch,
+                (branch, None),
                 Query::parse("type:Nested lang:rust")?,
                 Arc::new(app.activity.clone().read_owned().await),
                 crate::telemetry::Operation::default(),
