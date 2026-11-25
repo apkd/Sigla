@@ -494,9 +494,12 @@ fn main() {
     ] {
         workspace.update(fs::read(file).unwrap());
     }
+    // Only the compatibility line is shared across releases. The full marker
+    // below still hashes the actual sources, so derived workspaces are rebuilt.
+    let layout = format!("{:x}", cache_layout.clone().finalize());
     println!(
-        "cargo:rustc-env=SIGLA_CACHE_LAYOUT_FINGERPRINT={:x}",
-        cache_layout.clone().finalize()
+        "cargo:rustc-env=SIGLA_CACHE_LAYOUT_FINGERPRINT={}",
+        fingerprints::compatible("LAYOUT", &layout)
     );
     for (domain, hash) in [
         ("ANALYSIS", analysis),
@@ -508,7 +511,10 @@ fn main() {
         cache_layout.update(domain.as_bytes());
         cache_layout.update(source.as_bytes());
         println!("cargo:rustc-env=SIGLA_{domain}_SOURCE_FINGERPRINT={source}");
-        println!("cargo:rustc-env=SIGLA_{domain}_FINGERPRINT={source}");
+        println!(
+            "cargo:rustc-env=SIGLA_{domain}_FINGERPRINT={}",
+            fingerprints::compatible(domain, &source)
+        );
     }
     println!(
         "cargo:rustc-env=SIGLA_CACHE_FINGERPRINT={:x}",

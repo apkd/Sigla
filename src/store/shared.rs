@@ -658,12 +658,15 @@ impl Database {
         names::changed(self, tx, partition)?;
         // The key already contains the high bits of the object ordinal.
         let value = [(ordinal % PARTITION) as u8];
+        let prefix = partition.to_be_bytes();
+        let mut key = prefix.to_vec();
         for (table, names) in [
             (self.declarations, &names.declarations),
             (self.occurrences, &names.occurrences),
         ] {
             for name in names {
-                let key = scope_key(partition, name.as_bytes());
+                key.truncate(prefix.len());
+                key.extend_from_slice(name.as_bytes());
                 if add {
                     table.put(tx, &key, &value)?;
                 } else {
@@ -672,47 +675,82 @@ impl Database {
             }
         }
         if names.global_imports {
-            let key = partition.to_be_bytes();
             if add {
-                self.globals.put(tx, &key, &value)?;
+                self.globals.put(tx, &prefix, &value)?;
             } else {
-                self.globals.delete_one_duplicate(tx, &key, &value)?;
+                self.globals.delete_one_duplicate(tx, &prefix, &value)?;
             }
         }
         Ok(())
     }
-    fn adjust(
+    /// Bind an existing object or publish its immutable records and first binding together.
+    fn acquire_object(
         &self,
         tx: &mut RwTxn<'_>,
         id: &ObjectId,
-        add: bool,
-        count: u64,
-        now: u64,
-    ) -> Result<()> {
-        let mut live = self
-            .live(tx, id)?
-            .context("Binding points to missing object")?;
-        if add {
-            if let Some(at) = live.unused_since {
+        current: Option<Liveness>,
+        encoded: Option<&EncodedObject>,
+    ) -> Result<Option<Liveness>> {
+        let live = if let Some(mut live) = current {
+            if let Some(at) = live.unused_since.take() {
                 self.control.delete(tx, &unused_key(id, at))?;
             }
             live.bindings = live
                 .bindings
-                .checked_add(count)
+                .checked_add(1)
                 .context("Object binding count overflow")?;
-            live.unused_since = None;
+            live
         } else {
-            live.bindings = live
-                .bindings
-                .checked_sub(count)
-                .context("Object binding count underflow")?;
-            if live.bindings == 0 {
-                live.unused_since = Some(now);
-                self.control.put(tx, &unused_key(id, now), &[])?;
+            let Some((value, bytes, names)) = encoded else {
+                return Ok(None); // A prepared hit was collected; rebuild outside the writer.
+            };
+            self.records.put(tx, id, &value.names)?;
+            let mut key = id.to_vec();
+            for (suffix, bytes) in &value.records {
+                key.truncate(id.len());
+                key.extend_from_slice(suffix);
+                self.records.put(tx, &key, bytes)?;
             }
+            let ordinal = self
+                .control
+                .get(tx, b"next-object")?
+                .map(decode::<u64>)
+                .transpose()?
+                .unwrap_or(0);
+            let next = ordinal.checked_add(1).context("Object IDs exhausted")?;
+            self.control.put(tx, b"next-object", &encode(&next)?)?;
+            self.postings(tx, ordinal, names, true)?;
+            Liveness {
+                ordinal,
+                bindings: 1,
+                unused_since: None,
+                encoded_bytes: *bytes,
+            }
+        };
+        self.objects.put(tx, id, &encode_live(&live)?)?;
+        Ok(Some(live))
+    }
+
+    fn release_object(
+        &self,
+        tx: &mut RwTxn<'_>,
+        id: &ObjectId,
+        count: u64,
+        now: u64,
+    ) -> Result<u64> {
+        let mut live = self
+            .live(tx, id)?
+            .context("Binding points to missing object")?;
+        live.bindings = live
+            .bindings
+            .checked_sub(count)
+            .context("Object binding count underflow")?;
+        if live.bindings == 0 {
+            live.unused_since = Some(now);
+            self.control.put(tx, &unused_key(id, now), &[])?;
         }
         self.objects.put(tx, id, &encode_live(&live)?)?;
-        Ok(())
+        Ok(live.ordinal)
     }
 
     /// Visit only expired unused objects; removing their index entries records progress.
@@ -981,7 +1019,10 @@ impl Scope {
         Ok(info)
     }
     fn dirty_in(&self, tx: &mut RwTxn<'_>) -> Result<()> {
-        let mut info = self.writable(tx)?;
+        let info = self.writable(tx)?;
+        self.mark_dirty(tx, info)
+    }
+    fn mark_dirty(&self, tx: &mut RwTxn<'_>, mut info: WorkspaceInfo) -> Result<()> {
         if info.phase != Phase::Dirty {
             info.phase = Phase::Dirty;
             self.database
@@ -1283,76 +1324,46 @@ impl Scope {
             input: _,
         } = pending;
         let now = *now;
-        self.writable(tx)?;
+        let info = self.writable(tx)?;
         let old = self.binding(tx, file)?;
+        let current = self.database.live(tx, object)?;
         // Another caller may already have installed exactly this revision.
         if old
             .as_ref()
             .is_some_and(|b| &b.object == object && &b.revision == revision)
-            && self.indexed(tx, file, object)?
         {
-            let bytes = self
-                .database
-                .live(tx, object)?
-                .context("Missing bound object")?
-                .encoded_bytes;
-            return Ok(Some(Installed {
-                reused: true,
-                encoded_bytes: bytes,
-                ..Default::default()
-            }));
+            let live = current.as_ref().context("Missing bound object")?;
+            if self.indexed(tx, file, live.ordinal)? {
+                return Ok(Some(Installed {
+                    reused: true,
+                    encoded_bytes: live.encoded_bytes,
+                    ..Default::default()
+                }));
+            }
         }
         ensure!(
             &old == expected,
             "File binding changed during extraction; retry refresh"
         );
-        let absent = self.database.live(tx, object)?.is_none();
-        if absent && encoded.is_none() {
-            return Ok(None);
-        }
-        self.dirty_in(tx)?;
-        if absent {
-            let (value, bytes, names) = encoded.as_deref().unwrap();
-            self.database.records.put(tx, object, &value.names)?;
-            for (key, bytes) in &value.records {
+        let built = current.is_none();
+        let live = if old.as_ref().is_some_and(|b| &b.object == object) {
+            current.context("Missing bound object")?
+        } else {
+            let Some(live) =
                 self.database
-                    .records
-                    .put(tx, &record_key(object, key), bytes)?;
-            }
-            let ordinal = self
-                .database
-                .control
-                .get(tx, b"next-object")?
-                .map(decode::<u64>)
-                .transpose()?
-                .unwrap_or(0);
-            ensure!(ordinal < u64::MAX, "Object IDs exhausted");
-            self.database.control.put(
-                tx,
-                b"next-object",
-                &encode(&ordinal.checked_add(1).context("Object IDs exhausted")?)?,
-            )?;
-            self.database.postings(tx, ordinal, names, true)?;
-            let live = Liveness {
-                ordinal,
-                bindings: 0,
-                unused_since: Some(now),
-                encoded_bytes: *bytes,
+                    .acquire_object(tx, object, current, encoded.as_deref())?
+            else {
+                return Ok(None);
             };
-            self.database
-                .objects
-                .put(tx, object, &encode_live(&live)?)?;
-        }
-        let changed = old.as_ref().is_none_or(|b| &b.object != object);
-        if changed {
             if let Some(old) = &old {
-                self.member(tx, file, &old.object, false)?;
-                self.database.adjust(tx, &old.object, false, 1, now)?;
+                self.release_member(tx, file, &old.object, now)?;
             }
-            self.database.adjust(tx, object, true, 1, now)?;
-        }
-        self.member(tx, file, object, true)?;
-        let bytes = self.database.live(tx, object)?.unwrap().encoded_bytes;
+            live
+        };
+        self.mark_dirty(tx, info)?;
+        self.database
+            .members
+            .put(tx, &scope_key(self.id, &live.ordinal.to_be_bytes()), file)?;
         self.database.bindings.put(
             tx,
             &scope_key(self.id, file.as_bytes()),
@@ -1362,18 +1373,13 @@ impl Scope {
             })?,
         )?;
         Ok(Some(Installed {
-            built: absent,
-            reused: !absent,
-            encoded_bytes: bytes,
+            built,
+            reused: !built,
+            encoded_bytes: live.encoded_bytes,
         }))
     }
 
-    fn indexed(&self, tx: &RoTxn<'_>, file: &str, object: &ObjectId) -> Result<bool> {
-        let ordinal = self
-            .database
-            .live(tx, object)?
-            .context("Missing bound object")?
-            .ordinal;
+    fn indexed(&self, tx: &RoTxn<'_>, file: &str, ordinal: u64) -> Result<bool> {
         if let Some(rows) = self
             .database
             .members
@@ -1387,27 +1393,27 @@ impl Scope {
         }
         Ok(false)
     }
-    fn member(&self, tx: &mut RwTxn<'_>, file: &str, object: &ObjectId, add: bool) -> Result<()> {
-        let ordinal = self
-            .database
-            .live(tx, object)?
-            .context("Missing bound object")?
-            .ordinal;
-        let key = scope_key(self.id, &ordinal.to_be_bytes());
-        if add {
-            self.database.members.put(tx, &key, file)?;
-        } else {
-            self.database.members.delete_one_duplicate(tx, &key, file)?;
-        }
+    fn release_member(
+        &self,
+        tx: &mut RwTxn<'_>,
+        file: &str,
+        object: &ObjectId,
+        now: u64,
+    ) -> Result<()> {
+        let ordinal = self.database.release_object(tx, object, 1, now)?;
+        self.database.members.delete_one_duplicate(
+            tx,
+            &scope_key(self.id, &ordinal.to_be_bytes()),
+            file,
+        )?;
         Ok(())
     }
     fn detach_in(&self, tx: &mut RwTxn<'_>, file: &str, now: u64) -> Result<()> {
         if let Some(binding) = self.binding(tx, file)? {
-            self.member(tx, file, &binding.object, false)?;
+            self.release_member(tx, file, &binding.object, now)?;
             self.database
                 .bindings
                 .delete(tx, &scope_key(self.id, file.as_bytes()))?;
-            self.database.adjust(tx, &binding.object, false, 1, now)?;
         }
         Ok(())
     }
@@ -1745,7 +1751,7 @@ impl Scope {
         // Shared objects need one liveness update per batch. ID order also
         // groups writes to neighboring object pages on slower storage.
         for (object, count) in released {
-            self.database.adjust(&mut tx, &object, false, count, now)?;
+            self.database.release_object(&mut tx, &object, count, now)?;
         }
         let done = self.files_after(&tx, None, 1)?.is_empty();
         if done {

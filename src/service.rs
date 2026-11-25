@@ -3522,10 +3522,20 @@ mod tests {
         let repeated = app.search(project, "Prepared").await.unwrap();
         assert!(repeated.contains("Prepared"), "{repeated}");
         assert_eq!(job(), original_job);
+        // A query can pin this revision throughout the next preparation.
+        // Publishing an unchanged completion marker must not wait for it.
+        let analysis = branch.analyze().await;
         branch
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let refreshed = app.search(project, "Prepared").await.unwrap();
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.search(project, "Prepared wait:complete"),
+        )
+        .await
+        .expect("index completion should not wait for a pinned query")
+        .unwrap();
+        drop(analysis);
         assert!(refreshed.contains("Prepared"), "{refreshed}");
         assert_ne!(job(), original_job);
         let refreshed_job = job();

@@ -113,8 +113,12 @@ pub(crate) struct Directory {
 #[derive(Serialize, Deserialize)]
 struct Page<'a> {
     offsets: Vec<u32>,
-    #[serde(borrow)]
+    #[serde(borrow, serialize_with = "page_bytes")]
     data: &'a [u8],
+}
+
+fn page_bytes<S: serde::Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(data)
 }
 
 pub(crate) struct PageIndex {
@@ -150,8 +154,10 @@ fn pages<T: Serialize>(
     let mut starts = Vec::new();
     let mut data = Vec::new();
     let mut offsets = Vec::new();
+    let mut bytes = Vec::new();
     for (id, item) in items.iter().enumerate() {
-        let bytes = encode(item)?;
+        bytes.clear();
+        bytes = postcard::to_extend(item, bytes)?;
         if !data.is_empty() && data.len() + bytes.len() + offsets.len() * 4 > PAGE_BYTES {
             offsets.push(data.len().try_into()?);
             records.insert(
@@ -167,7 +173,7 @@ fn pages<T: Serialize>(
             starts.push(id.try_into()?);
         }
         offsets.push(data.len().try_into()?);
-        data.extend(bytes);
+        data.extend_from_slice(&bytes);
     }
     if !offsets.is_empty() {
         offsets.push(data.len().try_into()?);

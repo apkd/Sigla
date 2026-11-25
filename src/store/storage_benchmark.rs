@@ -109,6 +109,189 @@ fn queries(space: &Scope) -> Result<Vec<BTreeSet<String>>> {
     Ok(expected)
 }
 
+fn source_table(source: &Env, read: &RoTxn<'_>, name: &str) -> Result<Table<Bytes, Bytes>> {
+    source
+        .open_database(read, Some(name))?
+        .with_context(|| format!("Missing source table {name}"))
+}
+
+fn input_aliases<'a>(
+    control: Table<Bytes, Bytes>,
+    read: &'a RoTxn<'_>,
+) -> Result<BTreeMap<&'a [u8], &'a [u8]>> {
+    let mut aliases = BTreeMap::new();
+    for row in control.iter(read)? {
+        let (key, object) = row?;
+        if key.get(32..) == Some(b"input") {
+            aliases.insert(key, object);
+        }
+    }
+    Ok(aliases)
+}
+
+fn captured_installs(
+    source: &Env,
+    read: &RoTxn<'_>,
+    db: &Arc<Database>,
+) -> Result<(Scope, Vec<PendingInstall>)> {
+    let spaces = source_table(source, read, "workspaces")?;
+    ensure!(spaces.len(read)? == 1, "Expected one workspace");
+    let (fingerprint, info) = spaces.first(read)?.unwrap();
+    let info: WorkspaceInfo = decode(info)?;
+    ensure!(
+        info.phase == Phase::Clean,
+        "Source workspace is not complete"
+    );
+    let scope = db.workspace(fingerprint.try_into()?, &info.entry, info.owner.as_deref())?;
+    ensure!(scope.id == info.id, "Expected a fresh workspace namespace");
+    let mut files = BTreeMap::<ObjectId, Vec<_>>::new();
+    for row in source_table(source, read, "bindings")?.prefix_iter(read, &scope.id.to_be_bytes())? {
+        let (key, value) = row?;
+        let binding: Binding = decode(value)?;
+        files
+            .entry(binding.object)
+            .or_default()
+            .push((std::str::from_utf8(&key[8..])?, binding.revision));
+    }
+    let mut order = Vec::new();
+    for row in source_table(source, read, "objects")?.iter(read)? {
+        let (key, value) = row?;
+        order.push((decode_live(value)?.ordinal, ObjectId::try_from(key)?));
+    }
+    order.sort_unstable();
+    let records = source_table(source, read, "records")?;
+    let mut pending = Vec::new();
+    for (_, object) in order {
+        let mut aliases = Vec::new();
+        let mut encoded = Encoded {
+            names: records
+                .get(read, &object)?
+                .context("Missing names")?
+                .to_vec(),
+            records: BTreeMap::new(),
+        };
+        for row in records.prefix_iter(read, &object)? {
+            let (key, value) = row?;
+            let suffix = &key[object.len()..];
+            if let Some(input) = suffix.strip_prefix(INPUT_ALIAS) {
+                aliases.push(ObjectId::try_from(input)?);
+            } else if !suffix.is_empty() && suffix != POSTING_NAMES {
+                encoded.records.insert(suffix.into(), value.into());
+            }
+        }
+        let bindings = files.remove(&object).context("Expected a bound object")?;
+        ensure!(
+            aliases.len() <= bindings.len(),
+            "Snapshot contains historical input aliases"
+        );
+        let mut encoded = Some(encoded);
+        for (file, revision) in bindings {
+            pending.push(
+                scope
+                    .prepare_install(file, revision, object, 0, || {
+                        encoded.take().context("Shared encoding was not retained")
+                    })?
+                    .input(aliases.pop()),
+            );
+        }
+    }
+    ensure!(
+        files.is_empty() && !pending.is_empty(),
+        "Incomplete snapshot"
+    );
+    Ok((scope, pending))
+}
+
+/// Replay the writer alone. The input is a closed cold index with one workspace;
+/// its object ordinals preserve the order in which it first published each object.
+#[test]
+#[ignore = "requires SIGLA_STORAGE_REFERENCE and SIGLA_STORAGE_CACHE on the device under test"]
+fn replay_captured_publication() -> Result<()> {
+    let path = |key| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .with_context(|| format!("Missing {key}"))
+    };
+    let limit = setting("SIGLA_STORAGE_BATCH_MIB", 16)?;
+    ensure!((1..=128).contains(&limit), "Invalid batch size");
+    let directory = tempfile::tempdir_in(path("SIGLA_STORAGE_CACHE")?)?;
+    let db = Database::open(directory.path())?;
+    // Register a reader and leave the source database unchanged.
+    let source = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(12)
+            .flags(heed::EnvFlags::READ_ONLY)
+            .open(path("SIGLA_STORAGE_REFERENCE")?)
+    }?;
+    let read = source.read_txn()?;
+    let (scope, pending) = captured_installs(&source, &read, &db)?;
+    let writes = || -> Result<u64> {
+        Ok(std::fs::read_to_string("/proc/self/io")?
+            .lines()
+            .find_map(|line| line.strip_prefix("write_bytes: "))
+            .context("Missing write counter")?
+            .parse()?)
+    };
+    let before = scope.read()?.id();
+    let dirty = writes()?;
+    let started = Instant::now();
+    let mut remaining = pending.as_slice();
+    while !remaining.is_empty() {
+        let mut count = 0;
+        let mut bytes = 0;
+        for object in remaining {
+            bytes += object.bytes();
+            count += 1;
+            if bytes >= (limit as u64) << 20 {
+                break;
+            }
+        }
+        let (batch, tail) = remaining.split_at(count);
+        ensure!(
+            scope
+                .install_batch(batch, |_| Ok(()))?
+                .iter()
+                .all(Option::is_some),
+            "Missing install"
+        );
+        remaining = tail;
+    }
+    let elapsed = started.elapsed();
+    let written = writes()? - dirty;
+    let actual = scope.read()?;
+    for (name, output) in [
+        ("objects", db.objects),
+        ("records", db.records),
+        ("bindings", db.bindings),
+        ("members", db.members.remap_types()),
+        ("shared-declarations", db.declarations),
+        ("shared-occurrences", db.occurrences),
+        ("shared-global-imports", db.globals),
+    ] {
+        let expected = source_table(&source, &read, name)?;
+        ensure!(
+            expected.len(&read)? == output.len(&actual)?,
+            "{name}: row count changed"
+        );
+        for (a, b) in expected.iter(&read)?.zip(output.iter(&actual)?) {
+            ensure!(a? == b?, "{name}: row changed");
+        }
+    }
+    ensure!(
+        input_aliases(source_table(&source, &read, "control")?, &read)?
+            == input_aliases(db.control, &actual)?,
+        "Input aliases changed"
+    );
+    println!(
+        "batch_mib={limit} files={} transactions={} elapsed_ms={} write_bytes={written} data_file_bytes={}",
+        pending.len(),
+        actual.id() - before,
+        elapsed.as_millis(),
+        db.disk_bytes()?
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "opt-in storage replay; writes about 625 MiB with defaults"]
 fn replay_storage_publication() -> Result<()> {

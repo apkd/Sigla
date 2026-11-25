@@ -448,6 +448,53 @@ mod refresh_tests {
     }
 
     #[tokio::test]
+    async fn indexing_updates_only_the_current_healthy_header() {
+        let root = tempfile::tempdir().unwrap();
+        let branch = Arc::new(Branch::for_test(root.path().into()));
+        let initial = state();
+        branch.persist(&initial).unwrap();
+        *branch.state.write().await = Some(Arc::new(initial));
+        let _interest = branch.demand.interest();
+        let work = branch.demand.work();
+        let operation = crate::telemetry::Operation::default();
+        let mark = |complete| branch.mark_indexed(0, complete, &work, &operation);
+        let saved = || {
+            super::super::state_store::header(root.path())
+                .unwrap()
+                .indexed_revision
+        };
+
+        let reader = branch.analyze().await;
+        tokio::time::timeout(Duration::from_secs(5), mark(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved().as_ref(),
+            Some(&reader.as_ref().unwrap().prepared.revision)
+        );
+        assert!(reader.as_ref().unwrap().indexed_revision.is_none());
+        let indexed = branch.state.read().await.clone().unwrap();
+        mark(true).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &indexed,
+            branch.state.read().await.as_ref().unwrap()
+        ));
+        mark(false).await.unwrap();
+        assert!(saved().is_none());
+
+        branch.generation.store(1, Ordering::Release);
+        mark(true).await.unwrap();
+        assert!(saved().is_none());
+        Arc::make_mut(branch.state.write().await.as_mut().unwrap()).repair = true;
+        branch
+            .mark_indexed(1, true, &work, &operation)
+            .await
+            .unwrap();
+        assert!(saved().is_none());
+    }
+
+    #[tokio::test]
     async fn unchanged_ref_publication_preserves_indexing_and_rejects_stale_inputs() {
         let cache = tempfile::tempdir().unwrap();
         let mut options = options();
@@ -1095,6 +1142,7 @@ pub(crate) struct PublicationGuard {
     state: OwnedRwLockWriteGuard<Option<Arc<State>>>,
     _analysis: Option<OwnedRwLockWriteGuard<()>>,
 }
+#[cfg(test)]
 impl PublicationGuard {
     pub(crate) fn as_mut(&mut self) -> Option<&mut State> {
         self.state.as_mut().map(Arc::make_mut)
@@ -1248,6 +1296,44 @@ impl Branch {
 
     pub(crate) async fn publish(&self) -> PublicationGuard {
         self.publication(false).await
+    }
+
+    /// Completion changes the header only. Pinned analyses keep their source snapshot.
+    pub(crate) async fn mark_indexed(
+        self: &Arc<Self>,
+        generation: u64,
+        complete: bool,
+        work: &crate::demand::Work,
+        operation: &crate::telemetry::Operation,
+    ) -> Result<()> {
+        let mut gate = {
+            let _wait = operation.wait("branch_state");
+            work.until(async { Ok(self.state.clone().write_owned().await) })
+                .await?
+        };
+        let state = gate.as_ref().unwrap();
+        let revision = complete.then_some(state.prepared.revision.as_str());
+        if state.repair
+            || self.generation.load(Ordering::Acquire) != generation
+            || state.indexed_revision.as_deref() == revision
+        {
+            return Ok(());
+        }
+        let indexed = revision.map(str::to_owned);
+        let branch = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = Arc::make_mut(gate.as_mut().unwrap());
+            let previous = std::mem::replace(&mut state.indexed_revision, indexed);
+            let used =
+                std::mem::replace(&mut state.last_use, branch.last_use.load(Ordering::Relaxed));
+            if let Err(error) = branch.persist_header(state) {
+                state.indexed_revision = previous;
+                state.last_use = used;
+                return Err(error);
+            }
+            Ok(())
+        })
+        .await?
     }
 
     /// Optional assets only add deferred files; active code snapshots stay valid.

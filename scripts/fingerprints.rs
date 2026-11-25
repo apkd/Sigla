@@ -1,3 +1,24 @@
+// These writers preserve the 0.1.51/52 blob IDs, LMDB records and repository headers.
+const LAYOUT_0_1_52: &str = "7ea55abcbd7073418e58ad18045ca16cc0d54dff835a696bfa3e1f772deb067c";
+const ANALYSIS_0_1_52: &str = "6154a2c53407f83a0aa39cfff38a00f27aebacbee3a386f5df678fb30a5c42ae";
+const BUFFERED_PAGE_ENCODER: &str =
+    "5448e5e53db30c775b90ba19c79a49ab65584e1774bf12739f8ba8157b29302b";
+const COMPATIBLE_WRITERS: &[&str] = &[
+    "343eb29dc689806e25e79e36027290201a7f1a3237a05ae536af946a00a7aede", // First binding
+    "f795f98ce053000a88db10bf395ba01e258a2559f2cac94877708f42295d2085", // Index marker
+    "0264b8a95348bba494dee3707697fae41d175722baf356da58ed85f6b1403e79", // Key buffers
+    "cf1fafbe06938f4ca2dcce73c20e46ae68549b8337b83635cd9b008171db5dfe", // Page encoder
+];
+
+/// Use the released format ID only for an exact, reviewed source digest in its domain.
+pub fn compatible<'a>(domain: &str, digest: &'a str) -> &'a str {
+    match domain {
+        "LAYOUT" if COMPATIBLE_WRITERS.contains(&digest) => LAYOUT_0_1_52,
+        "ANALYSIS" if digest == BUFFERED_PAGE_ENCODER => ANALYSIS_0_1_52,
+        _ => digest,
+    }
+}
+
 /// Source inputs to analysis, workspace, assets, asset records, and cache layout.
 pub fn domains(name: &str) -> [bool; 5] {
     // These standalone modules are compiled only in test builds. Keep this list
@@ -87,6 +108,32 @@ pub fn domains(name: &str) -> [bool; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_reviewed_writers_can_reuse_the_released_layout_id() {
+        for &reviewed in COMPATIBLE_WRITERS {
+            assert_eq!(compatible("LAYOUT", reviewed), LAYOUT_0_1_52);
+            let mut unknown = reviewed.to_owned();
+            unknown.replace_range(..1, if reviewed.starts_with('0') { "1" } else { "0" });
+            assert_eq!(compatible("LAYOUT", &unknown), unknown);
+        }
+    }
+
+    #[test]
+    fn reviewed_page_encoding_preserves_only_analysis_identity() {
+        assert_eq!(
+            compatible("ANALYSIS", BUFFERED_PAGE_ENCODER),
+            ANALYSIS_0_1_52
+        );
+        assert_eq!(
+            compatible("WORKSPACE", BUFFERED_PAGE_ENCODER),
+            BUFFERED_PAGE_ENCODER
+        );
+        assert_eq!(
+            compatible("ANALYSIS", COMPATIBLE_WRITERS[0]),
+            COMPATIBLE_WRITERS[0]
+        );
+    }
 
     fn fingerprint(files: &[(&str, &str)]) -> [Vec<u8>; 5] {
         let mut hashes: [Vec<u8>; 5] = Default::default();

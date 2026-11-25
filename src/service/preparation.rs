@@ -1287,28 +1287,9 @@ pub(super) fn start(preparing_app: Arc<App>, request: Request) -> Ticket {
                 .as_ref()
                 .map(|branch| branch.generation.load(std::sync::atomic::Ordering::Acquire));
             drop(branch_state);
-            if let Some(branch) = &preparing_branch {
-                let mut gate = {
-                    let _wait = operation.wait("repository_publication");
-                    work.until(async { Ok(branch.publish().await) }).await?
-                };
-                let metadata = gate.as_mut().unwrap();
-                let indexed_revision = inventory.manifest.dependency_retry.is_none()
-                    .then(|| metadata.prepared.revision.clone());
-                // Publication can win the gap between releasing the read guard and
-                // acquiring the writer. Only mark the generation we actually indexed.
-                if !metadata.repair
-                    && Some(branch.generation.load(std::sync::atomic::Ordering::Acquire))
-                        == generation
-                    && metadata.indexed_revision != indexed_revision
-                {
-                    metadata.indexed_revision = indexed_revision;
-                    metadata.last_use = branch.last_use.load(std::sync::atomic::Ordering::Relaxed);
-                    let branch = branch.clone();
-                    tokio::task::spawn_blocking(move || {
-                        branch.persist_header(gate.as_ref().unwrap())
-                    }).await??;
-                }
+            if let (Some(branch), Some(generation)) = (&preparing_branch, generation) {
+                operation.stage("index_marker_publication");
+                branch.mark_indexed(generation, inventory.manifest.dependency_retry.is_none(), &work, &operation).await?;
             }
             preparing_app.owners.lock().unwrap().observe(
                 &entry,
