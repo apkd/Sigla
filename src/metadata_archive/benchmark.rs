@@ -117,7 +117,7 @@ fn dependency_setup_benchmark() -> Result<()> {
             identity: input.name.clone(),
             name: input.name.clone(),
             origin: None,
-            defines: input.defines.clone(),
+            defines: crate::store::canonical_defines(&input.defines),
             edition: String::new(),
             compiler_options: Default::default(),
             references: inputs[..project]

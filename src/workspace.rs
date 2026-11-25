@@ -1203,7 +1203,8 @@ fn input_key(input: &SourceInput, project: &Project, stamp: &Stamp) -> String {
     } else if input.language.document() {
         "document".into()
     } else if input.language == Language::CSharp {
-        crate::store::canonical_defines(&project.defines).join(";")
+        // Discovery sorts and deduplicates defines once per project.
+        project.defines.join(";")
     } else if input.language.native() {
         format!("native:{:?}", input.language)
     } else {
@@ -1229,7 +1230,7 @@ struct Indexed {
     storage: std::time::Duration,
 }
 
-enum InputContents {
+enum InputContents<'p> {
     Archived(crate::metadata_archive::Analysis),
     Metadata {
         bytes: Vec<u8>,
@@ -1238,12 +1239,12 @@ enum InputContents {
     Source {
         source: String,
         language: Language,
-        defines: Vec<String>,
-        edition: String,
+        defines: &'p [String],
+        edition: &'p str,
     },
 }
-impl InputContents {
-    fn read(input: &SourceInput, project: &Project) -> Result<Self> {
+impl<'p> InputContents<'p> {
+    fn read(input: &SourceInput, project: &'p Project) -> Result<Self> {
         if input.metadata {
             if crate::metadata_archive::assembly_path(&input.path) {
                 return Ok(Self::Archived(crate::metadata_archive::load_analysis(
@@ -1263,8 +1264,8 @@ impl InputContents {
             Ok(Self::Source {
                 source: read_stable(&input.path, input.language)?,
                 language: input.language,
-                defines: crate::store::canonical_defines(&project.defines),
-                edition: project.edition.clone(),
+                defines: &project.defines,
+                edition: &project.edition,
             })
         }
     }
@@ -1312,7 +1313,7 @@ impl InputContents {
                 edition,
             } => {
                 let facts = crate::extract::extract_cancellable(
-                    &source, language, &defines, &edition, cancel,
+                    &source, language, defines, edition, cancel,
                 )?;
                 Ok(FileData {
                     source,
@@ -1413,15 +1414,15 @@ fn scheduling_bytes(total: u64, workers: usize) -> u64 {
 
 type SourceJob<'a> = (String, (Stamp, &'a SourceInput, &'a Project));
 
-fn prepare_input(
+fn prepare_input<'p>(
     store: &Store,
     input: &SourceInput,
-    project: &Project,
+    project: &'p Project,
     stamp: &Stamp,
 ) -> Result<(
     crate::store::ObjectId,
     Option<crate::store::ObjectId>,
-    Option<InputContents>,
+    Option<InputContents<'p>>,
 )> {
     let identity = input_identity(input, project, stamp)?;
     if let Some(identity) = identity
@@ -1447,9 +1448,9 @@ fn input_identity(
                 input.language,
                 input.metadata,
                 if !input.metadata && input.language == Language::CSharp {
-                    crate::store::canonical_defines(&project.defines)
+                    project.defines.as_slice()
                 } else {
-                    Vec::new()
+                    &[]
                 },
                 if !input.metadata && input.language == Language::Rust {
                     project.edition.as_str()

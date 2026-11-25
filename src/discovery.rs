@@ -781,27 +781,29 @@ fn discover_documents(policy: &Policy, result: &mut Discovery) {
             .into_values()
             .collect(),
     });
-    for (path, language) in documents {
-        let projects = std::iter::once(context).chain(
-            result.projects[..context]
+    // Every eligible root contains the project origin. Their union is just the
+    // broadest one, including the origin's parent as an implicit root.
+    let scopes: Vec<_> = result.projects[..context]
+        .iter()
+        .enumerate()
+        .filter_map(|(i, project)| {
+            let origin = project.origin.as_deref()?;
+            let root = project
+                .source_roots
                 .iter()
-                .enumerate()
-                .filter(|(_, project)| {
-                    (language.native() || path.parent() != Some(result.root.as_path()))
-                        && (project.source_roots.iter().any(|r| {
-                            path.starts_with(&r.physical)
-                                && project
-                                    .origin
-                                    .as_ref()
-                                    .is_some_and(|origin| origin.starts_with(&r.physical))
-                        }) || project
-                            .origin
-                            .as_ref()
-                            .and_then(|p| p.parent())
-                            .is_some_and(|dir| path.starts_with(dir)))
-                })
-                .map(|(i, _)| i),
-        );
+                .map(|r| r.physical.as_path())
+                .filter(|root| origin.starts_with(root))
+                .chain(origin.parent())
+                .min_by_key(|root| root.components().count())?;
+            Some((i, root))
+        })
+        .collect();
+    for (path, language) in documents {
+        let include_projects = language.native() || path.parent() != Some(result.root.as_path());
+        let projects =
+            std::iter::once(context).chain(scopes.iter().filter_map(|&(i, root)| {
+                (include_projects && path.starts_with(root)).then_some(i)
+            }));
         for project in projects {
             result.sources.push(SourceInput {
                 path: path.clone(),
